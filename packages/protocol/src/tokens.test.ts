@@ -10,6 +10,7 @@ describe("isDeviceTokenShape", () => {
     expect(isDeviceTokenShape("dk_demo_cookie_unified")).toBe(true);
     expect(isDeviceTokenShape("dk_abc")).toBe(true); // min length: 3 past prefix
     expect(isDeviceTokenShape("dk_A0_-x")).toBe(true);
+    expect(isDeviceTokenShape(`dk_${"a".repeat(120)}`)).toBe(true); // exactly AT the cap
   });
   it("rejects junk before any lookup work", () => {
     expect(isDeviceTokenShape("")).toBe(false);

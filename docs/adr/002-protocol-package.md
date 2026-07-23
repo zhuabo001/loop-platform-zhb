@@ -33,8 +33,14 @@ server 与 daemon 是两个独立部署的进程，唯一耦合点是 HTTP wire 
      **`status`/`state` 不在此 body**（属 in-run CLI `loopany report` 动词，后续阶段）；
    - report 响应：`{ok:true}`，reconcile 分支附 `reconciled:true`（对应 ADR-001 T5）；
    - 凭证形状：`gateway/tokens.ts:27-50`（`dk_`/`rk_` 前缀、宽松字符集合法）。
+   唯一的非镜像字段：`errors.ts` 的 `code?`——经典 machine 路由线上只返回
+   `{error}`，`code` 是为编程化调用方预留的可选 slug（对齐 CLI transport 的
+   TOON `code:` 惯例），additive optional，老读者剥离它无影响。
 4. **caps/裁剪策略不进 protocol**（`WIRE_TEXT_CAP`/`clipText`/条目上限是 server 侧
    策略，且参考实现 server 会对入站再做裁剪）。protocol 只承载形状与枚举。
+   例外（有意收紧，记录于此）：基础值域约束 `int`/`nonnegative`（progress.step、
+   cost 各 token 计数、durationMs、attempts）——参考 wire 是普通 number，schema
+   略严于它；真实 daemon 载荷恒满足，收紧只为让畸形数据在边界即拒。
 5. **主入口保持纯净**（无 node 内建依赖，可被浏览器 bundle 引用——server 的
    TanStack client 会引用枚举/类型）；`sha256`/`machineIdFromToken` 放子路径
    `@loopzhb/protocol/node`（node:crypto）。

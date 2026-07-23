@@ -36,6 +36,12 @@ const GOLDEN_REPORT = {
 } as const;
 
 describe("reportRequestSchema", () => {
+  it("pins the exact wire-claimable outcome list (kills self-adaptive iteration)", () => {
+    // The acceptance test below ITERATES this constant — without pinning the
+    // list itself, deleting a value keeps the suite green (mutation-verified).
+    expect([...REPORT_OUTCOMES]).toEqual(["direct", "silent", "exec", "evolve"]);
+  });
+
   it("round-trips the full golden finalize body", () => {
     expect(reportRequestSchema.parse(GOLDEN_REPORT)).toEqual(GOLDEN_REPORT);
   });

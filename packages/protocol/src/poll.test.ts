@@ -93,6 +93,11 @@ describe("deliverySchema", () => {
     expect(() => deliverySchema.parse({ ...GOLDEN_DELIVERY, role: "review" })).toThrow();
   });
 
+  it("requires roots to be present ([] = unrestricted, but never absent)", () => {
+    const { roots: _roots, ...noRoots } = GOLDEN_DELIVERY;
+    expect(() => deliverySchema.parse(noRoots)).toThrow();
+  });
+
   it("requires non-null workdir to be a string, allows null", () => {
     expect(() =>
       deliverySchema.parse({ ...GOLDEN_DELIVERY, loop: { ...GOLDEN_DELIVERY.loop, workdir: 3 } }),
