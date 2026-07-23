@@ -1,0 +1,110 @@
+import { describe, expect, it } from "vitest";
+
+import {
+  deliverySchema,
+  pollRequestSchema,
+  pollResponseSchema,
+  runProgressSchema,
+} from "./poll.js";
+
+/** A golden Delivery, mirroring the reference shape field-for-field. */
+const GOLDEN_DELIVERY = {
+  runId: "r_01HXYZ",
+  runToken: `rk_${"b2".repeat(16)}`,
+  role: "exec",
+  loop: {
+    id: "loop_01",
+    name: "react-doctor",
+    workdir: "/home/dev/project",
+    taskFile: "/home/dev/project/loops/react-doctor/README.md",
+    workflow: null,
+    model: null,
+    allowControl: true,
+    agent: "claude-code",
+  },
+  prevState: { lastScore: 87 },
+  roots: ["/home/dev/project"],
+  systemPrompt: "",
+  task: "Read the task file first, do the work, end with exactly ONE loopany report.",
+} as const;
+
+describe("pollRequestSchema", () => {
+  it("round-trips a full golden poll body", () => {
+    const body = {
+      host: "mbp.local",
+      platform: "darwin",
+      arch: "arm64",
+      version: "0.16.0",
+      progress: [{ runId: "r_01", step: 3, label: "editing src/app.ts" }],
+      wait: true as const,
+    };
+    expect(pollRequestSchema.parse(body)).toEqual(body);
+  });
+
+  it("parses an empty body (every field optional — old daemons send almost nothing)", () => {
+    expect(pollRequestSchema.parse({})).toEqual({});
+  });
+
+  it("strips unknown keys (tolerant reader: a newer peer's fields never break us)", () => {
+    const parsed = pollRequestSchema.parse({ host: "h", watchDigest: "abc", futureField: 42 });
+    expect(parsed).toEqual({ host: "h" });
+    expect(parsed).not.toHaveProperty("watchDigest");
+    expect(parsed).not.toHaveProperty("futureField");
+  });
+
+  it("rejects wait:false — the flag is only ever SENT as true", () => {
+    expect(() => pollRequestSchema.parse({ wait: false })).toThrow();
+  });
+
+  it("rejects a progress entry without a label", () => {
+    expect(() => runProgressSchema.parse({ runId: "r", step: 1 })).toThrow();
+    expect(() =>
+      pollRequestSchema.parse({ progress: [{ runId: "r", step: 1 }] }),
+    ).toThrow();
+  });
+
+  it("rejects a non-integer progress step", () => {
+    expect(() => runProgressSchema.parse({ runId: "r", step: 1.5, label: "x" })).toThrow();
+  });
+});
+
+describe("deliverySchema", () => {
+  it("round-trips the golden delivery", () => {
+    expect(deliverySchema.parse(GOLDEN_DELIVERY)).toEqual(GOLDEN_DELIVERY);
+  });
+
+  it("passes prevState through untouched (any JSON, incl. null)", () => {
+    for (const prevState of [null, 0, "x", { nested: [1, 2] }]) {
+      const d = deliverySchema.parse({ ...GOLDEN_DELIVERY, prevState });
+      expect(d.prevState).toEqual(prevState);
+    }
+  });
+
+  it("accepts a delivery with no agent (old server) — daemon defaults to claude-code", () => {
+    const { agent: _agent, ...loopNoAgent } = GOLDEN_DELIVERY.loop;
+    const parsed = deliverySchema.parse({ ...GOLDEN_DELIVERY, loop: loopNoAgent });
+    expect(parsed.loop.agent).toBeUndefined();
+  });
+
+  it("rejects an unknown agent and an unknown role", () => {
+    expect(() =>
+      deliverySchema.parse({ ...GOLDEN_DELIVERY, loop: { ...GOLDEN_DELIVERY.loop, agent: "gpt" } }),
+    ).toThrow();
+    expect(() => deliverySchema.parse({ ...GOLDEN_DELIVERY, role: "review" })).toThrow();
+  });
+
+  it("requires non-null workdir to be a string, allows null", () => {
+    expect(() =>
+      deliverySchema.parse({ ...GOLDEN_DELIVERY, loop: { ...GOLDEN_DELIVERY.loop, workdir: 3 } }),
+    ).toThrow();
+  });
+});
+
+describe("pollResponseSchema", () => {
+  it("round-trips deliveries (incl. empty)", () => {
+    expect(pollResponseSchema.parse({ deliveries: [] })).toEqual({ deliveries: [] });
+    expect(pollResponseSchema.parse({ deliveries: [GOLDEN_DELIVERY] })).toEqual({
+      deliveries: [GOLDEN_DELIVERY],
+    });
+  });
+});
