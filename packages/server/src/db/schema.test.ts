@@ -129,6 +129,14 @@ describe("round-trips", () => {
     expect(back!.costUsd).toBeCloseTo(0.42);
   });
 
+  it("runs: a live progress row round-trips (the sweep reads `at` as last-heard-from)", async () => {
+    await seeded();
+    const progress = { step: 2, label: "editing src/x.ts", at: "2026-07-27T00:01:00.000Z" };
+    await db.insert(runs).values({ ...RUN_FIXTURE, phase: "running", progress });
+    const [back] = await db.select().from(runs);
+    expect(back!.progress).toEqual(progress);
+  });
+
   it("run_leases: defaults are the safe caps; expiresAt null encodes active/Infinity", async () => {
     await seeded();
     const [back] = await db

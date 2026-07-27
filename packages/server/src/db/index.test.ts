@@ -31,25 +31,32 @@ describe("runMigrations", () => {
     await expect(runMigrations(h)).resolves.toBeUndefined();
   });
 
-  it("delivers the full index set, incl. the ADR-001 partial claim index", async () => {
+  it("delivers the full index set, each with its pinned definition", async () => {
     const h = await migrated();
     const { rows } = await h.client.query<{ indexname: string; indexdef: string }>(
       "select indexname, indexdef from pg_indexes where schemaname = 'public' and indexname not like '%_pkey' order by indexname",
     );
-    expect(rows.map((r) => r.indexname)).toEqual([
-      "loops_machine_idx",
-      "run_leases_loop_idx",
-      "run_leases_run_idx",
-      "runs_loop_idx",
-      "runs_loop_ts_idx",
-      "runs_pending_idx",
-      "runs_phase_idx",
-    ]);
-    const pending = rows.find((r) => r.indexname === "runs_pending_idx")!;
-    // machine_id leads (the poll claim is `WHERE machineId=? AND phase='pending'`)
-    // and the partial predicate keeps the hot-path index tiny.
-    expect(pending.indexdef).toContain("USING btree (machine_id)");
-    expect(pending.indexdef).toContain("WHERE (phase = 'pending'::text)");
+    const byName = new Map(rows.map((r) => [r.indexname, r.indexdef]));
+    // Names AND column lists are pinned: a hand-edit of the committed SQL's
+    // index definition must not slip through (db:check only guards
+    // schema.ts↔snapshot, not snapshot↔committed-SQL).
+    const expected: Record<string, string> = {
+      loops_machine_idx: "USING btree (machine_id)",
+      run_leases_loop_idx: "USING btree (loop_id)",
+      run_leases_run_idx: "USING btree (run_id)",
+      runs_loop_idx: "USING btree (loop_id)",
+      runs_loop_ts_idx: "USING btree (loop_id, ts)",
+      runs_pending_idx: "USING btree (machine_id)",
+      runs_phase_idx: "USING btree (phase)",
+    };
+    expect([...byName.keys()].sort()).toEqual(Object.keys(expected).sort());
+    for (const [name, def] of Object.entries(expected)) {
+      expect(byName.get(name), name).toContain(def);
+    }
+    // The hot claim path additionally carries its partial predicate: machine_id
+    // leads (`WHERE machineId=? AND phase='pending'`) and pending-only rows keep
+    // the index tiny.
+    expect(byName.get("runs_pending_idx")).toContain("WHERE (phase = 'pending'::text)");
   });
 
   it("persists across close/reopen in the file-backed tier", async () => {
