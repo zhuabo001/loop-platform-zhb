@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4 # version comes from the root packageManager field
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # Server typecheck/test build @loopzhb/protocol first (its exports resolve
+      # to dist/) — order here is irrelevant, but a fresh clone must stay green.
+      - run: pnpm -r typecheck
+      - run: pnpm -r test
+      - run: pnpm -r build
+
+      # schema.ts is the source of truth but tests run the COMMITTED SQL — guard
+      # against the two silently drifting (regenerating must be a no-op diff).
+      - run: pnpm --filter @loopzhb/server db:check
