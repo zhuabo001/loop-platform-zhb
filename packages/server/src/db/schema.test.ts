@@ -173,7 +173,19 @@ describe("round-trips", () => {
 });
 
 describe("constraints that ARE the heart semantics", () => {
-  it("runs.ts is NOT NULL and re-stampable (last-transition time, not createdAt)", async () => {
+  it("runs.ts is NOT NULL — a ts-less insert is rejected (last-transition time, not createdAt)", async () => {
+    await seeded();
+    const h = handles[0]!;
+    // Raw SQL: the drizzle insert type rightly forbids omitting ts at compile
+    // time, so the negative case must go under the typechecker.
+    await expect(
+      h.client.query(
+        "insert into runs (id, loop_id, machine_id, phase, role) values ('run-no-ts', 'loop-1', 'm-test', 'pending', 'exec')",
+      ),
+    ).rejects.toThrow();
+  });
+
+  it("the atomic-claim shape: conditional UPDATE … WHERE phase='pending'", async () => {
     await seeded();
     await db.insert(runs).values(RUN_FIXTURE);
     const claimed = "2026-07-27T00:00:05.000Z";

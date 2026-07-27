@@ -20,9 +20,10 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "typecheck": "tsc --noEmit",
-    "test": "vitest run",
-    "db:generate": "drizzle-kit generate"
+    "typecheck": "pnpm --filter @loopzhb/protocol build && tsc --noEmit",
+    "test": "pnpm --filter @loopzhb/protocol build && vitest run",
+    "db:generate": "drizzle-kit generate",
+    "db:check": "drizzle-kit generate && git diff --exit-code -- drizzle/"
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.5.4",

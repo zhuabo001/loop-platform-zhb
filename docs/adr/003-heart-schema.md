@@ -78,3 +78,17 @@ expires_at 过期 ──▶ resolve 时惰性删除 / sweep 中 prune
   无 `user_id` 系列列（无 Better Auth）。托管分层缺席是推迟而非否决。
 - 工具链备注：drizzle-kit 以 CJS 语义解析 workspace 依赖，`@loopzhb/protocol`
   的 exports 因此补了 `default` 条件（纯 additive，无行为变化）。
+
+## 后续批次补记（对抗性审查 #1 之后）
+
+- **构建顺序**：`@loopzhb/server` 的 typecheck/test 脚本自带
+  `pnpm --filter @loopzhb/protocol build` 前置——server 经 package exports 解析
+  protocol 的 `dist/`，干净 clone 无先验 build 时 typecheck/test 必红。不要用
+  pnpm 的 pre/post 脚本（默认不启用）。
+- **schema.ts↔SQL 漂移守卫**：测试跑的是提交的迁移 SQL，而 drizzle 的
+  `.default()`/索引只进 DDL——schema.ts 可静默偏离 SQL。`db:check`（generate +
+  `git diff --exit-code`）在 CI 钉住这一点（`.github/workflows/ci.yml`）。
+- **已知继承自参考的松散不变量**：schema 允许 `state='terminal-grace'` 且
+  `expiresAt NULL`（一个永不被 prune 的永恒 grace 租约）——不变量只活在
+  `terminalizeLease` 的写入路径里。Day 3–4 实现 store 层时补一条
+  "terminalize 必带 expiresAt" 的测试。

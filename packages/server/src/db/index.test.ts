@@ -31,14 +31,25 @@ describe("runMigrations", () => {
     await expect(runMigrations(h)).resolves.toBeUndefined();
   });
 
-  it("delivers the ADR-001 partial claim index (pending-only, on machine)", async () => {
+  it("delivers the full index set, incl. the ADR-001 partial claim index", async () => {
     const h = await migrated();
-    const { rows } = await h.client.query<{ indexdef: string }>(
-      "select indexdef from pg_indexes where schemaname = 'public' and indexname = 'runs_pending_idx'",
+    const { rows } = await h.client.query<{ indexname: string; indexdef: string }>(
+      "select indexname, indexdef from pg_indexes where schemaname = 'public' and indexname not like '%_pkey' order by indexname",
     );
-    expect(rows).toHaveLength(1);
-    expect(rows[0]!.indexdef).toContain("USING btree (machine_id)");
-    expect(rows[0]!.indexdef).toContain("WHERE (phase = 'pending'::text)");
+    expect(rows.map((r) => r.indexname)).toEqual([
+      "loops_machine_idx",
+      "run_leases_loop_idx",
+      "run_leases_run_idx",
+      "runs_loop_idx",
+      "runs_loop_ts_idx",
+      "runs_pending_idx",
+      "runs_phase_idx",
+    ]);
+    const pending = rows.find((r) => r.indexname === "runs_pending_idx")!;
+    // machine_id leads (the poll claim is `WHERE machineId=? AND phase='pending'`)
+    // and the partial predicate keeps the hot-path index tiny.
+    expect(pending.indexdef).toContain("USING btree (machine_id)");
+    expect(pending.indexdef).toContain("WHERE (phase = 'pending'::text)");
   });
 
   it("persists across close/reopen in the file-backed tier", async () => {
