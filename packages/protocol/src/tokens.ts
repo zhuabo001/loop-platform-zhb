@@ -12,8 +12,6 @@
  *
  * Mirrors the reference (loop-platform packages/server/src/gateway/tokens.ts:27-50).
  */
-import { z } from "zod";
-
 export const DEVICE_TOKEN_PREFIX = "dk_";
 export const RUN_TOKEN_PREFIX = "rk_";
 
@@ -25,11 +23,9 @@ export function isDeviceTokenShape(token: string): boolean {
 
 export const RUN_TOKEN_RE = /^rk_[A-Za-z0-9_-]{3,120}$/;
 
+/** Mint/write-side shape filter for run tokens (e.g. asserting a freshly
+ *  minted lease carries the `rk_` form). NEVER used in a reader DTO — the
+ *  wire keeps run tokens opaque (see `deliverySchema.runToken`). */
 export function isRunTokenShape(token: string): boolean {
   return RUN_TOKEN_RE.test(token);
 }
-
-/** Shared shape validation for the `rk_…` run lease where it appears INSIDE a
- *  zod-parsed payload (today: `deliverySchema.runToken`). Same cheap-filter
- *  semantics as the regexes above — never the auth boundary. */
-export const runTokenSchema = z.string().regex(RUN_TOKEN_RE);

@@ -7,12 +7,14 @@
 > `docs/handoff/codex-handoff-roadmap-adr-adjustment.md` 统一修订进 ADR-001/002/003
 > （三份 ADR 文末均有当日修订记录）。要点：T3 = 效果幂等（第二次 report 401，零
 > 副作用）；cancel 与 lease 撤销同一事务（不再"取消不 retire"）；claim + lease
-> INSERT 同一事务；`run_leases.run_id` 已升级 unique index；`durationMs` 补 `.int()`、
-> `runToken` 补形状校验；方案 B 落定——预声明的 protocol/schema 形状 ≠ Phase 1 已
-> 支持全部能力（ADR-002 决策 6），handler 不得超前实现。测试基线更新为
-> **79 全绿（62 protocol + 17 server）**。注意：当前 Delivery reader 的 `runToken`
-> 形状收紧与方案 B 冲突，必须按 `codex-handoff-roadmap-adr-adjustment.md` §11.1 修正后
-> 才可作为兼容 DTO 直接消费。
+> INSERT 同一事务；`run_leases.run_id` 已升级 unique index；`durationMs` 补 `.int()`；
+> 新增 `isRunTokenShape`（mint/写入侧形状过滤）；方案 B 落定——预声明的
+> protocol/schema 形状 ≠ Phase 1 已支持全部能力（ADR-002 决策 6），handler 不得超前实现。测试基线更新为
+> **79 全绿（62 protocol + 17 server）**。codex handoff §11 的实现审查三条
+> 已全部闭环：Delivery `runToken` 已恢复宽容 reader（opaque，形状校验只留
+> mint/写入侧）；`run_leases.run_id` unique 的措辞收窄为"至多一条现存"；
+> report/cancel 竞态锁定语义（锁行/CAS）已写进 ADR-001/003，Day 3–4 需把
+> 交错测试实现为真实并发测试。
 
 ---
 
@@ -109,9 +111,10 @@ Phase 1「心脏」的前两步已完成并合入 main：wire 协议包（Day 1�
 5. **HTTP 框架已定：Hono**（`hono` + `@hono/node-server`，2026-07-28 拍板；
    对比材料见 `docs/handoff/002-day3-4-http-framework.md`）。测试用 `app.fetch`
    打实例，不起真端口；TanStack Start 留到 Phase 4 Dashboard 再评估。
-6. 协议侧 DTO 的 `durationMs` 已带 `.int()`；`deliverySchema.runToken` 当前已带形状
-   校验，但这会拒绝旧 server 的裸 UUID，**必须先按 Codex handoff §11.1 恢复宽容
-   reader 后再直接消费**。参考实现语义提取：`loop-platform-github` 的
+6. 协议侧 DTO 已就绪，直接消费：`pollRequestSchema` / `deliverySchema`
+   （`runToken` 为 opaque 字符串——宽容 reader，裸 UUID 与 `rk_` 都透传，
+   形状校验只在 mint/写入侧）/ `reportRequestSchema`（`durationMs` 已带
+   `.int()`）。参考实现语义提取：`loop-platform-github` 的
    `gateway/index.ts`（poll:456-623、report:1291-1558、sweep:354-428）、
    `db/store.ts`（claimPendingRun:200-208）、`gateway/tokens.ts`（lease 四函数）。
 

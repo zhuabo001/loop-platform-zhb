@@ -224,8 +224,10 @@ export const runLeases = pgTable(
     expiresAt: text("expires_at"),
     createdAt: text("created_at").notNull(),
   },
-  // runId is UNIQUE: at-most-once delivery means a run is leased exactly once
-  // (terminalizeLease targets by runId); the loop cascade deletes by loopId.
+  // runId is UNIQUE: at most one LIVE lease row per run (terminalizeLease
+  // targets by runId). The "never re-minted, ever" lifetime guarantee is NOT
+  // the index's job — it falls out of the run's terminal phase + the atomic
+  // claim + the gateway's no-re-delivery guard. The loop cascade deletes by loopId.
   (t) => [uniqueIndex("run_leases_run_idx").on(t.runId), index("run_leases_loop_idx").on(t.loopId)],
 );
 

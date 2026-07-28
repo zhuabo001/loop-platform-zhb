@@ -13,7 +13,6 @@
 import { z } from "zod";
 
 import { codingAgentSchema, runRoleSchema } from "./enums.js";
-import { runTokenSchema } from "./tokens.js";
 
 /** Live "what's it doing" line for one in-flight run (the server stamps `at`). */
 export const runProgressSchema = z.object({
@@ -60,8 +59,13 @@ export type DeliveryLoop = z.infer<typeof deliveryLoopSchema>;
  *  Mirrors loop-platform packages/server/src/gateway/delivery.ts:17-41. */
 export const deliverySchema = z.object({
   runId: z.string(),
-  /** The run-lease wire token (`rk_…`) minted at claim time (shape-checked). */
-  runToken: runTokenSchema,
+  /** The run-lease wire token minted at claim time. OPAQUE on the wire — the
+   *  daemon (reader) only echoes it back as the Bearer credential, so a shape
+   *  check here would buy nothing and break forward/backward compat the day the
+   *  mint format changes (the reference's pre-Batch-6 servers minted bare
+   *  UUIDs; they ride this same field). Shape filtering is mint/write-side
+   *  only (`isRunTokenShape`), never reader-side (ADR-002). */
+  runToken: z.string(),
   role: runRoleSchema,
   loop: deliveryLoopSchema,
   /** Workflow cursor (loop.state) passed back as the gate's `prev`. */
