@@ -20,3 +20,12 @@ export const DEVICE_TOKEN_RE = /^dk_[A-Za-z0-9_-]{3,120}$/;
 export function isDeviceTokenShape(token: string): boolean {
   return DEVICE_TOKEN_RE.test(token);
 }
+
+export const RUN_TOKEN_RE = /^rk_[A-Za-z0-9_-]{3,120}$/;
+
+/** Mint/write-side shape filter for run tokens (e.g. asserting a freshly
+ *  minted lease carries the `rk_` form). NEVER used in a reader DTO — the
+ *  wire keeps run tokens opaque (see `deliverySchema.runToken`). */
+export function isRunTokenShape(token: string): boolean {
+  return RUN_TOKEN_RE.test(token);
+}

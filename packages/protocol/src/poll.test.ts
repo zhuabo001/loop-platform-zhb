@@ -93,6 +93,20 @@ describe("deliverySchema", () => {
     expect(() => deliverySchema.parse({ ...GOLDEN_DELIVERY, role: "review" })).toThrow();
   });
 
+  it("keeps runToken OPAQUE (tolerant reader: any string passes, incl. bare UUIDs)", () => {
+    // Pinning the mirror discipline (ADR-002): the reader must NOT shape-check
+    // the token — a pre-Batch-6 bare UUID and a future mint format both ride
+    // this field. Shape filtering lives mint/write-side (isRunTokenShape).
+    for (const runToken of [
+      `rk_${"b2".repeat(16)}`, // current mint form
+      "4b6f8a2e-1c3d-4e5f-9a0b-7c8d9e0f1a2b", // pre-Batch-6 bare UUID
+      "whatever-a-future-server-mints",
+      "",
+    ]) {
+      expect(deliverySchema.parse({ ...GOLDEN_DELIVERY, runToken }).runToken).toBe(runToken);
+    }
+  });
+
   it("requires roots to be present ([] = unrestricted, but never absent)", () => {
     const { roots: _roots, ...noRoots } = GOLDEN_DELIVERY;
     expect(() => deliverySchema.parse(noRoots)).toThrow();

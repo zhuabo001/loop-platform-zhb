@@ -59,7 +59,12 @@ export type DeliveryLoop = z.infer<typeof deliveryLoopSchema>;
  *  Mirrors loop-platform packages/server/src/gateway/delivery.ts:17-41. */
 export const deliverySchema = z.object({
   runId: z.string(),
-  /** The run-lease wire token (`rk_…`) minted at claim time. */
+  /** The run-lease wire token minted at claim time. OPAQUE on the wire — the
+   *  daemon (reader) only echoes it back as the Bearer credential, so a shape
+   *  check here would buy nothing and break forward/backward compat the day the
+   *  mint format changes (the reference's pre-Batch-6 servers minted bare
+   *  UUIDs; they ride this same field). Shape filtering is mint/write-side
+   *  only (`isRunTokenShape`), never reader-side (ADR-002). */
   runToken: z.string(),
   role: runRoleSchema,
   loop: deliveryLoopSchema,

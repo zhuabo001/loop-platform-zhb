@@ -68,7 +68,7 @@ export const reportRequestSchema = z.object({
   finalText: z.string().optional(),
   /** Workflow cursor (free-form) → persisted as loop.state for the next run. */
   cursor: z.unknown().optional(),
-  durationMs: z.number().nonnegative().optional(),
+  durationMs: z.number().int().nonnegative().optional(),
   /** Agent session id on the machine (locates the local transcript). */
   sessionId: z.string().optional(),
   /** Latest content of the loop's task file (durable context+log doc). */

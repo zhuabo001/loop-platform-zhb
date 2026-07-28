@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { DEVICE_TOKEN_PREFIX, isDeviceTokenShape, RUN_TOKEN_PREFIX } from "./tokens.js";
+import { DEVICE_TOKEN_PREFIX, isDeviceTokenShape, isRunTokenShape, RUN_TOKEN_PREFIX } from "./tokens.js";
 
 describe("isDeviceTokenShape", () => {
   it("accepts the real minted form (dk_ + 30 hex chars)", () => {
@@ -22,6 +22,28 @@ describe("isDeviceTokenShape", () => {
     expect(isDeviceTokenShape("dk_abc.def")).toBe(false); // charset excludes dots
     expect(isDeviceTokenShape(`dk_${"a".repeat(121)}`)).toBe(false); // over the 120 cap
     expect(isDeviceTokenShape("xdk_abcdef")).toBe(false); // anchored at the start
+  });
+});
+
+describe("isRunTokenShape", () => {
+  it("accepts the real minted form (rk_ + 32 hex chars)", () => {
+    expect(isRunTokenShape(`rk_${"b2".repeat(16)}`)).toBe(true);
+  });
+  it("accepts word-shaped demo/dev tokens (deliberately permissive charset)", () => {
+    expect(isRunTokenShape("rk_demo_run")).toBe(true);
+    expect(isRunTokenShape("rk_abc")).toBe(true); // min length: 3 past prefix
+  });
+  it("rejects junk before any lookup work", () => {
+    expect(isRunTokenShape("")).toBe(false);
+    expect(isRunTokenShape("rk_")).toBe(false); // nothing past the prefix
+    expect(isRunTokenShape("rk_ab")).toBe(false); // under the 3-char floor
+    expect(isRunTokenShape(`dk_${"a".repeat(30)}`)).toBe(false); // device token, wrong prefix
+    expect(isRunTokenShape(`${"a".repeat(32)}`)).toBe(false); // no prefix at all
+    expect(isRunTokenShape(" rk_abcdef")).toBe(false); // stray whitespace
+    expect(isRunTokenShape("rk_abc def")).toBe(false);
+    expect(isRunTokenShape("rk_abc.def")).toBe(false); // charset excludes dots
+    expect(isRunTokenShape(`rk_${"a".repeat(121)}`)).toBe(false); // over the 120 cap
+    expect(isRunTokenShape("xrk_abcdef")).toBe(false); // anchored at the start
   });
 });
 

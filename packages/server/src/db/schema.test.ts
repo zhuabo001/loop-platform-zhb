@@ -214,6 +214,23 @@ describe("constraints that ARE the heart semantics", () => {
     expect(lost).toHaveLength(0);
   });
 
+  it("one run ⇒ at most one lease (run_leases.run_id is UNIQUE — ADR-003)", async () => {
+    await seeded();
+    const lease = {
+      runId: "run-1",
+      loopId: "loop-1",
+      machineId: "m-test",
+      role: "exec" as const,
+      createdAt: "2026-07-27T00:00:00.000Z",
+    };
+    await db.insert(runLeases).values({ ...lease, tokenHash: "hash-of-rk-1" });
+    // A second lease for the SAME run (different wire token) must be rejected
+    // at the DB level, not just by application discipline.
+    await expect(
+      db.insert(runLeases).values({ ...lease, tokenHash: "hash-of-rk-2" }),
+    ).rejects.toThrow();
+  });
+
   it("declares NO foreign keys (cascades are a store-layer concern — ADR-003)", async () => {
     await seeded();
     const h = handles[0]!;

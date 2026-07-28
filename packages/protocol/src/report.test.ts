@@ -74,8 +74,15 @@ describe("reportRequestSchema", () => {
     expect(() => transcriptStepSchema.parse({ kind: "thinking" })).toThrow();
   });
 
-  it("rejects a negative durationMs and a fractional token count", () => {
+  it("accepts durationMs 0 and positive integers; rejects negative/fractional/string", () => {
+    expect(reportRequestSchema.parse({ ok: true, durationMs: 0 }).durationMs).toBe(0);
+    expect(reportRequestSchema.parse({ ok: true, durationMs: 184_000 }).durationMs).toBe(184_000);
     expect(() => reportRequestSchema.parse({ ok: true, durationMs: -1 })).toThrow();
+    expect(() => reportRequestSchema.parse({ ok: true, durationMs: 1.5 })).toThrow();
+    expect(() => reportRequestSchema.parse({ ok: true, durationMs: "184000" })).toThrow();
+  });
+
+  it("rejects a fractional token count", () => {
     expect(() => costReportSchema.parse({ inputTokens: 1.5 })).toThrow();
   });
 });

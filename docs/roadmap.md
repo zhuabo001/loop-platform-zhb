@@ -7,12 +7,16 @@
 
 ## 核心原则
 
-这个系统的价值不在 cron，也不在 Agent，而在 **「调度—领取—执行—回报」链路在重试、重启、休眠下不重不漏**。
-因此实现顺序服从三条规则：
+这个系统的价值不在 cron，也不在 Agent，而在 **「调度—领取—执行—回报」链路在
+重试、重启、休眠下的精确承诺**：Run 不重复执行；未成功交付或未完成的 Run 最终
+进入可观察的失败状态，不得静默消失；已成功提交的最终报告不因 HTTP 重试产生
+重复副作用（at-most-once，见 ADR-001「投递保证」）。
+因此实现顺序服从四条规则：
 
 1. **心脏先行**：Run 状态机 + 原子 claim + RunLease 凭证模型是第一周的产出物，可靠性语义第一天就进入数据模型，而不是事后补丁。
-2. **一切皆可假**：Runner、Blob 存储、Dashboard 先全部用最薄实现（Fake Runner、内存 BlobStore、只读 JSON 页面），它们不影响骨架正确性。
+2. **一切皆可假**：Runner、Blob 存储、Dashboard 先全部用最薄实现（Fake Runner、内存 BlobStore、只读 JSON 页面），它们不影响骨架正确性。「实现最薄」指**行为**最薄，不指 protocol/schema 形状最薄（ADR-002 决策 6）。
 3. **链路上做插件**：cron、真实 Agent、artifact 同步都是已验证链路上的插件，排在心脏测试（ADR-001）全绿之后。
+4. **跨阶段 Definition of Done**：安全边界、数据上限和可观察性是每个阶段的完成定义的一部分，不是最后的扫除项。
 
 ## 三条架构不变量
 
@@ -21,6 +25,23 @@
 1. Server 只调度、存储、认证、通知，**绝不执行用户代码或调用 LLM**。
 2. Agent 只在用户本机由 daemon 启动；代码、凭证、本地工具默认不离开该机器。
 3. HTTP 重试、Server 重启、电脑休眠**不导致**重复执行、丢失最终报告或越权操作。
+
+**部署边界**：认证（Phase 5）完成之前，server 仅允许 localhost / 受信网络使用，
+**不得公开暴露**——机器注册与触发端点在 auth 之前没有任何身份边界。
+
+## 里程碑
+
+不以固定周数承诺「接近完整核心能力」；按行为标志划分四个里程碑：
+
+| 里程碑 | 到达标志 |
+|---|---|
+| 学习骨架 | Phase 1 完成：T1–T6 绿，手动触发端到端跑通 |
+| 可演示 MVP | Phase 2 完成：一条真实 Agent E2E |
+| 可靠单用户 | Phase 5 完成：artifact 同步 + 单用户使用闭环 |
+| 可公开部署多用户 | Phase 6 生产硬化完成 + auth 上线 |
+
+每个阶段用**行为验收标准**收尾（见各阶段「验收」），不用「完成某模块」当作
+完成定义；估算保留未知量与生产硬化缓冲。
 
 ## 工程结构
 
@@ -49,28 +70,53 @@ docs/adr/     # 架构决策记录
 | Day 8–10 | 故障注入：心脏测试 T4–T7（server 重启、daemon 休眠迟到 report、取消、supersede） |
 
 触发方式：手动 `POST /loops/:id/run`。
-完成标准：ADR-001 全部测试绿，且三者全部成立——重复 poll 不重复执行、server 重启不丢在途 run、迟到的成功 report 能翻正误判的失败。
+完成标准：ADR-001 心脏测试 **T1–T6 全绿**（T7 为 coordinator 级测试，随
+`supersedePendingRun` 一同交付），且三者全部成立——重复 poll 不重复执行、
+server 重启不丢在途 run、迟到的成功 report 能翻正误判的失败。阶段末尾提供
+**CLI 或 JSON 只读观察面**（loop/run 列表与最终消息），不做 Dashboard。
 
-## Phase 2 — 让 Loop 成为产品（第 3–6 周）
+## Phase 2 — 一个真实 Agent（第 3–4 周）
 
-在已验证链路上逐层叠加，每层不动心脏：
+claude-code 或 codex 选一：子进程 spawn、进程组 kill、timeout、env 白名单、
+工作目录 jail、progress heartbeat。
 
-| 周 | 内容 | 验收 |
-|---|---|---|
-| 3 | cron 调度（croner）+ loop 时区 + 离线 pending 保留 + 重叠保护（下一次触发 supersede 未领取的 pending） | server 重启 / 机器离线恢复后最多补跑一次，绝不双跑 |
-| 4 | 一个真实 Agent（claude-code 或 codex 选一）：子进程 spawn、进程组 kill、env 白名单、工作目录 jail | agent 无法越出允许的根目录 |
-| 5 | Task File + 跨 run state + open/closed loop（goal/finish 语义） | 连续 run 能读到前次状态；closed 达标即停 |
-| 6 | 最小 Dashboard：loop 列表、Run Now、run 状态与最终消息 | 只读 + 一个按钮，不做花活 |
+| 验收 |
+|---|
+| 一条真实 Agent E2E 绿；agent 无法越出允许的根目录 |
 
-## Phase 3 — 存储与协作（第 7–12 周）
+## Phase 3 — cron 与离线恢复（第 5–6 周）
+
+cron（croner）+ loop 时区 + DST + 离线 pending 保留 + 重叠保护（下一次触发
+supersede 未领取的 pending——T7 语义在 cron 表面继承）+ 重启 catch-up 合并。
+
+| 验收 |
+|---|
+| server 重启 / 机器离线恢复后最多补跑一次，绝不双跑 |
+
+## Phase 4 — Loop 产品语义（第 7–8 周）
+
+Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Dashboard
+（loop 列表、Run Now、run 状态与最终消息）。
+
+| 验收 |
+|---|
+| 连续 run 能读到前次状态；closed 达标即停；Dashboard 只读 + 一个按钮，不做花活 |
+
+## Phase 5 — 存储与协作（第 9–14 周）
 
 按依赖顺序，每层独立可验：
 
-1. **Artifact 同步**（7–9）：chokidar watcher、全量 sha256 manifest（删除=缺席）、增量哈希、协商上传（needHashes + PUT 验哈希）、每文件/每 loop 上限、never-sync 目录双侧一致、run 快照与 diff。
-2. **团队与认证**（10–11）：GitHub 登录、Team/Membership、connect key（24h TTL、不存本体）、机器归属、跨团队 fail-closed。
-3. **通知**（12）：失败告警 + 连续失败熔断自动暂停。
+1. **Artifact 同步**：chokidar watcher、全量 sha256 manifest（删除=缺席）、增量哈希、协商上传（needHashes + PUT 验哈希）、每文件/每 loop 上限、never-sync 目录双侧一致、run 快照与 diff。
+2. **团队与认证**：GitHub 登录、Team/Membership、connect key（24h TTL、不存本体）、机器归属、跨团队 fail-closed。**此层完成前 server 不得公开暴露。**
+3. **通知**：失败告警 + 连续失败熔断自动暂停。
 
-## Phase 4 — 高阶能力（第 13 周起，按需）
+## Phase 6 — 生产硬化（独立阶段）
+
+Postgres（托管分层）/R2、迁移预检、body/rate/storage caps、SSRF 防护、GC、
+健康检查、部署形态，以及**真实 Postgres 的并发验证**（pglite 单连接语义不等于
+托管 PG 的并发语义）。
+
+## Phase 7 — 高阶能力（按需）
 
 每一项都可独立裁掉，心脏不依赖它们：
 
@@ -86,5 +132,5 @@ evolve/edit、生成式 Dashboard 与模板、MCP workflow、多 Agent、R2 与�
 
 ## 与初版路线图（retro-roadmap.md）的两处关键差异
 
-1. **可靠性语义从 Phase 3 提前到 Phase 1 的设计中**（实现仍最薄）：原子 claim、lease 状态机、幂等 report 无法事后 retrofit，事后补的每一步都在打补丁。
-2. **真实 Agent 与 cron 都排在心脏测试绿之后**：它们是链路上的插件，不是链路本身。
+1. **可靠性语义从 Phase 3 提前到 Phase 1 的设计中**（实现仍最薄）：原子 claim、lease 状态机、效果幂等 report 无法事后 retrofit，事后补的每一步都在打补丁。
+2. **真实 Agent 与 cron 都排在心脏测试绿之后**，且**真实 Agent 先于 cron**——daemon/runner 契约的不确定性高于纯 server 侧的 cron，先验证契约；cron 是链路上的插件，不是链路本身。
