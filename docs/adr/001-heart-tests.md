@@ -32,9 +32,10 @@ reconcile 分支必须在第一版数据模型中就位，否则后续每个可�
    重复 report 不改变已落库终态、不重复推进 loop 游标/任务文件、不重复产生副作用，
    但**不保证**重复请求获得与第一次相同的成功响应：正常 finalize 消费并删除
    RunLease，同一 token 的第二次 report 在 resolve 处 401（daemon 视 401 为已确认）。
-   owner cancel 把 run 转为 `canceled` 并**在同一事务中撤销 lease**；迟到 report
-   在 token resolve 或写前 phase 检查处失败，在任何 loop 级写入（游标推进、
-   任务文件内容）**之前**被拦截。
+   owner cancel 把 run 转为 `canceled` 并**在同一事务中撤销 lease**；report 与 cancel
+   必须在各自事务中锁定同一 Run 行（或使用覆盖整个写入区间的 CAS），锁定/比较后才
+   检查 phase 并进行任何 loop 级写入。这样迟到 report 才会在 token resolve 或并发
+   guard 处失败，在游标推进、任务文件内容等写入之前被拦截。
 
 ## 投递保证（MVP：at-most-once execution）
 
@@ -57,7 +58,7 @@ reconcile 分支必须在第一版数据模型中就位，否则后续每个可�
 | T3 | 重复 report 效果幂等 | 第一次 report 已成功落库、lease 已 retire | 同一 token 再次 `report` | resolve 处 401；run/loop 状态与全部副作用（通知/游标）保持不变 |
 | T4 | server 重启不丢在途 run | run 处于 running，lease 已落库 | server 进程重启 | run 不被误判失败；daemon 后续 report 正常受理 |
 | T5 | 休眠迟到 report 翻正误判 | run 被 sweep 回收为失败（lease=terminal-grace） | daemon 醒来上报真实成功结果 | run 翻正为 done，记录消息/产物，lease 销毁；第二次迟到 report 在 resolve 处 401 |
-| T6 | 取消的 run 迟到 report 被拦截 | owner cancel：run 转 `canceled` 且 lease 在同一事务中撤销 | 迟到 report 到达 | token resolve 或写前 phase 检查处失败；游标/任务文件/loop 配置/通知均不变；cancel 后 run-token 的一切写操作失效（Phase 1 的 run-token 表面只有 report；set-\*/reschedule/finish 随其所在阶段落地时继承此规则） |
+| T6 | 取消的 run 迟到 report 被拦截 | owner cancel：run 转 `canceled` 且 lease 在同一事务中撤销 | 迟到 report 到达 | token resolve 或事务锁/CAS guard 处失败；游标/任务文件/loop 配置/通知均不变；cancel 后 run-token 的一切写操作失效（Phase 1 的 run-token 表面只有 report；set-\*/reschedule/finish 随其所在阶段落地时继承此规则） |
 | T7 | 下一次触发 supersede 陈旧 pending | pending run 一直未被领取 | 下一次触发到达（Phase 1 为手动 trigger，coordinator 级测试；cron 阶段继承同一语义） | 旧 pending 转为 skipped（不计失败、不告警），新 pending 入队 |
 
 ## 通过标准
@@ -71,7 +72,8 @@ reconcile 分支必须在第一版数据模型中就位，否则后续每个可�
 
 - 正面：可靠性成为骨架属性而非补丁；后续 cron/Agent/同步全部建立在已验证语义上。
 - 代价：第一周没有「看得见的」功能（无 UI、无真实 Agent）；需要克制提前做 cron 的冲动。
-- 约束：claim 事务是热路径，索引设计（`runs(state)` 部分索引）随第一版 schema 一起交付。
+- 约束：claim 事务是热路径，索引设计（`runs_pending_idx ON runs(machine_id) WHERE
+  phase='pending'`）随第一版 schema 一起交付。
 
 ## 修订记录
 

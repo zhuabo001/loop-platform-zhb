@@ -3,7 +3,7 @@
 > 日期：2026-07-28 ｜ 状态：**已定（2026-07-28）：Hono**（`hono` + `@hono/node-server`）
 > 范围：Day 3–4 只需要 `POST /machine/poll` + `POST /machine/report` 两个端点，
 > 但这个选择会影响 Phase 1 后续（`POST /loops`、`POST /loops/:id/run`）和
-> Phase 2 的 Dashboard API，所以值得单独留一份决策记录。
+> Phase 4 的 Dashboard API，所以值得单独留一份决策记录。
 
 ---
 
@@ -75,14 +75,14 @@ serve({ fetch: app.fetch, port: 3000 });
 | handler 抛异常 → 500 兜底 | 手写全局 try/catch | `app.onError` 一处搞定 |
 | 与 protocol 包 zod 校验配合 | 一样（解析后都过 schema） | 一样 |
 | Phase 1 后续端点（loops CRUD 等） | 路由表需自己维护 | 自然扩展 |
-| Phase 2 Dashboard API | 大概率被迫重写成"自制破框架" | 直接继续用 |
+| Phase 4 Dashboard API | 大概率被迫重写成"自制破框架" | 直接继续用 |
 | 测试方式 | 起真端口 或 手搓 req/res mock | `app.fetch(request)` 直接打，免端口 |
 | 学习成本 | 零（已在用 Node） | 约半小时 |
 
 ## 推荐理由
 
 1. **端点会持续增长**。Day 3–4 只有 2 个，但 Phase 1 还有 `POST /loops` /
-   `POST /loops/:id/run`，Phase 2 是整个 Dashboard API。裸 http 的手写路由迟早
+   `POST /loops/:id/run`，Phase 4 是整个 Dashboard API。裸 http 的手写路由迟早
    要重写成"自己发明的框架"，那是典型的浪费时间。
 2. **不污染心脏**。Hono 足够薄，不会把框架魔法带进核心逻辑——gateway/store
    仍然是纯函数 + 注入式写法，HTTP 层只做解析和返回，符合架构纪律
@@ -110,8 +110,8 @@ serve({ fetch: app.fetch, port: 3000 });
 - claim（pending→running）+ lease INSERT：同一事务——禁止 running Run 无 lease；
 - report finalize + lease DELETE：同一事务；
 - owner cancel（Run→canceled）+ lease DELETE：同一事务；
-- report 在任何 Loop 级写入之前重读 Run phase（防"先 resolve、cancel 后提交"
-  竞态的第二道防线）。
+- report 与 cancel 在各自事务中锁定同一 Run 行（或使用覆盖整个写入区间的 CAS），
+  再检查 phase 并进行任何 Loop 级写入（防"先 resolve、cancel 后提交"竞态）。
 
 **能力 guard 测试**：cancel 后 run-token 的一切写操作失效（Phase 1 的 run-token
 表面只有 report；控制动词随其阶段落地时继承此规则）；Phase 1 的 trigger 路径
@@ -128,6 +128,6 @@ store/gateway 层的契约，HTTP 层只做解析与返回。
 
 ## 备选：什么时候重新评估 TanStack Start
 
-TanStack Start（参考实现用的全栈框架）留到 **Phase 2 wk6 Dashboard** 再评估。
+TanStack Start（参考实现用的全栈框架）留到 **Phase 4（第 7–8 周）Dashboard** 再评估。
 届时如果决定上它，Phase 1 的 Hono 路由可以平移成 server 函数/路由文件，
 心脏逻辑（store/gateway/protocol）不受影响——它们本来就没有 HTTP 依赖。

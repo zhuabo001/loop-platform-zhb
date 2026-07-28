@@ -51,9 +51,9 @@ Day 1–2 的产出是把「调度—领取—执行—回报」链路的可靠�
    runs），加 ADR-001 明确要求的部分索引
    `runs_pending_idx ON runs(machine_id) WHERE phase='pending'`——poll 的 claim
    扫描是热路径（每台机器每次 poll），pending 行永远寥寥，索引保持极小。
-   `run_leases`：`run_idx` 为 **unique index**（数据库级保证一个 run 只有一条
-   lease——at-most-once 投递语义下一个 run 终生只 mint 一次；terminalizeLease
-   按 runId 打）、`loop_idx`（级联删）。
+   `run_leases`：`run_idx` 为 **unique index**（数据库级保证一个 run **至多一条现存**
+   lease；Lease 删除后不可重派的终生语义由 Run phase、原子 claim 与 gateway 事务
+   guard 保证；terminalizeLease 按 runId 打）、`loop_idx`（级联删）。
 
 ## RunLease 状态机（定型）
 
@@ -72,9 +72,10 @@ expires_at 过期 ──▶ resolve 时惰性删除 / sweep 中 prune
 - **取消立即 retire**（有意的参考偏离）：owner cancel 把 run 转 `canceled` 与
   删除 lease 放在**同一事务**——参考的「取消不 retire」会在 daemon 永不回报时
   留下永不过期且仍具控制能力的 active lease。迟到 report 在 token resolve 处
-  401；report 路径在任何 loop 级写入**之前**重读 run phase，作为防御
-  「report 已 resolve、cancel 后提交」竞态的第二道防线（T6）。cancel 后
-  run-token 的一切写操作失效。
+  401；report 与 cancel 必须在各自事务中锁定同一 Run 行（或使用覆盖整个写入区间的
+  CAS），锁定/比较后才检查 phase 并进行任何 loop 级写入，作为防御
+  「report 已 resolve、cancel 后提交」竞态的第二道防线（T6）。cancel 后 run-token
+  的一切写操作失效。
 - **claim 与 lease INSERT 同一事务**（有意的参考偏离：参考的 `claimPendingRun`
   与 `registerRunLease` 是两次独立调用）——禁止出现 `running` run 没有对应
   lease 的中间态。

@@ -10,7 +10,9 @@
 > INSERT 同一事务；`run_leases.run_id` 已升级 unique index；`durationMs` 补 `.int()`、
 > `runToken` 补形状校验；方案 B 落定——预声明的 protocol/schema 形状 ≠ Phase 1 已
 > 支持全部能力（ADR-002 决策 6），handler 不得超前实现。测试基线更新为
-> **79 全绿（62 protocol + 17 server）**。
+> **79 全绿（62 protocol + 17 server）**。注意：当前 Delivery reader 的 `runToken`
+> 形状收紧与方案 B 冲突，必须按 `codex-handoff-roadmap-adr-adjustment.md` §11.1 修正后
+> 才可作为兼容 DTO 直接消费。
 
 ---
 
@@ -24,9 +26,10 @@ Phase 1「心脏」的前两步已完成并合入 main：wire 协议包（Day 1�
 
 ### 创始文档（根提交 `8e71ac8`）
 
-- `docs/roadmap.md`——复刻路线图：心脏先行、四阶段、三条架构不变量、MVP 暂缓清单。
-- `docs/adr/001-heart-tests.md`——心脏测试 T1–T7 清单（Phase 1 验收门）+ 三个
-  先行机制：原子 claim / 持久化 RunLease / 幂等 report。
+- `docs/roadmap.md`——复刻路线图：初版四阶段已重排为当前七阶段；保留心脏先行、三条
+  架构不变量、MVP 暂缓清单。
+- `docs/adr/001-heart-tests.md`——心脏测试 T1–T7 清单（Phase 1 强制验收门为 T1–T6，
+  T7 是 coordinator 级测试）+ 三个先行机制：原子 claim / 持久化 RunLease / 幂等 report。
 
 ### Day 1：protocol 包（PR #1，`3c583d6` + `cd9579d`）
 
@@ -59,7 +62,8 @@ Phase 1「心脏」的前两步已完成并合入 main：wire 协议包（Day 1�
 
 ### 质量记录
 
-- 73 测试全绿（57 protocol + 16 server）；CI 通过。
+- 调整前基线：73 测试全绿（57 protocol + 16 server）；CI 通过。当前基线见本文
+  顶部的 79 tests（62 protocol + 17 server）。
 - **两轮独立对抗性审查**均完成：第一轮（2 MAJOR 级测试缺口 + fresh-clone MAJOR，
   已修）；第二轮 xhigh 复核（MERGE-READY 零 MAJOR，2 MINOR 已修）。审查结论在
   各 PR 评论中。
@@ -79,8 +83,9 @@ Phase 1「心脏」的前两步已完成并合入 main：wire 协议包（Day 1�
    report 在 resolve 处 401（效果幂等：零副作用，不保证重复成功响应）；
    `terminal-grace` 只能由 sweep 的 reclaim 写入。**cancel 立即 retire**——owner
    cancel 把 run 转 `canceled` 与删除 lease 放在同一事务（有意的参考偏离）；
-   report 路径在任何 loop 级写入之前重读 run phase，防"先 resolve、cancel 后
-   提交"竞态。`expiresAt` null 只允许 running run 持有的 active lease。Day 3–4
+   report 与 cancel 必须在各自事务中锁定同一 Run 行（或使用覆盖整个写入区间的 CAS），
+   再检查 phase 并写入，防"先 resolve、cancel 后提交"竞态。`expiresAt` null 只允许
+   running run 持有的 active lease。Day 3–4
    在 store 层补两条测试："terminalize 必带 expiresAt"、"cancel 后不存在
    active lease"。
 
@@ -95,9 +100,8 @@ Phase 1「心脏」的前两步已完成并合入 main：wire 协议包（Day 1�
 2. 需要新建：store 层（`addRun`/`claimPendingRun`（**与 lease INSERT 同一事务**）/
    `supersedePendingRun`/`pendingRunsForMachine`/lease 四函数 + `openRuns`）、
    HTTP 层（poll/report 两个端点）、gateway 逻辑（claim → mint lease →
-   buildDelivery；report 按 run.phase 分支：**写前重读 phase**——canceled 拦截 /
-   done 仅 enrich / terminal-grace reconcile / 正常 finalize；finalize + 删 lease
-   同一事务）。
+   buildDelivery；report 在事务中锁定/比较 Run phase 后分支：canceled 拦截 / done
+   仅 enrich / terminal-grace reconcile / 正常 finalize；finalize + 删 lease 同一事务）。
 3. **事务边界**（ADR-003 定型，前两条是有意的参考偏离）：claim+lease INSERT
    同事务；report finalize+lease DELETE 同事务；cancel+lease DELETE 同事务。
 4. **能力 guard**（ADR-002 决策 6）：Phase 1 的 trigger 路径只产出 `exec` role；
@@ -105,9 +109,9 @@ Phase 1「心脏」的前两步已完成并合入 main：wire 协议包（Day 1�
 5. **HTTP 框架已定：Hono**（`hono` + `@hono/node-server`，2026-07-28 拍板；
    对比材料见 `docs/handoff/002-day3-4-http-framework.md`）。测试用 `app.fetch`
    打实例，不起真端口；TanStack Start 留到 Phase 4 Dashboard 再评估。
-6. 协议侧 DTO 已就绪（`pollRequestSchema`/`deliverySchema`（`runToken` 已带形状
-   校验）/`reportRequestSchema`（`durationMs` 已带 `.int()`）），直接消费；参考
-   实现语义提取：`loop-platform-github` 的
+6. 协议侧 DTO 的 `durationMs` 已带 `.int()`；`deliverySchema.runToken` 当前已带形状
+   校验，但这会拒绝旧 server 的裸 UUID，**必须先按 Codex handoff §11.1 恢复宽容
+   reader 后再直接消费**。参考实现语义提取：`loop-platform-github` 的
    `gateway/index.ts`（poll:456-623、report:1291-1558、sweep:354-428）、
    `db/store.ts`（claimPendingRun:200-208）、`gateway/tokens.ts`（lease 四函数）。
 

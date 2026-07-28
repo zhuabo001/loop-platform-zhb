@@ -108,7 +108,7 @@
   canceled Run 不得留下 active Lease。
 - [ ] 保留 `terminal-grace` 只能由 inactivity sweep 写入的唯一性。
 - [ ] 建议把 `run_leases.run_id` 改为 unique index，数据库级保证一个 Run
-  只有一条 Lease。
+  至多一条**现存** Lease；终生不可重派由 phase 与事务 guard 保证。
 - [ ] 明确 claim 的 `pending → running` 与 Lease INSERT 必须在同一事务中。
 - [ ] 删除或弱化“未来 hosted Postgres 只需改一个文件”的承诺；托管化还会涉及
   配置、迁移、连接生命周期、部署和真实 Postgres 并发验证。
@@ -141,15 +141,19 @@
 
 - [ ] 增加 Run Token 的共享形状校验，例如 `RUN_TOKEN_RE`、
   `isRunTokenShape`/Zod schema。
-- [ ] `deliverySchema.runToken` 使用该 schema，而不是任意 `z.string()`。
-- [ ] 增加合法 `rk_...`、错误前缀、空 payload、非法字符测试。
+- [ ] 方案 B 下，`deliverySchema.runToken` 保持宽容 reader（接受旧 server 的裸 UUID）；
+  不得把共享 shape schema 直接绑定到 Delivery reader。若决定拒绝裸 UUID，必须先在
+  ADR-002 记录显式兼容例外。
+- [ ] 为 `isRunTokenShape` 增加合法 `rk_...`、错误前缀、空 payload、非法字符测试；
+  另为 Delivery 增加 legacy bare UUID 可解析测试。
 
 ### 2.5 为即将实现的 gateway/store 固定事务边界
 
 - [ ] `claimPendingRun + insert RunLease`：同一事务。
 - [ ] 正常 `report finalize + delete RunLease`：同一事务。
 - [ ] `cancel Run + delete RunLease`：同一事务。
-- [ ] report 在任何 Loop 级写入之前重新读取/锁定 Run phase。
+- [ ] report 与 cancel 在各自事务中锁定同一 Run 行（或使用覆盖整个写入区间的 CAS）；
+  锁定/比较后才检查 phase 并进行任何 Loop 级写入。
 - [ ] 正常重复 report：`401` 且零副作用。
 - [ ] terminal-grace reconcile：只允许一次，完成后删除 Lease。
 - [ ] canceled Run：无论 report 与 cancel 如何交错，Loop 级数据都不得被迟到结果修改。
@@ -282,7 +286,8 @@
 ### Protocol
 
 - [ ] `durationMs` 接受 `0` 和正整数，拒绝负数、小数、字符串。
-- [ ] `runToken` 接受合法 `rk_` token，拒绝 `dk_`、无前缀、空 payload、非法字符。
+- [ ] `isRunTokenShape` 接受合法 `rk_` token，拒绝 `dk_`、无前缀、空 payload、非法字符；
+  Delivery reader 仍接受 legacy bare UUID。
 
 ### Schema/store
 
@@ -306,7 +311,7 @@
   - cancel 与 Lease 撤销同事务；
   - cancel 后迟到 report 不写 Loop；
   - cancel 后所有控制动词失败；
-  - 构造“report 先 resolve、cancel 后提交”的竞态，写前 phase guard 仍拦截。
+  - 构造“report 先 resolve、cancel 后提交”的竞态，事务锁/CAS guard 仍拦截。
 - [ ] T7：移到 scheduler 阶段，验证新 trigger supersede 旧 pending。
 - [ ] Delivery 响应丢失：Run 不重派，最终由 sweep 进入可观察 error。
 
@@ -315,12 +320,13 @@
 ## 8. 推荐执行顺序
 
 1. [x] 未来字段采用方案 B，并在本文记录 A 的否决理由。
-2. [ ] 同步修订 ADR-001、ADR-002、ADR-003。
-3. [ ] 修改 protocol 的 `durationMs` 与 run-token 校验。
-4. [ ] 评估并记录是否将 `run_leases.run_id` 升级为 unique index；若采纳，再同步
-   migration/schema tests。
-5. [ ] 更新 001、002 handoff。
-6. [ ] 调整 roadmap 的阶段顺序、验收标准、部署边界和生产硬化阶段。
+2. [x] 同步修订 ADR-001、ADR-002、ADR-003。
+3. [x] 修改 protocol 的 `durationMs` 并添加 Run Token shape helper；Delivery reader 的
+   兼容收紧问题列入 §11.1，尚待修正。
+4. [x] 评估后将 `run_leases.run_id` 升级为 unique index，并同步 migration/schema tests；
+   “终生唯一”过强表述列入 §11.2，尚待修正。
+5. [x] 更新 001、002 handoff。
+6. [x] 调整 roadmap 的阶段顺序、验收标准、部署边界和生产硬化阶段。
 7. [ ] 再开始 Day 3–4，以 TDD 实现 store/gateway/HTTP。
 8. [ ] 完成后运行：
    - `pnpm typecheck`
@@ -331,7 +337,7 @@
 
 ---
 
-## 9. 当前验证基线
+## 9. 评审开始前的历史验证基线
 
 - 本次评审前，现有实现通过：
   - protocol：57 tests；
@@ -340,8 +346,8 @@
   - workspace typecheck。
 - 这些测试只覆盖已落地的 protocol/schema；T1–T7 的 gateway/daemon 行为尚未实现，
   不是当前回归。
-- `docs/handoff/002-day3-4-http-framework.md` 当前仍是未跟踪文件；后续提交时需要明确
-  是否与本 handoff、ADR 和 roadmap 调整一并纳入。
+- `docs/handoff/002-day3-4-http-framework.md` 已在 `dd68b2c` 与本 handoff、ADR 和
+  roadmap 调整一并纳入版本控制。
 
 ---
 
@@ -353,3 +359,36 @@
 - `tdd`：按 T1–T6 先写失败测试，再实现 poll/report/cancel。
 - `implement`：在 ADR 与 roadmap 定稿后执行 protocol/schema/gateway 改动。
 - `code-review`：以调整前提交为 fixed point，对 Standards 与 Spec 两条轴做最终复核。
+
+---
+
+## 11. 实现不一致提醒（`dd68b2c` 审查结论）
+
+以下问题来自 `dd68b2c` 相对本 handoff 的 Standards 审查；它们尚未在本次文档同步中
+修改运行时代码，必须在开始或实现 Day 3–4 前明确处理。
+
+### 11.1 Delivery 的 Run Token reader 过度收紧
+
+- [ ] 当前 `deliverySchema.runToken` 只接受 `rk_...`；参考实现的 lease lookup 还兼容
+  旧 server 发出的裸 UUID。该限制与 ADR-002 的方案 B（逐字镜像、宽容 reader）冲突。
+- [ ] 推荐做法：Delivery reader 恢复接受普通非空字符串；`RUN_TOKEN_RE`/
+  `isRunTokenShape` 保留给新 token 的 mint 或写入侧校验。若决定拒绝裸 UUID，必须把
+  这项兼容破坏作为 ADR-002 的显式例外记录。
+
+### 11.2 `run_leases.run_id` unique 的保证范围被写得过强
+
+- [ ] unique index 只能保证**同时存在**的 Lease 至多一条：Lease 被 DELETE 后，相同
+  `run_id` 仍可再次 INSERT。
+- [x] ADR-003 已改为“至多一条现存 Lease”；仍需修正 `schema.ts` 注释中的“终生只
+  mint 一次”。终生不可重派必须由 Run phase、原子 claim 和 gateway 事务 guard 保证；
+  若需 DB 单独证明，必须另行设计 tombstone/receipt。
+
+### 11.3 report/cancel 竞态不能只靠“重读 phase”封闭
+
+- [ ] 交错 `report 读到 running → cancel 提交 → report 写 Loop` 仍会发生，单次重读
+  不能保证后续写入前状态不变。
+- [x] ADR-001/003 与 handoff 已明确等价串行化方案：report 与 cancel 在各自事务中锁定
+  同一 Run 行（或使用覆盖整个写入区间的 CAS）；锁定/比较后才进行任何 Loop 写入和
+  Lease 删除。
+- [ ] Day 3–4 实现时保留既有“report 先 resolve、cancel 后提交”的交错测试，并把它
+  实现为真正的并发测试。
