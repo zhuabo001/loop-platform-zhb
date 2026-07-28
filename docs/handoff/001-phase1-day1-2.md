@@ -10,7 +10,7 @@
 > INSERT 同一事务；`run_leases.run_id` 已升级 unique index；`durationMs` 补 `.int()`；
 > 新增 `isRunTokenShape`（mint/写入侧形状过滤）；方案 B 落定——预声明的
 > protocol/schema 形状 ≠ Phase 1 已支持全部能力（ADR-002 决策 6），handler 不得超前实现。测试基线更新为
-> **79 全绿（62 protocol + 17 server）**。codex handoff §11 的实现审查三条
+> **79 全绿（62 protocol + 17 server）**。此前的三条实现审查意见
 > 已全部闭环：Delivery `runToken` 已恢复宽容 reader（opaque，形状校验只留
 > mint/写入侧）；`run_leases.run_id` unique 的措辞收窄为"至多一条现存"；
 > report/cancel 竞态锁定语义（锁行/CAS）已写进 ADR-001/003，Day 3–4 需把

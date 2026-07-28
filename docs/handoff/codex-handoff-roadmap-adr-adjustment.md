@@ -321,10 +321,10 @@
 
 1. [x] 未来字段采用方案 B，并在本文记录 A 的否决理由。
 2. [x] 同步修订 ADR-001、ADR-002、ADR-003。
-3. [x] 修改 protocol 的 `durationMs` 并添加 Run Token shape helper；Delivery reader 的
-   兼容收紧问题列入 §11.1，尚待修正。
+3. [x] 修改 protocol 的 `durationMs` 并添加 Run Token shape helper；Delivery reader
+   已恢复为兼容 legacy bare UUID 的 opaque string。
 4. [x] 评估后将 `run_leases.run_id` 升级为 unique index，并同步 migration/schema tests；
-   “终生唯一”过强表述列入 §11.2，尚待修正。
+   schema/ADR 已明确它只保证“至多一条现存 Lease”。
 5. [x] 更新 001、002 handoff。
 6. [x] 调整 roadmap 的阶段顺序、验收标准、部署边界和生产硬化阶段。
 7. [ ] 再开始 Day 3–4，以 TDD 实现 store/gateway/HTTP。
@@ -359,36 +359,3 @@
 - `tdd`：按 T1–T6 先写失败测试，再实现 poll/report/cancel。
 - `implement`：在 ADR 与 roadmap 定稿后执行 protocol/schema/gateway 改动。
 - `code-review`：以调整前提交为 fixed point，对 Standards 与 Spec 两条轴做最终复核。
-
----
-
-## 11. 实现不一致提醒（`dd68b2c` 审查结论）
-
-以下问题来自 `dd68b2c` 相对本 handoff 的 Standards 审查；它们尚未在本次文档同步中
-修改运行时代码，必须在开始或实现 Day 3–4 前明确处理。
-
-### 11.1 Delivery 的 Run Token reader 过度收紧
-
-- [ ] 当前 `deliverySchema.runToken` 只接受 `rk_...`；参考实现的 lease lookup 还兼容
-  旧 server 发出的裸 UUID。该限制与 ADR-002 的方案 B（逐字镜像、宽容 reader）冲突。
-- [ ] 推荐做法：Delivery reader 恢复接受普通非空字符串；`RUN_TOKEN_RE`/
-  `isRunTokenShape` 保留给新 token 的 mint 或写入侧校验。若决定拒绝裸 UUID，必须把
-  这项兼容破坏作为 ADR-002 的显式例外记录。
-
-### 11.2 `run_leases.run_id` unique 的保证范围被写得过强
-
-- [ ] unique index 只能保证**同时存在**的 Lease 至多一条：Lease 被 DELETE 后，相同
-  `run_id` 仍可再次 INSERT。
-- [x] ADR-003 已改为“至多一条现存 Lease”；仍需修正 `schema.ts` 注释中的“终生只
-  mint 一次”。终生不可重派必须由 Run phase、原子 claim 和 gateway 事务 guard 保证；
-  若需 DB 单独证明，必须另行设计 tombstone/receipt。
-
-### 11.3 report/cancel 竞态不能只靠“重读 phase”封闭
-
-- [ ] 交错 `report 读到 running → cancel 提交 → report 写 Loop` 仍会发生，单次重读
-  不能保证后续写入前状态不变。
-- [x] ADR-001/003 与 handoff 已明确等价串行化方案：report 与 cancel 在各自事务中锁定
-  同一 Run 行（或使用覆盖整个写入区间的 CAS）；锁定/比较后才进行任何 Loop 写入和
-  Lease 删除。
-- [ ] Day 3–4 实现时保留既有“report 先 resolve、cancel 后提交”的交错测试，并把它
-  实现为真正的并发测试。
