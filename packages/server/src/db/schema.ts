@@ -23,7 +23,7 @@
  * their columns additively (ADR-003 has the full deferral map).
  */
 import { sql } from "drizzle-orm";
-import { boolean, doublePrecision, index, integer, jsonb, pgTable, text } from "drizzle-orm/pg-core";
+import { boolean, doublePrecision, index, integer, jsonb, pgTable, text, uniqueIndex } from "drizzle-orm/pg-core";
 
 import {
   CODING_AGENTS,
@@ -190,8 +190,9 @@ export const runs = pgTable(
 // not hand out live run credentials. Lifecycle (the state machine ADR-001
 // requires to be fixed NOW):
 //
-//   active ──[any finalize: normal report / enriching report / canceled-run
-//             report / the ONE reconciling wake-report]──▶ retired (row DELETEd)
+//   active ──[any finalize: normal report / enriching report / the ONE
+//             reconciling wake-report]──▶ retired (row DELETEd)
+//   active ──[owner cancel: run → canceled + lease DELETE in ONE tx]──▶ retired
 //   active ──[sweep reclaim, and ONLY the sweep]──▶ terminal-grace
 //   terminal-grace ──[ONE reconciling wake-report]──▶ retired
 //   past expiresAt ──▶ lazy drop on resolve / prune in the sweep
@@ -200,7 +201,9 @@ export const runs = pgTable(
 // reconcile branch fire only for swept runs, never a normal failure. `finish`
 // (Phase 4) deliberately does NOT terminalize: it leaves the lease active for
 // one enriching report. `expiresAt` null encodes the active lease's Infinity —
-// the server's inactivity sweep, not lease expiry, is the vanished-machine guard.
+// the server's inactivity sweep, not lease expiry, is the vanished-machine guard;
+// ONLY an active lease held by a running run may carry null (a canceled run
+// never leaves an active lease — cancel deletes it in the same transaction).
 
 export const runLeases = pgTable(
   "run_leases",
@@ -221,8 +224,9 @@ export const runLeases = pgTable(
     expiresAt: text("expires_at"),
     createdAt: text("created_at").notNull(),
   },
-  // terminalizeLease targets by runId; the loop cascade deletes by loopId.
-  (t) => [index("run_leases_run_idx").on(t.runId), index("run_leases_loop_idx").on(t.loopId)],
+  // runId is UNIQUE: at-most-once delivery means a run is leased exactly once
+  // (terminalizeLease targets by runId); the loop cascade deletes by loopId.
+  (t) => [uniqueIndex("run_leases_run_idx").on(t.runId), index("run_leases_loop_idx").on(t.loopId)],
 );
 
 export type Machine = typeof machines.$inferSelect;

@@ -13,6 +13,7 @@
 import { z } from "zod";
 
 import { codingAgentSchema, runRoleSchema } from "./enums.js";
+import { runTokenSchema } from "./tokens.js";
 
 /** Live "what's it doing" line for one in-flight run (the server stamps `at`). */
 export const runProgressSchema = z.object({
@@ -59,8 +60,8 @@ export type DeliveryLoop = z.infer<typeof deliveryLoopSchema>;
  *  Mirrors loop-platform packages/server/src/gateway/delivery.ts:17-41. */
 export const deliverySchema = z.object({
   runId: z.string(),
-  /** The run-lease wire token (`rk_…`) minted at claim time. */
-  runToken: z.string(),
+  /** The run-lease wire token (`rk_…`) minted at claim time (shape-checked). */
+  runToken: runTokenSchema,
   role: runRoleSchema,
   loop: deliveryLoopSchema,
   /** Workflow cursor (loop.state) passed back as the gate's `prev`. */

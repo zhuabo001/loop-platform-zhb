@@ -2,6 +2,15 @@
 
 > 更新日期：2026-07-28 ｜ main @ `2df1050`（PR #2 已合并）
 > 用途：让任何新会话/新人在 5 分钟内接上当前进度。路线图全貌见 `docs/roadmap.md`。
+>
+> **2026-07-28 语义锁定**：Day 3–4 开工前，report/cancel/投递语义已按
+> `docs/handoff/codex-handoff-roadmap-adr-adjustment.md` 统一修订进 ADR-001/002/003
+> （三份 ADR 文末均有当日修订记录）。要点：T3 = 效果幂等（第二次 report 401，零
+> 副作用）；cancel 与 lease 撤销同一事务（不再"取消不 retire"）；claim + lease
+> INSERT 同一事务；`run_leases.run_id` 已升级 unique index；`durationMs` 补 `.int()`、
+> `runToken` 补形状校验；方案 B 落定——预声明的 protocol/schema 形状 ≠ Phase 1 已
+> 支持全部能力（ADR-002 决策 6），handler 不得超前实现。测试基线更新为
+> **79 全绿（62 protocol + 17 server）**。
 
 ---
 
@@ -67,26 +76,38 @@ Phase 1「心脏」的前两步已完成并合入 main：wire 协议包（Day 1�
 5. **`runs.ts` 是"最近生命周期转换时刻"**（claim/finalize/reclaim/supersede 都重打），
    不是创建时间；sweep 的不活跃窗口量 `max(ts, progress.at)`。
 6. lease 语义：每条 finalize 路径以 `retireLease`（单发 DELETE）收尾，第二次
-   report 在 resolve 处 401；`terminal-grace` 只能由 sweep 的 reclaim 写入。
-   已知松散不变量（terminal-grace + null expiry 的永恒 grace）待 Day 3–4 在
-   store 层补测试。
+   report 在 resolve 处 401（效果幂等：零副作用，不保证重复成功响应）；
+   `terminal-grace` 只能由 sweep 的 reclaim 写入。**cancel 立即 retire**——owner
+   cancel 把 run 转 `canceled` 与删除 lease 放在同一事务（有意的参考偏离）；
+   report 路径在任何 loop 级写入之前重读 run phase，防"先 resolve、cancel 后
+   提交"竞态。`expiresAt` null 只允许 running run 持有的 active lease。Day 3–4
+   在 store 层补两条测试："terminalize 必带 expiresAt"、"cancel 后不存在
+   active lease"。
 
 ## 下一步：Day 3–4（poll + report）
 
-按 roadmap 与 ADR-001：
+按 roadmap 与 ADR-001（2026-07-28 修订后语义）：
 
 1. **先写心脏测试 T1–T3**（并发 claim 唯一 / 重复 poll 不重复执行 / 重复 report
-   幂等）再写实现；随后 Day 8–10 的故障注入 T4–T7。
-2. 需要新建：store 层（`addRun`/`claimPendingRun`/`supersedePendingRun`/
-   `pendingRunsForMachine`/lease 四函数 + `openRuns`）、HTTP 层（poll/report 两个
-   端点）、gateway 逻辑（claim → mint lease → buildDelivery；report 按 run.phase
-   分支：canceled 写前拦截 / done 仅 enrich / terminal-grace reconcile / 正常
-   finalize）。
-3. **待决策**：HTTP 框架选型（裸 node http / hono / TanStack Start）——Day 3–4
-   计划阶段第一件事。倾向：先最薄（hono 或裸 http），TanStack Start 留到
-   Phase 2 wk6 Dashboard 再评估。
-4. 协议侧 DTO 已就绪（`pollRequestSchema`/`deliverySchema`/`reportRequestSchema`），
-   直接消费；参考实现语义提取：`loop-platform-github` 的
+   效果幂等——第一次 200、第二次 401、零副作用）再写实现；T7（supersede 陈旧
+   pending）保留为 Phase 1 coordinator 级测试随 `supersedePendingRun` 一同交付；
+   Day 8–10 的故障注入覆盖 T4–T6。
+2. 需要新建：store 层（`addRun`/`claimPendingRun`（**与 lease INSERT 同一事务**）/
+   `supersedePendingRun`/`pendingRunsForMachine`/lease 四函数 + `openRuns`）、
+   HTTP 层（poll/report 两个端点）、gateway 逻辑（claim → mint lease →
+   buildDelivery；report 按 run.phase 分支：**写前重读 phase**——canceled 拦截 /
+   done 仅 enrich / terminal-grace reconcile / 正常 finalize；finalize + 删 lease
+   同一事务）。
+3. **事务边界**（ADR-003 定型，前两条是有意的参考偏离）：claim+lease INSERT
+   同事务；report finalize+lease DELETE 同事务；cancel+lease DELETE 同事务。
+4. **能力 guard**（ADR-002 决策 6）：Phase 1 的 trigger 路径只产出 `exec` role；
+   预声明但未启用的字段（cursor/taskFile/caps…）不得提前产生写入或控制副作用。
+5. **HTTP 框架已定：Hono**（`hono` + `@hono/node-server`，2026-07-28 拍板；
+   对比材料见 `docs/handoff/002-day3-4-http-framework.md`）。测试用 `app.fetch`
+   打实例，不起真端口；TanStack Start 留到 Phase 4 Dashboard 再评估。
+6. 协议侧 DTO 已就绪（`pollRequestSchema`/`deliverySchema`（`runToken` 已带形状
+   校验）/`reportRequestSchema`（`durationMs` 已带 `.int()`）），直接消费；参考
+   实现语义提取：`loop-platform-github` 的
    `gateway/index.ts`（poll:456-623、report:1291-1558、sweep:354-428）、
    `db/store.ts`（claimPendingRun:200-208）、`gateway/tokens.ts`（lease 四函数）。
 

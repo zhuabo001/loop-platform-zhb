@@ -16,7 +16,8 @@ Day 1–2 的产出是把「调度—领取—执行—回报」链路的可靠�
 1. **pglite 单档，无 `DATABASE_URL` 分层**。`src/db/index.ts` 是唯一分支点：给了
    `dataDir` 走文件库（`<dataDir>/pgdata`），不给走内存（测试）。参考实现的
    postgres-js/Supabase 档推迟到需要托管时再加——store/gateway 只用 drizzle
-   查询构造器 API，届时只动这一个文件。
+   查询构造器 API，db 句柄工厂是唯一的驱动分支点；但托管化不止这一个文件，
+   还涉及配置、迁移路径、连接生命周期、部署形态与真实 Postgres 的并发验证。
 2. **迁移：drizzle-kit generate → 提交的 SQL + 进程内 `runMigrations()`**。无 hosted
    档，故 `drizzle.config.ts` 不配 dbCredentials、无 `db:migrate` CLI。前滚-only：
    列只增不删不改（ADR-002 的 additive 规则应用到 DB）。
@@ -32,28 +33,33 @@ Day 1–2 的产出是把「调度—领取—执行—回报」链路的可靠�
    supersede），语义是"最近一次转换时刻"；sweep 的不活跃窗口量的是
    `max(ts, progress.at)`。列注释已写明，避免误当 createdAt。
 7. **列裁剪**（提炼语义，不照抄；被裁列全部按阶段增量回迁，前滚-only 使其廉价）：
-   - `machines`：裁 `user_id`/`team_id`（Phase 3 团队）、`token` 明文（无 UI 重显
+   - `machines`：裁 `user_id`/`team_id`（团队与认证批次）、`token` 明文（无 UI 重显
      需求，只存 `token_hash`——比参考更严）、`online` 布尔（在场状态从 `last_seen`
      推导；参考实现自己也是每次读取时现算，列只是冗余缓存）。
-   - `loops`：裁 `cron`/`timezone`/`next_run_at`（Phase 2 wk3 cron 批次）、
-     `goal`/`completed_at`/`completion_reason`（wk5 closed loop）、
-     `notify`/`channel_id`/`user_id`/`team_id`（Phase 3）、`ui`/`state_schema`/
-     `evolve_*`/`edit_request`（Phase 4）。
-   - `runs`：全量保留（心脏表），仅裁 `user_id`（无用户）与 `control`（Phase 4 的
-     in-run 动词审计）。
-   - `run_leases`：**全量镜像**，包括 Phase 4 才消费的 `can_set_*`/`can_finish`
+   - `loops`：裁 `cron`/`timezone`/`next_run_at`（cron 批次）、
+     `goal`/`completed_at`/`completion_reason`（closed loop 批次）、
+     `notify`/`channel_id`/`user_id`/`team_id`（团队与认证批次）、`ui`/`state_schema`/
+     `evolve_*`/`edit_request`（高阶能力批次）。
+   - `runs`：全量保留（心脏表），仅裁 `user_id`（无用户）与 `control`（高阶能力
+     批次的 in-run 动词审计）。
+   - `run_leases`：**全量镜像**，包括高阶能力批次才消费的 `can_set_*`/`can_finish`
      caps——租约行形状是 ADR-001 要求此刻定型的东西，列已就位，语义后补。
+
+   注：`runs`/`run_leases` 的全量保留是**兼容形状预声明**（ADR-002 决策 6）——
+   列已就位，不等于 Phase 1 已开放其全部字段语义或控制能力。
 8. **索引**：`runs_loop_idx`、`runs_loop_ts_idx`、`runs_phase_idx`（sweep 扫 open
    runs），加 ADR-001 明确要求的部分索引
    `runs_pending_idx ON runs(machine_id) WHERE phase='pending'`——poll 的 claim
    扫描是热路径（每台机器每次 poll），pending 行永远寥寥，索引保持极小。
-   `run_leases`：`run_idx`（terminalizeLease 按 runId 打）、`loop_idx`（级联删）。
+   `run_leases`：`run_idx` 为 **unique index**（数据库级保证一个 run 只有一条
+   lease——at-most-once 投递语义下一个 run 终生只 mint 一次；terminalizeLease
+   按 runId 打）、`loop_idx`（级联删）。
 
 ## RunLease 状态机（定型）
 
 ```
-active ──[任一 finalize：正常 report / 取消 run 的迟到 report / 恰好一次
-          reconcile report]──▶ retired（行删除）
+active ──[任一 finalize：正常 report / 恰好一次 reconcile report]──▶ retired（行删除）
+active ──[owner cancel：run 转 canceled 与 lease 删除在同一事务]──▶ retired
 active ──[sweep 回收，且只有 sweep]──▶ terminal-grace（expires_at = now + 24h）
 terminal-grace ──[恰好一次 reconcile report]──▶ retired
 expires_at 过期 ──▶ resolve 时惰性删除 / sweep 中 prune
@@ -62,10 +68,19 @@ expires_at 过期 ──▶ resolve 时惰性删除 / sweep 中 prune
 - `terminal-grace` 唯一标记"被 sweep 回收的 run"——report() 的 reconcile 分支
   （`phase=error 且 lease.state=terminal-grace`）因此对正常失败永不误放行（T5）。
 - **幂等是租约级，不是 phase 级**：每条 finalize 路径以 `retireLease`（单发删除）
-  收尾，第二次 report 在 resolve 处 401（T3）。取消不 retire——吸收迟到 report
-  的那次 finalize 才 retire（T6）。
+  收尾，第二次 report 在 resolve 处 401（T3）。
+- **取消立即 retire**（有意的参考偏离）：owner cancel 把 run 转 `canceled` 与
+  删除 lease 放在**同一事务**——参考的「取消不 retire」会在 daemon 永不回报时
+  留下永不过期且仍具控制能力的 active lease。迟到 report 在 token resolve 处
+  401；report 路径在任何 loop 级写入**之前**重读 run phase，作为防御
+  「report 已 resolve、cancel 后提交」竞态的第二道防线（T6）。cancel 后
+  run-token 的一切写操作失效。
+- **claim 与 lease INSERT 同一事务**（有意的参考偏离：参考的 `claimPendingRun`
+  与 `registerRunLease` 是两次独立调用）——禁止出现 `running` run 没有对应
+  lease 的中间态。
 - `expires_at` null 编码 active 的"永不过期"：机器消失的守卫是 server 的不活跃
-  sweep，不是租约过期。
+  sweep，不是租约过期。`expires_at` null **只允许**仍由 running run 持有的
+  active lease——canceled run 不得留下 active lease，terminalize 必带 expires_at。
 - 只存 sha256(wire token)：DB 泄露不发活凭证。
 
 ## 后果
@@ -90,5 +105,18 @@ expires_at 过期 ──▶ resolve 时惰性删除 / sweep 中 prune
   `git diff --exit-code`）在 CI 钉住这一点（`.github/workflows/ci.yml`）。
 - **已知继承自参考的松散不变量**：schema 允许 `state='terminal-grace'` 且
   `expiresAt NULL`（一个永不被 prune 的永恒 grace 租约）——不变量只活在
-  `terminalizeLease` 的写入路径里。Day 3–4 实现 store 层时补一条
-  "terminalize 必带 expiresAt" 的测试。
+  `terminalizeLease` 的写入路径里。2026-07-28 修订后规则收窄为
+  「`expires_at` NULL ⇒ active 且由 running run 持有」；Day 3–4 实现 store 层时
+  补两条测试："terminalize 必带 expiresAt"、"cancel 后不存在 active lease"。
+
+## 修订记录
+
+- 2026-07-28（与 ADR-001 同日修订，互引）：（1）cancel 语义收紧——cancel 与
+  lease 删除同一事务，替代「取消不 retire，等待迟到 report 再 retire」；写前
+  phase 检查保留为竞态第二道防线。（2）claim 的 `pending → running` 与 lease
+  INSERT 定为同一事务。（1）（2）均为**有意的参考偏离**（参考是两次独立调用 +
+  取消不 retire）。（3）`run_leases.run_id` 升级 unique index。（4）`expires_at`
+  NULL 仅限 running run 持有的 active lease。（5）弱化托管 Postgres「只动一个
+  文件」的承诺。（6）§7 列归属改用批次名（cron/closed loop/团队/高阶能力），
+  配合 roadmap 阶段重排。（7）明确 `runs`/`run_leases` 预声明形状 ≠ Phase 1
+  已开放全部字段语义（ADR-002 决策 6）。前滚-only 与已接受的列裁剪决策不变。

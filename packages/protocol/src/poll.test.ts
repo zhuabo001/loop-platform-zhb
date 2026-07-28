@@ -93,6 +93,22 @@ describe("deliverySchema", () => {
     expect(() => deliverySchema.parse({ ...GOLDEN_DELIVERY, role: "review" })).toThrow();
   });
 
+  it("validates runToken shape (rk_ prefix, permissive charset)", () => {
+    for (const runToken of ["rk_abc", `rk_${"b2".repeat(16)}`, "rk_demo_run"]) {
+      expect(deliverySchema.parse({ ...GOLDEN_DELIVERY, runToken }).runToken).toBe(runToken);
+    }
+    for (const bad of [
+      "",
+      "rk_", // nothing past the prefix
+      `dk_${"a".repeat(30)}`, // device token, wrong prefix
+      `${"a".repeat(32)}`, // no prefix at all
+      "rk_abc def", // charset excludes spaces
+      "rk_abc.def", // charset excludes dots
+    ]) {
+      expect(() => deliverySchema.parse({ ...GOLDEN_DELIVERY, runToken: bad })).toThrow();
+    }
+  });
+
   it("requires roots to be present ([] = unrestricted, but never absent)", () => {
     const { roots: _roots, ...noRoots } = GOLDEN_DELIVERY;
     expect(() => deliverySchema.parse(noRoots)).toThrow();

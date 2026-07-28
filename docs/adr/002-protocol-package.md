@@ -44,6 +44,15 @@ server 与 daemon 是两个独立部署的进程，唯一耦合点是 HTTP wire 
 5. **主入口保持纯净**（无 node 内建依赖，可被浏览器 bundle 引用——server 的
    TanStack client 会引用枚举/类型）；`sha256`/`machineIdFromToken` 放子路径
    `@loopzhb/protocol/node`（node:crypto）。
+6. **镜像形状 ≠ 已支持语义**（2026-07-28 澄清，方案 B）。protocol/schema 逐字镜像
+   参考 wire，意味着它会提前携带后续阶段的字段与枚举（Task File/workflow/cursor、
+   artifacts/transcript/cost、evolve/edit role、grok、lease caps 等）。这些是
+   **兼容形状预声明**，不是能力承诺：
+   - 「Phase 1 实现最薄」严格指**行为实现最薄**，不指协议与存储形状最薄；
+   - 字段或枚举已在 schema 中，不代表当前 server/daemon 已支持其业务语义；
+   - handler 不得因为 schema 接受某字段/枚举就提前实现后期功能；
+   - 「能解析 wire 形状」与「承诺语义兼容」是两个层次——能力开放由当前阶段的
+     应用层 guard 和行为测试决定（如 Phase 1 的 trigger 路径只产出 `exec` role）。
 
 ## 后果
 
@@ -52,3 +61,11 @@ server 与 daemon 是两个独立部署的进程，唯一耦合点是 HTTP wire 
   tolerant-reader 行为（未知键剥离）使该规则不会退化。
 - 代价：多一个包的构建步骤（tsc → dist）；server/daemon 以 workspace 依赖引入。
 - zod 版本策略：protocol 直接依赖 zod ^4；下游包如需自建 schema 应复用同一主版本。
+
+## 修订记录
+
+- 2026-07-28：新增决策 6「镜像形状 ≠ 已支持语义」。本次只是澄清镜像纪律与能力
+  开放的关系，**没有收缩既有契约**——逐字镜像参考核心 wire 形状、字段/枚举
+  只增不减的规则原样保留（方案 A「按当前阶段收缩形状」经评审否决：它会破坏
+  镜像纪律、推翻 ADR-003 已接受的全量保留决策，且多数字段两个 phase 内就要
+  加回）。
