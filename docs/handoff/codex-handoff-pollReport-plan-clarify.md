@@ -193,7 +193,7 @@ ADR-003 规定 `terminal-grace` 只能由 sweep 的 reclaim 写入。计划没�
   `machine timed out / disconnected`、更新 `runs.ts` 数据库列（Run 最近转换时间）和
   `active lease → terminal-grace(expiresAt=首次 now+24h)`。
 - `terminalizeLease` 仅为 `reclaimStaleRun` 的 store 私有步骤；不得进入
-  MachineGateway、HTTP 或通用 store 公开面。只有 sweep 编排可以调用
+  RunCoordinator、HTTP 或通用 store 公开面。只有 sweep 编排可以调用
   `reclaimStaleRun`。
 - report、cancel、正常失败 finalize 和管理员操作不得调用 terminalize，从而不得把
   正常失败伪装成具有一次 reconcile 资格的 sweep 误判。
@@ -317,106 +317,199 @@ JSON 形状，会重新引入 server/daemon wire 漂移。
 
 ### A-01：首次 Poll 自动注册 Machine
 
-**计划假设**
+**决议（已确认）**
 
-任意形状合法的 `dk_` 在未启用 auth 的 Phase 1 模式下首次 Poll 时自动注册 Machine。
+复刻参考实现：`POST /api/machine/poll` 是 Phase 1 唯一允许 Machine 自注册的入口。
+在未启用 auth 的模式下，首次 Poll 携带形状合法的 `dk_` 时自动创建 Machine，并继续
+处理同一次 Poll，不要求 daemon 额外执行 register/connect 请求或再 Poll 一次。
 
-**尚未锁定的原因**
+精确语义如下：
 
-当前 schema 支持 Machine，roadmap 也承认 auth 前机器注册没有身份边界，但没有明确
-注册由 Poll 完成还是由独立 connect/register 流程完成。
+- `dk_` 形状检查只是廉价的畸形输入过滤，不是身份边界；不符合形状时返回统一的
+  Machine Credential 401，且不产生数据库写入。
+- machine ID 固定由完整 credential 派生：
+  `m-${sha256(machineCredential).slice(0, 16)}`；数据库只保存完整 credential 的
+  SHA-256，不保存明文。
+- Machine 不存在时，创建行并写入 `createdAt`、`lastSeen` 及首次 Poll 携带的机器
+  身份字段；`name` 优先使用 `host`，缺失时使用基于 machine ID 的稳定 fallback。
+  具体身份字段的后续更新频率仍由 A-13 单独决定。
+- Machine 已存在时，除派生 ID 命中外还必须校验完整 credential hash；hash 不匹配
+  返回 401，防止截断 machine ID 碰撞造成冒用。
+- 首次 Poll 的重试或并发请求必须幂等收敛到同一 Machine：同 hash 继续处理，不同
+  hash 拒绝，不得因主键竞争暴露 500。
+- Phase 5 不改变 daemon 的 Poll 自注册协议，只在“Machine 不存在”的创建分支前增加
+  有效 connect key/owner 校验；既有 Machine 继续走完整 hash 校验。
+- Phase 5 auth 完成前，server 仍仅允许 localhost/受信网络部署，不得公开暴露。
 
-**推荐**
+**参考依据与取舍**
 
-Phase 1 允许 Poll 自动注册，条件为：
-
-- 仅允许 localhost/受信网络部署；
-- `dk_` 形状检查只用于过滤畸形输入；
-- machine ID 由 token 派生，DB 只保存完整 token hash；
-- 后续 Poll 同时校验派生 ID 和完整 hash；
-- Phase 5 auth 上线时重新收紧 enrollment。
+`loop-platform-github` 的 `MachineGateway.poll` 正是唯一自注册入口：开放模式允许合法
+形状的未知 `dk_` 注册，认证模式在同一分支增加 connect-key gate。继续复用 Poll
+可以保持参考 daemon 的连接行为；独立 register/connect 端点会提前引入额外协议状态，
+预注册则会破坏首次启动即连接的行为，因此本阶段均不采用。并发首次注册幂等是对
+可重试 Poll 的当前正确性补强，不改变参考协议。
 
 ### A-02：深模块名称与接口
 
-**计划假设**
+**决议（已确认）**
 
-建立 `MachineGateway`，同时暴露 `poll`、`report`、`enqueueExecRun`。
+采用方案 B：Day 3–4 的心脏深模块统一命名为 `RunCoordinator`，包内接口仅包含
+`enqueueExecRun`、`poll`、`report`。暂不建立额外的 `MachineGateway` 包装层。
 
-**风险**
+三个方法按 Run 生命周期聚合，而不是按调用者身份聚合：
 
-`enqueueExecRun` 属于 owner/coordinator 表面，而 poll/report 属于 daemon 表面；以
-`MachineGateway` 命名会让同一接口承担两个角色。roadmap 已使用 `RunCoordinator`
-作为心脏深模块的名称。
+- owner/manual-trigger adapter 只能调用 `enqueueExecRun`；
+- Machine Poll adapter 只能调用 `poll`；
+- Machine Report adapter 只能调用 `report`；
+- 模块接口不等于 HTTP 权限表面，`enqueueExecRun` 不得通过 Machine Credential
+  暴露；
+- store 的 claim、finalize、supersede、lease 消费等细粒度事务函数保持内部实现，
+  HTTP adapter 不得直接调用；
+- Phase 3 Scheduler 到来后复用 `enqueueExecRun`，不得绕过 `RunCoordinator` 自行
+  编排 supersede + insert。
 
-**推荐**
+**参考依据与取舍**
 
-- 外部深模块命名为 `RunCoordinator`，接口包含心脏行为：
-  `poll`、`report`、`enqueueExecRun`。
-- Hono route 是 adapter，只解析/返回。
-- store 保持内部 seam，不把细粒度事务函数暴露给 HTTP。
+`loop-platform-github/docs/retro-roadmap.md` 原始设计使用 `RunCoordinator`，接口聚合
+trigger/poll/report/cancel；实际演化后的代码改用范围更广的 `MachineGateway`，并让
+`Scheduler` 直接编排 pending Run 的创建。ZHB 当前只交付心脏链路、尚无 cron
+Scheduler，直接复刻最终文件布局会提前引入一个浅 Scheduler，并使关键入队事务泄漏
+到调用方。因此选择参考项目的原始深模块设计，同时保持其外部行为；这也与 ZHB
+roadmap 已确定的 `RunCoordinator` 名称一致。当前不拆成 `MachineGateway + RunQueue`
+两个浅模块，等出现真实独立行为簇和第二个 adapter 后再评估拆分。
 
 ### A-03：依赖注入粒度
 
-**计划假设**
+**决议（已确认）**
 
-向深模块注入 DB、Clock、token factory 和 id factory。
+采用方案 B：`RunCoordinator` 接收单一 `RunCoordinatorDependencies` 对象，依赖项
+为必填的 `db`、`clock`、`newRunId` 和 `mintRunCredential`。
 
-**推荐**
+依赖语义如下：
 
-- DB、Clock 必须注入：分别支持 PGlite 测试和确定性时间。
-- token/id factory 可注入为一个 `Ids` 依赖，避免扩大构造接口。
-- 不为只有一个实现的依赖额外创建公开 port；PGlite 是本地可替代实现，直接通过 DB
-  seam 测试。
+- `db` 注入具体 Drizzle `Db`，而不是整个 `DbHandle`；Coordinator 只使用查询与事务，
+  open/migrate/close 和 `dataDir` 生命周期属于 boot。
+- `clock` 提供 `now(): Date`；production 使用 System Clock，测试使用 Fake Clock。
+  `RunCoordinator` 及其内部 store 写路径不得绕过它直接调用 `Date.now()` 或
+  `new Date()` 生成生命周期时间。
+- `newRunId` 与 `mintRunCredential` 保持两个明确依赖，不合并为含混的 `Ids`：
+  Run ID 是标识，Run Credential 是 capability bearer secret。production 分别使用
+  `randomUUID()` 与 `rk_` 加密码学随机字节；测试可提供确定值或故障工厂。
+- `sha256`、`machineIdFromToken` 等确定性纯函数直接复用 protocol/node，不注入。
+- store 是 `RunCoordinator` 的内部实现，绑定注入的 DB/transaction handle；不为当前
+  唯一持久化实现创建公开 repository port，HTTP adapter 也不得看到 DB 或 store。
+- logger、Delivery builder、hash function 等当前只有一个真实实现的依赖不提前注入。
+
+**参考依据与取舍**
+
+`loop-platform-github` 的实际实现直接 import 全局 DB/store，并在 gateway/store/token
+路径中调用系统时间与随机源；生产 wiring 较少，但测试需要通过环境变量、动态 import
+和手工改时间戳控制状态。ZHB 已经选择独立内存 PGlite、Fake Clock 与事务故障注入，
+若继续使用全局依赖，Day 8–10 再抽 Clock 会穿过 claim/report/reclaim/lease expiry/
+Machine lastSeen 等多个写路径。显式依赖对象保持参考行为，同时把修改集中在 boot
+wiring；不采用完整 Repository/Store 接口，避免为单一实现建立浅 seam。
+
+测试必须证明：两个 Coordinator 的内存 DB 完全隔离；Fake Clock 精确控制生命周期
+时间；固定 Run ID/Run Credential 能钉住持久化行和 credential hash；ID 或 credential
+factory 失败时所在事务整体回滚；production credential factory 始终生成合法 `rk_`
+形状。
 
 ### A-04：supersede 与新 Run 入队是否同事务
 
-**计划假设**
+**决议（已确认）**
 
-`enqueueExecRun` 在同一事务内 supersede 所有旧 pending Run 并插入新 pending Run。
+采用方案 B：保持参考实现的外部行为，但将“旧 pending 被 supersede + 新 pending
+入队”收敛为 `RunCoordinator.enqueueExecRun` 内的一次原子替换。
 
-**推荐**
+精确语义如下：
 
-采纳该假设。否则 supersede 成功而 insert 失败会造成 Loop 暂时没有待执行 Run，与
-“下一次触发替换旧 pending”的单一 coordinator 行为不一致。
+- 若该 Loop 已有 running Run，本次触发直接跳过且零写入；不得 supersede running
+  Run，也不得在其后额外排入 pending Run。
+- 若不存在 running Run，则在同一事务中把该 Loop 的全部旧 pending exec Run 转为
+  `phase=canceled/outcome=skipped`，更新各自的 Run Transition Time，再插入恰好一个
+  `phase=pending/role=exec` 的新 Run。
+- supersede 的 phase guard 若输给并发 Poll claim，说明旧 Run 已进入 running；整个
+  enqueue 回滚并跳过本次触发，不创建第二个 pending Run。
+- 任一 supersede 或新 Run insert 失败时整体回滚，旧 pending 保持原状，禁止出现
+  “旧 Run 已跳过但替代 Run 未入队”的部分提交。
+- Phase 1 像参考实现一样在 `RunCoordinator` 内按 Loop 做进程内串行化，覆盖单进程
+  并发 trigger；多实例下的数据库行锁、隔离级别与重试在 Phase 6 使用真实 Postgres
+  验证，不由 PGlite 测试冒充证明。
 
-需要明确：
+**参考依据与取舍**
 
-- 旧 pending 编码为 `phase=canceled, outcome=skipped`；
-- running Run 不受影响；
-- 新 Run 固定为 `phase=pending, role=exec`；
-- supersede 和 insert 任一步失败时整体回滚。
+`loop-platform-github` 的 Scheduler 已锁定相同外部行为：running 阻止本次触发，
+pending exec 被 supersede 后只留下一个新 pending，并使用进程内 per-loop guard
+合并并发 trigger。但参考实现逐条调用 `supersedePendingRun` 后再单独 `addRun`，没有
+包在同一事务中，存在 supersede 已提交而 insert 失败的窗口。ZHB 复刻其可观察行为，
+不复刻该部分提交窗口；事务封装在 A-02 已确认的 `RunCoordinator` seam 后，不把编排
+泄漏给 manual-trigger 或未来 Scheduler adapter。本决议不新增数据库约束或 migration。
 
 ### A-05：一次 Poll 可以领取多少 Run
 
-**计划假设**
+**决议（已确认）**
 
-一次 Poll 领取该 Machine 的全部 eligible pending Run。
+采用方案 B：Phase 1 的一次 Poll 在没有并发竞争时，尝试领取该 Machine 的全部
+eligible pending exec Runs，并使用稳定的 oldest-first 顺序。
 
-**尚未锁定的内容**
+精确语义如下：
 
-虽然 `PollResponse.deliveries` 是数组，但 protocol 没有规定领取数量、排序或并发上限。
+- eligible 指 `run.machineId` 等于 Machine Credential 派生出的 machine ID、
+  `phase=pending`、`role=exec`，且对应 Loop 存在并能构造合法 Delivery。
+- 候选按 `runs` 表 `ts` 列（Run Transition Time）升序，再按 `run.id` 升序；较早
+  入队的 Run 优先，ID 为相同时间戳提供确定性 tie-break。
+- 每个 Run 独立执行“条件 `pending → running` + active RunLease insert”事务；整个
+  Delivery 批次不承诺全有或全无。单个 Run 竞争失败不阻止本次 Poll 继续尝试其他
+  候选。
+- 并发 Poll 可以瓜分候选，且不保证哪个响应获得哪个 Run；但所有并发响应的并集对
+  每个 Run 至多包含一个 Delivery，最终至多存在一条对应 active lease。
+- 本阶段不设置每次领取上限或 daemon 并发上限。以后若真实资源压力要求背压，应增加
+  daemon 本地执行队列或 additive capacity 信号；单纯给每次 Poll 加 `LIMIT` 无法阻止
+  busy daemon 在后续 Poll 中继续累积 in-flight Runs。
 
-**推荐**
+**参考依据与取舍**
 
-- Phase 1 领取全部 eligible pending Run；
-- 使用稳定顺序，例如 `runs.ts`、再按 `run.id`；
-- 不在本批次新增任意并发上限；
-- 每个 Run 仍通过独立条件 UPDATE + lease INSERT 事务竞争。
+`loop-platform-github` 会查询该 Machine 的全部 pending Runs、逐个条件 claim，且没有
+数量上限；daemon 收到多个 Delivery 后逐个启动后台执行，也没有 capacity 协议。参考
+查询未使用 `ORDER BY`，因此顺序不是稳定契约。ZHB 保留“全部尝试领取 + 每个 Run
+独立竞争”的外部行为，只补充 `ts ASC, id ASC` 的确定顺序以稳定测试、日志与故障复现。
+领取策略容易在现有数组协议上调整，本决议不新增 ADR。
 
 ### A-06：RunLease caps 全部关闭
 
-**计划假设**
+**决议（已确认）**
 
-`allowControl`、`canSetUi`、`canSetSchema`、`canSetWorkflow`、`canFinish` 全部写 false。
+Phase 1 mint RunLease 时显式写入：
 
-**尚未锁定的原因**
+```text
+allowControl = false
+canSetUi = false
+canSetSchema = false
+canSetWorkflow = false
+canFinish = false
+```
 
-ADR 只规定这些列是兼容形状预声明，未规定 Phase 1 claim 时的持久化值。
+这些字段表示本次 Run 当前真正获得的有效控制能力，不是未来配置快照。Phase 1 唯一
+开放的 Run Credential 写入口是 Report；Report 的权限来自 coherent active
+RunLease，不依赖上述控制 caps。
 
-**推荐**
+Delivery 中的 `loop.allowControl` 仍忠实携带 Loop 配置值，即使它为 true；配置意图
+不等于本次 lease 已获授权。未来任一控制能力必须与对应 route、mint policy 和
+401/403/409 行为测试在同一批次开放。新规则只作用于新 mint 的 lease；既有 active
+lease 保持 false，不因 Server 部署追溯获得能力。
 
-Phase 1 全部 false。当前唯一 run-token 写表面是 report，没有必要提前颁发任何控制
-能力；对应控制动词上线时再逐项开放并补行为测试。
+**参考依据与取舍**
+
+`loop-platform-github` 对 exec Run 使用 `allowControl=loop.allowControl`，structural
+caps 仅给 evolve/edit，`canFinish` 仅给 closed Loop 的 exec。ZHB Phase 1 只领取
+exec、尚无 goal 列与任何控制 route，因此除 `allowControl` 外参考公式本来也全部为
+false。ZHB 不提前复制可能为 true 的存储值：参考项目把该值作为已上线 route 的真实
+授权，而 ZHB 当前只是预声明列；提前写 true 会使旧 active lease 在未来 route 部署
+后被追溯激活。所有 false 必须由 mint policy 显式写入，不能依赖数据库默认值。
+
+测试覆盖 Loop `allowControl=true/false` 时 lease caps 均全部为 false、Delivery 仍
+保留真实 Loop 配置、全 false 的 active lease 仍可正常 Report，以及持久化值不依赖
+数据库默认。
 
 ### A-07：Delivery task 的最小内容
 
@@ -558,15 +651,19 @@ fail closed：
 
 仍需要 owner 拍板的 ASSUMPTION：
 
-- [ ] A-01：首次 Poll 是否自动注册 Machine。
-- [ ] A-02：深模块是否统一命名为 `RunCoordinator`。
-- [ ] A-04：supersede + insert 是否同事务。
-- [ ] A-05：一次 Poll 的领取数量与排序。
-- [ ] A-06：Phase 1 lease caps 的值。
+- [x] A-01：首次 Poll 是 Phase 1 唯一自注册入口；开放模式按 credential 派生并幂等创建 Machine。
+- [x] A-02：心脏深模块统一为 `RunCoordinator`，包内接口仅含 enqueue/poll/report。
+- [x] A-03：注入单一 dependencies 对象，显式区分 DB、Clock、Run ID 与 Run Credential mint。
+- [x] A-04：保持参考 trigger 行为，并将 supersede + insert 收敛为原子 enqueue。
+- [x] A-05：无竞争时尝试领取全部 eligible exec Runs，按 ts/id 升序且逐 Run 原子竞争。
+- [x] A-06：全部控制 caps 显式 false，能力随 route 同批开放且不追溯既有 lease。
+- [ ] A-07：Delivery task 的最小内容。
 - [ ] A-08：正常 Report 当前保存的字段集合。
 - [x] A-09：竞态输家统一返回 `run_capability_invalid` 401。
 - [x] A-10：HTTP 状态与 `apiErrorSchema` 映射已由 G-04 解决。
-- [ ] A-11/A-12：package export、启动入口和环境变量。
+- [ ] A-11：server package export 与启动入口。
+- [ ] A-12：启动环境变量与持久化策略。
+- [ ] A-13：Machine 身份字段的更新策略。
 - [x] A-14：orphaned Run 统一使 capability 失效并清理孤儿 lease。
 
 确认后再执行：

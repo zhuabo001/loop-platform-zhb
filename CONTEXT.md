@@ -26,6 +26,11 @@ _Avoid_: Sweep, cancel
 The time of a Run's most recent lifecycle transition.
 _Avoid_: Run creation time
 
+**Supersede**:
+The replacement of unclaimed pending Exec Runs from earlier triggers by a newer trigger.
+Superseded Runs are skipped; running Runs are never superseded.
+_Avoid_: Cancel, retry
+
 **Run Capability**:
 The effective authority formed by a coherent live RunLease and its Run, presented through a Run
 Credential.

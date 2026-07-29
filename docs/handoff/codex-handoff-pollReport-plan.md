@@ -13,11 +13,32 @@
 
 ### 1. 深模块与事务
 
-建立 `MachineGateway` 深模块，外部接口仅包含 `poll`、`report` 和供后续手动触发复用的 `enqueueExecRun`；注入 DB、Clock 和 token/id factory，测试使用真实内存 PGlite。
+建立 `RunCoordinator` 深模块，包内接口仅包含 `enqueueExecRun`、`poll`、`report`；
+owner/manual-trigger、Machine Poll、Machine Report adapter 分别只调用对应方法，模块
+接口不等于 HTTP 权限表面。Phase 3 Scheduler 到来后复用 `enqueueExecRun`，不得绕过
+`RunCoordinator` 自行编排 store；本阶段不额外建立 `MachineGateway` 包装层。
+
+构造时注入单一 `RunCoordinatorDependencies` 对象：
+
+- `db` 为具体 Drizzle `Db`，不含由 boot 管理的 open/migrate/close/dataDir 生命周期；
+- `clock.now(): Date` 在 production/Fake Clock 间形成真实 seam，Coordinator 与内部
+  store 的生命周期写入不得绕过它读取系统时间；
+- `newRunId` 与 `mintRunCredential` 分开，分别表达标识生成和 capability secret
+  mint，不合并为 `Ids`；production 使用 UUID 与 `rk_` 加密码学随机字节；
+- 确定性 hash/ID 派生函数不注入，store 不建立公开 repository port。
+
+测试使用真实独立内存 PGlite、Fake Clock 和确定性/故障 factories；必须验证 DB
+隔离、时间戳、Delivery credential 与 DB hash 对应，以及 factory 失败时事务回滚。
 
 store 内部统一承担以下原子操作：
 
-- `enqueueExecRun`：同一事务内把该 Loop 的旧 pending Run 转为 `canceled/skipped`，再插入唯一的新 pending `exec` Run，作为 T7 coordinator 骨架。
+- `enqueueExecRun`：若该 Loop 已有 running Run，则跳过本次触发且零写入；否则在
+  同一事务内把全部旧 pending exec Run 转为 `canceled/skipped`、更新各自的 Run
+  Transition Time，再插入恰好一个新的 pending exec Run，作为 T7 coordinator
+  骨架。若任一 phase guard 输给并发 Poll claim，或 supersede/insert 任一步失败，
+  整体回滚，不得在 running Run 后排入 pending，也不得提交“旧 Run 已跳过但替代
+  Run 未入队”的中间结果。`RunCoordinator` 按 Loop 做进程内串行化；多实例数据库
+  竞争留在 Phase 6 的真实 Postgres 验证。
 - claim：条件更新 `pending → running`，并插入 SHA-256 RunLease；两步同一事务，lease 插入失败必须回滚 Run。
 - report：事务内重新解析 lease、锁定同一 Run 行，再检查 phase；Run finalize 与 lease 删除同一事务。
 - cancel 原语：锁定 Run，更新为 `canceled` 并删除 lease；不暴露 HTTP 路由。
@@ -27,19 +48,36 @@ store 内部统一承担以下原子操作：
   并把对应 active lease 转为 `terminal-grace`、写入首次 `now + 24h` 的过期时间。
   重复 reclaim 不得延长窗口。
 - `terminalizeLease` 仅为 `reclaimStaleRun` 的 store 私有步骤；不得进入
-  `MachineGateway`、HTTP 或其他通用公开接口。只有 sweep 编排可以调用
+  `RunCoordinator`、HTTP 或其他通用公开接口。只有 sweep 编排可以调用
   `reclaimStaleRun`，report、cancel、正常失败 finalize 与管理员操作均不得借此制造
   reconcile 资格。
 - 过期 terminal-grace lease 在 resolve 时惰性删除；retire 为单发删除。
 
 ### 2. Poll 与 Delivery
 
-- Bearer token 必须符合 `dk_` 形状；首次合法 poll 在未启用 auth 的 Phase 1 模式下自注册 Machine，后续同时校验派生 machine ID 和完整 token hash。
+- Bearer token 必须符合 `dk_` 形状；`POST /api/machine/poll` 是 Phase 1 唯一的
+  Machine 自注册入口。首次合法 Poll 在未启用 auth 的模式下按 credential 派生
+  machine ID、保存完整 credential hash 并创建 Machine，然后继续处理同一次 Poll；
+  `name` 优先使用 `host`，缺失时使用基于 machine ID 的稳定 fallback。首次 Poll
+  重试或并发时，同 hash 必须幂等收敛到同一行，不同 hash 必须 401，不得因主键竞争
+  暴露 500；后续 Poll 同时校验派生 machine ID 和完整 hash。Phase 5 保留此 Poll
+  自注册协议，只在创建分支前增加有效 connect key/owner 校验。
 - 更新 `lastSeen`、host/platform/arch/version；`progress` 和 `wait` 当前只解析、不产生 Phase 2 行为。
 - 只 claim `exec` Run；每个成功 claim 同时获得新的 `rk_` token，数据库只保存 hash。
 - Delivery 固定包含协议要求的完整字段：machine roots、Loop 快照、`prevState`、空 `systemPrompt` 和仅面向 exec 的最小任务说明。
-- RunLease 的 `allowControl`、`canSet*`、`canFinish` 全部保持关闭；预声明字段不等于能力已开放。
-- 同一 Machine 的一次 poll 可以领取多个 pending Run；并发 poll 对每个 Run 只能产生一个 Delivery。
+- Phase 1 mint RunLease 时显式写入 `allowControl=false`、全部 `canSet*=false`、
+  `canFinish=false`，不得依赖数据库默认值；预声明字段不等于能力已开放。Delivery
+  的 `loop.allowControl` 仍携带真实 Loop 配置，但配置意图不构成本次 lease 的有效
+  授权。Report 权限来自 coherent active RunLease，不依赖控制 caps。未来任一能力
+  必须与对应 route、mint policy 和 401/403/409 测试同批开放，且只作用于新 lease，
+  不得追溯激活既有 active lease。
+- 同一 Machine 的一次 Poll 在无竞争时尝试领取全部 eligible pending exec Runs：
+  `run.machineId` 必须匹配、`phase=pending`、`role=exec`，且对应 Loop 能构造合法
+  Delivery。候选按 `runs` 表 `ts` 列升序、再按 `run.id` 升序。每个 Run 独立执行
+  条件 claim + lease insert 事务，整个批次不承诺全有或全无；并发 Poll 可以瓜分
+  候选，但每个 Run 至多产生一个 Delivery 和一条 active lease。Phase 1 不设置领取
+  数量或 daemon 并发上限；未来背压需要 daemon 队列或 additive capacity 信号，
+  不以单次 Poll `LIMIT` 冒充并发控制。
 - claim 事务一旦提交，Run 就永久失去派发资格。即使首次 Delivery HTTP 响应丢失，
   后续 Poll 也只能看到该 Run 已是 running，必须返回空而不能重建 Delivery、重新
   mint credential 或把 Run 放回 pending；同一或其他 daemon、server 重启后均适用。
@@ -115,8 +153,17 @@ store 内部统一承担以下原子操作：
 
 - T1：同一 pending Run 的并发 poll 中，恰好一个响应含 Delivery；最终只有一个 running Run 和一条 active lease。
 - T2：领取后的重复 poll 返回空 deliveries，不生成新 Run、lease 或 token。
+- 多 Run Poll：同一 Machine 的多个 eligible pending exec 在无竞争时由一次 Poll
+  全部领取，响应按 `ts ASC, id ASC`；其他 Machine、非 exec 和不可构造 Delivery 的
+  候选不被领取。两个并发 Poll 的 Delivery 并集无重复，单项竞争失败不阻断其余候选。
+- Lease caps：Loop `allowControl=true/false` 时，Phase 1 mint 的全部控制 caps 均为
+  false，且由写入路径显式持久化；Delivery 保留真实 Loop 配置，全 false 的 active
+  lease 仍能完成正常 Report。
 - T3：首次 report 返回 200 并落库；第二次返回 401；前后 Run/Loop 快照证明无重复副作用。
-- T7：连续 enqueue 时旧 pending 变为 `canceled/skipped`，新 pending 为 `exec`；running Run 不被 supersede。
+- T7：连续 enqueue 时全部旧 pending exec 变为 `canceled/skipped`，且只留下一个新
+  pending exec；存在 running 时本次触发零写入。注入 insert 失败必须证明旧 pending
+  回滚，Poll 抢先 claim 必须证明 enqueue 回滚且不追加 pending；同进程两个并发
+  enqueue 最终只产生一个新 pending。
 - Delivery 丢失：让第一次 Poll 完成 claim/lease commit 后丢弃响应，再次 Poll 必须
   返回空 deliveries；Run 仍为原 running 行、Lease 仍为原 hash，不生成新 Run、
   Lease 或 credential。Day 8–10 再推进 Fake Clock 并执行 sweep，验证它最终进入
