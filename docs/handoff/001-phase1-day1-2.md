@@ -80,8 +80,9 @@ Phase 1「心脏」的前两步已完成并合入 main：wire 协议包（Day 1�
    （generate + `git diff --exit-code`）会抓 schema.ts↔SQL 漂移。注意 db:check
    失败后重跑前需清理 generate 留下的未跟踪文件并还原 `_journal.json`。
 4. **迁移前滚-only**：列只增不改不删；推迟列按 ADR-003 的归属阶段增量回迁。
-5. **`runs.ts` 是"最近生命周期转换时刻"**（claim/finalize/reclaim/supersede 都重打），
-   不是创建时间；sweep 的不活跃窗口量 `max(ts, progress.at)`。
+5. **`runs.ts` 指 `runs` 数据库表的 `ts` 列，不是 TypeScript 文件**。它记录“最近
+   生命周期转换时刻”（claim/finalize/reclaim/supersede 都更新），不是创建时间；
+   sweep 的不活跃窗口量 `max(ts, progress.at)`。
 6. lease 语义：每条 finalize 路径以 `retireLease`（单发 DELETE）收尾，第二次
    report 在 resolve 处 401（效果幂等：零副作用，不保证重复成功响应）；
    `terminal-grace` 只能由 sweep 的 reclaim 写入。**cancel 立即 retire**——owner

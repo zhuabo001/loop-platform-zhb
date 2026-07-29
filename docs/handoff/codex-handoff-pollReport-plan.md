@@ -21,7 +21,15 @@ store 内部统一承担以下原子操作：
 - claim：条件更新 `pending → running`，并插入 SHA-256 RunLease；两步同一事务，lease 插入失败必须回滚 Run。
 - report：事务内重新解析 lease、锁定同一 Run 行，再检查 phase；Run finalize 与 lease 删除同一事务。
 - cancel 原语：锁定 Run，更新为 `canceled` 并删除 lease；不暴露 HTTP 路由。
-- terminalize 原语：仅允许 `active → terminal-grace`，必须写入 `now + 24h` 的过期时间；重复调用不得延长首次窗口。
+- `reclaimStaleRun` 原语：在同一事务中把被 sweep 判定失联的 running Run 转为
+  `phase=error/outcome=error`，写入稳定通用原因
+  `machine timed out / disconnected`，把 `runs` 表的 `ts` 列更新为本次转换时间，
+  并把对应 active lease 转为 `terminal-grace`、写入首次 `now + 24h` 的过期时间。
+  重复 reclaim 不得延长窗口。
+- `terminalizeLease` 仅为 `reclaimStaleRun` 的 store 私有步骤；不得进入
+  `MachineGateway`、HTTP 或其他通用公开接口。只有 sweep 编排可以调用
+  `reclaimStaleRun`，report、cancel、正常失败 finalize 与管理员操作均不得借此制造
+  reconcile 资格。
 - 过期 terminal-grace lease 在 resolve 时惰性删除；retire 为单发删除。
 
 ### 2. Poll 与 Delivery
@@ -32,6 +40,11 @@ store 内部统一承担以下原子操作：
 - Delivery 固定包含协议要求的完整字段：machine roots、Loop 快照、`prevState`、空 `systemPrompt` 和仅面向 exec 的最小任务说明。
 - RunLease 的 `allowControl`、`canSet*`、`canFinish` 全部保持关闭；预声明字段不等于能力已开放。
 - 同一 Machine 的一次 poll 可以领取多个 pending Run；并发 poll 对每个 Run 只能产生一个 Delivery。
+- claim 事务一旦提交，Run 就永久失去派发资格。即使首次 Delivery HTTP 响应丢失，
+  后续 Poll 也只能看到该 Run 已是 running，必须返回空而不能重建 Delivery、重新
+  mint credential 或把 Run 放回 pending；同一或其他 daemon、server 重启后均适用。
+  系统无法判断响应是否到达，因此宁可让未完成 Run 后续被 sweep 回收为可观察 error，
+  也不冒险重复执行。
 
 ### 3. Report 状态机
 
@@ -42,9 +55,20 @@ store 内部统一承担以下原子操作：
 - 正常 running Run：
   - `ok=true` 写为 `done/exec`；
   - `ok=false` 写为 `error/error`，缺失错误时使用稳定的通用原因；
-  - 保存 message/finalText fallback、durationMs、sessionId，清除 progress，重打 `runs.ts`；
+  - 保存 message/finalText fallback、durationMs、sessionId，清除 progress，把
+    `runs` 表的 `ts` 列更新为本次转换时间；
   - finalize 与 lease retire 同事务。
-- terminal-grace + error Run：允许恰好一次 reconcile，返回 `{ok:true,reconciled:true}`，然后删除 lease。
+- terminal-grace + error Run 允许恰好一次 reconcile：
+  - `ok=true` 把 Run 从 `error` 翻正为 `done`、清除旧 reclaim error；
+  - `ok=false` 保持 `error/error`，以非空 `body.error` 替换 reclaim 原因；缺失或
+    空 error 时使用稳定 fallback `run failed on machine`，不得继续保留 sweep
+    timeout 原因；
+  - 两个分支都按正常 Report 的 Phase 1 字段策略保存基础字段、清除 progress，并把
+    `runs` 表的 `ts` 列更新为本次 reconcile 时间；失败分支不推进任何 Loop
+    cursor/state；
+  - Run 更新与 terminal-grace lease 删除必须在同一事务中，任一步失败整体回滚；
+    成功受理均返回 `{ok:true,reconciled:true}`，第二次 report 返回统一 401 且零
+    副作用。
 - canceled Run 或 report/cancel 竞态中失去 phase guard：按 Run Capability 已失效处理，
   返回 401，禁止任何 Loop 级写入。
 - Phase 1 不实现 `done + active lease` enrich。该组合当前没有合法来源；若出现则按
@@ -66,13 +90,19 @@ store 内部统一承担以下原子操作：
 ## HTTP 与启动接口
 
 - 新增 `hono`、`@hono/node-server` 并更新 lockfile；提供可注入的 `createServerApp`，HTTP route 只负责认证头、JSON/schema 解析、调用 gateway 和返回响应。
-- 两个端点统一使用 2 MiB wire body cap：
-  - 非法 JSON 或 DTO：400；
-  - 无效、过期、已消费或已撤销的 Run Capability：401，并使用稳定的
-    `run_capability_invalid` code；
-  - 超限：413；
-  - 未知路由：404；
-  - 未捕获异常：500，响应不泄露堆栈。
+- 两个端点统一使用 2 MiB wire body cap；所有 route、body-limit、not-found 和全局
+  exception 分支均通过集中的 JSON error helper 返回 `ApiError`，响应必须通过
+  protocol 的 `apiErrorSchema`，并设置 JSON Content-Type：
+  - 非法 JSON 或 DTO：400 + `{error:"invalid request"}`；
+  - 无效 Machine Credential：401 + `{error:"invalid machine credential"}`；
+  - 无效、过期、已消费或已撤销的 Run Capability：401 +
+    `{error:"invalid or expired run capability",code:"run_capability_invalid"}`；
+  - 超限：413 + `{error:"request body too large"}`；
+  - 未知路由：404 + `{error:"not found"}`；
+  - 未捕获异常：500 + `{error:"internal server error"}`。
+- `code` 保持 protocol 定义的可选 additive 字段；本批次只有已经锁定的
+  `run_capability_invalid` 必须携带 code，其他错误不提前创造 code。Zod issues、
+  异常消息、stack 和数据库细节只进入服务端日志，不得进入响应。
 - server 包公开 `@loopzhb/server/http` 的 app factory；Node 启动入口通过 `@hono/node-server` 监听。
 - 启动配置固定为：
   - `LOOPZHB_HOST` 默认 `127.0.0.1`；
@@ -87,6 +117,10 @@ store 内部统一承担以下原子操作：
 - T2：领取后的重复 poll 返回空 deliveries，不生成新 Run、lease 或 token。
 - T3：首次 report 返回 200 并落库；第二次返回 401；前后 Run/Loop 快照证明无重复副作用。
 - T7：连续 enqueue 时旧 pending 变为 `canceled/skipped`，新 pending 为 `exec`；running Run 不被 supersede。
+- Delivery 丢失：让第一次 Poll 完成 claim/lease commit 后丢弃响应，再次 Poll 必须
+  返回空 deliveries；Run 仍为原 running 行、Lease 仍为原 hash，不生成新 Run、
+  Lease 或 credential。Day 8–10 再推进 Fake Clock 并执行 sweep，验证它最终进入
+  error 且全程未重派。
 - report/cancel 交错：使用应用层 gate/deferred promise 让 report 完成初始 resolve
   后暂停，随后让 cancel 的 PGlite 事务真实 commit，再恢复 report 执行事务内二次
   验证；断言 report 返回统一 401、Run 保持 canceled、lease 不存在且 Loop 零写入。
@@ -94,7 +128,16 @@ store 内部统一承担以下原子操作：
   隔离级别。
 - 事务守卫：
   - lease INSERT 故意失败时 claim 整体回滚；
-  - terminalize 必带 expiry 且不能延长；
+  - `reclaimStaleRun` 原子提交 Run error 与 lease terminal-grace，terminalize 必带
+    expiry，并断言 Run 的通用 reclaim reason 为
+    `machine timed out / disconnected`；重复 reclaim 不延长首次窗口；
+  - 非 `running Run + active lease` 不得被 reclaim，正常失败不得获得
+    terminal-grace；store/gateway 公开面不存在通用 `terminalizeLease`；
+  - reconcile success 将 error 翻正为 done 并清除 reclaim 原因；reconcile failure
+    保持 error，以 daemon 的非空真实错误或 `run failed on machine` 替换 reclaim
+    timeout，不推进 Loop state；
+  - reconcile 的 Run 更新与 lease 删除做故障注入：任一步失败均整体回滚；首次成功
+    返回 `{ok:true,reconciled:true}`，第二次返回 401 且 Run/Loop 快照不变；
   - cancel 后不存在 active lease；
   - report 在事务内发现 canceled/phase 已变化时不写任何终态或 Loop 数据。
 - 协议与安全：
@@ -104,7 +147,10 @@ store 内部统一承担以下原子操作：
     UUID 只要对应 lease 存在仍可完成；
   - body.runId 伪造不能越过 lease；
   - 未启用字段不会修改 Loop/Run；
-  - Delivery 与 report 响应分别通过 protocol schema 校验。
+  - Delivery 与 report 响应分别通过 protocol schema 校验；
+  - 400/401/413/404/500 的 body 均通过 `apiErrorSchema`，精确断言稳定
+    status/error/必要 code 和 JSON Content-Type；404 不使用 Hono 默认文本，注入的
+    gateway 异常不得把异常消息、stack 或数据库信息泄漏到 500 body。
 - 完成验证：
   - `pnpm -r typecheck`
   - `pnpm -r test`

@@ -29,8 +29,9 @@ Day 1–2 的产出是把「调度—领取—执行—回报」链路的可靠�
    写顺序语义显式化，迟到 report 的写入不受 FK 约束顺序干扰。测试钉住
    `pg_constraint` 中 0 条 FK。
 5. **时间戳一律 ISO 字符串 text 列**，无 DB 默认值（写入方打戳；两档可移植）。
-6. **`runs.ts` 不是创建时间**。它在每次生命周期转换重打（claim/finalize/reclaim/
-   supersede），语义是"最近一次转换时刻"；sweep 的不活跃窗口量的是
+6. **`runs.ts` 指 `runs` 数据库表的 `ts` 列，不是 TypeScript 文件，也不是创建
+   时间**。它在每次生命周期转换时更新（claim/finalize/reclaim/supersede），语义是
+   “最近一次转换时刻”；sweep 的不活跃窗口量的是
    `max(ts, progress.at)`。列注释已写明，避免误当 createdAt。
 7. **列裁剪**（提炼语义，不照抄；被裁列全部按阶段增量回迁，前滚-only 使其廉价）：
    - `machines`：裁 `user_id`/`team_id`（团队与认证批次）、`token` 明文（无 UI 重显

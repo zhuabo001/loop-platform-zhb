@@ -1,7 +1,7 @@
 # Day 3–4 Poll / Report 计划澄清：CONFLICT、GAP 与 ASSUMPTION
 
 > 日期：2026-07-29
-> 状态：4 个 CONFLICT 已解决；GAP 与其余 ASSUMPTION 待后续收敛
+> 状态：4 个 CONFLICT、4 个 GAP 已解决；其余 ASSUMPTION 待后续收敛
 > 对象：[`codex-handoff-pollReport-plan.md`](./codex-handoff-pollReport-plan.md)
 > 目的：把当前开发计划中与既有决策冲突、未显式写出的既有约束，以及尚未被
 > ADR/roadmap 锁定的设计假设分别列出。在本文件收敛前，不直接按原计划实施。
@@ -161,7 +161,9 @@
 本节中的计划方向已经符合 ADR，不需要 owner 重新选择设计；只需把隐含约束补成显式
 表述和验收场景。
 
-### G-01：需显式限定 `terminalizeLease` 只能由 sweep/reclaim 调用
+### G-01：显式限定 `terminalizeLease` 只能由 sweep 的 reclaim 写入
+
+**状态：已解决（2026-07-29）**
 
 **当前计划已经正确的部分**
 
@@ -182,12 +184,28 @@ ADR-003 规定 `terminal-grace` 只能由 sweep 的 reclaim 写入。计划没�
 - [ADR-003 RunLease 状态机](../adr/003-heart-schema.md)
 - [Day 1–2 handoff 的 lease 工程规则](./001-phase1-day1-2.md)
 
-**需补入原计划**
+**Owner 决策**
 
-- terminalize 保持 store 内部操作，只有后续 sweep/reclaim 路径可以调用。
-- Day 3–4 可以实现和测试该操作，但不加入 HTTP 或通用外部接口。
+- `sweep` 是识别失联 Run 的扫描编排，`reclaim` 是回收单个失联 Run 的原子事务；
+  两者不是同义词。
+- 对外原语命名为 `reclaimStaleRun`：在同一事务中完成
+  `running Run → phase=error/outcome=error`、写入稳定通用原因
+  `machine timed out / disconnected`、更新 `runs.ts` 数据库列（Run 最近转换时间）和
+  `active lease → terminal-grace(expiresAt=首次 now+24h)`。
+- `terminalizeLease` 仅为 `reclaimStaleRun` 的 store 私有步骤；不得进入
+  MachineGateway、HTTP 或通用 store 公开面。只有 sweep 编排可以调用
+  `reclaimStaleRun`。
+- report、cancel、正常失败 finalize 和管理员操作不得调用 terminalize，从而不得把
+  正常失败伪装成具有一次 reconcile 资格的 sweep 误判。
+- Day 3–4 实现并测试事务原语，不实现 sweep 定时调度和超时扫描；后者留在
+  Day 8–10。
+- 验收覆盖原子提交、通用 reclaim reason、首次 24h 窗口、重复 reclaim 不续期、
+  非 `running Run + active lease` 零转换，以及公开面不存在通用 terminalize
+  能力。
 
-### G-02：需补齐 reconcile 失败分支的锁定语义
+### G-02：补齐 reconcile 失败分支的锁定语义
+
+**状态：已解决（2026-07-29）**
 
 **当前计划**
 
@@ -205,11 +223,28 @@ ADR-003 规定 `terminal-grace` 只能由 sweep 的 reclaim 写入。计划没�
 - [ADR-001 持久化 RunLease 与 T5](../adr/001-heart-tests.md)
 - [ADR-003 reconcile 状态机](../adr/003-heart-schema.md)
 
-**需补入原计划**
+**Owner 决策**
 
-在 report 状态机与测试中分别覆盖 reconcile success 和 reconcile failure。
+- reconcile 必须在事务内重新解析 lease 并锁定或 CAS 检查权威 Run；只有未过期的
+  `terminal-grace lease + error Run` 可以进入该分支。
+- reconcile success：`error → done`，清除通用 reclaim error。
+- reconcile failure：保持 `error/error`，以 daemon 报告的非空真实错误替换 reclaim
+  原因；缺失或空 error 时使用稳定 fallback `run failed on machine`，而不是保留
+  sweep timeout。
+- 两个分支均按 Phase 1 的正常 Report 字段策略保存基础字段、清除 progress，并更新
+  `runs.ts` 数据库列；失败分支不得推进 Loop cursor/state，也不得重复发送 reclaim
+  时已经发送过的失败通知。
+- Run 更新与 terminal-grace lease 删除必须在同一事务；任一步失败时全部回滚，不能
+  消费 credential 却丢失真实结果。
+- 成功受理无论 Run 最终成功或失败都返回 `{ok:true,reconciled:true}`；这里的
+  `ok:true` 表示请求被接受。第二次 report 返回统一 capability-invalid 401，且
+  Run/Loop 零副作用。
+- 测试分别覆盖 success、带真实错误的 failure、缺失/空错误的 failure、事务两端
+  故障回滚和第二次 report 的效果幂等。
 
-### G-03：需把 Delivery 丢失后的“不重派”承诺写成显式场景
+### G-03：把 Delivery 丢失后的“不重派”承诺写成显式场景
+
+**状态：已解决（2026-07-29）**
 
 **当前计划已经正确的部分**
 
@@ -225,12 +260,25 @@ sweep 进入可观察 error。
 
 - [ADR-001 投递保证](../adr/001-heart-tests.md)
 
-**需补入原计划**
+**Owner 决策**
 
-- Poll/gateway 不得依据 daemon 重试重新构建已 running Run 的 Delivery。
-- Day 3–4 至少测试“不重派”；最终进入 error 的 sweep 行为留 Day 8–10 验证。
+- claim 与 Lease 的事务一旦提交，Run 就永久失去派发资格；HTTP Delivery 响应是否
+  到达不改变这一点。
+- Poll 只 claim pending Run，不得因 daemon 重试重新返回 running Run、重建
+  Delivery、重新 mint credential 或把 Run 放回 pending。
+- 规则对同一 daemon、其他 daemon 和 server 重启后的 Poll 一致。数据库只保存
+  credential hash，本来也无法安全恢复原 credential。
+- server 无法区分“响应丢失”和“daemon 已收到并开始产生外部副作用”，因此 MVP
+  选择 at-most-once execution：Run 可能执行零次或一次，绝不因自动重派执行两次。
+- Day 3–4 测试第一次 Poll claim/lease commit 后丢弃响应，再次 Poll 返回空且
+  Run/Lease 数量和身份不变。Day 8–10 再以 Fake Clock+sweep 验证 Run 最终进入
+  可观察 error，全程不重派。
+- Delivery ACK、claim request ID、可重放 Delivery 和可恢复 credential 不进入当前
+  MVP，需要时另行设计。
 
-### G-04：需显式规定错误响应使用已有 protocol 形状
+### G-04：显式规定错误响应使用已有 protocol 形状
+
+**状态：已解决（2026-07-29）**
 
 **当前计划已经正确的部分**
 
@@ -246,10 +294,24 @@ JSON 形状，会重新引入 server/daemon wire 漂移。
 - [`errors.ts`](../../packages/protocol/src/errors.ts)
 - [ADR-002：protocol 是唯一 wire 耦合点](../adr/002-protocol-package.md)
 
-**需补入原计划**
+**Owner 决策**
 
-所有机器端点错误响应统一满足 `apiErrorSchema`；是否给每类错误附 `code` 可作为实现
-选择，但 `error` 字段必须稳定存在。
+- 所有机器端点以及 body-limit、not-found、全局 exception 分支都通过集中 JSON
+  error helper 返回 `ApiError`，body 必须满足 `apiErrorSchema` 并使用 JSON
+  Content-Type；禁止纯字符串、Zod issue 数组、框架默认 404 和自创错误形状。
+- 稳定映射为：
+  - 400 `{error:"invalid request"}`；
+  - 无效 Machine Credential 401 `{error:"invalid machine credential"}`；
+  - 无效 Run Capability 401
+    `{error:"invalid or expired run capability",code:"run_capability_invalid"}`；
+  - 413 `{error:"request body too large"}`；
+  - 404 `{error:"not found"}`；
+  - 500 `{error:"internal server error"}`。
+- `code` 保持 additive optional；当前仅已锁定的 `run_capability_invalid` 必须携带，
+  其他分类等 daemon 真正需要编程分支时再增量增加。
+- Zod 细节、异常消息、stack、SQL/数据库信息只进入服务端日志，不进入 wire。
+- 测试让所有错误分支通过 `apiErrorSchema`，精确断言 status、稳定 error、必要 code
+  和 JSON Content-Type，并单测 404/500 不泄漏框架或内部细节。
 
 ## 四、ASSUMPTION
 
@@ -402,9 +464,9 @@ artifacts、transcript、cost、attempts。
 - 两条路径统一返回 `run_capability_invalid` 401；daemon 将其视为终态确认。
 - 竞态输掉的 Report 不得产生任何 Run/Loop 写入。
 
-### A-10：HTTP 状态映射
+### A-10：HTTP 状态映射（已由 G-04 解决）
 
-**计划假设**
+**Owner 决议**
 
 - JSON/DTO 错误：400；
 - token 错误：401；
@@ -412,10 +474,8 @@ artifacts、transcript、cost、attempts。
 - 未知路由：404；
 - 未捕获异常：500。
 
-**推荐**
-
-采纳以上映射，所有 body 使用 `apiErrorSchema`。对 Zod 细节只写稳定错误摘要，不把内部
-stack 或数据库错误暴露到响应。
+以上映射已采纳；所有 body 使用 `apiErrorSchema`，稳定摘要与可选 code 规则以 G-04
+为准。
 
 ### A-11：server 包公开接口
 
@@ -491,10 +551,10 @@ fail closed：
 
 不需要 owner 再决策、可直接按 ADR 补齐的 GAP：
 
-- [ ] G-01：显式写明 terminalize 仅由 sweep/reclaim 调用。
-- [ ] G-02：补齐 reconcile failure。
-- [ ] G-03：显式写明 Delivery 丢失后不重派。
-- [ ] G-04：显式写明错误响应使用 `apiErrorSchema`。
+- [x] G-01：terminalize 仅为 sweep→reclaim 原子事务的私有步骤。
+- [x] G-02：锁定 reconcile success/failure、fallback 与原子消费语义。
+- [x] G-03：claim 提交后 Delivery 丢失也不重派，最终由 sweep 显式失败。
+- [x] G-04：全部 HTTP 错误统一使用 `apiErrorSchema` 与稳定公开摘要。
 
 仍需要 owner 拍板的 ASSUMPTION：
 
@@ -505,6 +565,7 @@ fail closed：
 - [ ] A-06：Phase 1 lease caps 的值。
 - [ ] A-08：正常 Report 当前保存的字段集合。
 - [x] A-09：竞态输家统一返回 `run_capability_invalid` 401。
+- [x] A-10：HTTP 状态与 `apiErrorSchema` 映射已由 G-04 解决。
 - [ ] A-11/A-12：package export、启动入口和环境变量。
 - [x] A-14：orphaned Run 统一使 capability 失效并清理孤儿 lease。
 

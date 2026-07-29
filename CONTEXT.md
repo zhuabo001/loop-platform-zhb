@@ -13,6 +13,19 @@ _Avoid_: Run token when referring to the authority itself
 The durable grant that authorizes actions against exactly one Run.
 _Avoid_: Session, machine credential
 
+**Sweep**:
+The server process that identifies open Runs whose machine activity has gone stale.
+_Avoid_: Reclaim
+
+**Reclaim**:
+The recovery of one stale running Run into an observable failure while preserving its one-time
+reconciliation opportunity.
+_Avoid_: Sweep, cancel
+
+**Run Transition Time**:
+The time of a Run's most recent lifecycle transition.
+_Avoid_: Run creation time
+
 **Run Capability**:
 The effective authority formed by a coherent live RunLease and its Run, presented through a Run
 Credential.
