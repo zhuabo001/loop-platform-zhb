@@ -51,6 +51,18 @@ reconcile 分支必须在第一版数据模型中就位，否则后续每个可�
 
 ## 心脏测试清单（Phase 1 完成标准）
 
+### T7 原子 Supersede
+
+`enqueueExecRun` 把“替换未领取的旧 exec 触发”定义为一个原子动作：若 Loop 已有
+running Run，本次触发跳过且零写入；否则在同一事务中将全部旧 pending exec Run
+转为 `canceled/skipped`，并插入恰好一个新 pending exec Run。任一 phase guard 输给
+并发 Poll claim，或任一写入失败时，整个 enqueue 回滚。
+
+参考实现具有相同的最终行为，并以进程内 per-loop guard 合并并发 trigger，但其
+supersede 与 insert 是分离写入。ZHB 保留 per-loop 进程内串行化作为 Phase 1
+单进程保证，同时消除部分提交窗口；多实例下的行锁、隔离级别与重试留在 Phase 6
+使用真实 Postgres 验证。本决议不新增数据库约束。
+
 | # | 名称 | Given / When / Then |
 |---|---|---|
 | T1 | 并发 claim 唯一 | 同一 pending run，N 个并发 `poll` | 恰好 1 个 200 拿到 run，其余空手 | run 只被执行一次 |
@@ -59,7 +71,7 @@ reconcile 分支必须在第一版数据模型中就位，否则后续每个可�
 | T4 | server 重启不丢在途 run | run 处于 running，lease 已落库 | server 进程重启 | run 不被误判失败；daemon 后续 report 正常受理 |
 | T5 | 休眠迟到 report 翻正误判 | run 被 sweep 回收为失败（lease=terminal-grace） | daemon 醒来上报真实成功结果 | run 翻正为 done，记录消息/产物，lease 销毁；第二次迟到 report 在 resolve 处 401 |
 | T6 | 取消的 run 迟到 report 被拦截 | owner cancel：run 转 `canceled` 且 lease 在同一事务中撤销 | 迟到 report 到达 | token resolve 或事务锁/CAS guard 处失败；游标/任务文件/loop 配置/通知均不变；cancel 后 run-token 的一切写操作失效（Phase 1 的 run-token 表面只有 report；set-\*/reschedule/finish 随其所在阶段落地时继承此规则） |
-| T7 | 下一次触发 supersede 陈旧 pending | pending run 一直未被领取 | 下一次触发到达（Phase 1 为手动 trigger，coordinator 级测试；cron 阶段继承同一语义） | 旧 pending 转为 skipped（不计失败、不告警），新 pending 入队 |
+| T7 | 下一次触发原子 supersede 陈旧 pending | pending run 一直未被领取 | 下一次触发到达（Phase 1 为手动 trigger，coordinator 级测试；cron 阶段继承同一语义） | 同一事务中旧 pending 转为 skipped（不计失败、不告警）且恰好一个新 pending 入队；存在 running、phase guard 输给 Poll 或写入失败时不得留下部分结果 |
 
 ## 通过标准
 
@@ -84,3 +96,6 @@ reconcile 分支必须在第一版数据模型中就位，否则后续每个可�
   daemon 永不回报时留下永不过期且仍具控制能力的 active lease）。（3）验收门调整为
   T1–T6，T7 保留为 Phase 1 coordinator 级测试。（4）新增「投递保证」一节。
   （5）机制 1 补充 claim 与 lease 持久化为同一事务（有意的参考偏离）。
+- 2026-07-29：T7 明确为原子 Supersede：running 阻止触发；否则旧 pending exec 的
+  `canceled/skipped` 转换与恰好一个新 pending exec 的插入处于同一事务。保留参考
+  实现的单进程 per-loop 串行化，但不继承其 supersede 与 insert 分离提交窗口。

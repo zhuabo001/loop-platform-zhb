@@ -65,9 +65,9 @@ docs/adr/     # 架构决策记录
 |---|---|
 | Day 1 | `packages/protocol`：wire DTO + zod 校验；workspace 骨架 |
 | Day 1–2 | 四张表 `machines / loops / runs / run_leases` + 状态枚举（从 loop-platform `db/schema.ts` 提炼语义，不照抄）；lease 状态机 `active → terminal-grace` 此刻定型 |
-| Day 3–4 | `POST /machine/poll` 原子 claim + `POST /machine/report`；**先写心脏测试 T1–T3 再写实现** |
+| Day 3–4 | `POST /api/machine/poll` 原子 claim + `POST /api/machine/report`；**先写心脏测试 T1–T3 再写实现**；交付 T7 coordinator 测试与 report/cancel 应用层交错测试 |
 | Day 5–7 | daemon 前台 poll 循环 + Fake Runner（假装执行、直接回报），端到端打通 |
-| Day 8–10 | 故障注入：心脏测试 T4–T7（server 重启、daemon 休眠迟到 report、取消、supersede） |
+| Day 8–10 | 完整故障注入：心脏测试 T4–T6（server 重启、daemon 休眠迟到 report、取消）；T7 已在 Day 3–4 以 coordinator 级测试交付 |
 
 触发方式：手动 `POST /loops/:id/run`。
 完成标准：ADR-001 心脏测试 **T1–T6 全绿**（T7 为 coordinator 级测试，随
@@ -113,8 +113,9 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
 ## Phase 6 — 生产硬化（独立阶段）
 
 Postgres（托管分层）/R2、迁移预检、body/rate/storage caps、SSRF 防护、GC、
-健康检查、部署形态，以及**真实 Postgres 的并发验证**（pglite 单连接语义不等于
-托管 PG 的并发语义）。
+健康检查、部署形态，以及**真实 Postgres 的并发验证**：使用多个物理连接验证行锁
+竞争、隔离级别、死锁与重试（PGlite 在 Phase 1 只验证应用层交错编排与真实事务提交，
+不代表托管 PG 的并发语义）。
 
 ## Phase 7 — 高阶能力（按需）
 

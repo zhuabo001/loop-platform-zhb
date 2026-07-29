@@ -91,10 +91,10 @@ export const machines = pgTable("machines", {
   tokenHash: text("token_hash").notNull(),
   /** Workdir allowlist the daemon enforces as cwd jail; null/[] = unrestricted. */
   roots: jsonb("roots").$type<string[]>(),
-  /** Last poll contact (ISO). Presence (online/asleep/offline) is DERIVED from
-   *  this stamp — there is deliberately no `online` boolean column (even the
-   *  reference recomputes `now - lastSeen` on every read; its column is a
-   *  redundant cache). */
+  /** Persisted Machine heartbeat watermark (ISO), not an exact per-Poll audit
+   *  timestamp. Presence is DERIVED from this stamp + current time — there is
+   *  deliberately no `online` boolean column (even the reference recomputes
+   *  `now - lastSeen` on every read; its column is a redundant cache). */
   lastSeen: text("last_seen"),
   createdAt: text("created_at").notNull(),
 });

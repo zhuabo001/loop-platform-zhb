@@ -29,13 +29,15 @@ Day 1–2 的产出是把「调度—领取—执行—回报」链路的可靠�
    写顺序语义显式化，迟到 report 的写入不受 FK 约束顺序干扰。测试钉住
    `pg_constraint` 中 0 条 FK。
 5. **时间戳一律 ISO 字符串 text 列**，无 DB 默认值（写入方打戳；两档可移植）。
-6. **`runs.ts` 不是创建时间**。它在每次生命周期转换重打（claim/finalize/reclaim/
-   supersede），语义是"最近一次转换时刻"；sweep 的不活跃窗口量的是
+6. **`runs.ts` 指 `runs` 数据库表的 `ts` 列，不是 TypeScript 文件，也不是创建
+   时间**。它在每次生命周期转换时更新（claim/finalize/reclaim/supersede），语义是
+   “最近一次转换时刻”；sweep 的不活跃窗口量的是
    `max(ts, progress.at)`。列注释已写明，避免误当 createdAt。
 7. **列裁剪**（提炼语义，不照抄；被裁列全部按阶段增量回迁，前滚-only 使其廉价）：
    - `machines`：裁 `user_id`/`team_id`（团队与认证批次）、`token` 明文（无 UI 重显
-     需求，只存 `token_hash`——比参考更严）、`online` 布尔（在场状态从 `last_seen`
-     推导；参考实现自己也是每次读取时现算，列只是冗余缓存）。
+     需求，只存 `token_hash`——比参考更严）、`online` 布尔（在场状态从
+     `last_seen` 持久化心跳水位结合当前时间推导；参考实现自己也是每次读取时现算，
+     列只是冗余缓存）。
    - `loops`：裁 `cron`/`timezone`/`next_run_at`（cron 批次）、
      `goal`/`completed_at`/`completion_reason`（closed loop 批次）、
      `notify`/`channel_id`/`user_id`/`team_id`（团队与认证批次）、`ui`/`state_schema`/
@@ -46,7 +48,10 @@ Day 1–2 的产出是把「调度—领取—执行—回报」链路的可靠�
      caps——租约行形状是 ADR-001 要求此刻定型的东西，列已就位，语义后补。
 
    注：`runs`/`run_leases` 的全量保留是**兼容形状预声明**（ADR-002 决策 6）——
-   列已就位，不等于 Phase 1 已开放其全部字段语义或控制能力。
+   列已就位，不等于 Phase 1 已开放其全部字段语义或控制能力。Phase 1 mint policy
+   显式将 `allow_control`、全部 `can_set_*` 与 `can_finish` 写为 false；这些字段表示
+   当前有效授权，不是未来配置快照。能力必须与对应 route 和行为测试同批开放，且
+   不追溯激活此前 mint 的 active lease。
 8. **索引**：`runs_loop_idx`、`runs_loop_ts_idx`、`runs_phase_idx`（sweep 扫 open
    runs），加 ADR-001 明确要求的部分索引
    `runs_pending_idx ON runs(machine_id) WHERE phase='pending'`——poll 的 claim
@@ -121,3 +126,8 @@ expires_at 过期 ──▶ resolve 时惰性删除 / sweep 中 prune
   文件」的承诺。（6）§7 列归属改用批次名（cron/closed loop/团队/高阶能力），
   配合 roadmap 阶段重排。（7）明确 `runs`/`run_leases` 预声明形状 ≠ Phase 1
   已开放全部字段语义（ADR-002 决策 6）。前滚-only 与已接受的列裁剪决策不变。
+- 2026-07-29：补充 Phase 1 lease mint policy：全部控制 caps 显式 false，预声明列
+  不作为潜伏授权；未来能力与 route 同批启用，并且不追溯既有 active lease。
+- 2026-07-29：澄清 `machines.last_seen` 是可节流但必须单调的持久化心跳水位，不是
+  每次 Poll 的精确审计时间；Machine 在场状态仍由该水位结合当前时间推导，不恢复
+  `online` 列。
