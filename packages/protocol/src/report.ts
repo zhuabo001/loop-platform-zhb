@@ -1,5 +1,5 @@
 /**
- * Report: POST /machine/report — the daemon's run finalize.
+ * Report: POST /api/machine/report — the daemon's run finalize.
  *
  * Auth is the run lease (`Authorization: Bearer <rk_…>`); the server resolves
  * the run from the LEASE, so `runId` in the body is a mere echo (ignored for

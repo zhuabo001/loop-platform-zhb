@@ -1,9 +1,14 @@
 # Handoff：Day 3–4 HTTP 框架选型（Hono vs 裸 node http）
 
 > 日期：2026-07-28 ｜ 状态：**已定（2026-07-28）：Hono**（`hono` + `@hono/node-server`）
-> 范围：Day 3–4 只需要 `POST /machine/poll` + `POST /machine/report` 两个端点，
+> 范围：Day 3–4 只需要 `POST /api/machine/poll` +
+> `POST /api/machine/report` 两个端点，
 > 但这个选择会影响 Phase 1 后续（`POST /loops`、`POST /loops/:id/run`）和
 > Phase 4 的 Dashboard API，所以值得单独留一份决策记录。
+>
+> 2026-07-29 澄清：机器路由统一使用 `/api/machine/*`；Report credential 读取侧
+> 保持 opaque；Phase 1 不实现 done-enrich；report/cancel 在 Day 3–4 验证应用层
+> 交错与真实事务提交，真实 Postgres 锁竞争/隔离级别留 Phase 6。
 
 ---
 
@@ -113,9 +118,21 @@ serve({ fetch: app.fetch, port: 3000 });
 - report 与 cancel 在各自事务中锁定同一 Run 行（或使用覆盖整个写入区间的 CAS），
   再检查 phase 并进行任何 Loop 级写入（防"先 resolve、cancel 后提交"竞态）。
 
+Day 3–4 的交错测试使用应用层 gate/deferred promise 控制顺序，并让 PGlite 事务真实
+commit：report 初始 resolve 后暂停，cancel 提交，再恢复 report 做事务内二次 guard。
+它验证应用层编排、事务边界和写前拦截，不声称覆盖数据库锁竞争或隔离级别；真实
+Postgres 多连接验证留在 Phase 6。
+
 **能力 guard 测试**：cancel 后 run-token 的一切写操作失效（Phase 1 的 run-token
 表面只有 report；控制动词随其阶段落地时继承此规则）；Phase 1 的 trigger 路径
 只产出 `exec` role（ADR-002 决策 6：预声明形状 ≠ 已支持语义）。
+
+Report 把 Bearer token 当作 opaque Run Credential，直接按 hash resolve lease；只有
+当前 server 的 mint/write 侧要求 `rk_` 形状。unknown/expired/consumed/revoked、
+竞态输家、orphaned Run 和 Phase 1 的 stale `done + active lease` 都统一视为
+Run Capability 已失效，返回
+`{error:"invalid or expired run capability",code:"run_capability_invalid"}` + 401，
+且不得产生 Run/Loop 副作用。Phase 1 不实现 done-enrich。
 
 随后才是 store 层（`claimPendingRun` 等）→ gateway（claim → mint lease →
 buildDelivery；report 按 `run.phase` 分支）→ HTTP 层（本决策的落点）。

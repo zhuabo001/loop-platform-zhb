@@ -1,6 +1,6 @@
 # Handoff：Phase 1 心脏（Day 1–2 完成态）
 
-> 更新日期：2026-07-28 ｜ main @ `2df1050`（PR #2 已合并）
+> 更新日期：2026-07-29 ｜ main @ `2df1050`（PR #2 已合并）
 > 用途：让任何新会话/新人在 5 分钟内接上当前进度。路线图全貌见 `docs/roadmap.md`。
 >
 > **2026-07-28 语义锁定**：Day 3–4 开工前，report/cancel/投递语义已按
@@ -13,16 +13,17 @@
 > **79 全绿（62 protocol + 17 server）**。此前的三条实现审查意见
 > 已全部闭环：Delivery `runToken` 已恢复宽容 reader（opaque，形状校验只留
 > mint/写入侧）；`run_leases.run_id` unique 的措辞收窄为"至多一条现存"；
-> report/cancel 竞态锁定语义（锁行/CAS）已写进 ADR-001/003，Day 3–4 需把
-> 交错测试实现为真实并发测试。
+> report/cancel 竞态锁定语义（锁行/CAS）已写进 ADR-001/003。Day 3–4 通过应用层
+> gate 编排交错并让 PGlite 事务真实提交，验证事务内二次 guard；真实 Postgres 的
+> 多连接锁竞争与隔离级别验证留在 Phase 6。
 
 ---
 
 ## 一句话现状
 
 Phase 1「心脏」的前两步已完成并合入 main：wire 协议包（Day 1）+ 心脏数据模型
-（Day 1–2）。**下一步是 Day 3–4：`POST /machine/poll` 原子 claim +
-`POST /machine/report`，按 ADR-001 纪律先写心脏测试 T1–T3 再写实现。**
+（Day 1–2）。**下一步是 Day 3–4：`POST /api/machine/poll` 原子 claim +
+`POST /api/machine/report`，按 ADR-001 纪律先写心脏测试 T1–T3 再写实现。**
 
 ## 已完成清单
 
@@ -101,9 +102,12 @@ Phase 1「心脏」的前两步已完成并合入 main：wire 协议包（Day 1�
    Day 8–10 的故障注入覆盖 T4–T6。
 2. 需要新建：store 层（`addRun`/`claimPendingRun`（**与 lease INSERT 同一事务**）/
    `supersedePendingRun`/`pendingRunsForMachine`/lease 四函数 + `openRuns`）、
-   HTTP 层（poll/report 两个端点）、gateway 逻辑（claim → mint lease →
-   buildDelivery；report 在事务中锁定/比较 Run phase 后分支：canceled 拦截 / done
-   仅 enrich / terminal-grace reconcile / 正常 finalize；finalize + 删 lease 同一事务）。
+   HTTP 层（`/api/machine/poll`、`/api/machine/report`）、gateway 逻辑
+   （claim → mint lease → buildDelivery；report 在事务中锁定/比较 Run phase 后分支：
+   canceled/竞态失效拦截 / terminal-grace reconcile / 正常 finalize；finalize + 删
+   lease 同一事务）。Phase 1 不实现 `done + active lease` enrich：该组合当前没有合法
+   来源，出现时删除残留 lease、零 Run/Loop 写入并返回统一的 capability-invalid 401；
+   finish 动词落地时再增加 enrich。
 3. **事务边界**（ADR-003 定型，前两条是有意的参考偏离）：claim+lease INSERT
    同事务；report finalize+lease DELETE 同事务；cancel+lease DELETE 同事务。
 4. **能力 guard**（ADR-002 决策 6）：Phase 1 的 trigger 路径只产出 `exec` role；
@@ -117,6 +121,11 @@ Phase 1「心脏」的前两步已完成并合入 main：wire 协议包（Day 1�
    `.int()`）。参考实现语义提取：`loop-platform-github` 的
    `gateway/index.ts`（poll:456-623、report:1291-1558、sweep:354-428）、
    `db/store.ts`（claimPendingRun:200-208）、`gateway/tokens.ts`（lease 四函数）。
+7. **Run Capability 失效语义统一**：Report 读取侧不做 `rk_` 前缀预过滤，直接按
+   opaque credential hash resolve lease；unknown/expired/consumed/revoked、竞态输家、
+   orphaned Run 和 stale phase 对 daemon 统一返回
+   `{error:"invalid or expired run capability",code:"run_capability_invalid"}` + 401，
+   具体原因只记服务端日志。
 
 ## 工作环境备注
 
