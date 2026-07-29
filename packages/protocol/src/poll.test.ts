@@ -25,7 +25,14 @@ const GOLDEN_DELIVERY = {
   prevState: { lastScore: 87 },
   roots: ["/home/dev/project"],
   systemPrompt: "",
-  task: "Read the task file first, do the work, end with exactly ONE loopany report.",
+  task: [
+    "[loop run]",
+    'Loop id: "loop_01"',
+    'Loop name: "react-doctor"',
+    'Read the task file first: "/home/dev/project/loops/react-doctor/README.md"',
+    "Do the work it describes.",
+    "Run once, then stop.",
+  ].join("\n"),
 } as const;
 
 describe("pollRequestSchema", () => {

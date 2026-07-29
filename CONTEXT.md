@@ -26,6 +26,11 @@ _Avoid_: Sweep, cancel
 The time of a Run's most recent lifecycle transition.
 _Avoid_: Run creation time
 
+**Machine Heartbeat Watermark**:
+Durable recent proof that an authenticated Machine has contacted the server; Machine presence is
+derived from this watermark rather than stored as a separate fact.
+_Avoid_: Exact last-Poll audit time, online flag
+
 **Supersede**:
 The replacement of unclaimed pending Exec Runs from earlier triggers by a newer trigger.
 Superseded Runs are skipped; running Runs are never superseded.

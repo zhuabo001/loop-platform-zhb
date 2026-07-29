@@ -513,36 +513,97 @@ false。ZHB 不提前复制可能为 true 的存储值：参考项目把该值�
 
 ### A-07：Delivery task 的最小内容
 
-**计划假设**
+**决议（已确认）**
 
-`systemPrompt=""`，`task` 使用一段仅面向 exec 的最小任务说明。
+采用方案 C：复刻参考 prompt 的结构方向，但只交付当前阶段能够兑现的最小 exec
+指令。`systemPrompt` 精确等于空字符串；`task` 由独立、确定性的纯函数
+`buildExecTask(loop)` 构造，Delivery DTO 组装不内联 prompt 文案。
 
-**已锁定与未锁定部分**
+配置了本地 `taskFile` 时，模板为：
 
-- `systemPrompt` 当前为空有 protocol 注释依据。
-- `task` 必须是字符串，但具体文案没有 ADR。
+```text
+[loop run]
+Loop id: "<loop-id>"
+Loop name: "<loop-name>"
+Read the task file first: "<task-file-path>"
+Do the work it describes.
+Run once, then stop.
+```
 
-**推荐**
+没有配置 `taskFile` 时，模板为：
 
-使用独立、确定性的 `buildExecDelivery` 内部函数；任务只包含当前 Loop 名称和必要的
-执行说明，不提前实现 evolve/edit/workflow/Task File prompt 语义。
+```text
+[loop run]
+Loop id: "<loop-id>"
+Loop name: "<loop-name>"
+No task file is configured; this delivery has no real-agent task source.
+Run once, then stop.
+```
+
+`loop.id`、显示名称（`loop.name ?? loop.id`）和路径必须通过 JSON 字符串编码后插入，
+避免换行、引号或反引号破坏模板结构。Day 3–4/Phase 1 的 Fake Runner 允许接收无
+task-file Delivery；Phase 2 的真实 Agent E2E 必须使用配置了本地 `taskFile` 的 Loop，
+该文件此时只是一轮执行的输入来源，不提前开放 Phase 4 的 Spec/Current
+understanding/Timeline、同步或跨 Run 演进语义。
+
+Fake/真实 Runner 负责把执行结果提交给 Report endpoint；当前 task 不得宣传尚未实现
+的 in-run `loopany report/finish`。同样不得注入 evolve/edit、workflow、prevState、
+state schema、控制动作或 artifact 指令。以后相应能力落地时整体替换
+`buildExecTask`，不得改动 claim、lease 或 HTTP route。
+
+**参考依据与取舍**
+
+`loop-platform-github` 当前同样使用空 `systemPrompt`，并由独立 `buildExecTask`
+把完整首轮指令放入 `task`；但其文案依赖成熟的 Task File 生命周期、in-run CLI、
+report/finish、goal/state 与 skill。直接照抄会形成虚假契约。protocol golden 中原有
+“end with exactly ONE loopany report”也只是参考形状示例，与当前能力不符，本决议
+同步替换该示例。最小模板保留参考实现的 Run 身份、task-file 输入和 one-pass 约束，
+其余能力按阶段后补。
+
+测试覆盖空 `systemPrompt`、有/无 task-file 两个确定模板、元数据 JSON 编码、无残留
+模板变量、不得出现未开放能力文案，以及完整 Delivery 通过 `deliverySchema`。
 
 ### A-08：正常 Report 当前保存哪些字段
 
-**计划假设**
+**决议（已确认）**
 
-保存 message/finalText、durationMs、sessionId，忽略 cursor、taskFileContent、
-artifacts、transcript、cost、attempts。
+采用严格定义的 Phase 1 字段子集，复刻参考项目已经可用的基础执行结果，但不因协议和
+数据库中的预声明形状提前开放后续阶段语义。
 
-**推荐**
+- `ok=true` 必须写为 `phase=done, outcome=exec`；`ok=false` 必须写为
+  `phase=error, outcome=error`。请求中的 `outcome=direct/silent/evolve` 当前只解析，
+  不改变 Phase 1 只有 exec Run 的终态分类。
+- 每次成功受理都把 `runs.ts` 更新为注入 Clock 的本次转换时间，并把 `progress`
+  清为 `null`。Run finalize 与 lease retire 必须处于同一事务。
+- message 采用与参考实现一致、兼容未来 in-run message 的优先级：
+  1. 请求显式携带 `body.message` 时使用它；
+  2. 未携带时保留 Run 已有的非空 message；
+  3. Run 没有 message 时才使用 `body.finalText`；
+  4. 三者均无值时保持 `null`。
+- success 显式清除旧 `error`；failure 使用清理后非空、非纯空白的 `body.error`，
+  否则统一写入 `run failed on machine`。正常 Report 与 G-02 reconcile 共用这套错误
+  归一化规则。
+- `durationMs` 有值时保存，无值时写 `null`；`sessionId` 有值时保存，无值时写
+  `null`。
+- 所有进入文本列的 daemon 输入先去除 NUL：message/finalText fallback/error 最多
+  保存 2000 字符，sessionId 最多保存 200 字符。
+- cursor、taskFileContent、artifacts、transcript、cost、attempts 以及非 exec
+  outcome 继续通过 protocol 校验，但当前不得写 Run/Loop，也不得触发通知、快照或
+  其他后续阶段副作用。具体包括不修改 `Loop.state`、Task File 内容/同步时间，以及
+  Run 的 state、artifacts、transcript、costUsd、usage。
 
-采纳该最小集合：
+**参考依据与取舍**
 
-- 必须写：phase、outcome、ts；
-- 成功/失败观察面：message/finalText fallback、error；
-- 可写基础执行元数据：durationMs、sessionId；
-- 清除 progress 是否属于当前阶段需单独确认；
-- cursor、Task File、artifact、transcript、cost/attempts 暂不产生业务写入。
+`loop-platform-github` 的正常 Report 除上述基础字段外，还会持久化 cursor/Run
+state、Task File、artifacts、transcript、cost/attempts，并接受 daemon 声明的
+outcome；这些写入依赖成熟的 workflow、Task File、运行详情和后续调度语义。ZHB 的
+相关 wire 字段和数据库列是兼容形状预声明，不代表 Phase 1 已开放这些行为。延后消费
+它们无需改 wire shape 或数据库迁移，因此不会形成后续大改；反而现在照搬会把尚未定义
+的 Loop 级副作用带入可靠性心脏。
+
+测试覆盖 success/failure 的精确 phase/outcome/error、注入时间、progress 清空、
+message 优先级和 fallback、文本 NUL/长度处理、duration/session 的有值与缺失分支，
+以及携带全部暂不消费字段时 Run/Loop 快照保持零额外写入。
 
 ### A-09：report/cancel 竞态输家返回什么状态（已由 C-02 解决）
 
@@ -572,50 +633,132 @@ artifacts、transcript、cost、attempts。
 
 ### A-11：server 包公开接口
 
-**计划假设**
+**决议（已确认）**
 
-公开 `@loopzhb/server/http` app factory，并新增 `start` script。
+采用方案 C：保留可注入的 Hono app factory，但只把它作为 server 包内模块导出和测试
+seam，不新增 `@loopzhb/server/http` package 子路径；对运行者提供构建后启动脚本。
 
-**推荐**
+- `src/http/app.ts` 具名导出 `createServerApp(coordinator)`，供同包 HTTP/心脏测试
+  直接 import。它只装配 route 并返回新的 Hono app，不读取环境变量、不打开/关闭
+  数据库、不监听端口、不注册进程信号，也不持有全局 singleton。
+- app factory 接收包内 `RunCoordinator`，HTTP adapter 只调用其 `poll`/`report`；
+  `RunCoordinator`、`RunCoordinatorDependencies` 和 app factory 均不进入
+  `package.json#exports`。现有 `./db`、`./db/schema` exports 保持不变。
+- `src/start.ts` 是唯一 production composition root：读取并校验配置、调用
+  `openMigratedDb`、以生产依赖构造 Coordinator 和 app、通过
+  `@hono/node-server` 监听，并统一管理 shutdown。host/port/dataDir 的具体规则由
+  A-12 决定。
+- `SIGINT`/`SIGTERM` 触发同一个幂等关闭流程：先停止接收新请求并等待 HTTP server
+  关闭，再关闭 `DbHandle`；启动中途失败也必须释放已经打开的资源。boot 只做 wiring
+  和生命周期管理，不承载 Poll/Report 业务逻辑。
+- server package 增加
+  `"start": "node --enable-source-maps dist/start.js"`；根 package 增加
+  `"start": "pnpm --filter @loopzhb/server start"`。`start` 运行已构建产物，不使用
+  隐式 `prestart` 自动 build。
+- HTTP/心脏测试通过 `createServerApp(...).request()` 或 `app.fetch()` 驱动真实
+  Coordinator 和内存 PGlite，不监听真实端口；fixture 拥有并关闭自己的
+  `DbHandle`，app factory 不接管资源所有权。
 
-- 公开可注入的 app factory，供 HTTP 测试与未来集成复用；
-- `RunCoordinator` 是否作为 package export 暂不开放，先保持包内接口；
-- Node boot 保持独立入口，负责 open/migrate DB、serve 和 shutdown；
-- 测试只使用 app factory，不监听真实端口。
+**参考依据与取舍**
+
+`loop-platform-github` 的 `@loopany/server` 同样是 private package，没有通过
+`package.json#exports` 暴露 app/gateway/boot；根 `start` 委托 server package
+启动构建产物，内部入口自行完成 backend wiring。ZHB 保留该部署边界，但利用 Hono
+factory 改善测试隔离，不复制参考项目的全局 boot singleton。
+
+当前没有任何 workspace consumer 需要嵌入 server app；daemon 与 server 的唯一耦合点
+仍是 ADR-002 定义的 HTTP wire protocol。将来出现真实嵌入方时再新增 `./http` 是
+additive 且改动很小，而现在公开它会迫使包同时暴露 Coordinator 或 composition
+dependencies，绕过 A-02/A-03 已锁定的包内边界。因此本决议不需要新增 ADR，记录在
+Day 3–4 handoff 即可。
 
 ### A-12：启动环境变量与持久化策略
 
-**计划假设**
+**决议（已确认）**
 
-- `LOOPZHB_HOST` 默认 `127.0.0.1`；
-- `LOOPZHB_PORT` 默认 `3000`；
-- `LOOPZHB_DATA_DIR` 必填。
+采用方案 B：启动配置允许环境变量覆盖，但零配置 production boot 也必须默认使用
+用户级文件目录持久化，不能因缺少 `LOOPZHB_DATA_DIR` 静默进入内存模式。
 
-**尚未锁定的原因**
+- `LOOPZHB_HOST`：trim 后的非空值覆盖默认值；未配置或纯空白时使用
+  `127.0.0.1`。默认使用明确的 IPv4 loopback，避免 `localhost` 的 IPv4/IPv6
+  解析差异。
+- `LOOPZHB_PORT`：未配置或纯空白时使用 `3000`；显式值必须是 1–65535 的十进制
+  整数。`0`、负数、小数、指数形式、非数字和越界值全部 fail fast，不静默回退默认
+  端口。
+- `LOOPZHB_DATA_DIR`：未配置或纯空白时使用
+  `path.join(os.homedir(), ".loopzhb")`；显式值 trim 后相对启动 cwd 解析为绝对路径。
+  boot 在打开数据库前递归创建目录，并记录最终绝对路径。
+- 包内纯函数 `loadServerConfig(env, homeDir, cwd)` 一次性解析配置；`src/start.ts`
+  必须先完成配置校验，再打开任何资源。错误不得留到 listen 或首次请求时才暴露。
 
-ADR-003 只规定 `createDb/openMigratedDb`：提供 dataDir 时使用文件库，不提供时使用
-内存库；没有规定进程启动配置。
+production `src/start.ts` 始终把解析后的非空 `dataDir` 传给 `openMigratedDb`，实际
+数据库位于 `<dataDir>/pgdata`；不得使用无参数调用，也不提供 `:memory:` 等启动环境
+捷径。`openMigratedDb()` 无 dataDir 时创建内存库的能力继续保留，但只供测试和显式
+包内 fixture 使用。由此，“DB factory 支持内存”与“production boot 永远持久化”成为
+两个不同且不冲突的契约。
 
-**推荐**
+默认绑定 localhost。显式把 `LOOPZHB_HOST` 配置为非 loopback 地址代表操作者主动选择
+受信网络或容器监听；Phase 5 auth 完成前允许启动，但必须记录醒目的无认证暴露警告，
+不得把 credential、token 或其他 secret 写入日志。启动成功日志可以记录最终
+host、port、dataDir。
 
-- 默认 host 保持 `127.0.0.1`，符合 auth 前不得公开暴露的 roadmap 约束；
-- 默认 port 使用 3000；
-- 正式 Node boot 要求提供 `LOOPZHB_DATA_DIR`，测试 app factory 可继续使用内存库；
-- 若希望开发模式自动使用临时/仓库内目录，应另行明确，不能静默牺牲重启持久性。
+**参考依据与取舍**
+
+`loop-platform-github` 的 embedded PGlite 默认使用 `~/.loopany`，并允许
+`LOOPANY_DATA_DIR` 覆盖；这说明参考行为是“零配置默认持久化”，而不是要求每次启动
+显式声明目录。参考项目当前 Vite dev、base URL 和用户连接示例以 3000 为主；旧
+standalone `src/main.ts` 的 8787 不属于当前 package `start` 入口。ZHB 因此采用
+`~/.loopzhb` 和 3000，同时保留 roadmap 要求的 loopback 默认。
+
+测试覆盖默认配置、三项 override、空白值、相对 DATA_DIR 绝对化、端口有效边界及全部
+非法形式、目录创建失败、production boot 不得打开内存库、默认目录重启后
+Machine/Run/RunLease 仍存在，以及非 loopback host 产生安全警告。app factory 和
+内存 DB fixture 不读取启动配置。
 
 ### A-13：Machine 身份字段的更新策略
 
-**计划假设**
+**决议（已确认）**
 
-每次 Poll 更新 lastSeen，并在 host/platform/arch/version 变化时更新 Machine。
+采用方案 B：`lastSeen` 是 Server 持久化的最近 Machine 心跳水位，不是每次 Poll 的
+精确审计时间；使用 10 秒刷新窗口抑制 Poll 热路径写放大，身份快照发生变化时立即
+更新。
 
-**推荐**
+- 只有通过 schema 校验和 Device Credential 验证的 Poll 可以更新 Machine。首次
+  自注册 INSERT 使用注入 Clock 的当前时间写 `lastSeen`，同时保存合法身份字段。
+- 已有 Machine 的 `lastSeen` 为 null、非法时间、未来时间，或距当前时间已满
+  10 秒时刷新；未满 10 秒且身份字段没有变化时，本次 Poll 对 Machine 表只读。
+- 任一身份字段发生变化时立即写入，并在同一次 UPDATE 中顺带刷新 `lastSeen`；每个
+  已有 Machine 的 Poll 至多执行一次 Machine UPDATE。该心跳/身份更新先于 Run claim，
+  不属于某个 claim 事务；单项 claim 竞争失败不得回滚已确认的 Machine 联系。
+- 并发 Poll 必须保证 `lastSeen(new) = max(lastSeen(stored), pollTime)`，旧请求晚提交
+  不得把水位倒写。节流判断和单调条件必须落实到数据库写入 guard，不能只靠应用层
+  先读后写。
+- wire `host/platform/arch/version` 分别映射到
+  `hostname/platform/arch/daemonVersion`。这些字段是 daemon 最近报告的可变描述
+  快照，不是 Machine 主身份；变化不得修改 credential 派生的 Machine ID、
+  tokenHash、Loop 绑定或已有 friendly name。
+- 字段缺失、去除 NUL 并 trim 后为空时视为“未报告”，保留旧值；非空且变化才写。
+  hostname 最多 255 字符，platform/arch/daemonVersion 各最多 64 字符。version
+  记录当前报告值，不做只能升级的 semver 比较。
+- 首次注册的 `name` 继续遵循 A-01：合法 host 优先，否则使用稳定 machine-ID
+  fallback。后续 Poll 只有在已有 `name` 为空时才可用合法 hostname 补齐，人工名称
+  或 fallback 不得被 hostname 变化覆盖。
+- 不新增 `online` 列，也不维护第二套内存在线真相；未来 presence 和 sweep 都由
+  `lastSeen + 注入的当前时间 + 各自阈值` 推导。消费方阈值必须大于心跳持久化间隔与
+  正常 Poll 间隔之和。
 
-采纳该行为，但把写入节流视为实现细节：
+**参考依据与取舍**
 
-- lastSeen 必须反映 Poll 联系；
--身份字段只在值变化时写入；
-- Day 3–4 不实现 `online` 列，因为 ADR-003 明确在线状态由 lastSeen 推导。
+`loop-platform-github` 在约 3 秒 Poll 热路径上使用 10 秒
+`LAST_SEEN_REFRESH_MS`，并让 identity 只在变化时写；其在线判断窗口为 30 秒。ZHB
+复刻该已验证的写入策略，但不保留参考项目的冗余 `online` 布尔，并补上并发单调
+guard、全部身份文本的 NUL/长度防护。节流会改变时间戳的可观察精度，因此在 ZHB
+中是显式契约而非未测试的实现细节。
+
+测试覆盖首次 INSERT、10 秒边界、窗口内相同 Poll 零 UPDATE、身份变化时单次合并
+UPDATE、缺失/空白字段保留、friendly name 稳定、文本清理与上限、非法/未来水位
+纠正、两个并发 Poll 不倒写、非法 credential/body 零写入，以及 schema/迁移仍无
+`online` 列。
 
 ### A-14：Report 找到 Lease 但 Run 不存在（已由 C-02 解决）
 
@@ -633,7 +776,7 @@ fail closed：
 - 记录内部 `orphaned_run` invariant violation；
 - 增加 store/gateway 测试。
 
-## 五、建议的澄清顺序
+## 五、澄清完成状态
 
 已解决并同步到原计划/来源文档的 CONFLICT：
 
@@ -649,7 +792,7 @@ fail closed：
 - [x] G-03：claim 提交后 Delivery 丢失也不重派，最终由 sweep 显式失败。
 - [x] G-04：全部 HTTP 错误统一使用 `apiErrorSchema` 与稳定公开摘要。
 
-仍需要 owner 拍板的 ASSUMPTION：
+已由 owner 拍板并回写的 ASSUMPTION：
 
 - [x] A-01：首次 Poll 是 Phase 1 唯一自注册入口；开放模式按 credential 派生并幂等创建 Machine。
 - [x] A-02：心脏深模块统一为 `RunCoordinator`，包内接口仅含 enqueue/poll/report。
@@ -657,18 +800,17 @@ fail closed：
 - [x] A-04：保持参考 trigger 行为，并将 supersede + insert 收敛为原子 enqueue。
 - [x] A-05：无竞争时尝试领取全部 eligible exec Runs，按 ts/id 升序且逐 Run 原子竞争。
 - [x] A-06：全部控制 caps 显式 false，能力随 route 同批开放且不追溯既有 lease。
-- [ ] A-07：Delivery task 的最小内容。
-- [ ] A-08：正常 Report 当前保存的字段集合。
+- [x] A-07：空 systemPrompt + 最小 one-pass exec task；真实 Agent E2E 要求本地 taskFile。
+- [x] A-08：正常 Report 采用明确的 Phase 1 基础字段子集，其余预声明字段零业务写入。
 - [x] A-09：竞态输家统一返回 `run_capability_invalid` 401。
 - [x] A-10：HTTP 状态与 `apiErrorSchema` 映射已由 G-04 解决。
-- [ ] A-11：server package export 与启动入口。
-- [ ] A-12：启动环境变量与持久化策略。
-- [ ] A-13：Machine 身份字段的更新策略。
+- [x] A-11：app factory 保持包内测试 seam，唯一 production boot 启动构建产物。
+- [x] A-12：环境变量可覆盖，零配置 production boot 默认持久化到 `~/.loopzhb`。
+- [x] A-13：lastSeen 使用单调的 10 秒持久化水位，身份快照只在变化时更新。
 - [x] A-14：orphaned Run 统一使 capability 失效并清理孤儿 lease。
 
-确认后再执行：
+CONFLICT、GAP 与 ASSUMPTION 已全部收口。后续进入实现时：
 
-1. 将结论回写本文件，把相应 checkbox 勾选并记录 owner 决策。
-2. 修订 `codex-handoff-pollReport-plan.md`，删除不再成立的假设。
-3. 对于只是文档漂移的内容，同步 protocol 注释、roadmap 与 handoff。
-4. 只有当最终选择改变 Accepted ADR 的语义时，才修订 ADR 或新增 superseding ADR。
+1. 以 `codex-handoff-pollReport-plan.md` 作为执行计划，以本文件作为决策追踪依据。
+2. 实现中若发现代码事实与已确认决议冲突，先重新打开对应条目，不得静默改写语义。
+3. 只有新证据改变 Accepted ADR 的语义时，才修订 ADR 或新增 superseding ADR。
