@@ -7,8 +7,8 @@
 > Day 3–4 的完整执行计划与全部 22 项决议（4 CONFLICT + 4 GAP + 14 ASSUMPTION）
 > 见 `docs/handoff/codex-handoff-pollReport-plan.md` 与
 > `codex-handoff-pollReport-plan-clarify.md`（两份均已全量收敛）。本批次按计划
-> 七个 step 逐提交交付，随后完成两轮独立代码审查与 7 项修复（见末节
-> 「评审与修复记录」）；测试基线更新为 **197 全绿（62 protocol + 135 server）**。
+> 七个 step 逐提交交付，随后完成两轮独立代码审查、7 项修复与 1 项语义裁决
+> 落地（见末节「评审与修复记录」）；测试基线更新为 **204 全绿（62 protocol + 142 server）**。
 
 ---
 
@@ -84,7 +84,7 @@
 
 两轮独立代码审查（`codex-handoff-code-review-day34.md`，双轴：plan 一致性 +
 对抗性）共 9 项发现；独立复核结论见 `kimi-response-code-review.md`。
-7 项成立并已逐项修复（每项一提交）:
+7 项成立并已逐项修复（每项一提交），1 项经语义裁决后落地，全部闭环:
 
 | 发现 | 修复 | 提交 |
 |---|---|---|
@@ -121,5 +121,4 @@ Agent E2E 必须使用配置了本地 taskFile 的 Loop。T4–T6 的故障注�
   `testTimeout` 已调至 20s(`packages/server/vitest.config.ts`)。
 - 启动：`pnpm --filter @loopzhb/server build && pnpm start`（只跑构建产物，
   无隐式 build);env 覆盖 `LOOPZHB_HOST/PORT/DATA_DIR`。
-- 勿提交：`.serena/`（已 gitignore)、`docs/handoff/codex-handoff-code-review-day34.md`
-  （外部评审稿，待处理）。
+- 勿提交：`.serena/`（已 gitignore，本地 MCP 工具状态）。
