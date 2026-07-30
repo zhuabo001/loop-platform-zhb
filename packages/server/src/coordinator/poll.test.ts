@@ -15,6 +15,7 @@ import { machineIdFromToken, sha256 } from "@loopzhb/protocol/node";
 
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
 import { machines, type Machine } from "../db/schema.js";
+import { HEARTBEAT_SKEW_SLACK_MS } from "../store/machines.js";
 import { FakeClock, seedMachineForToken, testDeps } from "../testkit/index.js";
 import { createRunCoordinator, type RunCoordinator } from "./index.js";
 
@@ -169,18 +170,43 @@ describe("poll: heartbeat watermark + identity snapshot (A-13)", () => {
     expect((await getRow(idNull))!.lastSeen).toBe(clock.iso());
   });
 
-  it("corrects garbage watermarks but never writes a future watermark BACK (monotonic)", async () => {
+  it("corrects garbage watermarks; a WITHIN-SLACK future stamp reads as fresh (monotonic, never written back)", async () => {
     await fresh();
     const id = await enrolled("not-a-timestamp");
     await coordinator.poll(TOKEN, {});
     expect((await getRow(id))!.lastSeen).toBe(clock.iso());
 
-    // A future stamp (clock skew / clock regression) reads as FRESH: the
-    // monotonic guard forbids writing it backwards; it goes stale naturally.
+    // A within-slack future stamp (here +60s, inside the 5min window) reads
+    // as FRESH: the monotonic guard forbids writing it backwards; it goes
+    // stale naturally as real time catches up.
     const future = new Date(clock.now().getTime() + 60_000).toISOString();
     await db.update(machines).set({ lastSeen: future }).where(eq(machines.id, id));
     await coordinator.poll(TOKEN, {});
     expect((await getRow(id))!.lastSeen).toBe(future);
+  });
+
+  it("repairs an ANOMALOUS far-future watermark (beyond the skew window) to the poll time — the one legal downward write", async () => {
+    await fresh();
+    const id = await enrolled(new Date(clock.now().getTime() + 60 * 60 * 1000).toISOString()); // +1h ≫ slack
+    await coordinator.poll(TOKEN, {});
+    expect((await getRow(id))!.lastSeen).toBe(clock.iso());
+  });
+
+  it("pins the skew-window boundary: exactly at the slack is legal (fresh), one ms beyond is anomalous (repaired)", async () => {
+    await fresh();
+    const id = await enrolled(clock.iso());
+
+    // At exactly +SLACK: legal domain — stays fresh, untouched.
+    const atSlack = new Date(clock.now().getTime() + HEARTBEAT_SKEW_SLACK_MS).toISOString();
+    await db.update(machines).set({ lastSeen: atSlack }).where(eq(machines.id, id));
+    await coordinator.poll(TOKEN, {});
+    expect((await getRow(id))!.lastSeen).toBe(atSlack);
+
+    // One ms beyond: anomalous — repaired to the poll time.
+    const beyond = new Date(clock.now().getTime() + HEARTBEAT_SKEW_SLACK_MS + 1).toISOString();
+    await db.update(machines).set({ lastSeen: beyond }).where(eq(machines.id, id));
+    await coordinator.poll(TOKEN, {});
+    expect((await getRow(id))!.lastSeen).toBe(clock.iso());
   });
 
   it("never regresses under skewed clocks: a later stamp survives an earlier-clocked poll", async () => {
