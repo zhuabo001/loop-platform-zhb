@@ -16,7 +16,7 @@
 | Step 序号 | 发现的问题（若有） | 修复状态 |
 |---|---|---|
 | Step 1 | 未发现需修复问题。 | 已完成 |
-| Step 2 | **P1 — 未来 `lastSeen` 未按计划纠正。** `packages/server/src/store/machines.ts:131-150` 将未来水位当作 fresh；身份不变时直接返回，身份变化时也通过 `GREATEST` 保留未来值。异常的远未来水位会使 presence/sweep 长期误判 Machine 在线，与 `docs/handoff/codex-handoff-pollReport-plan.md`「未来水位纠正」的要求相反。`packages/server/src/coordinator/poll.test.ts:172-183` 目前反而把该偏差固化为绿色测试。建议将 future 与非法水位一样纠正为当前 Poll 时间，并改写测试。 | 已完成（语义裁决落地：`5c8025a` + ADR-003 2026-07-30 修订 + A-13 补记）|
+| Step 2 | **P1 — 未来 `lastSeen` 未按计划纠正。** `packages/server/src/store/machines.ts:131-150` 将未来水位当作 fresh；身份不变时直接返回，身份变化时也通过 `GREATEST` 保留未来值。异常的远未来水位会使 presence/sweep 长期误判 Machine 在线，与 `docs/handoff/codex-handoff-pollReport-plan.md`「未来水位纠正」的要求相反。`packages/server/src/coordinator/poll.test.ts:172-183` 目前反而把该偏差固化为绿色测试。建议将 future 与非法水位一样纠正为当前 Poll 时间，并改写测试。 | 已完成（`5c8025a` 语义落地 + `0710ed8` 并发 CAS）|
 | Step 2 | **P1 — claim 的写时守卫不完整。** `packages/server/src/store/runs.ts:154-180` 的条件更新只校验 `run.id + phase=pending`，而 lease 的 `loopId/machineId/role` 来自候选扫描时的旧快照（调用点：`packages/server/src/coordinator/index.ts:133-143`）。若扫描与 UPDATE 之间归属、角色或 Loop 发生变化，旧 Machine 仍可能领取 Run，并生成元数据不一致的 capability/Delivery；现有测试只证明扫描时过滤，没有证明写入时仍满足全部领取条件。建议将 `machineId/loopId/role` 一并加入 UPDATE guard，并使用 `RETURNING` 的权威行生成 lease 和 Delivery。 | 已完成（`8a09c0c`） |
 | Step 3 | **P1 — report 缺少覆盖整个写入窗口的锁或 CAS，现有并发测试不能证明单次消费。** `packages/server/src/store/report.ts:112-136` 在事务内普通读取 lease/Run，最终 UPDATE 仅按 `run.id`，DELETE 也未校验恰好删除一行。真实多连接 PostgreSQL 下，两个并发 report 可能都读取到 `active + running`，随后依次覆盖终态并都返回成功；report/cancel 也存在同类写入窗口。`packages/server/src/coordinator/report.test.ts:420-433` 基于单连接 PGlite，事务被串行化，无法证明该并发语义。建议使用 `SELECT ... FOR UPDATE`，或把 Run phase、lease state/token 纳入原子 CAS 并校验受影响行数；真实 PostgreSQL 多连接竞争测试按 roadmap 留到 Phase 6，但当前状态转换本身应先具备正确守卫。 | 已完成（`57a640a`） |
 | Step 3 | **P1 — terminal-grace expiry 只在事务前检查。** `packages/server/src/coordinator/index.ts:156-161` 首次 resolve 后，到 `packages/server/src/store/report.ts:109-136` 的写事务之间可能跨过过期时间；事务内重新读取 lease 时没有复核 `expiresAt`，因此过期 capability 仍可 reconcile。`packages/server/src/store/leases.ts:27` 使用 `>`，还会放行 `now === expiresAt` 的边界。建议在写事务内用同一 Clock 快照再次校验 `expiresAt <= now`，过期时删除 lease 并返回统一 401；增加 FakeClock 在首次 resolve 后推进到/越过边界的测试。 | 已完成（`b7edeb4`） |
@@ -72,3 +72,49 @@ Step 4–7 在 `ba81965` 固定快照中执行：
 待裁决后回写 clarify 再改代码。复核中额外指出:#3 修复说明里 cancelRunTx
 已是 CAS 形态(点名合规);#5 的 NUL 臂无法经 DB 播种(Postgres 拒绝
 text 列存 0x00),已在纯函数层钉死。
+
+## 二次审核（2026-07-30）
+
+固定范围为 `ba81965...fd59241`，并额外检查当前未提交的
+`docs/handoff/003-phase1-day3-4.md`。继续沿用“plan/roadmap 一致性”和
+“代码质量/逻辑对抗性”两条独立审查轴。
+
+| Step 序号 | 发现的问题（若有） | 修复状态 |
+|---|---|---|
+| Step 1 | 未发现回归。 | 已完成 |
+| Step 2 | **P1 — 远未来水位纠正仍可能被并发旧 Poll 倒写。** `packages/server/src/store/machines.ts:169-195` 基于调用前读取的 `machine.lastSeen` 判定污染，但纠正分支最终只按 `machine.id` 无条件写入 `pollIso`。两个 Poll 若同时读到同一远未来污染值，较新请求先修复为 `T2`、较旧请求后提交时仍会覆盖为 `T1`，使已经回到合法域的水位再次倒退，违反 A-13 `codex-handoff-pollReport-plan-clarify.md:733-735`“旧请求晚提交不得倒写、数据库写入 guard”的要求。现有并发测试是顺序重新读取后的普通 `GREATEST` 路径，未覆盖同一污染快照的逆序提交。建议污染/非法纠正按观测到的原始 `lastSeen` 做 optimistic CAS；CAS 失败后重读并重新合并身份与水位，再补 `T2 → T1` 逆序提交测试。 | 未完成 |
+| Step 2 | claim 写时守卫已覆盖 `id + pending + machineId + loopId + role`，lease/Delivery 使用 `RETURNING` 权威行；反例测试有效。 | 已完成 |
+| Step 3 | report 终态 phase CAS 与两次写入行数校验、事务内 expiry 复核（含等号边界）、最终 message 统一清理均已落地，未发现回归。真实多连接 PostgreSQL 竞争证明仍按原 roadmap 留到 Phase 6。 | 已完成 |
+| Step 4 | reclaim 已要求 active lease 恰好一行，否则抛错回滚；无 lease 与非 active lease 反例均证明零写入。Coordinator 公开面也已收窄为三方法。 | 已完成 |
+| Step 4 | **P3 — 注释仍描述已不存在的调用边界。** `packages/server/src/store/runs.ts:214-215` 与 `packages/server/src/coordinator/lifecycle.test.ts:7` 仍称 owner adapter 调用 Coordinator，但当前实现与 A-02 已改为未来 adapter 直接调用窄 store 原语。建议统一注释，避免后续实现重新越过三方法边界。 | 已完成（`434cf0b`） |
+| Step 5 | 未发现回归。 | 已完成 |
+| Step 6 | 原 listener 启动失败问题的核心路径已修复：成功监听后才记录 ready，启动错误会关闭 DB 并向上抛出。 | 已完成 |
+| Step 6 | **P2 — `waitForListening` 会残留互斥事件监听器。** `packages/server/src/start.ts:86-91` 同时注册一次性的 `listening` 与 `error`，任一分支完成后未移除另一监听器。正常启动后残留的 `error` listener 会消费后续 server error，却只尝试 reject 一个已 settled 的 Promise，导致运行期错误被静默吞掉。建议使用具名 handler，并在 resolve/reject 前移除另一监听器。 | 已完成（`55806aa`） |
+| Step 7 | **P2 — handoff 再次提前声明“全部闭环”。** 当前未提交的 `docs/handoff/003-phase1-day3-4.md:87,100-105` 声称 9 项发现全部闭环，但 Step 2 的污染水位并发 CAS 尚未实现。应在该 P1 修复并复核前恢复为未完成/待办表述。 | 已完成（003 已补二次审核记录） |
+
+二次审核验证：
+
+- `pnpm -r typecheck`：通过。
+- `pnpm -r build`：通过，产物包含 `dist/start.js`。
+- `pnpm --filter @loopzhb/server db:check`：通过，无 schema drift。
+- `git diff --check ba81965...fd59241` 与工作区 `git diff --check`：通过。
+- `pnpm -r test`：protocol 62/62 通过；server 141/142 通过。唯一未完成用例为
+  `start.test.ts` 的真实回环端口测试，当前受执行沙箱禁止 `listen`
+  （`EPERM 127.0.0.1`）影响，不能据此判定代码失败，也未在本环境独立确认文档所写
+  的 204/204 全绿。
+
+二次审核结论：原 #2–#9 的核心修复均通过复核；#1 的语义与共享阈值已落地，但
+写入侧并发纠正仍缺数据库 CAS，因此不能认定“所有问题均已修复”。presence/sweep
+实际消费者尚未在 Day 3–4 实现；当前只落地了共享 helper，待 Day 8–10 接线时必须
+再次验证所有消费路径确实使用同一谓词。
+
+## 二次审核修复记录（2026-07-31,kimi)
+
+二次审核 4 项新发现全部复核成立并已修复:远未来纠正按观测值 optimistic
+CAS、逆序提交不倒写(`0710ed8`,含 T2→T1 逆序测试);waitForListening
+具名 handler 移除落选监听器(`55806aa`,运行期 error 不再被静默吞掉);
+cancel/reclaim 调用边界注释统一为 store 直调(`434cf0b`);handoff 003
+已补二次审核记录。server 基线 145 全绿(总 207)。另注:二次审核环境
+的 EPERM listen 沙箱限制不影响本机验证——204→207 全绿已在开发环境
+独立确认。presence/sweep 实际消费者接线(Day 8–10)时须再次验证其所
+有路径使用同一谓词,已在 003 的 Day 5–7 备注中登记。

@@ -164,3 +164,21 @@ SIGINT/SIGTERM 时幂等地先关闭 HTTP server、再关闭 DB"对失败路径�
 
 另注:两轮验证记录(typecheck/test/build/db:check 通过)与当前分支一致;
 绿色套件不覆盖上述边界,与本复核不矛盾。
+
+---
+
+## 二次审核复核(2026-07-31)
+
+对审查稿「二次审核」一节(范围 `ba81965...fd59241`)4 项新发现的独立复核:
+
+| # | 发现 | 复核结论 | 修复 |
+|---|---|---|---|
+| 10 | 远未来纠正无条件写入,逆序提交可倒写(P1) | **成立**——纠正分支缺 DB guard,违反 A-13「单调条件必须落实到数据库写入 guard」;GREATEST 路径有 guard,纠正路径没有 | `0710ed8`:按观测值 optimistic CAS,落空即重读重决策(有界 3 次);T2→T1 逆序测试 |
+| 11 | cancel/reclaim 注释仍写"调 Coordinator"(P3) | **成立**——F7 收窄后注释未同步 | `434cf0b` |
+| 12 | waitForListening 残留落选监听器(P2) | **成立**——Node 语义下任一 'error' listener 即视为已处理,残留的 once('error') 会把运行期错误吞进已 settled 的 promise | `55806aa`:具名 handler、settle 时互删;emit('error') 抛出测试 |
+| 13 | handoff 再次提前声明闭环(P2) | **成立(流程项)**——本次修复+记录后成立 | 003 已补二次审核记录 |
+
+二次审核的验证记录中,"server 141/142、唯一失败为 EPERM listen 沙箱限制"
+系其执行环境所致;本开发环境不受此限,207 全绿(62 protocol + 145
+server)已独立确认。审查结论"presence/sweep 消费者接线时须再次验证同一
+谓词"已登记进 003 的 Day 5–7 备注。

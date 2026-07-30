@@ -8,7 +8,7 @@
 > 见 `docs/handoff/codex-handoff-pollReport-plan.md` 与
 > `codex-handoff-pollReport-plan-clarify.md`（两份均已全量收敛）。本批次按计划
 > 七个 step 逐提交交付，随后完成两轮独立代码审查、7 项修复与 1 项语义裁决
-> 落地（见末节「评审与修复记录」）；测试基线更新为 **204 全绿（62 protocol + 142 server）**。
+> 落地（见末节「评审与修复记录」）；测试基线更新为 **207 全绿（62 protocol + 145 server）**。
 
 ---
 
@@ -74,7 +74,7 @@
 ## 完成验证（分支 HEAD)
 
 - `pnpm -r typecheck` ✅
-- `pnpm -r test` ✅ **204 全绿（62 protocol + 142 server)**
+- `pnpm -r test` ✅ **207 全绿（62 protocol + 145 server)**
 - `pnpm -r build` ✅（产物含 `dist/start.js`)
 - `pnpm --filter @loopzhb/server db:check` ✅（无 schema 变更）
 - 冒烟：`node dist/start.js` 真实启动 → poll 自注册 200、未知 credential
@@ -98,11 +98,17 @@
 | #1 未来 lastSeen 纠正 vs 单调水位（语义裁决） | 有界 skew 窗口:近未来不倒写、远未来写入侧纠正 + 消费侧共享谓词;ADR-003 修订 + A-13 补记 | `5c8025a` |
 
 **语义裁决项 #1 亦已收口**:codex 澄清轮接受复核的核心反驳并补充消费侧条
-款（合理且必要——写入侧纠正触达不到"污染后沉默"的场景）。裁决落地为有界
+款（合理且必要——写入侧纠正触达不到"污染后沉默"的场景;Day 8–10 接线
+presence/sweep 真实消费者时，须再次验证其所有路径使用同一谓词——已在此
+登记）。裁决落地为有界
 clock-skew 窗口（`HEARTBEAT_SKEW_SLACK_MS = 5min`）:窗口内近未来保持单调
 不倒写，超窗远未来视为污染——写入侧纠正（`5c8025a`),presence/sweep 消费
 侧共用同一谓词判定为无存活证据。ADR-003 已补 2026-07-30 修订条目，A-13 已
-补记。至此两轮审查 9 项发现全部闭环（8 项修复 + 1 项裁决落地）。
+补记。**二次审核（范围 `ba81965...fd59241`)4 项新发现亦全部复核成立并修复**:
+远未来纠正按观测值 optimistic CAS、逆序不倒写（`0710ed8`);
+waitForListening 移除落选监听器（`55806aa`);cancel/reclaim 注释统一为
+store 直调（`434cf0b`);本节的二次记录即第四项的处置。至此两轮审查 +
+一次二次审核共 13 项发现全部闭环。
 
 ## 下一步：Day 5–7（daemon)
 
