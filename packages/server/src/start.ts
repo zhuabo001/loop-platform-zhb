@@ -53,7 +53,19 @@ export async function main(): Promise<void> {
 
   const { app, handle } = await bootstrapServer(config);
   const server: ServerType = serve({ fetch: app.fetch, port: config.port, hostname: config.host });
-  // Startup log: host/port/dataDir only — NEVER a secret.
+  try {
+    // serve() returns BEFORE listen completes — EADDRINUSE & friends arrive
+    // via the async error event. Await the outcome; on failure run the SAME
+    // ordered cleanup as shutdown (HTTP first, then DB) and rethrow so boot
+    // exits non-zero instead of falsely reporting ready (review #8).
+    await waitForListening(server);
+  } catch (err) {
+    server.close();
+    await closeDb(handle).catch(() => {});
+    throw err;
+  }
+  // Startup log: host/port/dataDir only — NEVER a secret. Logged only once
+  // the listener is actually bound.
   console.log(`loopzhb server listening on http://${config.host}:${config.port} (dataDir: ${config.dataDir})`);
 
   let closing = false;
@@ -68,6 +80,15 @@ export async function main(): Promise<void> {
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+}
+
+/** Resolve once the server is bound; reject on the first listen error. */
+function waitForListening(server: ServerType): Promise<void> {
+  if (server.listening) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    server.once("listening", () => resolve());
+    server.once("error", (err) => reject(err));
+  });
 }
 
 /** True only when executed as `node dist/start.js` — importing this module in

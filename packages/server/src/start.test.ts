@@ -11,6 +11,7 @@
  *  - the production mint issues shape-valid `rk_` credentials.
  */
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -22,7 +23,7 @@ import { machineIdFromToken } from "@loopzhb/protocol/node";
 import { mintRunCredential } from "./coordinator/index.js";
 import { closeDb, type DbHandle } from "./db/index.js";
 import { loops } from "./db/schema.js";
-import { bootstrapServer, type BootedServer } from "./start.js";
+import { bootstrapServer, main, type BootedServer } from "./start.js";
 
 const handles: DbHandle[] = [];
 afterEach(async () => {
@@ -66,6 +67,28 @@ describe("bootstrapServer", () => {
     const blocker = path.join(dir, "blocker");
     await writeFile(blocker, "a file, not a dir");
     await expect(bootstrapServer({ host: "127.0.0.1", port: 3000, dataDir: path.join(blocker, "sub") })).rejects.toThrow();
+  });
+
+  it("fails fast AND closes the DB when the port is already taken (review #8)", async () => {
+    const dir = await tmpDataDir();
+    // Occupy a real port first.
+    const blocker = net.createServer();
+    await new Promise<void>((resolve) => blocker.listen(0, "127.0.0.1", resolve));
+    const port = (blocker.address() as net.AddressInfo).port;
+
+    process.env.LOOPZHB_PORT = String(port);
+    process.env.LOOPZHB_DATA_DIR = dir;
+    try {
+      await expect(main()).rejects.toThrow(/EADDRINUSE|address already in use/i);
+    } finally {
+      delete process.env.LOOPZHB_PORT;
+      delete process.env.LOOPZHB_DATA_DIR;
+      await new Promise<void>((resolve) => blocker.close(() => resolve()));
+    }
+    // The failed boot CLOSED its DB handle: a fresh bootstrap on the same
+    // dataDir acquires the PGlite dir lock without contention.
+    const second = await boot(dir);
+    expect(second.handle.dataDir).toBe(dir);
   });
 
   it("restart durability: machine, run and ACTIVE LEASE survive close/reopen — a pre-restart claim still reports (T4)", async () => {
