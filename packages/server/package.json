@@ -20,6 +20,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "start": "node --enable-source-maps dist/start.js",
     "typecheck": "pnpm --filter @loopzhb/protocol build && tsc --noEmit",
     "test": "pnpm --filter @loopzhb/protocol build && vitest run",
     "db:generate": "drizzle-kit generate",

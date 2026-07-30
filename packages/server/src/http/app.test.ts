@@ -48,7 +48,7 @@ async function fresh(): Promise<void> {
   app = createServerApp(coordinator);
 }
 
-function pollReq(body: unknown = {}, token: string | null = TOKEN): Promise<Response> {
+async function pollReq(body: unknown = {}, token: string | null = TOKEN): Promise<Response> {
   return app.request("/api/machine/poll", {
     method: "POST",
     headers: {
@@ -59,7 +59,7 @@ function pollReq(body: unknown = {}, token: string | null = TOKEN): Promise<Resp
   });
 }
 
-function reportReq(body: unknown = { ok: true }, token: string | null = "rk_cred"): Promise<Response> {
+async function reportReq(body: unknown = { ok: true }, token: string | null = "rk_cred"): Promise<Response> {
   return app.request("/api/machine/report", {
     method: "POST",
     headers: {
