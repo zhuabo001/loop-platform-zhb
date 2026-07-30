@@ -760,6 +760,23 @@ UPDATE、缺失/空白字段保留、friendly name 稳定、文本清理与上�
 纠正、两个并发 Poll 不倒写、非法 credential/body 零写入，以及 schema/迁移仍无
 `online` 列。
 
+**2026-07-30 补记（语义裁决落地）**
+
+Day 3–4 评审发现本节「未来时间……时刷新」与「并发写不得倒退（max guard）」字面
+冲突（`codex-handoff-code-review-day34.md` 发现 1；`kimi-response-code-review.md`
+复核 + codex 澄清轮接受并补充）。裁决如下，ADR-003 已同日修订互引：
+
+- 单调性契约的适用域是**合法水位域**：引入有界 clock-skew 容忍窗口
+  （`HEARTBEAT_SKEW_SLACK_MS = 5min`）。窗口内的近未来水位读作 fresh，写入侧
+  不倒写；「未来时间时刷新」中的"未来"据此细分为近未来（fresh）与远未来
+  （污染）。
+- 超出窗口的远未来水位是**污染**：写入侧在下一次 Poll 纠正为当前 Poll 时间
+  （唯一合法的向下写），并已落地于 `applyMachinePollContact`（提交 `5c8025a`）。
+- presence/sweep **消费侧必须采用同一窗口谓词**
+  （`classifyHeartbeatWatermark`/`heartbeatAgeMs`，已随 `5c8025a` 落地），把远未
+  来值判定为无存活证据而非持续 online——否则写入污染值后沉默的 Machine 会被
+  永久误判在线，单靠写入侧纠正无法消除。
+
 ### A-14：Report 找到 Lease 但 Run 不存在（已由 C-02 解决）
 
 **此前缺口**
