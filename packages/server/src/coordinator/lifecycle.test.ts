@@ -4,7 +4,8 @@
  *
  *  - cancelRun: run → canceled + lease DELETE in ONE transaction (a deliberate
  *    reference deviation — no "canceled but lease still live" window). No
- *    HTTP route in Phase 1; the owner adapter will call the coordinator.
+ *    HTTP route in Phase 1; the future owner adapter calls the store
+ *    primitive directly (A-02 keeps it off the coordinator interface).
  *  - reclaimStaleRun: SWEEP-ONLY. running → error/error with the generic
  *    reclaim reason + lease → terminal-grace (first window = now+24h), one
  *    transaction. The lease terminalize step is store-PRIVATE — there is no

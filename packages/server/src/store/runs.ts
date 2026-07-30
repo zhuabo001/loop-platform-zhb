@@ -211,8 +211,9 @@ export interface LifecycleStoreDeps {
 export const TERMINAL_GRACE_MS = 24 * 60 * 60 * 1000;
 
 /**
- * Owner cancel (Phase 1: NO HTTP route — the owner adapter calls the
- * coordinator). Run → `canceled` and the lease DELETE land in ONE transaction
+ * Owner cancel (Phase 1: NO HTTP route — the future owner adapter calls
+ * THIS store primitive directly; A-02 keeps it off the coordinator's
+ * three-method interface). Run → `canceled` and the lease DELETE land in ONE transaction
  * (a deliberate reference deviation: there is no "canceled but lease still
  * live" window, so a late report always meets the unified 401). Terminal and
  * missing runs are a no-op. Returns whether the run transitioned.
