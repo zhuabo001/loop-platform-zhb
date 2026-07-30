@@ -21,7 +21,7 @@
  * contact. No `online` column exists anywhere — presence is derived from this
  * watermark plus a threshold at read time.
  */
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 
 import { InvalidMachineCredentialError } from "../coordinator/errors.js";
 import type { Db } from "../db/index.js";
@@ -149,20 +149,43 @@ export async function registerMachineOnPoll(
  *
  * Write shape (at most ONE update per poll):
  *  - watermark stale / null      → lastSeen = GREATEST(stored, pollTime) (monotonic)
- *  - watermark unparsable        → lastSeen = pollTime (correction; garbage can't max())
- *  - watermark ANOMALOUS-future  → lastSeen = pollTime (pollution repair; the
- *    ONE allowed downward write, outside the legal monotonic domain)
+ *  - watermark unparsable        → lastSeen = pollTime, CAS-guarded
+ *  - watermark ANOMALOUS-future  → lastSeen = pollTime, CAS-guarded (pollution
+ *    repair; the ONE allowed downward write, outside the legal monotonic domain)
  *  - watermark within-slack-future → reads as fresh, no write (never regress)
  *  - identity changed            → the changed fields ride the SAME update, which
  *                                  also refreshes the watermark (max-guarded)
  *  - empty name + valid host     → name is filled from the hostname (a non-empty
  *                                  friendly name is NEVER overwritten)
+ *
+ * The correction branches are OPTIMISTIC-CAS'd on the observed watermark
+ * (A-13: the monotonic condition must live in the DB write guard — 二次审核
+ * P1): two polls that observed the SAME polluted value race to repair it, and
+ * the loser's `WHERE last_seen = <observed>` simply misses — it re-reads and
+ * re-decides against the winner's (legal) value instead of blindly
+ * overwriting it with an older poll time.
  */
 export async function applyMachinePollContact(
   deps: MachineStoreDeps,
   machine: Machine,
   identity: PollIdentity,
 ): Promise<Machine> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const result = await tryApplyContact(deps, machine, identity);
+    if (result !== "cas-lost") return result;
+    // Lost the repair race: re-read the winner's row and re-decide (its value
+    // is in the legal domain now, so the next attempt takes the monotonic or
+    // read-only path).
+    machine = (await getMachine(deps.db, machine.id))!;
+  }
+  return machine; // contention settling — skip this poll's write; the next poll repairs
+}
+
+async function tryApplyContact(
+  deps: MachineStoreDeps,
+  machine: Machine,
+  identity: PollIdentity,
+): Promise<Machine | "cas-lost"> {
   const pollTime = deps.clock.now();
   const pollIso = pollTime.toISOString();
   const pollMs = pollTime.getTime();
@@ -186,12 +209,25 @@ export async function applyMachinePollContact(
   if (hostname !== undefined && machine.name.trim() === "") patch.name = hostname;
 
   const identityChanged = Object.keys(patch).length > 0;
-  if (!garbage && !anomalousFuture && !stale && !identityChanged) return machine; // fresh — read-only
 
-  const lastSeen = garbage || anomalousFuture ? pollIso : sql`GREATEST(${machines.lastSeen}, ${pollIso})`;
+  // Pollution repair (downward write) — optimistic CAS on the observed value
+  // (non-null in both correction branches: garbage and anomalous-future both
+  // require a present watermark).
+  if (garbage || anomalousFuture) {
+    const repaired = await deps.db
+      .update(machines)
+      .set({ ...patch, lastSeen: pollIso })
+      .where(and(eq(machines.id, machine.id), eq(machines.lastSeen, machine.lastSeen!)))
+      .returning({ id: machines.id });
+    if (repaired.length === 0) return "cas-lost";
+    return (await getMachine(deps.db, machine.id))!;
+  }
+
+  if (!stale && !identityChanged) return machine; // fresh — read-only
+
   await deps.db
     .update(machines)
-    .set({ ...patch, lastSeen })
+    .set({ ...patch, lastSeen: sql`GREATEST(${machines.lastSeen}, ${pollIso})` })
     .where(eq(machines.id, machine.id));
   return (await getMachine(deps.db, machine.id))!;
 }

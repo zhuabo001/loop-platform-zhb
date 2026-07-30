@@ -15,7 +15,7 @@ import { machineIdFromToken, sha256 } from "@loopzhb/protocol/node";
 
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
 import { machines, type Machine } from "../db/schema.js";
-import { HEARTBEAT_SKEW_SLACK_MS } from "../store/machines.js";
+import { HEARTBEAT_SKEW_SLACK_MS, applyMachinePollContact } from "../store/machines.js";
 import { FakeClock, seedMachineForToken, testDeps } from "../testkit/index.js";
 import { createRunCoordinator, type RunCoordinator } from "./index.js";
 
@@ -207,6 +207,25 @@ describe("poll: heartbeat watermark + identity snapshot (A-13)", () => {
     await db.update(machines).set({ lastSeen: beyond }).where(eq(machines.id, id));
     await coordinator.poll(TOKEN, {});
     expect((await getRow(id))!.lastSeen).toBe(clock.iso());
+  });
+
+  it("inverse-order pollution repairs NEVER regress: the older poll's CAS misses and it re-decides (二次审核 P1)", async () => {
+    await fresh();
+    const polluted = new Date(clock.now().getTime() + 60 * 60 * 1000).toISOString(); // +1h ≫ slack
+    const id = await enrolled(polluted);
+    // Both polls read the SAME polluted snapshot before either commits.
+    const staleSnapshot = (await getRow(id))!;
+
+    // The NEWER-clocked poll (T2 = T1 + 5s) repairs first → watermark = T2.
+    const newerClock = new FakeClock(clock.now().getTime() + 5_000);
+    await applyMachinePollContact({ db, clock: newerClock }, staleSnapshot, {});
+    expect((await getRow(id))!.lastSeen).toBe(newerClock.iso());
+
+    // The OLDER-clocked poll (T1) commits SECOND against the stale snapshot:
+    // its CAS on the observed polluted value misses, it re-reads, and now sees
+    // T2 — a WITHIN-SLACK future value → fresh → NO write. No regression.
+    await applyMachinePollContact({ db, clock }, staleSnapshot, {});
+    expect((await getRow(id))!.lastSeen).toBe(newerClock.iso());
   });
 
   it("never regresses under skewed clocks: a later stamp survives an earlier-clocked poll", async () => {
