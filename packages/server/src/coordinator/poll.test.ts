@@ -8,7 +8,7 @@
  * monotonic 10s persisted watermark — never a per-poll audit stamp — with the
  * identity snapshot merged into the same single UPDATE when it changes.
  */
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { machineIdFromToken, sha256 } from "@loopzhb/protocol/node";
@@ -226,6 +226,42 @@ describe("poll: heartbeat watermark + identity snapshot (A-13)", () => {
     // T2 — a WITHIN-SLACK future value → fresh → NO write. No regression.
     await applyMachinePollContact({ db, clock }, staleSnapshot, {});
     expect((await getRow(id))!.lastSeen).toBe(newerClock.iso());
+  });
+
+  it("fails explicitly when bounded CAS contention cannot preserve this Poll's identity", async () => {
+    await fresh();
+    const polluted = new Date(clock.now().getTime() + 60 * 60 * 1000).toISOString();
+    const id = await enrolled(polluted);
+    const staleSnapshot = (await getRow(id))!;
+
+    // A real PostgreSQL trigger makes the first three UPDATE statements affect
+    // zero rows. This deterministically drives the bounded retry exhaustion
+    // branch without mocking Drizzle or the store's internal helpers.
+    await db.execute(sql`CREATE TEMP TABLE machine_contact_cas_gate (remaining integer NOT NULL)`);
+    await db.execute(sql`INSERT INTO machine_contact_cas_gate (remaining) VALUES (3)`);
+    await db.execute(sql`
+      CREATE FUNCTION skip_first_three_machine_contact_updates() RETURNS trigger AS $$
+      DECLARE remaining_attempts integer;
+      BEGIN
+        SELECT remaining INTO remaining_attempts FROM machine_contact_cas_gate;
+        IF remaining_attempts > 0 THEN
+          UPDATE machine_contact_cas_gate SET remaining = remaining - 1;
+          RETURN NULL;
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql
+    `);
+    await db.execute(sql`
+      CREATE TRIGGER skip_machine_contact_updates
+      BEFORE UPDATE ON machines
+      FOR EACH ROW EXECUTE FUNCTION skip_first_three_machine_contact_updates()
+    `);
+
+    await expect(
+      applyMachinePollContact({ db, clock }, staleSnapshot, { host: "new-host", version: "0.2.0" }),
+    ).rejects.toMatchObject({ name: "MachineContactContentionError" });
+    expect(await getRow(id)).toMatchObject({ hostname: "old-host", daemonVersion: null, lastSeen: polluted });
   });
 
   it("never regresses under skewed clocks: a later stamp survives an earlier-clocked poll", async () => {

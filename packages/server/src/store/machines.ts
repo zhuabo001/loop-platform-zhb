@@ -142,12 +142,24 @@ export async function registerMachineOnPoll(
   return (await getMachine(deps.db, input.machineId))!;
 }
 
+/** The contact could not safely settle within the bounded CAS budget.
+ *  Failing explicitly is preferable to returning success after silently
+ *  dropping this Poll's identity snapshot; the daemon will retry on its next
+ *  Poll while every competing successful writer remains monotonic. */
+export class MachineContactContentionError extends Error {
+  constructor(readonly machineId: string) {
+    super(`machine contact contention did not settle for ${machineId}`);
+    this.name = "MachineContactContentionError";
+  }
+}
+
 /**
  * The per-poll heartbeat + identity write for an ALREADY-VERIFIED machine.
  * Returns the fresh row. Read-only when the watermark is fresh and no
  * identity field changed — the hot path of an idle daemon.
  *
- * Write shape (at most ONE update per poll):
+ * Write shape (at most ONE successful row mutation per Poll; correction CAS
+ * misses may issue bounded zero-row UPDATE attempts before success/failure):
  *  - watermark stale / null      → lastSeen = GREATEST(stored, pollTime) (monotonic)
  *  - watermark unparsable        → lastSeen = pollTime, CAS-guarded
  *  - watermark ANOMALOUS-future  → lastSeen = pollTime, CAS-guarded (pollution
@@ -174,11 +186,14 @@ export async function applyMachinePollContact(
     const result = await tryApplyContact(deps, machine, identity);
     if (result !== "cas-lost") return result;
     // Lost the repair race: re-read the winner's row and re-decide (its value
-    // is in the legal domain now, so the next attempt takes the monotonic or
-    // read-only path).
+    // is normally in the legal domain now, so the next attempt takes the
+    // monotonic or read-only path while recomputing this Poll's identity patch).
     machine = (await getMachine(deps.db, machine.id))!;
   }
-  return machine; // contention settling — skip this poll's write; the next poll repairs
+  // Do not acknowledge a Poll whose identity/contact write never landed.
+  // An explicit failure lets the caller retry; returning `machine` here would
+  // silently discard optional identity fields that may not be sent again.
+  throw new MachineContactContentionError(machine.id);
 }
 
 async function tryApplyContact(

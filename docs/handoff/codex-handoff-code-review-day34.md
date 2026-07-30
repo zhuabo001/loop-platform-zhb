@@ -82,7 +82,7 @@ text 列存 0x00),已在纯函数层钉死。
 | Step 序号 | 发现的问题（若有） | 修复状态 |
 |---|---|---|
 | Step 1 | 未发现回归。 | 已完成 |
-| Step 2 | **P1 — 远未来水位纠正仍可能被并发旧 Poll 倒写。** `packages/server/src/store/machines.ts:169-195` 基于调用前读取的 `machine.lastSeen` 判定污染，但纠正分支最终只按 `machine.id` 无条件写入 `pollIso`。两个 Poll 若同时读到同一远未来污染值，较新请求先修复为 `T2`、较旧请求后提交时仍会覆盖为 `T1`，使已经回到合法域的水位再次倒退，违反 A-13 `codex-handoff-pollReport-plan-clarify.md:733-735`“旧请求晚提交不得倒写、数据库写入 guard”的要求。现有并发测试是顺序重新读取后的普通 `GREATEST` 路径，未覆盖同一污染快照的逆序提交。建议污染/非法纠正按观测到的原始 `lastSeen` 做 optimistic CAS；CAS 失败后重读并重新合并身份与水位，再补 `T2 → T1` 逆序提交测试。 | 未完成 |
+| Step 2 | **P1 — 远未来水位纠正仍可能被并发旧 Poll 倒写。** `packages/server/src/store/machines.ts:169-195` 基于调用前读取的 `machine.lastSeen` 判定污染，但纠正分支最终只按 `machine.id` 无条件写入 `pollIso`。两个 Poll 若同时读到同一远未来污染值，较新请求先修复为 `T2`、较旧请求后提交时仍会覆盖为 `T1`，使已经回到合法域的水位再次倒退，违反 A-13 `codex-handoff-pollReport-plan-clarify.md:733-735`“旧请求晚提交不得倒写、数据库写入 guard”的要求。现有并发测试是顺序重新读取后的普通 `GREATEST` 路径，未覆盖同一污染快照的逆序提交。建议污染/非法纠正按观测到的原始 `lastSeen` 做 optimistic CAS；CAS 失败后重读并重新合并身份与水位，再补 `T2 → T1` 逆序提交测试。 | 已完成（`0710ed8`；第三轮另发现重试耗尽分支问题，见文末） |
 | Step 2 | claim 写时守卫已覆盖 `id + pending + machineId + loopId + role`，lease/Delivery 使用 `RETURNING` 权威行；反例测试有效。 | 已完成 |
 | Step 3 | report 终态 phase CAS 与两次写入行数校验、事务内 expiry 复核（含等号边界）、最终 message 统一清理均已落地，未发现回归。真实多连接 PostgreSQL 竞争证明仍按原 roadmap 留到 Phase 6。 | 已完成 |
 | Step 4 | reclaim 已要求 active lease 恰好一行，否则抛错回滚；无 lease 与非 active lease 反例均证明零写入。Coordinator 公开面也已收窄为三方法。 | 已完成 |
@@ -118,3 +118,33 @@ cancel/reclaim 调用边界注释统一为 store 直调(`434cf0b`);handoff 003
 的 EPERM listen 沙箱限制不影响本机验证——204→207 全绿已在开发环境
 独立确认。presence/sweep 实际消费者接线(Day 8–10)时须再次验证其所
 有路径使用同一谓词,已在 003 的 Day 5–7 备注中登记。
+
+## 第三轮审核（2026-07-31）
+
+固定范围为 `fd59241...1069499`，继续沿用“plan/roadmap 一致性”和
+“代码质量/逻辑对抗性”两条独立审查轴，复核 Kimi 对二次审核 4 项发现的修复。
+
+| Step 序号 | 发现的问题（若有） | 修复状态 |
+|---|---|---|
+| Step 1 | 未发现回归。 | 已完成 |
+| Step 2 | 二次审核 P1 的核心问题已修复：污染/非法水位纠正按观测到的原始 `lastSeen` 做 optimistic CAS；旧 Poll 在 `T2 → T1` 逆序提交时 CAS 落空、重读并重新决策，不会再倒写水位。新增测试真实复用同一旧快照，能够证明该守卫。 | 已完成（`0710ed8`） |
+| Step 2 | **P2 — CAS 有界重试耗尽时会静默丢弃本 Poll 的身份变更。** `packages/server/src/store/machines.ts:173-181` 连续 3 次 `cas-lost` 后直接返回最后一次重读的 Machine 行；该 Poll 携带的 `host/platform/arch/version` patch 没有落库，也没有显式失败，违反 A-13 `codex-handoff-pollReport-plan-clarify.md:730-735`“身份变化立即写入”和 CAS 失败后重新合并的要求。`packages/server/src/coordinator/poll.test.ts:212-228` 的逆序测试传入空 identity，只覆盖一次 CAS miss，无法钉住身份保留和重试耗尽分支。建议在退出前以不会倒写水位的方式安全落地重新计算后的 identity patch，或显式失败而不是返回成功；补充带 `host/version` 的 CAS-loss 测试及连续 3 次 loss 的反例。 | 已完成（重试耗尽改为显式 `MachineContactContentionError`，真实 PGlite trigger 反例钉死） |
+| Step 3 | 本轮未修改该 Step，既有事务/CAS 修复未发现回归。 | 已完成 |
+| Step 4 | cancel/reclaim 注释已统一为未来 adapter 直接调用窄 store 原语，与 A-02 三方法 Coordinator 边界一致。 | 已完成（`434cf0b`） |
+| Step 5 | 未发现回归。 | 已完成 |
+| Step 6 | `waitForListening` 已使用具名 handler，并在 success/error 任一分支完成前移除落选监听器；成功与失败测试分别钉住 listener 数量及运行期 error 不再被吞掉。 | 已完成（`55806aa`） |
+| Step 7 | 二次审核表中 Step 2 状态仍写“未完成”，与后文修复记录及 `0710ed8` 不一致；本轮已同步为“核心问题已完成，第三轮新增问题另列”，不再把两个问题混为一项。 | 已完成（本轮记录同步） |
+
+第三轮审核验证：
+
+- `pnpm -r typecheck`：通过。
+- `pnpm -r build`：通过，产物包含 `dist/start.js`。
+- `pnpm --filter @loopzhb/server db:check`：通过，无 schema drift。
+- `git diff --check fd59241...1069499` 与工作区 `git diff --check`：通过。
+- `pnpm -r test`：沙箱内真实 listener 用例因禁止 `listen` 出现环境性 `EPERM`；
+  获准在沙箱外复跑后 protocol 62/62、server 146/146，通过共 208/208。
+
+第三轮审核结论：Kimi 对二次审核中“水位倒写 CAS、listener 残留、调用边界注释、
+handoff 记录”的核心修复均有效。第三轮新增的 CAS 重试耗尽问题也已修复：预算耗尽
+时显式失败，不再以成功结果静默丢失身份变更；daemon 可在下一次 Poll 重试。至此本
+文档记录的三轮问题全部闭环。
