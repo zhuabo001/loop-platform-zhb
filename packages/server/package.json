@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Loop-platform-zhb control plane: scheduling, state, auth, storage. Currently the db module only (Phase 1 Day 1-2: heart schema) — the HTTP layer lands with poll/report in Day 3-4. See docs/adr/003-heart-schema.md.",
+  "description": "Loop-platform-zhb control plane: scheduling, state, auth, storage. Phase 1 Day 3-4 delivered: RunCoordinator deep module + POST /api/machine/poll (self-register, heartbeat, atomic claim) + POST /api/machine/report (finalize, terminal-grace reconcile) over Hono, with a zero-config boot (dist/start.js → 127.0.0.1:3000 + ~/.loopzhb). Package exports stay ./db + ./db/schema. See docs/handoff/003-phase1-day3-4.md.",
   "exports": {
     "./db": {
       "types": "./dist/db/index.d.ts",
