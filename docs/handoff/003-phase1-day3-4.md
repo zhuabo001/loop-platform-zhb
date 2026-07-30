@@ -7,8 +7,8 @@
 > Day 3–4 的完整执行计划与全部 22 项决议（4 CONFLICT + 4 GAP + 14 ASSUMPTION）
 > 见 `docs/handoff/codex-handoff-pollReport-plan.md` 与
 > `codex-handoff-pollReport-plan-clarify.md`（两份均已全量收敛）。本批次按计划
-> 七个 step 逐提交交付，每提交含对应测试；测试基线更新为
-> **189 全绿（62 protocol + 127 server）**。
+> 七个 step 逐提交交付，随后完成两轮独立代码审查与 7 项修复（见末节
+> 「评审与修复记录」）；测试基线更新为 **197 全绿（62 protocol + 135 server）**。
 
 ---
 
@@ -74,11 +74,32 @@
 ## 完成验证（分支 HEAD)
 
 - `pnpm -r typecheck` ✅
-- `pnpm -r test` ✅ **189 全绿（62 protocol + 127 server)**
+- `pnpm -r test` ✅ **197 全绿（62 protocol + 135 server)**
 - `pnpm -r build` ✅（产物含 `dist/start.js`)
 - `pnpm --filter @loopzhb/server db:check` ✅（无 schema 变更）
 - 冒烟：`node dist/start.js` 真实启动 → poll 自注册 200、未知 credential
   统一 401+code、SIGTERM 有序关停 ✅
+
+## 评审与修复记录
+
+两轮独立代码审查（`codex-handoff-code-review-day34.md`，双轴：plan 一致性 +
+对抗性）共 9 项发现；独立复核结论见 `kimi-response-code-review.md`。
+7 项成立并已逐项修复（每项一提交）:
+
+| 发现 | 修复 | 提交 |
+|---|---|---|
+| #2 claim 写时守卫不含 machineId/role | 条件 UPDATE 纳入全量领取条件，lease/Delivery 用 RETURNING 权威行 | `8a09c0c` |
+| #3 report 缺覆盖写入窗口的 CAS(ADR 符合性） | 终态 UPDATE 相位 guard + 两写均校验行数，0 行即回滚 | `57a640a` |
+| #4 terminal-grace expiry 只在事务前检查 | 事务内同一 Clock 快照复核；边界 `now >= expiresAt` 钉死 | `b7edeb4` |
+| #5 existing message 复用未统一清理 | 最终选中值统一 cleanText | `1c521d7` |
+| #6 reclaim 无 active lease 提交半套状态 | 合取守卫：lease 恰一行否则抛错回滚，两个零写入反例 | `7093dfb` |
+| #7 Coordinator 越过 A-02 三方法边界 | 收窄回三方法；cancel/reclaim 留 store 层；接口 keys 结构钉 | `e2fe462` |
+| #8 listener 启动失败不关 DB、误报 ready | 等待 listening/error，失败有序清理后非零退出；端口占用测试 | `1eba754` |
+
+**唯一未决项**:#1（未来 `lastSeen` 纠正 vs 单调水位）是计划文本自相矛盾的
+语义裁决项，待裁决后回写 clarify（A-13 补记）再改代码——复核建议方案 A
+（正常 skew 窗口内不倒退 + 远未来钳制纠正），裁决前代码维持单调水位语义。
+#9（本 handoff 完成态声明超前）随本节的补记消解。
 
 ## 下一步：Day 5–7（daemon)
 
