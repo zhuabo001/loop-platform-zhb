@@ -131,3 +131,13 @@ expires_at 过期 ──▶ resolve 时惰性删除 / sweep 中 prune
 - 2026-07-29：澄清 `machines.last_seen` 是可节流但必须单调的持久化心跳水位，不是
   每次 Poll 的精确审计时间；Machine 在场状态仍由该水位结合当前时间推导，不恢复
   `online` 列。
+- 2026-07-30：澄清上条「单调」的适用域（Day 3–4 评审语义裁决，见
+  `docs/handoff/codex-handoff-code-review-day34.md` 与
+  `kimi-response-code-review.md` 发现 1）：单调性契约在**合法水位域**内成立——
+  引入有界 clock-skew 容忍窗口（`HEARTBEAT_SKEW_SLACK_MS = 5min`，远超健康 NTP/
+  多实例偏移，远低于真实污染量级）：(1) 窗口内的近未来水位读作 fresh，写入侧
+  不得倒写（GREATEST guard）；(2) 超出窗口的远未来水位视为**污染**而非存活证
+  据——写入侧在下一次 Poll 时纠正为当前 Poll 时间（唯一合法的向下写），且
+  presence/sweep 消费侧必须经同一窗口谓词（`classifyHeartbeatWatermark` /
+  `heartbeatAgeMs`）把远未来值判定为无存活证据，否则「写入污染值后机器沉默」
+  会被永久误判在线。

@@ -74,7 +74,7 @@
 ## 完成验证（分支 HEAD)
 
 - `pnpm -r typecheck` ✅
-- `pnpm -r test` ✅ **197 全绿（62 protocol + 135 server)**
+- `pnpm -r test` ✅ **204 全绿（62 protocol + 142 server)**
 - `pnpm -r build` ✅（产物含 `dist/start.js`)
 - `pnpm --filter @loopzhb/server db:check` ✅（无 schema 变更）
 - 冒烟：`node dist/start.js` 真实启动 → poll 自注册 200、未知 credential
@@ -95,11 +95,14 @@
 | #6 reclaim 无 active lease 提交半套状态 | 合取守卫：lease 恰一行否则抛错回滚，两个零写入反例 | `7093dfb` |
 | #7 Coordinator 越过 A-02 三方法边界 | 收窄回三方法；cancel/reclaim 留 store 层；接口 keys 结构钉 | `e2fe462` |
 | #8 listener 启动失败不关 DB、误报 ready | 等待 listening/error，失败有序清理后非零退出；端口占用测试 | `1eba754` |
+| #1 未来 lastSeen 纠正 vs 单调水位（语义裁决） | 有界 skew 窗口:近未来不倒写、远未来写入侧纠正 + 消费侧共享谓词;ADR-003 修订 + A-13 补记 | `5c8025a` |
 
-**唯一未决项**:#1（未来 `lastSeen` 纠正 vs 单调水位）是计划文本自相矛盾的
-语义裁决项，待裁决后回写 clarify（A-13 补记）再改代码——复核建议方案 A
-（正常 skew 窗口内不倒退 + 远未来钳制纠正），裁决前代码维持单调水位语义。
-#9（本 handoff 完成态声明超前）随本节的补记消解。
+**语义裁决项 #1 亦已收口**:codex 澄清轮接受复核的核心反驳并补充消费侧条
+款（合理且必要——写入侧纠正触达不到"污染后沉默"的场景）。裁决落地为有界
+clock-skew 窗口（`HEARTBEAT_SKEW_SLACK_MS = 5min`）:窗口内近未来保持单调
+不倒写，超窗远未来视为污染——写入侧纠正（`5c8025a`),presence/sweep 消费
+侧共用同一谓词判定为无存活证据。ADR-003 已补 2026-07-30 修订条目，A-13 已
+补记。至此两轮审查 9 项发现全部闭环（8 项修复 + 1 项裁决落地）。
 
 ## 下一步：Day 5–7（daemon)
 
