@@ -68,19 +68,22 @@ function cleanError(value: string | undefined): string | undefined {
  * attempts, daemon-claimed outcome) are NOT here — they never write.
  */
 export function buildReportWriteSet(body: ReportRequest, run: Run, nowIso: string): Partial<NewRun> {
-  const message =
+  // Priority-select the RAW value first, then clean the FINAL selection
+  // uniformly (review #5 — the reused run.message branch must get the same
+  // NUL-strip + cap as daemon-supplied text).
+  const selectedMessage =
     body.message !== undefined
-      ? cleanText(body.message, MESSAGE_CAP)
+      ? body.message
       : run.message != null && run.message !== ""
         ? run.message
         : body.finalText !== undefined
-          ? cleanText(body.finalText, MESSAGE_CAP)
+          ? body.finalText
           : null;
   return {
     phase: body.ok ? "done" : "error",
     outcome: body.ok ? "exec" : "error",
     error: body.ok ? null : (cleanError(body.error) ?? GENERIC_RUN_ERROR),
-    message,
+    message: selectedMessage === null ? null : cleanText(selectedMessage, MESSAGE_CAP),
     durationMs: body.durationMs ?? null,
     sessionId: body.sessionId !== undefined ? cleanText(body.sessionId, SESSION_ID_CAP) : null,
     progress: null,

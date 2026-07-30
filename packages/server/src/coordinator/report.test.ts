@@ -20,8 +20,8 @@ import type { Delivery, ReportRequest } from "@loopzhb/protocol";
 import { sha256 } from "@loopzhb/protocol/node";
 
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
-import type { NewRun } from "../db/schema.js";
-import { GENERIC_RUN_ERROR } from "../store/report.js";
+import type { NewRun, Run } from "../db/schema.js";
+import { buildReportWriteSet, GENERIC_RUN_ERROR } from "../store/report.js";
 import { RECLAIM_RUN_ERROR } from "../store/runs.js";
 import {
   FakeClock,
@@ -196,6 +196,19 @@ describe("report: message priority (A-08)", () => {
     const token = await seedActiveRun({ message: "existing" });
     await coordinator.report(token, { ok: true, finalText: "fallback" });
     expect((await snapshotRuns(db))[0]!.message).toBe("existing");
+  });
+
+  it("2b. a reused existing message is cleaned uniformly — capped, and NUL-stripped (review #5)", async () => {
+    await fresh();
+    // Cap arm, through the full report path:
+    const token = await seedActiveRun({ message: `kept-${"k".repeat(3000)}` });
+    await coordinator.report(token, { ok: true });
+    expect((await snapshotRuns(db))[0]!.message).toBe(`kept-${"k".repeat(1995)}`);
+
+    // NUL arm, at the pure builder (Postgres refuses 0x00 in text columns, so
+    // a NUL-bearing message can't be seeded — assert the write-set directly).
+    const ws = buildReportWriteSet({ ok: true }, { message: "a\0b" } as unknown as Run, clock.iso());
+    expect(ws.message).toBe("ab");
   });
 
   it("3. finalText is the fallback only when the run has no message", async () => {
