@@ -82,12 +82,23 @@ export async function main(): Promise<void> {
   process.on("SIGTERM", shutdown);
 }
 
-/** Resolve once the server is bound; reject on the first listen error. */
-function waitForListening(server: ServerType): Promise<void> {
+/** Resolve once the server is bound; reject on the first listen error. The
+ *  LOSER listener is removed on settle — a leftover once-listener would keep
+ *  consuming later runtime 'error' events into an already-settled promise,
+ *  silently swallowing them (Node treats any 'error' listener as handled). */
+export function waitForListening(server: ServerType): Promise<void> {
   if (server.listening) return Promise.resolve();
   return new Promise((resolve, reject) => {
-    server.once("listening", () => resolve());
-    server.once("error", (err) => reject(err));
+    const onListening = (): void => {
+      server.removeListener("error", onError);
+      resolve();
+    };
+    const onError = (err: Error): void => {
+      server.removeListener("listening", onListening);
+      reject(err);
+    };
+    server.once("listening", onListening);
+    server.once("error", onError);
   });
 }
 

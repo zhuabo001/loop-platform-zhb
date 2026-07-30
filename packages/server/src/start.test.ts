@@ -15,6 +15,7 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
+import { serve } from "@hono/node-server";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { isRunTokenShape, pollResponseSchema } from "@loopzhb/protocol";
@@ -23,7 +24,7 @@ import { machineIdFromToken } from "@loopzhb/protocol/node";
 import { mintRunCredential } from "./coordinator/index.js";
 import { closeDb, type DbHandle } from "./db/index.js";
 import { loops } from "./db/schema.js";
-import { bootstrapServer, main, type BootedServer } from "./start.js";
+import { bootstrapServer, main, waitForListening, type BootedServer } from "./start.js";
 
 const handles: DbHandle[] = [];
 afterEach(async () => {
@@ -126,6 +127,39 @@ describe("bootstrapServer", () => {
       body: JSON.stringify({ ok: true }),
     });
     expect(again.status).toBe(401);
+  });
+});
+
+describe("waitForListening (二次审核 P2)", () => {
+  it("removes the losing listener on success — a later runtime error is NOT swallowed", async () => {
+    const srv = serve({ fetch: () => new Response("ok"), port: 0, hostname: "127.0.0.1" });
+    try {
+      await waitForListening(srv);
+      expect(srv.listenerCount("error")).toBe(0);
+      // With the stale once-listener gone, an emitted 'error' has NO handler
+      // and surfaces (Node throws) instead of being consumed into a settled
+      // promise.
+      expect(() => srv.emit("error", new Error("boom"))).toThrow("boom");
+    } finally {
+      srv.close();
+    }
+  });
+
+  it("removes the listening listener on failure", async () => {
+    const blocker = net.createServer();
+    await new Promise<void>((resolve) => blocker.listen(0, "127.0.0.1", resolve));
+    const port = (blocker.address() as net.AddressInfo).port;
+    const srv = serve({ fetch: () => new Response("ok"), port, hostname: "127.0.0.1" });
+    try {
+      // hono's serve() registers its own internal listeners — the hygiene
+      // check is that waitForListening adds NOTHING that survives settle.
+      const before = srv.listenerCount("listening");
+      await expect(waitForListening(srv)).rejects.toThrow();
+      expect(srv.listenerCount("listening")).toBe(before);
+    } finally {
+      srv.close();
+      await new Promise<void>((resolve) => blocker.close(() => resolve()));
+    }
   });
 });
 
