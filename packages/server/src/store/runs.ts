@@ -221,6 +221,18 @@ export async function cancelRunTx(deps: RunStoreDeps, runId: string): Promise<bo
   });
 }
 
+/** The reclaim's conjunctive guard lost: the run was running but NO active
+ *  lease flipped — an invariant violation (claim+lease are one transaction,
+ *  so a running run ALWAYS has an active lease). Thrown to roll the whole
+ *  transaction back: erroring the run without a grace window would create a
+ *  terminal state no late report can ever reconcile (review #6). */
+export class ReclaimGuardLostError extends Error {
+  constructor(readonly runId: string) {
+    super(`reclaim guard lost for run ${runId}: running without an active lease`);
+    this.name = "ReclaimGuardLostError";
+  }
+}
+
 /**
  * Sweep reclaim — SWEEP-ORCHESTRATION ONLY (report, cancel, normal failure
  * and admin paths must never call this: they must not manufacture reconcile
@@ -228,6 +240,11 @@ export async function cancelRunTx(deps: RunStoreDeps, runId: string): Promise<bo
  * the generic reclaim reason (the wake-report replaces it with the truth),
  * `ts` is stamped, and the lease flips active → terminal-grace with the FIRST
  * `now + 24h` window.
+ *
+ * The eligibility guard is CONJUNCTIVE (plan §事务守卫 — review #6): only
+ * `running run + active lease` reclaims. The lease flip must affect EXACTLY
+ * one row — zero rows means the invariant is broken, and the whole
+ * transaction rolls back via ReclaimGuardLostError (zero writes).
  *
  * The lease-terminalize step is PRIVATE to this transaction — there is
  * deliberately no standalone exported terminalizeLease (structural pin in the
@@ -244,10 +261,12 @@ export async function reclaimStaleRunTx(deps: RunStoreDeps, runId: string): Prom
       .where(and(eq(runs.id, runId), eq(runs.phase, "running")))
       .returning({ id: runs.id });
     if (updated.length === 0) return false;
-    await tx
+    const terminalized = await tx
       .update(runLeases)
       .set({ state: "terminal-grace", expiresAt: new Date(now.getTime() + TERMINAL_GRACE_MS).toISOString() })
-      .where(and(eq(runLeases.runId, runId), eq(runLeases.state, "active")));
+      .where(and(eq(runLeases.runId, runId), eq(runLeases.state, "active")))
+      .returning({ tokenHash: runLeases.tokenHash });
+    if (terminalized.length !== 1) throw new ReclaimGuardLostError(runId);
     return true;
   });
 }

@@ -22,7 +22,7 @@ import { sha256 } from "@loopzhb/protocol/node";
 
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
 import type { NewRun } from "../db/schema.js";
-import { RECLAIM_RUN_ERROR } from "../store/runs.js";
+import { RECLAIM_RUN_ERROR, reclaimStaleRunTx } from "../store/runs.js";
 import * as leasesStore from "../store/leases.js";
 import * as reportStore from "../store/report.js";
 import * as runsStore from "../store/runs.js";
@@ -148,6 +148,29 @@ describe("reclaimStaleRun primitive (sweep-only)", () => {
     }
     expect(await snapshotRuns(db)).toEqual(before); // zero writes
     expect(await snapshotLeases(db)).toEqual([]); // no terminal-grace created
+  });
+
+  it("refuses a running run with NO lease: guard error, the whole transaction rolls back (review #6)", async () => {
+    await fresh();
+    await seedRun(db, { id: "run-no-lease", machineId, phase: "running" });
+    await expect(reclaimStaleRunTx(testDeps(db, clock), "run-no-lease")).rejects.toMatchObject({
+      name: "ReclaimGuardLostError",
+    });
+    // Zero writes: the run was NOT error-ized without a grace window.
+    expect((await snapshotRuns(db))[0]).toMatchObject({ id: "run-no-lease", phase: "running", outcome: null });
+    expect(await snapshotLeases(db)).toEqual([]);
+  });
+
+  it("refuses a running run whose lease is NOT active: guard error, zero writes (review #6)", async () => {
+    await fresh();
+    await seedRun(db, { id: "run-1", machineId, phase: "running" });
+    const expiry = new Date(clock.now().getTime() + 60_000).toISOString();
+    await seedLease(db, { tokenHash: sha256("rk_tg"), runId: "run-1", machineId, state: "terminal-grace", expiresAt: expiry });
+    await expect(reclaimStaleRunTx(testDeps(db, clock), "run-1")).rejects.toMatchObject({
+      name: "ReclaimGuardLostError",
+    });
+    expect((await snapshotRuns(db))[0]).toMatchObject({ phase: "running", outcome: null });
+    expect((await snapshotLeases(db))[0]).toMatchObject({ state: "terminal-grace", expiresAt: expiry });
   });
 
   it("has NO general-purpose terminalizeLease on any store surface", () => {
