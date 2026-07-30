@@ -9,7 +9,7 @@
  *    ONE transaction;
  *  - report finalize (Step 3): run UPDATE + lease DELETE in ONE transaction.
  */
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, inArray } from "drizzle-orm";
 
 import { sha256 } from "@loopzhb/protocol/node";
 import type { RunRole } from "@loopzhb/protocol";
@@ -179,5 +179,62 @@ export async function claimRunWithLeaseTx(
       createdAt: clock.now().toISOString(),
     });
     return { run: claimed, runToken };
+  });
+}
+
+// ---- lifecycle primitives (cancel / sweep reclaim) ----
+
+/** How long a reclaimed run's terminal-grace lease stays alive to accept the
+ *  ONE reconciling wake-report (a laptop can sleep overnight or a weekend). */
+export const TERMINAL_GRACE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Owner cancel (Phase 1: NO HTTP route — the owner adapter calls the
+ * coordinator). Run → `canceled` and the lease DELETE land in ONE transaction
+ * (a deliberate reference deviation: there is no "canceled but lease still
+ * live" window, so a late report always meets the unified 401). Terminal and
+ * missing runs are a no-op. Returns whether the run transitioned.
+ */
+export async function cancelRunTx(deps: RunStoreDeps, runId: string): Promise<boolean> {
+  return deps.db.transaction(async (tx) => {
+    const updated = await tx
+      .update(runs)
+      .set({ phase: "canceled", ts: deps.clock.now().toISOString() })
+      .where(and(eq(runs.id, runId), inArray(runs.phase, ["pending", "running"])))
+      .returning({ id: runs.id });
+    if (updated.length === 0) return false;
+    await tx.delete(runLeases).where(eq(runLeases.runId, runId));
+    return true;
+  });
+}
+
+/**
+ * Sweep reclaim — SWEEP-ORCHESTRATION ONLY (report, cancel, normal failure
+ * and admin paths must never call this: they must not manufacture reconcile
+ * eligibility). In ONE transaction: a still-running run goes error/error with
+ * the generic reclaim reason (the wake-report replaces it with the truth),
+ * `ts` is stamped, and the lease flips active → terminal-grace with the FIRST
+ * `now + 24h` window.
+ *
+ * The lease-terminalize step is PRIVATE to this transaction — there is
+ * deliberately no standalone exported terminalizeLease (structural pin in the
+ * tests). Guards: only a `running` run reclaims (a repeat reclaim is a no-op
+ * and can NEVER extend the first window), and only an `active` lease flips.
+ */
+export async function reclaimStaleRunTx(deps: RunStoreDeps, runId: string): Promise<boolean> {
+  return deps.db.transaction(async (tx) => {
+    const now = deps.clock.now();
+    const nowIso = now.toISOString();
+    const updated = await tx
+      .update(runs)
+      .set({ phase: "error", outcome: "error", error: RECLAIM_RUN_ERROR, ts: nowIso })
+      .where(and(eq(runs.id, runId), eq(runs.phase, "running")))
+      .returning({ id: runs.id });
+    if (updated.length === 0) return false;
+    await tx
+      .update(runLeases)
+      .set({ state: "terminal-grace", expiresAt: new Date(now.getTime() + TERMINAL_GRACE_MS).toISOString() })
+      .where(and(eq(runLeases.runId, runId), eq(runLeases.state, "active")));
+    return true;
   });
 }

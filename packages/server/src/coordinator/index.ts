@@ -32,10 +32,12 @@ import { resolveLiveLease } from "../store/leases.js";
 import { applyMachinePollContact, getMachine, registerMachineOnPoll } from "../store/machines.js";
 import { executeReportTx, type ReportTxResult } from "../store/report.js";
 import {
+  cancelRunTx,
   claimRunWithLeaseTx,
   enqueueExecRunTx,
   getLoop,
   pendingExecRunsForMachine,
+  reclaimStaleRunTx,
   type EnqueueExecRunResult,
   type RunStoreDeps,
 } from "../store/runs.js";
@@ -159,6 +161,19 @@ export function createRunCoordinator(deps: RunCoordinatorDependencies) {
       if (!lease) throw new RunCapabilityInvalidError("unknown_or_expired");
       await deps.hooks?.afterReportResolve?.(tokenHash);
       return executeReportTx(deps, { tokenHash, body, insideTxHook: deps.hooks?.insideReportTx });
+    },
+
+    /** Owner cancel primitive (NO HTTP route in Phase 1): run → canceled and
+     *  lease deleted in one transaction. Terminal/missing runs are a no-op. */
+    async cancelRun(runId: string): Promise<{ canceled: boolean }> {
+      return { canceled: await cancelRunTx(deps, runId) };
+    },
+
+    /** Sweep-facing reclaim primitive: ONLY the sweep orchestration calls
+     *  this (a vanished machine's running run → error + terminal-grace
+     *  reconcile window, one transaction). Never wired to an HTTP route. */
+    async reclaimStaleRun(runId: string): Promise<{ reclaimed: boolean }> {
+      return { reclaimed: await reclaimStaleRunTx(deps, runId) };
     },
   };
 }

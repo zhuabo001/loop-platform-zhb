@@ -6,3 +6,6 @@ dist/
 .env
 .env.*
 !.env.example
+
+# local MCP tooling state
+.serena/
