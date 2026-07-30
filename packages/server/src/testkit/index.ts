@@ -8,9 +8,11 @@
  */
 import { asc } from "drizzle-orm";
 
+import { machineIdFromToken, sha256 } from "@loopzhb/protocol/node";
+
 import type { RunCoordinatorDependencies } from "../coordinator/index.js";
 import type { Db } from "../db/index.js";
-import { loops, machines, runs, type NewLoop, type NewRun, type Run } from "../db/schema.js";
+import { loops, machines, runs, type NewLoop, type NewMachine, type NewRun, type Run } from "../db/schema.js";
 import type { Clock } from "../time.js";
 
 export const FIXTURE_T0 = new Date("2026-07-29T00:00:00.000Z");
@@ -53,6 +55,24 @@ export function testDeps(
 
 export async function seedMachine(db: Db, id: string, tokenHash = `hash-${id}`): Promise<void> {
   await db.insert(machines).values({ id, name: "", tokenHash, createdAt: "2026-07-01T00:00:00.000Z" });
+}
+
+/** Seed the machine a given device token would self-register as (derived id +
+ *  full hash — exactly what a first poll would have created). Returns the id. */
+export async function seedMachineForToken(
+  db: Db,
+  token: string,
+  overrides: Partial<NewMachine> = {},
+): Promise<string> {
+  const id = machineIdFromToken(token);
+  await db.insert(machines).values({
+    id,
+    name: "",
+    tokenHash: sha256(token),
+    createdAt: "2026-07-01T00:00:00.000Z",
+    ...overrides,
+  });
+  return id;
 }
 
 export async function seedLoop(db: Db, values: Partial<NewLoop> & { id: string }): Promise<void> {

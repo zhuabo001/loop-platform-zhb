@@ -11,8 +11,11 @@
  */
 import { and, asc, eq } from "drizzle-orm";
 
+import { sha256 } from "@loopzhb/protocol/node";
+import type { RunRole } from "@loopzhb/protocol";
+
 import type { Db } from "../db/index.js";
-import { loops, runs, type Loop } from "../db/schema.js";
+import { loops, runLeases, runs, type Loop, type Run } from "../db/schema.js";
 import type { Clock } from "../time.js";
 
 /** The slice of coordinator dependencies the run store needs. */
@@ -95,5 +98,80 @@ export async function enqueueExecRunTx(deps: RunStoreDeps, loop: Loop): Promise<
       ts,
     });
     return { enqueued: true as const, runId, supersededRunIds };
+  });
+}
+
+// ---- poll claim (ADR-001's atomic claim + at-most-once delivery) ----
+
+/** Every pending EXEC run a machine's poll may attempt, in deterministic
+ *  dispatch order (`ts ASC, id ASC` — the plan's candidate order). */
+export async function pendingExecRunsForMachine(db: Db, machineId: string): Promise<Run[]> {
+  return db
+    .select()
+    .from(runs)
+    .where(and(eq(runs.machineId, machineId), eq(runs.phase, "pending"), eq(runs.role, "exec")))
+    .orderBy(asc(runs.ts), asc(runs.id));
+}
+
+export interface ClaimStoreDeps extends RunStoreDeps {
+  mintRunCredential(): string;
+}
+
+export interface ClaimedRun {
+  run: Run;
+  /** The plaintext wire credential — returned to the daemon ONCE; the DB only
+   *  ever holds its sha256. */
+  runToken: string;
+}
+
+/**
+ * THE atomic claim: conditional `pending → running` UPDATE + lease INSERT in
+ * ONE transaction (a deliberate reference deviation — the reference mints the
+ * lease in a second statement).
+ *
+ * Returns undefined when the phase guard loses a concurrent race (the run was
+ * claimed by another poll): the caller skips THAT candidate and keeps going —
+ * the batch is never all-or-nothing. Once this transaction commits, the run
+ * has PERMANENTLY left the dispatch surface: a dropped delivery response can
+ * never cause a re-execution (at-most-once), the inactivity sweep reaps the
+ * orphaned running run later.
+ *
+ * Phase 1 lease mint policy (ADR-003): every capability is written FALSE
+ * explicitly — never inherited from loop config, never left to DB defaults.
+ */
+export async function claimRunWithLeaseTx(
+  deps: ClaimStoreDeps,
+  input: { runId: string; loopId: string; machineId: string; role: RunRole },
+): Promise<ClaimedRun | undefined> {
+  const { db, clock, mintRunCredential } = deps;
+  return db.transaction(async (tx) => {
+    const claimed = (
+      await tx
+        .update(runs)
+        .set({ phase: "running", ts: clock.now().toISOString() })
+        .where(and(eq(runs.id, input.runId), eq(runs.phase, "pending")))
+        .returning()
+    )[0];
+    if (!claimed) return undefined;
+
+    // Mint INSIDE the transaction: a factory failure rolls the claim back,
+    // leaving the run pending for a later poll.
+    const runToken = mintRunCredential();
+    await tx.insert(runLeases).values({
+      tokenHash: sha256(runToken),
+      runId: claimed.id,
+      loopId: input.loopId,
+      machineId: input.machineId,
+      role: input.role,
+      allowControl: false,
+      canSetUi: false,
+      canSetSchema: false,
+      canSetWorkflow: false,
+      canFinish: false,
+      state: "active",
+      expiresAt: null,
+      createdAt: clock.now().toISOString(),
+    });
+    return { run: claimed, runToken };
   });
 }

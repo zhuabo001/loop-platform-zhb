@@ -24,7 +24,20 @@
  */
 import { randomBytes, randomUUID } from "node:crypto";
 
-import { enqueueExecRunTx, getLoop, type EnqueueExecRunResult, type RunStoreDeps } from "../store/runs.js";
+import { isDeviceTokenShape, type Delivery, type PollRequest } from "@loopzhb/protocol";
+import { machineIdFromToken, sha256 } from "@loopzhb/protocol/node";
+
+import { buildDelivery } from "../gateway/delivery.js";
+import { applyMachinePollContact, getMachine, registerMachineOnPoll } from "../store/machines.js";
+import {
+  claimRunWithLeaseTx,
+  enqueueExecRunTx,
+  getLoop,
+  pendingExecRunsForMachine,
+  type EnqueueExecRunResult,
+  type RunStoreDeps,
+} from "../store/runs.js";
+import { InvalidMachineCredentialError } from "./errors.js";
 
 export interface CoordinatorHooks {
   /** Runs after the loop lookup, BEFORE the enqueue write transaction opens —
@@ -79,6 +92,48 @@ export function createRunCoordinator(deps: RunCoordinatorDependencies) {
         await deps.hooks?.beforeEnqueueTx?.(loopId);
         return enqueueExecRunTx(deps, loop);
       });
+    },
+
+    /**
+     * The daemon's heartbeat + run claim (plan §2).
+     *
+     * Order matters: cheap shape filter → derived-id + full-hash verification
+     * (self-registering on first contact) → heartbeat/identity write (OUTSIDE
+     * any claim transaction — confirmed contact survives a lost claim race) →
+     * the per-candidate atomic claims. `progress`/`wait` are parse-only in
+     * Phase 1. Throws InvalidMachineCredentialError on any credential
+     * failure; the HTTP adapter maps that to the unified 401.
+     */
+    async poll(deviceToken: string, body: PollRequest): Promise<{ deliveries: Delivery[] }> {
+      if (!isDeviceTokenShape(deviceToken)) throw new InvalidMachineCredentialError();
+      const machineId = machineIdFromToken(deviceToken);
+      const tokenHash = sha256(deviceToken);
+
+      let machine = await getMachine(deps.db, machineId);
+      if (machine) {
+        // Full-hash verification on top of the derived id — a 64-bit
+        // truncation collision must not hand one machine's authority to a
+        // different token (reference audit H-01).
+        if (machine.tokenHash !== tokenHash) throw new InvalidMachineCredentialError();
+        machine = await applyMachinePollContact(deps, machine, body);
+      } else {
+        machine = await registerMachineOnPoll(deps, { machineId, tokenHash, identity: body });
+      }
+
+      const deliveries: Delivery[] = [];
+      for (const candidate of await pendingExecRunsForMachine(deps.db, machineId)) {
+        const loop = await getLoop(deps.db, candidate.loopId);
+        if (!loop) continue; // undeliverable: stays pending, never fails the batch
+        const claimed = await claimRunWithLeaseTx(deps, {
+          runId: candidate.id,
+          loopId: loop.id,
+          machineId,
+          role: candidate.role,
+        });
+        if (!claimed) continue; // race loser — another poll owns this run now
+        deliveries.push(buildDelivery({ loop, run: claimed.run, roots: machine.roots ?? [], runToken: claimed.runToken }));
+      }
+      return { deliveries };
     },
   };
 }
