@@ -24,7 +24,9 @@ export interface LeaseStoreDeps {
 export async function resolveLiveLease(deps: LeaseStoreDeps, tokenHash: string): Promise<RunLeaseRow | undefined> {
   const row = (await deps.db.select().from(runLeases).where(eq(runLeases.tokenHash, tokenHash)))[0];
   if (!row) return undefined;
-  if (row.expiresAt != null && deps.clock.now().getTime() > Date.parse(row.expiresAt)) {
+  // `now >= expiresAt` ⇒ dead (boundary pinned with the in-transaction
+  // re-check in store/report.ts — a lease dies AT its expiresAt).
+  if (row.expiresAt != null && deps.clock.now().getTime() >= Date.parse(row.expiresAt)) {
     await deps.db.delete(runLeases).where(eq(runLeases.tokenHash, tokenHash));
     return undefined;
   }

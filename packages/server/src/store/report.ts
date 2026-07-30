@@ -41,7 +41,7 @@ export type ReportTxResult = { ok: true } | { ok: true; reconciled: true };
 
 type ReportTxOutcome =
   | { kind: "ok"; result: ReportTxResult }
-  | { kind: "denied"; reason: "consumed_or_revoked" | "orphaned_run" | "stale_phase" };
+  | { kind: "denied"; reason: "unknown_or_expired" | "consumed_or_revoked" | "orphaned_run" | "stale_phase" };
 
 /** NUL-strip + cap — every daemon string that enters a text column. */
 function cleanText(value: string, cap: number): string {
@@ -114,6 +114,16 @@ export async function executeReportTx(
     // resolve shows up HERE (the lease is gone) — never write against it.
     const lease = (await tx.select().from(runLeases).where(eq(runLeases.tokenHash, input.tokenHash)))[0];
     if (!lease) return { kind: "denied", reason: "consumed_or_revoked" };
+
+    // Re-validate expiry INSIDE the transaction against the same clock
+    // snapshot (review #4): the read-side resolve happened before this tx —
+    // the grace window may have closed in between. `now >= expiresAt` ⇒ dead
+    // (the boundary is pinned: a lease dies AT its expiresAt). The cleanup
+    // delete commits; the 401 is thrown after.
+    if (lease.expiresAt != null && now.getTime() >= Date.parse(lease.expiresAt)) {
+      await tx.delete(runLeases).where(eq(runLeases.tokenHash, input.tokenHash));
+      return { kind: "denied", reason: "unknown_or_expired" };
+    }
 
     const run = (await tx.select().from(runs).where(eq(runs.id, lease.runId)))[0];
     if (!run) {

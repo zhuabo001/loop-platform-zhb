@@ -346,6 +346,49 @@ describe("report: credential resolution", () => {
     expect(await snapshotLeases(db)).toEqual([]);
     expect((await snapshotRuns(db))[0]!.phase).toBe("error"); // untouched
   });
+
+  it("pins the expiry boundary: a lease dies AT its expiresAt", async () => {
+    await fresh();
+    await seedRun(db, { id: "run-1", machineId, phase: "error", outcome: "error", error: RECLAIM_RUN_ERROR });
+    await seedLease(db, {
+      tokenHash: sha256("rk_boundary"),
+      runId: "run-1",
+      machineId,
+      state: "terminal-grace",
+      expiresAt: clock.iso(), // exactly now
+    });
+    await expect(coordinator.report("rk_boundary", { ok: true })).rejects.toMatchObject({
+      reason: "unknown_or_expired",
+    });
+    expect(await snapshotLeases(db)).toEqual([]);
+  });
+
+  it("re-checks expiry INSIDE the write transaction — a window that closes after resolve still denies (review #4)", async () => {
+    await fresh({
+      hooks: {
+        afterReportResolve: () => {
+          // The grace window closes between the read-side resolve and the
+          // write transaction.
+          clock.advance(2 * 60 * 60 * 1000); // +2h
+        },
+      },
+    });
+    await seedRun(db, { id: "run-1", machineId, phase: "error", outcome: "error", error: RECLAIM_RUN_ERROR });
+    await seedLease(db, {
+      tokenHash: sha256("rk_expiring_midflight"),
+      runId: "run-1",
+      machineId,
+      state: "terminal-grace",
+      expiresAt: new Date(clock.now().getTime() + 60 * 60 * 1000).toISOString(), // +1h: live at resolve
+    });
+    await expect(coordinator.report("rk_expiring_midflight", { ok: true })).rejects.toMatchObject({
+      name: "RunCapabilityInvalidError",
+      reason: "unknown_or_expired",
+    });
+    // Lease cleaned up, run NOT reconciled.
+    expect(await snapshotLeases(db)).toEqual([]);
+    expect((await snapshotRuns(db))[0]).toMatchObject({ phase: "error", error: RECLAIM_RUN_ERROR });
+  });
 });
 
 describe("report: T5 terminal-grace reconcile (exactly once)", () => {
