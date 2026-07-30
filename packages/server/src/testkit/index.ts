@@ -12,7 +12,19 @@ import { machineIdFromToken, sha256 } from "@loopzhb/protocol/node";
 
 import type { RunCoordinatorDependencies } from "../coordinator/index.js";
 import type { Db } from "../db/index.js";
-import { loops, machines, runs, type NewLoop, type NewMachine, type NewRun, type Run } from "../db/schema.js";
+import {
+  loops,
+  machines,
+  runLeases,
+  runs,
+  type Loop,
+  type NewLoop,
+  type NewMachine,
+  type NewRun,
+  type NewRunLease,
+  type Run,
+  type RunLeaseRow,
+} from "../db/schema.js";
 import type { Clock } from "../time.js";
 
 export const FIXTURE_T0 = new Date("2026-07-29T00:00:00.000Z");
@@ -95,7 +107,34 @@ export async function seedRun(db: Db, values: Partial<NewRun> & { id: string }):
   });
 }
 
+/** Seed a run lease (Phase 1 all-false caps by default). Key by the sha256 of
+ *  the wire credential the test will present. */
+export async function seedLease(db: Db, values: Partial<NewRunLease> & { tokenHash: string }): Promise<void> {
+  await db.insert(runLeases).values({
+    runId: "run-1",
+    loopId: "loop-1",
+    machineId: "m-test",
+    role: "exec",
+    allowControl: false,
+    canSetUi: false,
+    canSetSchema: false,
+    canSetWorkflow: false,
+    canFinish: false,
+    state: "active",
+    createdAt: "2026-07-01T00:00:00.000Z",
+    ...values,
+  });
+}
+
 /** Whole-table snapshot, id-ordered — for exact "zero writes" assertions. */
 export async function snapshotRuns(db: Db): Promise<Run[]> {
   return db.select().from(runs).orderBy(asc(runs.id));
+}
+
+export async function snapshotLoops(db: Db): Promise<Loop[]> {
+  return db.select().from(loops).orderBy(asc(loops.id));
+}
+
+export async function snapshotLeases(db: Db): Promise<RunLeaseRow[]> {
+  return db.select().from(runLeases).orderBy(asc(runLeases.tokenHash));
 }

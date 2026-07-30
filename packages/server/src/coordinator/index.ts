@@ -24,11 +24,13 @@
  */
 import { randomBytes, randomUUID } from "node:crypto";
 
-import { isDeviceTokenShape, type Delivery, type PollRequest } from "@loopzhb/protocol";
+import { isDeviceTokenShape, type Delivery, type PollRequest, type ReportRequest } from "@loopzhb/protocol";
 import { machineIdFromToken, sha256 } from "@loopzhb/protocol/node";
 
 import { buildDelivery } from "../gateway/delivery.js";
+import { resolveLiveLease } from "../store/leases.js";
 import { applyMachinePollContact, getMachine, registerMachineOnPoll } from "../store/machines.js";
+import { executeReportTx, type ReportTxResult } from "../store/report.js";
 import {
   claimRunWithLeaseTx,
   enqueueExecRunTx,
@@ -37,13 +39,20 @@ import {
   type EnqueueExecRunResult,
   type RunStoreDeps,
 } from "../store/runs.js";
-import { InvalidMachineCredentialError } from "./errors.js";
+import { InvalidMachineCredentialError, RunCapabilityInvalidError } from "./errors.js";
 
 export interface CoordinatorHooks {
   /** Runs after the loop lookup, BEFORE the enqueue write transaction opens —
    *  lets a test commit a competing claim on the (then-idle) single pglite
    *  connection, proving the in-transaction re-check skips/rolls back. */
   beforeEnqueueTx?(loopId: string): void | Promise<void>;
+  /** Runs after the report's read-side lease resolve, BEFORE the write
+   *  transaction opens — the report/cancel interleaving gate (lets a test
+   *  commit a real cancel in between). */
+  afterReportResolve?(tokenHash: string): void | Promise<void>;
+  /** Fires INSIDE the report transaction between the run update and the lease
+   *  delete — the fault-injection seam proving those two writes are atomic. */
+  insideReportTx?(runId: string): void | Promise<void>;
 }
 
 export interface RunCoordinatorDependencies extends RunStoreDeps {
@@ -134,6 +143,22 @@ export function createRunCoordinator(deps: RunCoordinatorDependencies) {
         deliveries.push(buildDelivery({ loop, run: claimed.run, roots: machine.roots ?? [], runToken: claimed.runToken }));
       }
       return { deliveries };
+    },
+
+    /**
+     * The daemon's run finalize (plan §3). The credential is OPAQUE — hashed
+     * and resolved, never shape-filtered on the read side. Two-phase resolve:
+     * a cheap read-side check (unknown/expired → 401, expired terminal-grace
+     * lazily dropped), then the write transaction re-resolves and re-checks
+     * phase, catching any cancel that committed in between. `body.runId` is
+     * an echo only — the lease's run is authoritative.
+     */
+    async report(runCredential: string, body: ReportRequest): Promise<ReportTxResult> {
+      const tokenHash = sha256(runCredential);
+      const lease = await resolveLiveLease(deps, tokenHash);
+      if (!lease) throw new RunCapabilityInvalidError("unknown_or_expired");
+      await deps.hooks?.afterReportResolve?.(tokenHash);
+      return executeReportTx(deps, { tokenHash, body, insideTxHook: deps.hooks?.insideReportTx });
     },
   };
 }

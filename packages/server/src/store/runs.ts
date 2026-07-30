@@ -28,6 +28,12 @@ export interface RunStoreDeps {
 /** Stable terminal message for a superseded run (pinned by T7 tests). */
 export const SUPERSEDED_MESSAGE = "superseded by a newer pending run";
 
+/** The generic reason the SWEEP writes when reclaiming a vanished machine's
+ *  run (Step 4's reclaimStaleRun). Deliberately unstable-looking and generic:
+ *  a reconciling failure report replaces it with the real error or the
+ *  fallback — it must never survive a wake-report. */
+export const RECLAIM_RUN_ERROR = "machine timed out / disconnected";
+
 export type EnqueueExecRunResult =
   | { enqueued: true; runId: string; supersededRunIds: string[] }
   | { enqueued: false; reason: "loop_not_found" | "running_exists" };
