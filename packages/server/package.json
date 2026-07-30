@@ -27,8 +27,10 @@
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.5.4",
+    "@hono/node-server": "^2.0.12",
     "@loopzhb/protocol": "workspace:*",
-    "drizzle-orm": "^0.45.2"
+    "drizzle-orm": "^0.45.2",
+    "hono": "^4.12.32"
   },
   "devDependencies": {
     "@types/node": "^25.9.3",
