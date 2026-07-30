@@ -14,7 +14,7 @@
  *  - active lease + running run        → FINALIZE (done/exec | error/error)
  *  - terminal-grace lease + error run  → RECONCILE, exactly once (T5)
  */
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 
 import type { ReportRequest } from "@loopzhb/protocol";
 
@@ -107,6 +107,9 @@ export async function executeReportTx(
 ): Promise<ReportTxResult> {
   const { db, clock } = deps;
   const outcome = await db.transaction(async (tx): Promise<ReportTxOutcome> => {
+    // ONE clock snapshot for the whole transaction: the expiry re-check and
+    // the transition stamp must agree.
+    const now = clock.now();
     // In-transaction re-resolve: a cancel that committed since the read-side
     // resolve shows up HERE (the lease is gone) — never write against it.
     const lease = (await tx.select().from(runLeases).where(eq(runLeases.tokenHash, input.tokenHash)))[0];
@@ -128,12 +131,26 @@ export async function executeReportTx(
       return { kind: "denied", reason: "stale_phase" };
     }
 
-    await tx
+    // CAS over the whole write window (ADR-001:36 / ADR-003:80 — review #3):
+    // the terminal UPDATE re-guards on the phase we validated, and BOTH writes
+    // verify their affected row count. On real multi-connection Postgres a
+    // competing report/cancel that committed in between turns a guard to 0
+    // rows → throw → the whole transaction rolls back, so a credential can
+    // never be consumed twice. (On single-connection pglite the guards are
+    // structural depth; the real contention proof stays with Phase 6.)
+    const updated = await tx
       .update(runs)
-      .set(buildReportWriteSet(input.body, run, clock.now().toISOString()))
-      .where(eq(runs.id, run.id));
+      .set(buildReportWriteSet(input.body, run, now.toISOString()))
+      .where(and(eq(runs.id, run.id), eq(runs.phase, run.phase)))
+      .returning({ id: runs.id });
+    if (updated.length !== 1) throw new RunCapabilityInvalidError("consumed_or_revoked");
+    // Fault-injection seam (between the two writes — see the jsdoc above).
     await input.insideTxHook?.(run.id);
-    await tx.delete(runLeases).where(eq(runLeases.tokenHash, input.tokenHash));
+    const deleted = await tx
+      .delete(runLeases)
+      .where(eq(runLeases.tokenHash, input.tokenHash))
+      .returning({ tokenHash: runLeases.tokenHash });
+    if (deleted.length !== 1) throw new RunCapabilityInvalidError("consumed_or_revoked");
     return { kind: "ok", result: reconcile ? { ok: true as const, reconciled: true as const } : { ok: true as const } };
   });
   if (outcome.kind === "denied") throw new RunCapabilityInvalidError(outcome.reason);
