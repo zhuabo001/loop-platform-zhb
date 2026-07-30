@@ -135,7 +135,12 @@ export interface ClaimedRun {
  * ONE transaction (a deliberate reference deviation — the reference mints the
  * lease in a second statement).
  *
- * Returns undefined when the phase guard loses a concurrent race (the run was
+ * The UPDATE guard carries the FULL write-time eligibility (`id + pending +
+ * machineId + loopId + role` — review finding #2): the candidate scan's
+ * snapshot is only a hint, and the lease/Delivery are built from the
+ * RETURNING authoritative row, never from the caller's stale copy.
+ *
+ * Returns undefined when the guard loses a concurrent race (the run was
  * claimed by another poll): the caller skips THAT candidate and keeps going —
  * the batch is never all-or-nothing. Once this transaction commits, the run
  * has PERMANENTLY left the dispatch surface: a dropped delivery response can
@@ -155,7 +160,15 @@ export async function claimRunWithLeaseTx(
       await tx
         .update(runs)
         .set({ phase: "running", ts: clock.now().toISOString() })
-        .where(and(eq(runs.id, input.runId), eq(runs.phase, "pending")))
+        .where(
+          and(
+            eq(runs.id, input.runId),
+            eq(runs.phase, "pending"),
+            eq(runs.machineId, input.machineId),
+            eq(runs.loopId, input.loopId),
+            eq(runs.role, input.role),
+          ),
+        )
         .returning()
     )[0];
     if (!claimed) return undefined;
@@ -166,9 +179,9 @@ export async function claimRunWithLeaseTx(
     await tx.insert(runLeases).values({
       tokenHash: sha256(runToken),
       runId: claimed.id,
-      loopId: input.loopId,
-      machineId: input.machineId,
-      role: input.role,
+      loopId: claimed.loopId,
+      machineId: claimed.machineId,
+      role: claimed.role,
       allowControl: false,
       canSetUi: false,
       canSetSchema: false,

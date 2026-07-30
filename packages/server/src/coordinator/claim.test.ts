@@ -24,6 +24,7 @@ import { sha256 } from "@loopzhb/protocol/node";
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
 import { machines, runLeases, type NewRun } from "../db/schema.js";
 import { buildExecTask } from "../gateway/delivery.js";
+import { claimRunWithLeaseTx } from "../store/runs.js";
 import {
   FakeClock,
   makeTestFactories,
@@ -168,6 +169,24 @@ describe("poll claim: batch semantics (A-05)", () => {
     expect(new Set(ids).size).toBe(4);
     expect(await leaseRows()).toHaveLength(4);
     expect(mintCount).toBe(4);
+  });
+});
+
+describe("poll claim: write-time eligibility guard (review #2)", () => {
+  it("rejects when the expected machineId/loopId/role no longer matches — zero writes", async () => {
+    await fresh();
+    await seedExec("run-1");
+    const deps = testDeps(db, clock);
+    for (const wrong of [
+      { runId: "run-1", loopId: "loop-1", machineId: "m-intruder", role: "exec" as const },
+      { runId: "run-1", loopId: "loop-other", machineId, role: "exec" as const },
+      { runId: "run-1", loopId: "loop-1", machineId, role: "evolve" as const },
+    ]) {
+      expect(await claimRunWithLeaseTx(deps, wrong)).toBeUndefined();
+    }
+    // Every mismatched attempt left the run pending and minted nothing.
+    expect((await snapshotRuns(db))[0]).toMatchObject({ id: "run-1", phase: "pending" });
+    expect(await leaseRows()).toEqual([]);
   });
 });
 
