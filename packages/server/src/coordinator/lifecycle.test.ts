@@ -22,7 +22,7 @@ import { sha256 } from "@loopzhb/protocol/node";
 
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
 import type { NewRun } from "../db/schema.js";
-import { RECLAIM_RUN_ERROR, reclaimStaleRunTx } from "../store/runs.js";
+import { cancelRunTx, RECLAIM_RUN_ERROR, reclaimStaleRunTx } from "../store/runs.js";
 import * as leasesStore from "../store/leases.js";
 import * as reportStore from "../store/report.js";
 import * as runsStore from "../store/runs.js";
@@ -62,18 +62,30 @@ async function fresh(depsOverrides: Parameters<typeof testDeps>[2] = {}): Promis
   coordinator = createRunCoordinator(testDeps(db, clock, depsOverrides));
 }
 
+/** Store-level lifecycle primitives under test (deliberately NOT on the
+ *  coordinator interface — A-02). */
+const cancel = (runId: string) => cancelRunTx({ db, clock }, runId);
+const reclaim = (runId: string) => reclaimStaleRunTx({ db, clock }, runId);
+
 async function seedActiveRun(runOverrides: Partial<NewRun> = {}): Promise<string> {
   await seedRun(db, { id: "run-1", machineId, phase: "running", ...runOverrides });
   await seedLease(db, { tokenHash: sha256(SEED_CRED), runId: "run-1", machineId });
   return SEED_CRED;
 }
 
+describe("coordinator interface (A-02)", () => {
+  it("exposes EXACTLY enqueueExecRun / poll / report — cancel and reclaim stay store-level", async () => {
+    await fresh();
+    expect(Object.keys(coordinator).sort()).toEqual(["enqueueExecRun", "poll", "report"]);
+  });
+});
+
 describe("cancelRun primitive", () => {
   it("cancels a running run and deletes its lease in one transaction", async () => {
     await fresh();
     await seedActiveRun();
-    const result = await coordinator.cancelRun("run-1");
-    expect(result).toEqual({ canceled: true });
+    const result = await cancel("run-1");
+    expect(result).toBe(true);
 
     expect((await snapshotRuns(db))[0]).toMatchObject({ phase: "canceled", ts: clock.iso(), outcome: null });
     // The store-layer pin: after cancel there is NO active lease.
@@ -88,7 +100,7 @@ describe("cancelRun primitive", () => {
   it("cancels a pending run (no lease existed) and stamps the transition", async () => {
     await fresh();
     await seedRun(db, { id: "run-1", machineId, phase: "pending" });
-    expect(await coordinator.cancelRun("run-1")).toEqual({ canceled: true });
+    expect(await cancel("run-1")).toBe(true);
     expect((await snapshotRuns(db))[0]).toMatchObject({ phase: "canceled", ts: clock.iso() });
   });
 
@@ -97,9 +109,9 @@ describe("cancelRun primitive", () => {
     await seedRun(db, { id: "run-done", machineId, phase: "done", outcome: "exec" });
     await seedRun(db, { id: "run-canceled", machineId, phase: "canceled" });
     const before = await snapshotRuns(db);
-    expect(await coordinator.cancelRun("run-done")).toEqual({ canceled: false });
-    expect(await coordinator.cancelRun("run-canceled")).toEqual({ canceled: false });
-    expect(await coordinator.cancelRun("run-ghost")).toEqual({ canceled: false });
+    expect(await cancel("run-done")).toBe(false);
+    expect(await cancel("run-canceled")).toBe(false);
+    expect(await cancel("run-ghost")).toBe(false);
     expect(await snapshotRuns(db)).toEqual(before);
   });
 });
@@ -108,7 +120,7 @@ describe("reclaimStaleRun primitive (sweep-only)", () => {
   it("atomically errors the run and terminalizes the lease with the first now+24h window", async () => {
     await fresh();
     await seedActiveRun({ progress: { step: 2, label: "working" } });
-    expect(await coordinator.reclaimStaleRun("run-1")).toEqual({ reclaimed: true });
+    expect(await reclaim("run-1")).toBe(true);
 
     expect((await snapshotRuns(db))[0]).toMatchObject({
       phase: "error",
@@ -127,11 +139,11 @@ describe("reclaimStaleRun primitive (sweep-only)", () => {
   it("a repeat reclaim does NOT extend the first window", async () => {
     await fresh();
     await seedActiveRun();
-    await coordinator.reclaimStaleRun("run-1");
+    await reclaim("run-1");
     const first = (await snapshotLeases(db))[0]!;
 
     clock.advance(60_000);
-    expect(await coordinator.reclaimStaleRun("run-1")).toEqual({ reclaimed: false });
+    expect(await reclaim("run-1")).toBe(false);
     const again = (await snapshotLeases(db))[0]!;
     expect(again.expiresAt).toBe(first.expiresAt); // untouched first window
   });
@@ -144,7 +156,7 @@ describe("reclaimStaleRun primitive (sweep-only)", () => {
     const before = await snapshotRuns(db);
 
     for (const id of ["run-pending", "run-done", "run-failed", "run-ghost"]) {
-      expect(await coordinator.reclaimStaleRun(id)).toEqual({ reclaimed: false });
+      expect(await reclaim(id)).toBe(false);
     }
     expect(await snapshotRuns(db)).toEqual(before); // zero writes
     expect(await snapshotLeases(db)).toEqual([]); // no terminal-grace created
@@ -207,7 +219,7 @@ describe("transaction guards", () => {
 
     // The machine vanishes; the sweep reclaims the orphaned running run.
     clock.advance(15 * 60_000);
-    expect(await coordinator.reclaimStaleRun("run-1")).toEqual({ reclaimed: true });
+    expect(await reclaim("run-1")).toBe(true);
 
     // Still no re-dispatch — the run left the surface at claim time.
     const after = await coordinator.poll(TOKEN, {});
@@ -242,7 +254,7 @@ describe("transaction guards", () => {
     const reportPromise = coordinator.report(SEED_CRED, { ok: true, message: "too late" });
     await resolved;
     // The cancel's transaction commits FOR REAL while the report is parked.
-    expect(await coordinator.cancelRun("run-1")).toEqual({ canceled: true });
+    expect(await cancel("run-1")).toBe(true);
     openGate();
 
     // The report's in-transaction re-resolve catches the revoked capability:

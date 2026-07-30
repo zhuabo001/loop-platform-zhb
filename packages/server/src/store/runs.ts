@@ -197,6 +197,15 @@ export async function claimRunWithLeaseTx(
 
 // ---- lifecycle primitives (cancel / sweep reclaim) ----
 
+/** The deps the lifecycle primitives need — narrower than RunStoreDeps (no
+ *  id/credential factories). Their future adapters (owner cancel, Day 8–10
+ *  sweep orchestration) call them DIRECTLY: they are deliberately NOT on the
+ *  RunCoordinator interface (A-02). */
+export interface LifecycleStoreDeps {
+  db: Db;
+  clock: Clock;
+}
+
 /** How long a reclaimed run's terminal-grace lease stays alive to accept the
  *  ONE reconciling wake-report (a laptop can sleep overnight or a weekend). */
 export const TERMINAL_GRACE_MS = 24 * 60 * 60 * 1000;
@@ -208,7 +217,7 @@ export const TERMINAL_GRACE_MS = 24 * 60 * 60 * 1000;
  * live" window, so a late report always meets the unified 401). Terminal and
  * missing runs are a no-op. Returns whether the run transitioned.
  */
-export async function cancelRunTx(deps: RunStoreDeps, runId: string): Promise<boolean> {
+export async function cancelRunTx(deps: LifecycleStoreDeps, runId: string): Promise<boolean> {
   return deps.db.transaction(async (tx) => {
     const updated = await tx
       .update(runs)
@@ -251,7 +260,7 @@ export class ReclaimGuardLostError extends Error {
  * tests). Guards: only a `running` run reclaims (a repeat reclaim is a no-op
  * and can NEVER extend the first window), and only an `active` lease flips.
  */
-export async function reclaimStaleRunTx(deps: RunStoreDeps, runId: string): Promise<boolean> {
+export async function reclaimStaleRunTx(deps: LifecycleStoreDeps, runId: string): Promise<boolean> {
   return deps.db.transaction(async (tx) => {
     const now = deps.clock.now();
     const nowIso = now.toISOString();

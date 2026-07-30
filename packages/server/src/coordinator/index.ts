@@ -1,9 +1,13 @@
 /**
  * The RunCoordinator — the package-internal DEEP MODULE that owns every run
- * lifecycle write (plan §1). Adapters (owner/manual trigger, machine poll,
- * machine report — and the Phase 3 scheduler) each call exactly their own
- * method; the module interface is NOT the HTTP permission surface. Nothing
- * bypasses it to orchestrate the store directly.
+ * lifecycle write (plan §1). Its interface is EXACTLY three methods —
+ * `enqueueExecRun` / `poll` / `report` (A-02; pinned by a structural test):
+ * adapters (owner/manual trigger, machine poll, machine report — and the
+ * Phase 3 scheduler) each call exactly their own method, and the module
+ * interface is NOT the HTTP permission surface. Owner cancel and sweep
+ * reclaim stay STORE-level primitives (`cancelRunTx` / `reclaimStaleRunTx`)
+ * consumed directly by their future adapters — they are deliberately NOT on
+ * this interface.
  *
  * Dependencies are injected as ONE object:
  *  - `db`: a concrete Drizzle handle — open/migrate/close lifecycle belongs to
@@ -32,12 +36,10 @@ import { resolveLiveLease } from "../store/leases.js";
 import { applyMachinePollContact, getMachine, registerMachineOnPoll } from "../store/machines.js";
 import { executeReportTx, type ReportTxResult } from "../store/report.js";
 import {
-  cancelRunTx,
   claimRunWithLeaseTx,
   enqueueExecRunTx,
   getLoop,
   pendingExecRunsForMachine,
-  reclaimStaleRunTx,
   type EnqueueExecRunResult,
   type RunStoreDeps,
 } from "../store/runs.js";
@@ -161,19 +163,6 @@ export function createRunCoordinator(deps: RunCoordinatorDependencies) {
       if (!lease) throw new RunCapabilityInvalidError("unknown_or_expired");
       await deps.hooks?.afterReportResolve?.(tokenHash);
       return executeReportTx(deps, { tokenHash, body, insideTxHook: deps.hooks?.insideReportTx });
-    },
-
-    /** Owner cancel primitive (NO HTTP route in Phase 1): run → canceled and
-     *  lease deleted in one transaction. Terminal/missing runs are a no-op. */
-    async cancelRun(runId: string): Promise<{ canceled: boolean }> {
-      return { canceled: await cancelRunTx(deps, runId) };
-    },
-
-    /** Sweep-facing reclaim primitive: ONLY the sweep orchestration calls
-     *  this (a vanished machine's running run → error + terminal-grace
-     *  reconcile window, one transaction). Never wired to an HTTP route. */
-    async reclaimStaleRun(runId: string): Promise<{ reclaimed: boolean }> {
-      return { reclaimed: await reclaimStaleRunTx(deps, runId) };
     },
   };
 }
