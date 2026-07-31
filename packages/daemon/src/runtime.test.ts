@@ -12,7 +12,13 @@ import { describe, expect, it } from "vitest";
 
 import type { Delivery, PollRequest, ReportRequest } from "@loopzhb/protocol";
 
-import type { MachineClient, PollOutcome, ReportOutcome } from "./client.js";
+import {
+  createMachineClient,
+  type MachineClient,
+  type PollOutcome,
+  type ReportOutcome,
+  type SerializedReportRequest,
+} from "./client.js";
 import type { AgentRunner, RunnerReport } from "./runner.js";
 import {
   ERROR_CAP,
@@ -42,13 +48,15 @@ class StubClient implements MachineClient {
   pollQueue: PollOutcome[] = [];
   reportQueue: ReportOutcome[] = [];
   polls: PollRequest[] = [];
-  reports: { credential: string; body: ReportRequest }[] = [];
+  reports: { credential: string; body: SerializedReportRequest }[] = [];
+  reportJson: string[] = [];
   poll(body: PollRequest): Promise<PollOutcome> {
     this.polls.push(body);
     return Promise.resolve(this.pollQueue.shift() ?? { kind: "ok", deliveries: [] });
   }
-  report(credential: string, body: ReportRequest): Promise<ReportOutcome> {
+  report(credential: string, body: SerializedReportRequest): Promise<ReportOutcome> {
     this.reports.push({ credential, body });
+    this.reportJson.push(body.json);
     return Promise.resolve(this.reportQueue.shift() ?? { kind: "confirmed" });
   }
 }
@@ -93,16 +101,19 @@ function makeRuntime(overrides: Partial<Parameters<typeof createDaemonRuntime>[0
   const client = new StubClient();
   const clock = manualSleep();
   const logs: string[] = [];
-  const { runner, calls: runnerCalls } = captureRunner(overrides.runner ? undefined : undefined);
+  const selectedRunner = overrides.runner;
+  const { runner, calls: runnerCalls } = captureRunner(
+    selectedRunner ? (delivery, signal) => selectedRunner.run(delivery, signal) : undefined,
+  );
   const rt = createDaemonRuntime({
     client,
-    runner: overrides.runner ?? runner,
     identity: IDENTITY,
     pollMs: 3000,
     machineCredential: MACHINE_CRED,
     sleep: clock.sleep,
     log: (line) => logs.push(line),
     ...overrides,
+    runner,
   });
   return { rt, client, clock, logs, runnerCalls };
 }
@@ -117,14 +128,15 @@ describe("happy path", () => {
     expect(runnerCalls).toHaveLength(1);
     expect(runnerCalls[0]!.delivery.runId).toBe("run-1");
     expect(client.reports).toHaveLength(1);
-    expect(client.reports[0]).toEqual({ credential: "rk_tok_run-1", body: { ...OK_RUNNER, runId: "run-1" } });
+    expect(client.reports[0]!.credential).toBe("rk_tok_run-1");
+    expect(JSON.parse(client.reports[0]!.body.json)).toEqual({ ...OK_RUNNER, runId: "run-1" });
     expect(rt.inFlightCount()).toBe(0);
     expect(rt.pendingCount()).toBe(0);
     expect(logs.join("\n")).not.toContain("rk_tok_run-1");
     expect(logs.join("\n")).not.toContain(MACHINE_CRED);
   });
 
-  it("writes delivery.runId unconditionally, even over a Runner type-lie; the body is frozen", async () => {
+  it("writes delivery.runId unconditionally, even over a Runner type-lie", async () => {
     const { runner } = captureRunner(() =>
       Promise.resolve({ ...OK_RUNNER, runId: "evil" } as RunnerReport),
     );
@@ -133,12 +145,23 @@ describe("happy path", () => {
 
     await rt.pollOnce();
 
-    expect(client.reports[0]!.body.runId).toBe("run-1");
-    expect(Object.isFrozen(client.reports[0]!.body)).toBe(true);
+    const body = JSON.parse(client.reports[0]!.body.json) as ReportRequest;
+    expect(body.runId).toBe("run-1");
   });
 });
 
 describe("dedupe", () => {
+  it("executes a duplicated runId only once within one poll response", async () => {
+    const { rt, client, runnerCalls } = makeRuntime();
+    const sameDelivery = delivery("run-1");
+    client.pollQueue.push({ kind: "ok", deliveries: [sameDelivery, sameDelivery] });
+
+    await rt.pollOnce();
+
+    expect(runnerCalls).toHaveLength(1);
+    expect(client.reports).toHaveLength(1);
+  });
+
   it("a redelivered runId in inFlight or pendingReports never re-executes the Runner", async () => {
     const { rt, client, runnerCalls } = makeRuntime();
     client.pollQueue.push({ kind: "ok", deliveries: [delivery("run-1")] });
@@ -156,6 +179,24 @@ describe("dedupe", () => {
 });
 
 describe("report retry", () => {
+  it("retries the exact wire snapshot when the Runner mutates a retained nested reference", async () => {
+    const cost = { usd: 1 };
+    const { runner } = captureRunner(() => Promise.resolve({ ...OK_RUNNER, cost }));
+    const { rt, client, clock } = makeRuntime({ runner });
+    client.pollQueue.push({ kind: "ok", deliveries: [delivery("run-1")] });
+    client.reportQueue.push({ kind: "retry", reason: "HTTP 503" }, { kind: "confirmed" });
+
+    await rt.pollOnce();
+    cost.usd = 9;
+    clock.fireNext();
+    await flush();
+    await flush();
+
+    expect(client.reportJson).toHaveLength(2);
+    expect(client.reportJson[1]).toBe(client.reportJson[0]);
+    expect(JSON.parse(client.reportJson[1]!)).toMatchObject({ cost: { usd: 1 } });
+  });
+
   it("retries with the same credential/body on 1s→2s→4s backoff, without blocking poll", async () => {
     const { rt, client, clock } = makeRuntime();
     client.pollQueue.push({ kind: "ok", deliveries: [delivery("run-1")] });
@@ -223,6 +264,21 @@ describe("report retry", () => {
 });
 
 describe("Runner failure synthesis", () => {
+  it("turns a non-JSON-serializable Runner report into a safe failure report", async () => {
+    const { runner } = captureRunner(() => Promise.resolve({ ...OK_RUNNER, cursor: 1n }));
+    const { rt, client } = makeRuntime({ runner });
+    client.pollQueue.push({ kind: "ok", deliveries: [delivery("run-1")] });
+
+    await expect(rt.pollOnce()).resolves.toBeUndefined();
+
+    const body = JSON.parse(client.reports[0]!.body.json) as ReportRequest;
+    expect(body).toEqual({
+      runId: "run-1",
+      ok: false,
+      error: "runner returned a report that could not be serialized",
+    });
+  });
+
   it("Runner-thrown errors become { ok:false, error } — sanitized, capped, credential-free, NO outcome", async () => {
     const d = delivery("run-1");
     const { runner } = captureRunner(() =>
@@ -233,7 +289,7 @@ describe("Runner failure synthesis", () => {
 
     await rt.pollOnce();
 
-    const body = client.reports[0]!.body;
+    const body = JSON.parse(client.reports[0]!.body.json) as ReportRequest;
     expect(body.ok).toBe(false);
     expect(body).not.toHaveProperty("outcome");
     expect(body.error).toBeDefined();
@@ -271,6 +327,35 @@ describe("fatal classification", () => {
 });
 
 describe("shutdown", () => {
+  it("propagates shutdown through the runtime into an in-flight HTTP poll", async () => {
+    let markStarted: ((signal: AbortSignal) => void) | undefined;
+    const started = new Promise<AbortSignal>((resolve) => {
+      markStarted = resolve;
+    });
+    const client = createMachineClient({
+      baseUrl: "http://server.test",
+      machineCredential: MACHINE_CRED,
+      timeoutMs: 60_000,
+      fetchImpl: (_input, init) => {
+        const requestSignal = init?.signal as AbortSignal;
+        markStarted?.(requestSignal);
+        return new Promise<Response>((_resolve, reject) => {
+          requestSignal.addEventListener("abort", () => reject(requestSignal.reason), { once: true });
+        });
+      },
+    });
+    const { rt } = makeRuntime({ client });
+    const ctl = new AbortController();
+
+    const done = rt.run(ctl.signal);
+    const requestSignal = await started;
+    expect(requestSignal.aborted).toBe(false);
+
+    ctl.abort();
+    await expect(done).resolves.toBeUndefined();
+    expect(requestSignal.aborted).toBe(true);
+  });
+
   it("passes the daemon signal to the Runner; SIGINT resolves run() cleanly", async () => {
     const { rt, client, runnerCalls } = makeRuntime();
     client.pollQueue.push({ kind: "ok", deliveries: [delivery("run-1")] });

@@ -18,9 +18,9 @@
  *
  * Time is injectable (`sleep`) so tests drive the backoff deterministically.
  */
-import type { Delivery, PollRequest, ReportRequest } from "@loopzhb/protocol";
+import type { Delivery, PollRequest } from "@loopzhb/protocol";
 
-import type { MachineClient } from "./client.js";
+import { serializeReportRequest, type MachineClient, type SerializedReportRequest } from "./client.js";
 import type { AgentRunner, RunnerReport } from "./runner.js";
 
 export class FatalDaemonError extends Error {
@@ -38,8 +38,8 @@ export interface PendingReport {
   runId: string;
   /** The Delivery's opaque runToken, held only to re-send. */
   credential: string;
-  /** Frozen at construction — a retry sends byte-identical JSON. */
-  body: ReportRequest;
+  /** Serialized once at construction — every retry sends byte-identical JSON. */
+  body: SerializedReportRequest;
   /** Attempts made so far (the immediate first try counts as #1). */
   attempt: number;
 }
@@ -173,7 +173,19 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
     }
     // runId is the orchestration layer's, ALWAYS — a Runner-supplied value
     // (only possible via a type lie) is overwritten.
-    const body: ReportRequest = Object.freeze({ ...report, runId: delivery.runId });
+    let body: SerializedReportRequest;
+    try {
+      body = serializeReportRequest({ ...report, runId: delivery.runId });
+    } catch {
+      // `cursor` is intentionally unknown at the protocol seam and may contain
+      // a non-JSON value. Treat an unserializable return as a Runner failure so
+      // the claimed Run still reaches a terminal report.
+      body = serializeReportRequest({
+        runId: delivery.runId,
+        ok: false,
+        error: "runner returned a report that could not be serialized",
+      });
+    }
     const entry: PendingReport = { runId: delivery.runId, credential: delivery.runToken, body, attempt: 0 };
     pendingReports.set(entry.runId, entry);
     await attemptReport(entry);
@@ -186,9 +198,14 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
       log(`poll: ${outcome.reason} — next cycle`);
       return;
     }
+    const seenRunIds = new Set<string>();
     for (const delivery of outcome.deliveries) {
-      // Defensive dedupe across BOTH sets — the server never re-delivers a
-      // claimed run, but a redelivery must never re-execute the Runner.
+      // The protocol accepts a Delivery array, so defend against a duplicated
+      // runId within one response even if the first report confirms immediately.
+      if (seenRunIds.has(delivery.runId)) continue;
+      seenRunIds.add(delivery.runId);
+      // Across poll cycles, the server never re-delivers a claimed run; these
+      // two live sets cover the only legitimate unconfirmed windows.
       if (inFlight.has(delivery.runId) || pendingReports.has(delivery.runId)) continue;
       await execute(delivery);
       if (fatal) throw fatal;

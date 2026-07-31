@@ -8,7 +8,7 @@ import { describe, expect, it } from "vitest";
 
 import type { Delivery } from "@loopzhb/protocol";
 
-import { createMachineClient, type MachineClient } from "./client.js";
+import { createMachineClient, serializeReportRequest, type MachineClient } from "./client.js";
 
 const BASE = "http://server.test";
 const MACHINE_CRED = "dk_test_machine";
@@ -56,6 +56,7 @@ function delivery(runId: string): Delivery {
 
 const IDENTITY = { host: "h", platform: "linux", arch: "x64", version: "0.1.0" };
 const REPORT_BODY = { runId: "run-1", ok: true, outcome: "exec" as const, message: "m", durationMs: 0 };
+const REPORT_WIRE = serializeReportRequest(REPORT_BODY);
 
 describe("poll transport", () => {
   it("sends the exact URL, Bearer and flat identity body — never `wait`", async () => {
@@ -140,50 +141,51 @@ describe("report transport", () => {
 
   it("sends the exact URL, the opaque run credential as Bearer, and the immutable body", async () => {
     const { client, calls } = makeClient(() => Promise.resolve(json({ ok: true })));
-    const outcome = await client.report(RUN_CRED, REPORT_BODY);
+    const outcome = await client.report(RUN_CRED, REPORT_WIRE);
     expect(outcome).toEqual({ kind: "confirmed" });
     const { url, init } = calls[0]!;
     expect(url).toBe("http://server.test/api/machine/report");
     expect((init.headers as Record<string, string>).authorization).toBe(`Bearer ${RUN_CRED}`);
+    expect(init.body).toBe(REPORT_WIRE.json);
     expect(JSON.parse(String(init.body))).toEqual(REPORT_BODY);
   });
 
   it("a 2xx carrying `reconciled` is confirmed and otherwise ignored (Day-5 reader duty)", async () => {
     const { client } = makeClient(() => Promise.resolve(json({ ok: true, reconciled: true })));
-    expect(await client.report(RUN_CRED, REPORT_BODY)).toEqual({ kind: "confirmed" });
+    expect(await client.report(RUN_CRED, REPORT_WIRE)).toEqual({ kind: "confirmed" });
   });
 
   it("malformed 2xx is RETRY (server may have consumed the lease; re-report reaches coded 401)", async () => {
     const { client } = makeClient(() => Promise.resolve(json({ nope: true })));
-    expect((await client.report(RUN_CRED, REPORT_BODY)).kind).toBe("retry");
+    expect((await client.report(RUN_CRED, REPORT_WIRE)).kind).toBe("retry");
     const notJson = makeClient(() => Promise.resolve(new Response("garbage", { status: 200 })));
-    expect((await notJson.client.report(RUN_CRED, REPORT_BODY)).kind).toBe("retry");
+    expect((await notJson.client.report(RUN_CRED, REPORT_WIRE)).kind).toBe("retry");
   });
 
   it("401 + run_capability_invalid is the TERMINAL confirmation", async () => {
     const { client } = makeClient(() =>
       Promise.resolve(json({ error: "invalid or expired run capability", code: "run_capability_invalid" }, 401)),
     );
-    expect(await client.report(RUN_CRED, REPORT_BODY)).toEqual({ kind: "confirmed" });
+    expect(await client.report(RUN_CRED, REPORT_WIRE)).toEqual({ kind: "confirmed" });
   });
 
   it("401 without the code (or unparseable) is FATAL", async () => {
     const noCode = makeClient(() => Promise.resolve(json({ error: "nope" }, 401)));
-    expect((await noCode.client.report(RUN_CRED, REPORT_BODY)).kind).toBe("fatal");
+    expect((await noCode.client.report(RUN_CRED, REPORT_WIRE)).kind).toBe("fatal");
     const wrongCode = makeClient(() => Promise.resolve(json({ error: "nope", code: "other" }, 401)));
-    expect((await wrongCode.client.report(RUN_CRED, REPORT_BODY)).kind).toBe("fatal");
+    expect((await wrongCode.client.report(RUN_CRED, REPORT_WIRE)).kind).toBe("fatal");
     const garbage = makeClient(() => Promise.resolve(new Response("garbage", { status: 401 })));
-    expect((await garbage.client.report(RUN_CRED, REPORT_BODY)).kind).toBe("fatal");
+    expect((await garbage.client.report(RUN_CRED, REPORT_WIRE)).kind).toBe("fatal");
   });
 
   it("408/429/5xx retry; other 4xx are fatal; reasons never carry the credential", async () => {
     for (const status of [408, 429, 500, 502]) {
       const { client } = makeClient(() => Promise.resolve(json({ error: "x" }, status)));
-      expect((await client.report(RUN_CRED, REPORT_BODY)).kind, String(status)).toBe("retry");
+      expect((await client.report(RUN_CRED, REPORT_WIRE)).kind, String(status)).toBe("retry");
     }
     for (const status of [400, 403, 404]) {
       const { client } = makeClient(() => Promise.resolve(json({ error: "x" }, status)));
-      const outcome = await client.report(RUN_CRED, REPORT_BODY);
+      const outcome = await client.report(RUN_CRED, REPORT_WIRE);
       expect(outcome.kind, String(status)).toBe("fatal");
       expect(JSON.stringify(outcome)).not.toContain(RUN_CRED);
     }
@@ -191,7 +193,7 @@ describe("report transport", () => {
 
   it("network failure and timeout are retry", async () => {
     const { client } = makeClient(() => Promise.reject(new TypeError("fetch failed")));
-    expect((await client.report(RUN_CRED, REPORT_BODY)).kind).toBe("retry");
+    expect((await client.report(RUN_CRED, REPORT_WIRE)).kind).toBe("retry");
     const slow = makeClient(
       (_url, init) =>
         new Promise<Response>((_resolve, reject) => {
@@ -200,6 +202,6 @@ describe("report transport", () => {
         }),
       20,
     );
-    expect((await slow.client.report(RUN_CRED, REPORT_BODY)).kind).toBe("retry");
+    expect((await slow.client.report(RUN_CRED, REPORT_WIRE)).kind).toBe("retry");
   });
 });

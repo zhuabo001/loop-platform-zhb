@@ -25,17 +25,13 @@ import {
   pollResponseSchema,
   reportResponseSchema,
   apiErrorSchema,
+  RUN_CAPABILITY_INVALID_CODE,
   type Delivery,
   type PollRequest,
   type ReportRequest,
 } from "@loopzhb/protocol";
 
 export const REQUEST_TIMEOUT_MS = 10_000;
-
-/** 401 + this code is the report's TERMINAL confirmation (ADR-001): the lease
- *  is consumed/revoked — the report's outcome already happened (or never
- *  will); either way the daemon stops retrying this exact body. */
-export const RUN_CAPABILITY_INVALID = "run_capability_invalid";
 
 export type PollOutcome =
   | { kind: "ok"; deliveries: Delivery[] }
@@ -47,11 +43,22 @@ export type ReportOutcome =
   | { kind: "retry"; reason: string }
   | { kind: "fatal"; reason: string };
 
+/** A ReportRequest captured once at the runtime/client boundary. Retries reuse
+ *  this exact string, so later mutations of Runner-owned references cannot
+ *  change the wire body. */
+export interface SerializedReportRequest {
+  readonly json: string;
+}
+
+export function serializeReportRequest(body: ReportRequest): SerializedReportRequest {
+  return Object.freeze({ json: JSON.stringify(body) });
+}
+
 export interface MachineClient {
   poll(body: PollRequest, signal?: AbortSignal): Promise<PollOutcome>;
   /** `credential` is the Delivery's OPAQUE runToken — echoed as-is, never
    *  shape-checked or logged (ADR-002 reader-side opacity). */
-  report(credential: string, body: ReportRequest, signal?: AbortSignal): Promise<ReportOutcome>;
+  report(credential: string, body: SerializedReportRequest, signal?: AbortSignal): Promise<ReportOutcome>;
 }
 
 export interface MachineClientDeps {
@@ -72,7 +79,7 @@ function isTransientStatus(status: number): boolean {
 /** 2xx body that fails the wire schema (or isn't JSON at all). */
 const MALFORMED = Symbol("malformed");
 
-async function parse2xx(res: Response): Promise<unknown | typeof MALFORMED> {
+async function tryParseJsonResponse(res: Response): Promise<unknown | typeof MALFORMED> {
   try {
     return await res.json();
   } catch {
@@ -89,7 +96,7 @@ export function createMachineClient(deps: MachineClientDeps): MachineClient {
   async function post(
     path: string,
     credential: string,
-    body: unknown,
+    bodyJson: string,
     outer: AbortSignal | undefined,
   ): Promise<{ ok: true; res: Response } | { ok: false; reason: string }> {
     const timeout = AbortSignal.timeout(timeoutMs);
@@ -101,7 +108,7 @@ export function createMachineClient(deps: MachineClientDeps): MachineClient {
           "content-type": "application/json",
           authorization: `Bearer ${credential}`,
         },
-        body: JSON.stringify(body),
+        body: bodyJson,
         signal,
       });
       return { ok: true, res };
@@ -114,11 +121,11 @@ export function createMachineClient(deps: MachineClientDeps): MachineClient {
 
   return {
     async poll(body, signal) {
-      const r = await post("/api/machine/poll", deps.machineCredential, body, signal);
+      const r = await post("/api/machine/poll", deps.machineCredential, JSON.stringify(body), signal);
       if (!r.ok) return { kind: "transient", reason: r.reason };
       const res = r.res;
       if (res.ok) {
-        const raw = await parse2xx(res);
+        const raw = await tryParseJsonResponse(res);
         const parsed = raw === MALFORMED ? undefined : pollResponseSchema.safeParse(raw);
         if (!parsed?.success) {
           return { kind: "fatal", reason: "malformed poll 2xx (a claim may already have happened; cannot recover)" };
@@ -131,11 +138,11 @@ export function createMachineClient(deps: MachineClientDeps): MachineClient {
     },
 
     async report(credential, body, signal) {
-      const r = await post("/api/machine/report", credential, body, signal);
+      const r = await post("/api/machine/report", credential, body.json, signal);
       if (!r.ok) return { kind: "retry", reason: r.reason };
       const res = r.res;
       if (res.ok) {
-        const raw = await parse2xx(res);
+        const raw = await tryParseJsonResponse(res);
         const parsed = raw === MALFORMED ? undefined : reportResponseSchema.safeParse(raw);
         if (!parsed?.success) {
           return {
@@ -148,9 +155,9 @@ export function createMachineClient(deps: MachineClientDeps): MachineClient {
         return { kind: "confirmed" };
       }
       if (res.status === 401) {
-        const raw = await parse2xx(res);
+        const raw = await tryParseJsonResponse(res);
         const parsed = raw === MALFORMED ? undefined : apiErrorSchema.safeParse(raw);
-        if (parsed?.success && parsed.data.code === RUN_CAPABILITY_INVALID) return { kind: "confirmed" };
+        if (parsed?.success && parsed.data.code === RUN_CAPABILITY_INVALID_CODE) return { kind: "confirmed" };
         return { kind: "fatal", reason: "report 401 without run_capability_invalid code (protocol error)" };
       }
       if (isTransientStatus(res.status)) return { kind: "retry", reason: `report HTTP ${res.status}` };
