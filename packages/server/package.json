@@ -21,8 +21,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "start": "node --enable-source-maps dist/start.js",
-    "typecheck": "pnpm --filter @loopzhb/protocol build && tsc --noEmit",
-    "test": "pnpm --filter @loopzhb/protocol build && vitest run",
+    "typecheck": "pnpm --filter @loopzhb/protocol build && pnpm --filter @loopzhb/daemon build && tsc --noEmit",
+    "test": "pnpm --filter @loopzhb/protocol build && pnpm --filter @loopzhb/daemon build && vitest run",
     "db:generate": "drizzle-kit generate",
     "db:check": "drizzle-kit generate && git diff --exit-code -- drizzle/"
   },
@@ -34,6 +34,7 @@
     "hono": "^4.12.32"
   },
   "devDependencies": {
+    "@loopzhb/daemon": "workspace:*",
     "@types/node": "^25.9.3",
     "drizzle-kit": "^0.31.10",
     "typescript": "^6.0.3",
