@@ -1,0 +1,31 @@
+{
+  "name": "@loopzhb/daemon",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Loop-platform-zhb machine daemon (Phase 1 Day 5): short-poll claim → Fake Runner → report, with in-process retry of unconfirmed reports. Production dependency surface is @loopzhb/protocol only; HTTP is Node 22 native fetch. See docs/goal/day5-daemon-fake-runner.md and docs/handoff/codex-handoff-day5-plan.md.",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node --enable-source-maps dist/cli.js",
+    "typecheck": "pnpm --filter @loopzhb/protocol build && tsc --noEmit",
+    "test": "pnpm --filter @loopzhb/protocol build && vitest run"
+  },
+  "dependencies": {
+    "@loopzhb/protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9"
+  }
+}
