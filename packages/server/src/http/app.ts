@@ -19,7 +19,7 @@
 import { bodyLimit } from "hono/body-limit";
 import { Hono, type Context } from "hono";
 
-import { pollRequestSchema, reportRequestSchema } from "@loopzhb/protocol";
+import { pollRequestSchema, reportRequestSchema, RUN_CAPABILITY_INVALID_CODE } from "@loopzhb/protocol";
 
 import { InvalidMachineCredentialError, RunCapabilityInvalidError } from "../coordinator/errors.js";
 import type { RunCoordinator } from "../coordinator/index.js";
@@ -99,7 +99,7 @@ export function createServerApp(coordinator: RunCoordinator): Hono {
     } catch (err) {
       if (err instanceof RunCapabilityInvalidError) {
         console.warn("[http] report capability denied", err.reason);
-        return jsonError(c, 401, "invalid or expired run capability", "run_capability_invalid");
+        return jsonError(c, 401, "invalid or expired run capability", RUN_CAPABILITY_INVALID_CODE);
       }
       throw err;
     }

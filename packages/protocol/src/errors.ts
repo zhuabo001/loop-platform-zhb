@@ -15,6 +15,10 @@
  */
 import { z } from "zod";
 
+/** The one machine-readable code whose semantics are fixed in Phase 1: a Run
+ *  Capability is permanently invalid, so a daemon must stop reporting with it. */
+export const RUN_CAPABILITY_INVALID_CODE = "run_capability_invalid" as const;
+
 export const apiErrorSchema = z.object({
   error: z.string(),
   code: z.string().optional(),
