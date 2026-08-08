@@ -121,6 +121,13 @@ export const createLoopResponseSchema = z.object({
 });
 export type CreateLoopResponse = z.infer<typeof createLoopResponseSchema>;
 
+/** POST /api/loops/:id/run — currently NO business params: `{}` (and the
+ *  empty body, normalized to `{}` at the HTTP edge) is the whole request;
+ *  unknown keys strip away. Future trigger options arrive as additive
+ *  optional fields only (ADR-002 演进只增不减). */
+export const triggerRunRequestSchema = z.object({});
+export type TriggerRunRequest = z.infer<typeof triggerRunRequestSchema>;
+
 /** POST /api/loops/:id/run — 202 when enqueued, 200 no-op while a run is
  *  running. (`loop_not_found` never rides this body: it is the flat 404.) */
 export const triggerRunResponseSchema = z.union([

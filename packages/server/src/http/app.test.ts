@@ -11,18 +11,28 @@
  */
 import { afterEach, describe, expect, it } from "vitest";
 
-import { apiErrorSchema, deliverySchema, pollResponseSchema, reportResponseSchema } from "@loopzhb/protocol";
+import {
+  apiErrorSchema,
+  createLoopResponseSchema,
+  deliverySchema,
+  pollResponseSchema,
+  reportResponseSchema,
+  triggerRunResponseSchema,
+} from "@loopzhb/protocol";
 import { sha256 } from "@loopzhb/protocol/node";
 import { eq } from "drizzle-orm";
 
+import { createLoopAdmin, type LoopAdmin } from "../admin/index.js";
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
 import { machines } from "../db/schema.js";
 import {
   FakeClock,
   seedLease,
   seedLoop,
+  seedMachine,
   seedMachineForToken,
   seedRun,
+  snapshotLoops,
   snapshotRuns,
   testDeps,
 } from "../testkit/index.js";
@@ -30,6 +40,7 @@ import { createRunCoordinator, type RunCoordinator } from "../coordinator/index.
 import { createServerApp } from "./app.js";
 
 const TOKEN = "dk_test_machine_alpha";
+const MACHINE_ID = "m-0123456789abcdef";
 
 const handles: DbHandle[] = [];
 afterEach(async () => {
@@ -37,15 +48,20 @@ afterEach(async () => {
 });
 
 let db: Db;
+let clock: FakeClock;
 let coordinator: RunCoordinator;
+let admin: LoopAdmin;
 let app: ReturnType<typeof createServerApp>;
 
 async function fresh(): Promise<void> {
   const h = await openMigratedDb();
   handles.push(h);
   db = h.db;
-  coordinator = createRunCoordinator(testDeps(db, new FakeClock()));
-  app = createServerApp(coordinator);
+  clock = new FakeClock();
+  coordinator = createRunCoordinator(testDeps(db, clock));
+  let loopN = 0;
+  admin = createLoopAdmin({ db, clock, newLoopId: () => `loop-${++loopN}` });
+  app = createServerApp(coordinator, admin);
 }
 
 async function pollReq(body: unknown = {}, token: string | null = TOKEN): Promise<Response> {
@@ -70,6 +86,23 @@ async function reportReq(body: unknown = { ok: true }, token: string | null = "r
   });
 }
 
+async function createLoopReq(body: unknown): Promise<Response> {
+  return app.request("/api/loops", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: typeof body === "string" ? body : JSON.stringify(body),
+  });
+}
+
+/** `body` ABSENT means no request body at all (the empty-body case). */
+async function triggerReq(loopId: string, body?: unknown): Promise<Response> {
+  return app.request(`/api/loops/${loopId}/run`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    ...(body === undefined ? {} : { body: typeof body === "string" ? body : JSON.stringify(body) }),
+  });
+}
+
 async function expectJsonError(res: Response, status: number, body: { error: string; code?: string }): Promise<void> {
   expect(res.status).toBe(status);
   expect(res.headers.get("content-type")).toMatch(/application\/json/);
@@ -81,7 +114,7 @@ async function expectJsonError(res: Response, status: number, body: { error: str
 describe("createServerApp: seam properties", () => {
   it("returns an independent app per call and constructs with no DB/env/listener side effects", async () => {
     await fresh();
-    const other = createServerApp(coordinator);
+    const other = createServerApp(coordinator, admin);
     expect(other).not.toBe(app);
     // Both serve independently.
     expect((await app.request("/api/machine/poll", { method: "GET" })).status).toBe(404);
@@ -204,6 +237,160 @@ describe("POST /api/machine/report", () => {
   });
 });
 
+describe("POST /api/loops", () => {
+  it("201 with a schema-valid LoopSummary for a registered machine — and NO run", async () => {
+    await fresh();
+    await seedMachine(db, MACHINE_ID);
+    const res = await createLoopReq({
+      machineId: MACHINE_ID,
+      name: "react-doctor",
+      workdir: "/home/dev/project",
+    });
+    expect(res.status).toBe(201);
+    const json = await res.json();
+    expect(createLoopResponseSchema.parse(json)).toBeTruthy();
+    expect(json).toEqual({
+      loop: {
+        id: "loop-1",
+        machineId: MACHINE_ID,
+        name: "react-doctor",
+        workdir: "/home/dev/project",
+        taskFile: null,
+        agent: "claude-code",
+        allowControl: true,
+        enabled: true,
+        createdAt: clock.iso(),
+        updatedAt: clock.iso(),
+        lastRun: null,
+      },
+    });
+    expect(await snapshotLoops(db)).toHaveLength(1);
+    // Creation NEVER enqueues (goal: 创建与触发分离; HTTP 重试不得产生隐式 Run).
+    expect(await snapshotRuns(db)).toEqual([]);
+  });
+
+  it("404 + zero writes for a well-shaped but unregistered machine", async () => {
+    await fresh();
+    const res = await createLoopReq({ machineId: "m-ffffffffffffffff" });
+    await expectJsonError(res, 404, { error: "not found" });
+    expect(await snapshotLoops(db)).toEqual([]);
+  });
+
+  it("400 for malformed JSON and every non-object JSON, all zero-write", async () => {
+    await fresh();
+    for (const body of ["{", "[1,2]", '"str"', "null", "42"]) {
+      await expectJsonError(await createLoopReq(body), 400, { error: "invalid request" });
+    }
+    expect(await snapshotLoops(db)).toEqual([]);
+  });
+
+  it("400 for malformed machineId, empty/NUL strings and over-cap fields", async () => {
+    await fresh();
+    await seedMachine(db, MACHINE_ID);
+    const bad = [
+      { machineId: "m-UPPERCASED789AB" }, // not m-<16 lowercase hex>
+      { machineId: "" },
+      { machineId: MACHINE_ID, name: "" },
+      { machineId: MACHINE_ID, name: "a\0b" },
+      { machineId: MACHINE_ID, workdir: "\0" },
+      { machineId: MACHINE_ID, name: "n".repeat(256) },
+      { machineId: MACHINE_ID, workdir: "/".repeat(4097) },
+      { machineId: MACHINE_ID, taskFile: "t".repeat(4097) },
+    ];
+    for (const body of bad) {
+      await expectJsonError(await createLoopReq(body), 400, { error: "invalid request" });
+    }
+    expect(await snapshotLoops(db)).toEqual([]);
+  });
+
+  it("strips not-yet-open fields — the row keeps Phase-1 fixed defaults (ADR-002 决策 6)", async () => {
+    await fresh();
+    await seedMachine(db, MACHINE_ID);
+    const res = await createLoopReq({
+      machineId: MACHINE_ID,
+      workflow: "return true",
+      model: "claude-opus",
+      agent: "codex",
+      enabled: false,
+      state: { hijack: true },
+    });
+    expect(res.status).toBe(201);
+    const parsed = createLoopResponseSchema.parse(await res.json());
+    expect(parsed.loop).toMatchObject({ agent: "claude-code", allowControl: true, enabled: true });
+    const rows = await snapshotLoops(db);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ agent: "claude-code", enabled: true, workflow: null, model: null, state: null });
+  });
+
+  it("413 over the shared 2 MiB body cap", async () => {
+    await fresh();
+    await seedMachine(db, MACHINE_ID);
+    const res = await createLoopReq({ machineId: MACHINE_ID, name: "x".repeat(2 * 1024 * 1024) });
+    await expectJsonError(res, 413, { error: "request body too large" });
+    expect(await snapshotLoops(db)).toEqual([]);
+  });
+});
+
+describe("POST /api/loops/:id/run", () => {
+  it("202 enqueues exactly one pending exec run (empty body normalizes to {})", async () => {
+    await fresh();
+    await seedMachine(db, "m-test");
+    await seedLoop(db, { id: "loop-1" });
+    const res = await triggerReq("loop-1"); // NO body at all
+    expect(res.status).toBe(202);
+    const json = await res.json();
+    expect(triggerRunResponseSchema.parse(json)).toBeTruthy();
+    expect(json).toEqual({ enqueued: true, runId: "run-1", supersededRunIds: [] });
+    const rows = await snapshotRuns(db);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ id: "run-1", loopId: "loop-1", phase: "pending", role: "exec", ts: clock.iso() });
+  });
+
+  it("inherits T7 over HTTP: re-trigger atomically supersedes the stale pending run", async () => {
+    await fresh();
+    await seedMachine(db, "m-test");
+    await seedLoop(db, { id: "loop-1" });
+    await triggerReq("loop-1", {});
+    // Unknown keys strip away; the second trigger supersedes the first.
+    const res = await triggerReq("loop-1", { futureField: 1 });
+    expect(res.status).toBe(202);
+    expect(await res.json()).toEqual({ enqueued: true, runId: "run-2", supersededRunIds: ["run-1"] });
+    const byId = new Map((await snapshotRuns(db)).map((r) => [r.id, r]));
+    expect(byId.get("run-1")).toMatchObject({ phase: "canceled", outcome: "skipped" });
+    expect(byId.get("run-2")).toMatchObject({ phase: "pending" });
+  });
+
+  it("200 no-op with zero writes while a run is running", async () => {
+    await fresh();
+    await seedMachine(db, "m-test");
+    await seedLoop(db, { id: "loop-1" });
+    await seedRun(db, { id: "run-live", phase: "running" });
+    const before = await snapshotRuns(db);
+    const res = await triggerReq("loop-1", {});
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(triggerRunResponseSchema.parse(json)).toBeTruthy();
+    expect(json).toEqual({ enqueued: false, reason: "running_exists" });
+    expect(await snapshotRuns(db)).toEqual(before);
+  });
+
+  it("404 + zero writes for an unknown loop", async () => {
+    await fresh();
+    await expectJsonError(await triggerReq("loop-nope", {}), 404, { error: "not found" });
+    expect(await snapshotRuns(db)).toEqual([]);
+  });
+
+  it("400 for malformed or non-object JSON, zero writes", async () => {
+    await fresh();
+    await seedMachine(db, "m-test");
+    await seedLoop(db, { id: "loop-1" });
+    for (const body of ["{", "[1]", '"str"', "null"]) {
+      await expectJsonError(await triggerReq("loop-1", body), 400, { error: "invalid request" });
+    }
+    expect(await snapshotRuns(db)).toEqual([]);
+  });
+});
+
 describe("unified error surface", () => {
   it("404 + not found as JSON (never Hono's default text) for unknown routes and methods", async () => {
     await fresh();
@@ -213,12 +400,15 @@ describe("unified error surface", () => {
 
   it("500 + internal server error without leaking exception, stack or DB details", async () => {
     await fresh();
-    const sabotaged = createServerApp({
-      ...coordinator,
-      poll: () => {
-        throw new Error("pg connection failed: password=hunter2 at db.internal:5432");
+    const sabotaged = createServerApp(
+      {
+        ...coordinator,
+        poll: () => {
+          throw new Error("pg connection failed: password=hunter2 at db.internal:5432");
+        },
       },
-    });
+      admin,
+    );
     const res = await sabotaged.request("/api/machine/poll", {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${TOKEN}` },
