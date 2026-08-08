@@ -134,6 +134,16 @@ export function createServerApp(coordinator: RunCoordinator, admin: LoopAdmin): 
 
   // ---- local management routes (no credential — Phase 1 loopback boundary) ----
 
+  app.get("/api/machines", async (c) => c.json({ machines: await admin.listMachines() }));
+
+  app.get("/api/loops", async (c) => c.json({ loops: await admin.listLoops() }));
+
+  app.get("/api/loops/:id/runs", async (c) => {
+    const list = await admin.listRuns(c.req.param("id"));
+    if (list === undefined) return jsonError(c, 404, "not found");
+    return c.json({ runs: list });
+  });
+
   app.post("/api/loops", cap, async (c) => {
     const raw = await parseJsonBody(c);
     if (raw === undefined) return jsonError(c, 400, "invalid request");

@@ -16,19 +16,28 @@
  */
 import { randomUUID } from "node:crypto";
 
-import type { CreateLoopRequest, LoopSummary } from "@loopzhb/protocol";
+import { and, asc, desc, eq, inArray } from "drizzle-orm";
+
+import type { CreateLoopRequest, LoopSummary, MachineSummary, RunSummary } from "@loopzhb/protocol";
 
 import type { Db } from "../db/index.js";
-import { loops } from "../db/schema.js";
+import { loops, machines, runs, type Run } from "../db/schema.js";
 import { getMachine } from "../store/machines.js";
 import { getLoop } from "../store/runs.js";
 import type { Clock } from "../time.js";
 import { LoopValidationError } from "./errors.js";
-import { toLoopSummary } from "./views.js";
+import { toLoopSummary, toMachineSummary, toRunSummary } from "./views.js";
 
 /** Server-side length ceilings (goal §2). Exceeding ⇒ LoopValidationError. */
 export const LOOP_NAME_CAP = 255;
 export const LOOP_PATH_CAP = 4096;
+
+/** Observation-surface page caps (goal §4): fixed, no pagination params in
+ *  Phase 1. The SQL ORDER BY lands BEFORE the LIMIT — sort-then-truncate is
+ *  pinned by tests. */
+export const MACHINE_LIST_CAP = 100;
+export const LOOP_LIST_CAP = 100;
+export const RUN_LIST_CAP = 50;
 
 export interface LoopAdminDeps {
   db: Db;
@@ -93,6 +102,68 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
     /** Existence check for routes that 404 on an unknown loop. */
     async loopExists(loopId: string): Promise<boolean> {
       return (await getLoop(deps.db, loopId)) !== undefined;
+    },
+
+    /** `name ASC, id ASC`, capped — the machine picker for loop creation. */
+    async listMachines(): Promise<MachineSummary[]> {
+      const rows = await deps.db
+        .select()
+        .from(machines)
+        .orderBy(asc(machines.name), asc(machines.id))
+        .limit(MACHINE_LIST_CAP);
+      return rows.map(toMachineSummary);
+    },
+
+    /**
+     * `updatedAt DESC, id ASC`, capped. Each loop's `lastRun` is its latest
+     * EXEC run by `ts DESC, id DESC` (one extra ordered query for the page's
+     * loops; first row per loop wins). Non-exec roles never appear — they are
+     * Phase 3's surface, and `ts` is the last TRANSITION time (ADR-003 决策 6),
+     * so a run re-enters the top of the list after every lifecycle write.
+     */
+    async listLoops(): Promise<LoopSummary[]> {
+      const loopRows = await deps.db
+        .select()
+        .from(loops)
+        .orderBy(desc(loops.updatedAt), asc(loops.id))
+        .limit(LOOP_LIST_CAP);
+      if (loopRows.length === 0) return [];
+
+      const runRows = await deps.db
+        .select()
+        .from(runs)
+        .where(
+          and(
+            inArray(
+              runs.loopId,
+              loopRows.map((l) => l.id),
+            ),
+            eq(runs.role, "exec"),
+          ),
+        )
+        .orderBy(desc(runs.ts), desc(runs.id));
+      const latestByLoop = new Map<string, Run>();
+      for (const row of runRows) {
+        if (!latestByLoop.has(row.loopId)) latestByLoop.set(row.loopId, row);
+      }
+      return loopRows.map((row) => {
+        const lastRun = latestByLoop.get(row.id);
+        return toLoopSummary(row, lastRun ? toRunSummary(lastRun) : null);
+      });
+    },
+
+    /** `ts DESC, id DESC`, capped; `undefined` when the loop does not exist
+     *  (the route's 404). All phases/roles are listed — superseded
+     *  (`canceled/skipped`) runs stay visible (goal §4). */
+    async listRuns(loopId: string): Promise<RunSummary[] | undefined> {
+      if ((await getLoop(deps.db, loopId)) === undefined) return undefined;
+      const rows = await deps.db
+        .select()
+        .from(runs)
+        .where(eq(runs.loopId, loopId))
+        .orderBy(desc(runs.ts), desc(runs.id))
+        .limit(RUN_LIST_CAP);
+      return rows.map(toRunSummary);
     },
   };
 }

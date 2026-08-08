@@ -15,8 +15,11 @@ import {
   apiErrorSchema,
   createLoopResponseSchema,
   deliverySchema,
+  loopListResponseSchema,
+  machineListResponseSchema,
   pollResponseSchema,
   reportResponseSchema,
+  runListResponseSchema,
   triggerRunResponseSchema,
 } from "@loopzhb/protocol";
 import { sha256 } from "@loopzhb/protocol/node";
@@ -388,6 +391,108 @@ describe("POST /api/loops/:id/run", () => {
       await expectJsonError(await triggerReq("loop-1", body), 400, { error: "invalid request" });
     }
     expect(await snapshotRuns(db)).toEqual([]);
+  });
+});
+
+describe("GET observation surface", () => {
+  it("GET /api/machines returns schema-valid summaries without tokenHash/roots", async () => {
+    await fresh();
+    await db.insert(machines).values({
+      id: MACHINE_ID,
+      name: "mbp",
+      tokenHash: "secret-hash-must-not-leak",
+      roots: ["/secret/root"],
+      hostname: "mbp.local",
+      createdAt: "2026-07-01T00:00:00.000Z",
+    });
+    const res = await app.request("/api/machines");
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).not.toContain("secret-hash-must-not-leak");
+    expect(text).not.toContain("/secret/root");
+    const json = machineListResponseSchema.parse(JSON.parse(text));
+    expect(json.machines).toEqual([
+      {
+        id: MACHINE_ID,
+        name: "mbp",
+        hostname: "mbp.local",
+        platform: null,
+        arch: null,
+        daemonVersion: null,
+        lastSeen: null,
+        createdAt: "2026-07-01T00:00:00.000Z",
+      },
+    ]);
+  });
+
+  it("GET /api/loops returns schema-valid summaries with lastRun, no unopened fields", async () => {
+    await fresh();
+    await seedMachine(db, "m-test");
+    await seedLoop(db, {
+      id: "loop-1",
+      workflow: "secret-js-body",
+      state: { secret: "cursor" },
+      taskFileContent: "secret-doc",
+    });
+    await seedRun(db, {
+      id: "run-1",
+      loopId: "loop-1",
+      phase: "done",
+      outcome: "exec",
+      message: "fake runner completed",
+      durationMs: 7,
+      ts: "2026-07-01T00:00:01.000Z",
+    });
+    const res = await app.request("/api/loops");
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    for (const leak of ["secret-js-body", "secret-doc", "cursor"]) {
+      expect(text).not.toContain(leak);
+    }
+    const json = loopListResponseSchema.parse(JSON.parse(text));
+    expect(json.loops).toEqual([
+      {
+        id: "loop-1",
+        machineId: "m-test",
+        name: null,
+        workdir: null,
+        taskFile: null,
+        agent: "claude-code",
+        allowControl: true,
+        enabled: true,
+        createdAt: "2026-07-01T00:00:00.000Z",
+        updatedAt: "2026-07-01T00:00:00.000Z",
+        lastRun: {
+          id: "run-1",
+          loopId: "loop-1",
+          machineId: "m-test",
+          phase: "done",
+          role: "exec",
+          ts: "2026-07-01T00:00:01.000Z",
+          outcome: "exec",
+          status: null,
+          message: "fake runner completed",
+          error: null,
+          durationMs: 7,
+          progress: null,
+        },
+      },
+    ]);
+  });
+
+  it("GET /api/loops/:id/runs returns schema-valid runs; 404 for an unknown loop", async () => {
+    await fresh();
+    await seedMachine(db, "m-test");
+    await seedLoop(db, { id: "loop-1" });
+    await seedRun(db, { id: "run-1", loopId: "loop-1", ts: "2026-07-01T00:00:01.000Z" });
+
+    const res = await app.request("/api/loops/loop-1/runs");
+    expect(res.status).toBe(200);
+    const json = runListResponseSchema.parse(await res.json());
+    expect(json.runs).toHaveLength(1);
+    expect(json.runs[0]).toMatchObject({ id: "run-1", loopId: "loop-1", phase: "pending" });
+
+    await expectJsonError(await app.request("/api/loops/loop-nope/runs"), 404, { error: "not found" });
   });
 });
 

@@ -8,9 +8,22 @@
  * explicit `null`, never an omitted key — e.g. the stored progress row's
  * optional `at` becomes `at: null`.
  */
-import type { LoopSummary, RunSummary } from "@loopzhb/protocol";
+import type { LoopSummary, MachineSummary, RunSummary } from "@loopzhb/protocol";
 
-import type { Loop, Run } from "../db/schema.js";
+import type { Loop, Machine, Run } from "../db/schema.js";
+
+export function toMachineSummary(row: Machine): MachineSummary {
+  return {
+    id: row.id,
+    name: row.name,
+    hostname: row.hostname,
+    platform: row.platform,
+    arch: row.arch,
+    daemonVersion: row.daemonVersion,
+    lastSeen: row.lastSeen,
+    createdAt: row.createdAt,
+  };
+}
 
 export function toRunSummary(row: Run): RunSummary {
   return {
