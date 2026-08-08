@@ -12,8 +12,21 @@ import type { LoopSummary, MachineSummary, RunSummary } from "@loopzhb/protocol"
 
 import type { Loop, Machine, Run } from "../db/schema.js";
 
-/** The deliberately narrow row shape observation queries may load. Large or
- *  unopened Run columns are excluded before data leaves the database. */
+/** The deliberately narrow row shapes observation queries may load: large,
+ *  unopened or sensitive columns (runs.transcript/artifacts/usage/session/
+ *  state, loops.workflow/model/state/task-file content, machines.tokenHash/
+ *  roots) are excluded before data leaves the database — a column added to a
+ *  heart table later is excluded by DEFAULT until a query opts in. */
+export type MachineSummaryRow = Pick<
+  Machine,
+  "id" | "name" | "hostname" | "platform" | "arch" | "daemonVersion" | "lastSeen" | "createdAt"
+>;
+
+export type LoopSummaryRow = Pick<
+  Loop,
+  "id" | "machineId" | "name" | "workdir" | "taskFile" | "agent" | "allowControl" | "enabled" | "createdAt" | "updatedAt"
+>;
+
 export type RunSummaryRow = Pick<
   Run,
   | "id"
@@ -30,7 +43,7 @@ export type RunSummaryRow = Pick<
   | "progress"
 >;
 
-export function toMachineSummary(row: Machine): MachineSummary {
+export function toMachineSummary(row: MachineSummaryRow): MachineSummary {
   return {
     id: row.id,
     name: row.name,
@@ -62,7 +75,7 @@ export function toRunSummary(row: RunSummaryRow): RunSummary {
   };
 }
 
-export function toLoopSummary(row: Loop, lastRun: RunSummary | null): LoopSummary {
+export function toLoopSummary(row: LoopSummaryRow, lastRun: RunSummary | null): LoopSummary {
   return {
     id: row.id,
     machineId: row.machineId,

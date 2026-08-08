@@ -26,7 +26,7 @@ import { getMachine } from "../store/machines.js";
 import { getLoop } from "../store/runs.js";
 import type { Clock } from "../time.js";
 import { LoopValidationError } from "./errors.js";
-import { toLoopSummary, toMachineSummary, toRunSummary, type RunSummaryRow } from "./views.js";
+import { toLoopSummary, toMachineSummary, toRunSummary, type LoopSummaryRow, type RunSummaryRow } from "./views.js";
 
 /** Server-side length ceilings (goal §2). Exceeding ⇒ LoopValidationError. */
 export const LOOP_NAME_CAP = 255;
@@ -39,9 +39,37 @@ export const MACHINE_LIST_CAP = 100;
 export const LOOP_LIST_CAP = 100;
 export const RUN_LIST_CAP = 50;
 
-/** Explicit DB projection for the JSON observation surface. In particular,
- *  transcript/artifacts/usage/session/state never enter application memory. */
-const runSummaryColumns = {
+/** Explicit DB projections for the JSON observation surface: large, unopened
+ *  or sensitive columns (runs.transcript/artifacts/usage/session/state,
+ *  loops.workflow/model/state/task-file content, machines.tokenHash/roots)
+ *  never enter application memory. A column added to a heart table later is
+ *  excluded by DEFAULT until a query opts in; the key sets are pinned to the
+ *  wire DTOs by a structural test in list.test.ts. */
+export const machineSummaryColumns = {
+  id: machines.id,
+  name: machines.name,
+  hostname: machines.hostname,
+  platform: machines.platform,
+  arch: machines.arch,
+  daemonVersion: machines.daemonVersion,
+  lastSeen: machines.lastSeen,
+  createdAt: machines.createdAt,
+} as const;
+
+export const loopSummaryColumns = {
+  id: loops.id,
+  machineId: loops.machineId,
+  name: loops.name,
+  workdir: loops.workdir,
+  taskFile: loops.taskFile,
+  agent: loops.agent,
+  allowControl: loops.allowControl,
+  enabled: loops.enabled,
+  createdAt: loops.createdAt,
+  updatedAt: loops.updatedAt,
+} as const;
+
+export const runSummaryColumns = {
   id: runs.id,
   loopId: runs.loopId,
   machineId: runs.machineId,
@@ -54,7 +82,7 @@ const runSummaryColumns = {
   error: runs.error,
   durationMs: runs.durationMs,
   progress: runs.progress,
-};
+} as const;
 
 export interface LoopAdminDeps {
   db: Db;
@@ -98,7 +126,7 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
       if (!machine) return { created: false as const, reason: "machine_not_found" as const };
 
       const nowIso = deps.clock.now().toISOString();
-      const inserted = await deps.db
+      const inserted: LoopSummaryRow[] = await deps.db
         .insert(loops)
         .values({
           id: deps.newLoopId(),
@@ -112,14 +140,14 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
           createdAt: nowIso,
           updatedAt: nowIso,
         })
-        .returning();
+        .returning(loopSummaryColumns);
       return { created: true as const, loop: toLoopSummary(inserted[0]!, null) };
     },
 
     /** `name ASC, id ASC`, capped — the machine picker for loop creation. */
     async listMachines(): Promise<MachineSummary[]> {
       const rows = await deps.db
-        .select()
+        .select(machineSummaryColumns)
         .from(machines)
         .orderBy(asc(machines.name), asc(machines.id))
         .limit(MACHINE_LIST_CAP);
@@ -136,7 +164,7 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
      */
     async listLoops(): Promise<LoopSummary[]> {
       const loopRows = await deps.db
-        .select()
+        .select(loopSummaryColumns)
         .from(loops)
         .orderBy(desc(loops.updatedAt), asc(loops.id))
         .limit(LOOP_LIST_CAP);

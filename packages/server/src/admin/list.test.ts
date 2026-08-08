@@ -7,14 +7,19 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { eq } from "drizzle-orm";
 
+import { loopSummarySchema, machineSummarySchema, runSummarySchema } from "@loopzhb/protocol";
+
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
 import { machines, runs, type NewMachine } from "../db/schema.js";
 import { FakeClock, seedLoop, seedRun } from "../testkit/index.js";
 import {
   createLoopAdmin,
   LOOP_LIST_CAP,
+  loopSummaryColumns,
   MACHINE_LIST_CAP,
+  machineSummaryColumns,
   RUN_LIST_CAP,
+  runSummaryColumns,
   type LoopAdmin,
 } from "./index.js";
 
@@ -205,5 +210,18 @@ describe("listRuns", () => {
     expect(list).toHaveLength(RUN_LIST_CAP);
     expect(list!.some((r) => r.id === "run-oldest")).toBe(false);
     expect(list![0]!.id).toBe(`run-${String(RUN_LIST_CAP - 1).padStart(3, "0")}`);
+  });
+});
+
+describe("observation projections stay in lockstep with the wire DTOs", () => {
+  it("every projected column set equals its summary DTO's key set (default-exclude for new columns)", () => {
+    expect(Object.keys(machineSummaryColumns).sort()).toEqual(Object.keys(machineSummarySchema.shape).sort());
+    // lastRun is the one DTO field with no backing column (joined aggregate).
+    expect(Object.keys(loopSummaryColumns).sort()).toEqual(
+      Object.keys(loopSummarySchema.shape)
+        .filter((k) => k !== "lastRun")
+        .sort(),
+    );
+    expect(Object.keys(runSummaryColumns).sort()).toEqual(Object.keys(runSummarySchema.shape).sort());
   });
 });
