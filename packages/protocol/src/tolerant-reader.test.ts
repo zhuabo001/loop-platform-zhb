@@ -118,9 +118,14 @@ const CASES: ReadonlyArray<readonly [string, z.ZodTypeAny, Record<string, unknow
   ["createLoopResponseSchema", createLoopResponseSchema, { loop: { ...MINIMAL_LOOP_SUMMARY } }],
   ["triggerRunRequestSchema", triggerRunRequestSchema, {}],
   [
-    "triggerRunResponseSchema",
+    "triggerRunResponseSchema(enqueued)",
     triggerRunResponseSchema,
     { enqueued: true, runId: "r_01", supersededRunIds: [] },
+  ],
+  [
+    "triggerRunResponseSchema(running-noop)",
+    triggerRunResponseSchema,
+    { enqueued: false, reason: "running_exists" },
   ],
   ["machineListResponseSchema", machineListResponseSchema, { machines: [] }],
   ["loopListResponseSchema", loopListResponseSchema, { loops: [] }],
@@ -139,6 +144,6 @@ describe("tolerant reader: EVERY exported object schema strips unknown keys", ()
   it("covers every object schema — adding a new one requires a row here", () => {
     // Guard against a FUTURE schema silently escaping this suite: the case list
     // is reviewed whenever a schema is added (CI review checklist, ADR-002).
-    expect(CASES.length).toBe(22);
+    expect(CASES.length).toBe(23);
   });
 });

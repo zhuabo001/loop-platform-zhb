@@ -37,6 +37,10 @@ export const MACHINE_ID_RE = /^m-[0-9a-f]{16}$/;
 /** No NUL bytes in any declared string (malformed at the boundary). */
 const nulFreeString = (): z.ZodString => z.string().refine((s) => !s.includes("\0"), { message: "NUL byte" });
 
+/** Admin wire timestamps are real ISO datetimes, not arbitrary strings. Offsets
+ *  remain valid for additive clients; current server writers emit UTC `Z`. */
+const isoTimestampSchema = z.iso.datetime({ offset: true });
+
 // ---- POST /api/loops ----
 
 export const createLoopRequestSchema = z.object({
@@ -63,8 +67,8 @@ export const machineSummarySchema = z.object({
   arch: z.string().nullable(),
   daemonVersion: z.string().nullable(),
   /** Persisted heartbeat watermark (ISO) — presence derives from it + now. */
-  lastSeen: z.string().nullable(),
-  createdAt: z.string(),
+  lastSeen: isoTimestampSchema.nullable(),
+  createdAt: isoTimestampSchema,
 });
 export type MachineSummary = z.infer<typeof machineSummarySchema>;
 
@@ -74,7 +78,7 @@ export type MachineSummary = z.infer<typeof machineSummarySchema>;
 export const runProgressSnapshotSchema = z.object({
   step: z.number().int().nonnegative(),
   label: z.string(),
-  at: z.string().nullable(),
+  at: isoTimestampSchema.nullable(),
 });
 export type RunProgressSnapshot = z.infer<typeof runProgressSnapshotSchema>;
 
@@ -87,7 +91,7 @@ export const runSummarySchema = z.object({
   machineId: z.string(),
   phase: runPhaseSchema,
   role: runRoleSchema,
-  ts: z.string(),
+  ts: isoTimestampSchema,
   outcome: runOutcomeSchema.nullable(),
   status: runStatusSchema.nullable(),
   message: z.string().nullable(),
@@ -108,8 +112,8 @@ export const loopSummarySchema = z.object({
   agent: codingAgentSchema,
   allowControl: z.boolean(),
   enabled: z.boolean(),
-  createdAt: z.string(),
-  updatedAt: z.string(),
+  createdAt: isoTimestampSchema,
+  updatedAt: isoTimestampSchema,
   lastRun: runSummarySchema.nullable(),
 });
 export type LoopSummary = z.infer<typeof loopSummarySchema>;

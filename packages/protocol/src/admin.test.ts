@@ -153,6 +153,21 @@ describe("summary schemas pin explicit nullability (no omitted keys)", () => {
     });
     expect(() => runProgressSnapshotSchema.parse({ step: 0, label: "x" })).toThrow();
   });
+
+  it("rejects non-ISO timestamps at every admin wire position", () => {
+    expect(() => machineSummarySchema.parse({ ...GOLDEN_MACHINE_SUMMARY, createdAt: "not-a-date" })).toThrow();
+    expect(() => machineSummarySchema.parse({ ...GOLDEN_MACHINE_SUMMARY, lastSeen: "yesterday" })).toThrow();
+    expect(() => loopSummarySchema.parse({ ...GOLDEN_LOOP_SUMMARY, createdAt: "someday" })).toThrow();
+    expect(() => loopSummarySchema.parse({ ...GOLDEN_LOOP_SUMMARY, updatedAt: "soon" })).toThrow();
+    expect(() => runSummarySchema.parse({ ...GOLDEN_RUN_SUMMARY, ts: "later" })).toThrow();
+    expect(() => runProgressSnapshotSchema.parse({ step: 0, label: "x", at: "eventually" })).toThrow();
+  });
+
+  it("accepts ISO datetimes with an explicit offset", () => {
+    expect(
+      machineSummarySchema.parse({ ...GOLDEN_MACHINE_SUMMARY, lastSeen: "2026-08-08T09:02:03+08:00" }).lastSeen,
+    ).toBe("2026-08-08T09:02:03+08:00");
+  });
 });
 
 describe("response envelopes", () => {
