@@ -7,7 +7,9 @@
 > 本批次的验收契约是 `docs/goal/day6-7-manual-trigger-json-observation.md`，
 > 开发计划是 `codex-handoff-day67-work-plan.md`（已经一轮评审修订，评审与裁决见
 > `kimi-handoff-day67-plan-review.md`，裁决回填于目标文档「目标review反馈」表）。
-> 实现按 step 逐提交交付；测试基线更新为 **305 全绿（85 protocol + 43 daemon + 177 server）**。
+> 实现按 step 逐提交交付；随后完成一轮代码评审修复（`c079071` 时间戳契约收紧 +
+> `40f320d` 观察查询有界化 + `3cb6790` 投影补齐至 loops/machines）。测试基线更新为
+> **309 全绿（88 protocol + 43 daemon + 178 server）**。
 
 ---
 
@@ -71,8 +73,13 @@ Phase 1 的用户可操作闭环已打通：daemon 首次 poll 自注册 Machine
    tolerant-reader 剥离与统一 400 边界，protocol 补了空 object schema。
 3. **`createServerApp` 签名变更**：`(coordinator)` → `(coordinator, admin)`；
    `BootedServer` 形状不变（admin 在 `bootstrapServer` 内接线，不外露）。
-4. **lastRun 聚合**：页面内 loops 的一次有序查询 + 内存取每 loop 首行（既非逐 loop
-   N+1，也未引入 `DISTINCT ON` 原生 SQL）。
+4. **lastRun 聚合与观察查询的有界化**（评审修复后更新）：`lastRun` 用 drizzle
+   `selectDistinctOn`（PG `DISTINCT ON`，query-builder 方法而非 raw SQL，不违
+   ADR-003 的 store 约束）在库内完成 top-1-per-loop，结果至多为页面 loop 数；
+   三张表的观察查询全部使用显式列投影（`machineSummaryColumns`/
+   `loopSummaryColumns`/`runSummaryColumns`），`tokenHash`/`roots`/`workflow`/
+   `state`/task-file 内容/transcript 等大字段或未开放列不进应用内存；投影键集与
+   wire DTO 键集有结构钉（`list.test.ts` 末尾），新增列默认被排除。
 5. **旧 E2E 被替代而非并存**：预置数据 E2E 的全部断言（done/exec、lease 消费、
    不重执行）已由完整链路 E2E 覆盖。
 6. **管理模块多了 `loopExists` 辅助**：仅供 `listRuns` 的 404 判定复用。
@@ -94,7 +101,7 @@ Phase 1 的用户可操作闭环已打通：daemon 首次 poll 自注册 Machine
 ## 完成验证（分支 HEAD）
 
 - `pnpm -r typecheck` ✅（server 脚本自带 protocol/daemon 构建前置）
-- `pnpm -r test` ✅ **305 全绿**（85 protocol + 43 daemon + 177 server）
+- `pnpm -r test` ✅ **309 全绿**（88 protocol + 43 daemon + 178 server）
 - `pnpm -r build` ✅
 - `pnpm --filter @loopzhb/server db:check` ✅（No schema changes——ADR-003 未动）
 - `git diff --check` ✅
