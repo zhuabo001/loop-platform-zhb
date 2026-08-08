@@ -69,7 +69,7 @@ docs/adr/     # 架构决策记录
 | Day 5–7 | daemon 前台 poll 循环 + Fake Runner（假装执行、直接回报），端到端打通 |
 | Day 8–10 | 完整故障注入：心脏测试 T4–T6（server 重启、daemon 休眠迟到 report、取消）；T7 已在 Day 3–4 以 coordinator 级测试交付 |
 
-触发方式：手动 `POST /loops/:id/run`。
+触发方式：手动 `POST /api/loops/:id/run`。
 完成标准：ADR-001 心脏测试 **T1–T6 全绿**（T7 为 coordinator 级测试，随
 `supersedePendingRun` 一同交付），且三者全部成立——重复 poll 不重复执行、
 server 重启不丢在途 run、迟到的成功 report 能翻正误判的失败。阶段末尾提供

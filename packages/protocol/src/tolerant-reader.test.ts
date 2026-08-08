@@ -3,6 +3,19 @@ import type { z } from "zod";
 
 import { apiErrorSchema } from "./errors.js";
 import {
+  createLoopRequestSchema,
+  createLoopResponseSchema,
+  loopListResponseSchema,
+  loopSummarySchema,
+  machineListResponseSchema,
+  machineSummarySchema,
+  runListResponseSchema,
+  runProgressSnapshotSchema,
+  runSummarySchema,
+  triggerRunRequestSchema,
+  triggerRunResponseSchema,
+} from "./admin.js";
+import {
   deliveryLoopSchema,
   deliverySchema,
   pollRequestSchema,
@@ -34,6 +47,35 @@ const MINIMAL_LOOP = {
   allowControl: true,
 } as const;
 
+const MINIMAL_RUN_SUMMARY = {
+  id: "r_01",
+  loopId: "loop-01",
+  machineId: "m-0123456789abcdef",
+  phase: "pending",
+  role: "exec",
+  ts: "2026-08-08T00:00:00.000Z",
+  outcome: null,
+  status: null,
+  message: null,
+  error: null,
+  durationMs: null,
+  progress: null,
+} as const;
+
+const MINIMAL_LOOP_SUMMARY = {
+  id: "loop-01",
+  machineId: "m-0123456789abcdef",
+  name: null,
+  workdir: null,
+  taskFile: null,
+  agent: "claude-code",
+  allowControl: true,
+  enabled: true,
+  createdAt: "2026-08-08T00:00:00.000Z",
+  updatedAt: "2026-08-08T00:00:00.000Z",
+  lastRun: null,
+} as const;
+
 const CASES: ReadonlyArray<readonly [string, z.ZodTypeAny, Record<string, unknown>]> = [
   ["pollRequestSchema", pollRequestSchema, {}],
   ["runProgressSchema", runProgressSchema, { runId: "r", step: 0, label: "x" }],
@@ -59,6 +101,35 @@ const CASES: ReadonlyArray<readonly [string, z.ZodTypeAny, Record<string, unknow
   ["costReportSchema", costReportSchema, {}],
   ["reportResponseSchema", reportResponseSchema, { ok: true }],
   ["apiErrorSchema", apiErrorSchema, { error: "e" }],
+  ["createLoopRequestSchema", createLoopRequestSchema, { machineId: "m-0123456789abcdef" }],
+  ["machineSummarySchema", machineSummarySchema, {
+    id: "m-0123456789abcdef",
+    name: "mbp",
+    hostname: null,
+    platform: null,
+    arch: null,
+    daemonVersion: null,
+    lastSeen: null,
+    createdAt: "2026-08-08T00:00:00.000Z",
+  }],
+  ["runProgressSnapshotSchema", runProgressSnapshotSchema, { step: 0, label: "x", at: null }],
+  ["runSummarySchema", runSummarySchema, { ...MINIMAL_RUN_SUMMARY }],
+  ["loopSummarySchema", loopSummarySchema, { ...MINIMAL_LOOP_SUMMARY }],
+  ["createLoopResponseSchema", createLoopResponseSchema, { loop: { ...MINIMAL_LOOP_SUMMARY } }],
+  ["triggerRunRequestSchema", triggerRunRequestSchema, {}],
+  [
+    "triggerRunResponseSchema(enqueued)",
+    triggerRunResponseSchema,
+    { enqueued: true, runId: "r_01", supersededRunIds: [] },
+  ],
+  [
+    "triggerRunResponseSchema(running-noop)",
+    triggerRunResponseSchema,
+    { enqueued: false, reason: "running_exists" },
+  ],
+  ["machineListResponseSchema", machineListResponseSchema, { machines: [] }],
+  ["loopListResponseSchema", loopListResponseSchema, { loops: [] }],
+  ["runListResponseSchema", runListResponseSchema, { runs: [] }],
 ];
 
 describe("tolerant reader: EVERY exported object schema strips unknown keys", () => {
@@ -73,6 +144,6 @@ describe("tolerant reader: EVERY exported object schema strips unknown keys", ()
   it("covers every object schema — adding a new one requires a row here", () => {
     // Guard against a FUTURE schema silently escaping this suite: the case list
     // is reviewed whenever a schema is added (CI review checklist, ADR-002).
-    expect(CASES.length).toBe(11);
+    expect(CASES.length).toBe(23);
   });
 });

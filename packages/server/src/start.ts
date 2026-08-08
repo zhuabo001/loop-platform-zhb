@@ -16,6 +16,7 @@ import { pathToFileURL } from "node:url";
 
 import { serve, type ServerType } from "@hono/node-server";
 
+import { createLoopAdmin, newUuidLoopId } from "./admin/index.js";
 import { createRunCoordinator, mintRunCredential, newUuidRunId, type RunCoordinator } from "./coordinator/index.js";
 import { loadServerConfig, unauthenticatedExposureWarning, type ServerConfig } from "./config.js";
 import { closeDb, openMigratedDb, type DbHandle } from "./db/index.js";
@@ -43,7 +44,8 @@ export async function bootstrapServer(config: ServerConfig): Promise<BootedServe
     newRunId: newUuidRunId,
     mintRunCredential,
   });
-  return { app: createServerApp(coordinator), coordinator, handle };
+  const admin = createLoopAdmin({ db: handle.db, clock: systemClock, newLoopId: newUuidLoopId });
+  return { app: createServerApp(coordinator, admin), coordinator, handle };
 }
 
 export async function main(): Promise<void> {

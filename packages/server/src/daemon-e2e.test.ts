@@ -1,27 +1,35 @@
 /**
- * Day-5 cross-package E2E (plan §4/§5): the BUILT @loopzhb/daemon drives a
- * real booted server (in-memory PGlite via bootstrapServer, Hono app.request
- * adapted into the daemon's injectable fetch — no TCP port). The pending Run
- * is seeded through the coordinator (enqueueExecRun) — NOT through the
- * manual-trigger HTTP that doesn't exist yet.
+ * Day 6–7 cross-package E2E (goal §6.6): the FULL user chain over HTTP — no
+ * test-fixture seeding of loops or runs. The BUILT @loopzhb/daemon drives a
+ * real booted server (file-backed PGlite via bootstrapServer, Hono
+ * app.request adapted into the daemon's injectable fetch — no TCP port):
  *
- * The assertions are the goal doc's single-cycle acceptance: after ONE
- * pollOnce the Run is `done/exec` (the server's Phase-1 write rule — NOT the
- * daemon's claimed outcome), message is the Fake Runner's line, progress is
- * cleared, the RunLease is consumed; a second poll never re-executes.
+ *   daemon poll (self-registers the machine) → GET /api/machines →
+ *   POST /api/loops → POST /api/loops/:id/run → daemon pollOnce (claim →
+ *   Fake Runner → report) → GET observation APIs show done/exec + message.
+ *
+ * Acceptance: every success response validates against its protocol schema;
+ * done/exec is the SERVER's Phase-1 write rule (not the daemon-claimed
+ * outcome); the RunLease is consumed; a second poll re-executes nothing.
  */
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { eq } from "drizzle-orm";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createDaemonRuntime, createFakeRunner, createMachineClient, type AgentRunner } from "@loopzhb/daemon";
+import {
+  createLoopResponseSchema,
+  loopListResponseSchema,
+  machineListResponseSchema,
+  runListResponseSchema,
+  triggerRunResponseSchema,
+} from "@loopzhb/protocol";
 import { machineIdFromToken } from "@loopzhb/protocol/node";
 
 import { closeDb, type DbHandle } from "./db/index.js";
-import { loops, runLeases, runs } from "./db/schema.js";
+import { runLeases } from "./db/schema.js";
 import { bootstrapServer, type BootedServer } from "./start.js";
 
 const TOKEN = "dk_e2e_machine";
@@ -47,19 +55,9 @@ function appFetch(app: BootedServer["app"]): typeof fetch {
   }) as typeof fetch;
 }
 
-describe("daemon E2E: pending → running → done/exec", () => {
-  it("one pollOnce claims, fake-runs and finalizes; a second poll is a no-op", async () => {
+describe("daemon E2E: the full HTTP user chain", () => {
+  it("register → create → trigger → execute → observe; second poll re-executes nothing", async () => {
     const b = await boot();
-    // Seed via store/coordinator, not HTTP: the loop row binds the machine the
-    // token self-registers as; enqueue creates the pending Exec Run.
-    await b.handle.db.insert(loops).values({
-      id: "loop-1",
-      machineId: machineIdFromToken(TOKEN),
-      createdAt: "2026-07-01T00:00:00.000Z",
-      updatedAt: "2026-07-01T00:00:00.000Z",
-    });
-    expect(await b.coordinator.enqueueExecRun("loop-1")).toMatchObject({ enqueued: true });
-
     const client = createMachineClient({
       baseUrl: "http://e2e.local",
       machineCredential: TOKEN,
@@ -81,24 +79,91 @@ describe("daemon E2E: pending → running → done/exec", () => {
       machineCredential: TOKEN,
     });
 
-    // ONE cycle: the daemon's first poll also self-registers the machine.
+    // 1. First poll: self-registration only — nothing is pending yet.
     await runtime.pollOnce();
+    expect(runnerCalls).toBe(0);
 
+    // 2. The user locates THEIR machine through the observation API (matched
+    //    by the token-derived id, not by position).
+    const machinesRes = await b.app.request("/api/machines");
+    expect(machinesRes.status).toBe(200);
+    const machineId = machineIdFromToken(TOKEN);
+    const machineList = machineListResponseSchema.parse(await machinesRes.json()).machines;
+    expect(machineList.find((m) => m.id === machineId)).toMatchObject({
+      name: "e2e-host",
+      hostname: "e2e-host",
+      platform: "test",
+      daemonVersion: "0.1.0",
+    });
+
+    // 3. Create the loop over HTTP. The id is the production `loop-<uuid>`
+    //    mint — read it off the response, never predicted.
+    const createRes = await b.app.request("/api/loops", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        machineId,
+        name: "e2e-loop",
+        workdir: "/srv/project",
+        taskFile: "/srv/project/LOOP.md",
+      }),
+    });
+    expect(createRes.status).toBe(201);
+    const { loop } = createLoopResponseSchema.parse(await createRes.json());
+    expect(loop).toMatchObject({
+      machineId,
+      name: "e2e-loop",
+      workdir: "/srv/project",
+      taskFile: "/srv/project/LOOP.md",
+      agent: "claude-code",
+      enabled: true,
+      lastRun: null,
+    });
+
+    // 4. Manual trigger — Phase 1's ONLY run entry point (empty body).
+    const triggerRes = await b.app.request(`/api/loops/${loop.id}/run`, { method: "POST" });
+    expect(triggerRes.status).toBe(202);
+    const trigger = triggerRunResponseSchema.parse(await triggerRes.json());
+    if (!trigger.enqueued) throw new Error("expected the trigger to enqueue");
+    expect(trigger.supersededRunIds).toEqual([]);
+
+    // 5. The daemon's next poll claims, fake-runs and reports.
+    await runtime.pollOnce();
     expect(runnerCalls).toBe(1);
-    const runRows = await b.handle.db.select().from(runs).where(eq(runs.loopId, "loop-1"));
-    expect(runRows).toHaveLength(1);
-    // done/exec comes from the SERVER's Phase-1 rule (ok:true → done/exec),
-    // not from the daemon-claimed outcome, which is never persisted.
-    expect(runRows[0]).toMatchObject({
+    expect(runtime.pendingCount()).toBe(0);
+
+    // 6. The observation surface shows the terminal result. done/exec is the
+    //    SERVER's Phase-1 rule (ok:true ⇒ done/exec) — not the daemon-claimed
+    //    outcome, which is never persisted.
+    const runsRes = await b.app.request(`/api/loops/${loop.id}/runs`);
+    expect(runsRes.status).toBe(200);
+    const runList = runListResponseSchema.parse(await runsRes.json()).runs;
+    expect(runList).toHaveLength(1);
+    expect(runList[0]).toMatchObject({
+      id: trigger.runId,
+      loopId: loop.id,
+      machineId,
       phase: "done",
       outcome: "exec",
       message: "fake runner completed",
+      error: null,
       progress: null,
     });
-    expect(await b.handle.db.select().from(runLeases)).toHaveLength(0);
-    expect(runtime.pendingCount()).toBe(0);
+    expect(Number.isInteger(runList[0]!.durationMs)).toBe(true);
+    expect(runList[0]!.durationMs!).toBeGreaterThanOrEqual(0);
 
-    // Second poll: nothing to claim, nothing re-executes.
+    const loopsRes = await b.app.request("/api/loops");
+    const loopList = loopListResponseSchema.parse(await loopsRes.json()).loops;
+    expect(loopList.find((l) => l.id === loop.id)?.lastRun).toMatchObject({
+      id: trigger.runId,
+      phase: "done",
+      outcome: "exec",
+    });
+
+    // The RunLease was consumed by the finalize.
+    expect(await b.handle.db.select().from(runLeases)).toHaveLength(0);
+
+    // 7. At-most-once: a second poll claims nothing, re-executes nothing.
     await runtime.pollOnce();
     expect(runnerCalls).toBe(1);
   });

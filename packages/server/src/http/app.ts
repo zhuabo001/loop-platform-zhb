@@ -1,15 +1,22 @@
 /**
- * The HTTP adapter (plan §HTTP). `createServerApp(coordinator)` is a PURE
- * assembly seam — it wires the two machine routes onto a standalone Hono app
- * and returns it. It never reads env vars, opens a DB, listens on a port,
- * registers signals or holds a global singleton; each call is an independent
- * instance (tests drive it via app.request; boot wires exactly one).
+ * The HTTP adapter (plan §HTTP). `createServerApp(coordinator, admin)` is a
+ * PURE assembly seam — it wires the two machine routes plus the local
+ * management routes (loop creation, manual trigger, JSON observation
+ * surface) onto a standalone Hono app and returns it. It never reads env
+ * vars, opens a DB, listens on a port, registers signals or holds a global
+ * singleton; each call is an independent instance (tests drive it via
+ * app.request; boot wires exactly one).
  *
  * Routes do exactly four things: extract the Bearer credential, parse the
- * JSON body against the protocol DTO, call the coordinator, shape the
- * response. Every response — success or any error branch — is JSON that
- * validates against `apiErrorSchema` / the response schemas; Zod issues,
+ * JSON body against the protocol DTO, call the coordinator/admin module,
+ * shape the response. Every response — success or any error branch — is JSON
+ * that validates against `apiErrorSchema` / the response schemas; Zod issues,
  * exception messages, stacks and DB details go to the server log only.
+ *
+ * The management routes carry NO credential at all (Phase 1: localhost /
+ * trusted network is the whole security boundary — see config.ts's
+ * unauthenticated-exposure warning). The trigger route owns no lifecycle
+ * logic: it delegates to `coordinator.enqueueExecRun` (ADR-001 T7).
  *
  * Unified taxonomy (G-04): 400 invalid request / 401 invalid machine
  * credential / 401 + run_capability_invalid / 413 too large / 404 not found /
@@ -19,8 +26,16 @@
 import { bodyLimit } from "hono/body-limit";
 import { Hono, type Context } from "hono";
 
-import { pollRequestSchema, reportRequestSchema, RUN_CAPABILITY_INVALID_CODE } from "@loopzhb/protocol";
+import {
+  createLoopRequestSchema,
+  pollRequestSchema,
+  reportRequestSchema,
+  RUN_CAPABILITY_INVALID_CODE,
+  triggerRunRequestSchema,
+} from "@loopzhb/protocol";
 
+import { LoopValidationError } from "../admin/errors.js";
+import type { LoopAdmin } from "../admin/index.js";
 import { InvalidMachineCredentialError, RunCapabilityInvalidError } from "../coordinator/errors.js";
 import type { RunCoordinator } from "../coordinator/index.js";
 
@@ -48,7 +63,19 @@ async function parseJsonBody(c: Context): Promise<unknown> {
   }
 }
 
-export function createServerApp(coordinator: RunCoordinator): Hono {
+/** The manual trigger takes NO business params: an EMPTY body normalizes to
+ *  `{}` at this edge (goal §3); malformed JSON still marks `undefined`. */
+async function parseJsonBodyOrEmpty(c: Context): Promise<unknown> {
+  const text = await c.req.text();
+  if (text.trim() === "") return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+
+export function createServerApp(coordinator: RunCoordinator, admin: LoopAdmin): Hono {
   const app = new Hono();
 
   app.onError((err, c) => {
@@ -103,6 +130,56 @@ export function createServerApp(coordinator: RunCoordinator): Hono {
       }
       throw err;
     }
+  });
+
+  // ---- local management routes (no credential — Phase 1 loopback boundary) ----
+
+  app.get("/api/machines", async (c) => c.json({ machines: await admin.listMachines() }));
+
+  app.get("/api/loops", async (c) => c.json({ loops: await admin.listLoops() }));
+
+  app.get("/api/loops/:id/runs", async (c) => {
+    const list = await admin.listRuns(c.req.param("id"));
+    if (list === undefined) return jsonError(c, 404, "not found");
+    return c.json({ runs: list });
+  });
+
+  app.post("/api/loops", cap, async (c) => {
+    const raw = await parseJsonBody(c);
+    if (raw === undefined) return jsonError(c, 400, "invalid request");
+    const parsed = createLoopRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      console.warn("[http] create-loop DTO rejected", parsed.error.issues);
+      return jsonError(c, 400, "invalid request");
+    }
+    try {
+      const result = await admin.createLoop(parsed.data);
+      if (!result.created) return jsonError(c, 404, "not found");
+      return c.json({ loop: result.loop }, 201);
+    } catch (err) {
+      if (err instanceof LoopValidationError) {
+        console.warn("[http] create-loop cap rejected", err.message);
+        return jsonError(c, 400, "invalid request");
+      }
+      throw err;
+    }
+  });
+
+  app.post("/api/loops/:id/run", cap, async (c) => {
+    const raw = await parseJsonBodyOrEmpty(c);
+    if (raw === undefined) return jsonError(c, 400, "invalid request");
+    const parsed = triggerRunRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      console.warn("[http] trigger DTO rejected", parsed.error.issues);
+      return jsonError(c, 400, "invalid request");
+    }
+    // T7 lives in the coordinator — this route only maps its result.
+    const result = await coordinator.enqueueExecRun(c.req.param("id"));
+    if (result.enqueued) {
+      return c.json({ enqueued: true, runId: result.runId, supersededRunIds: result.supersededRunIds }, 202);
+    }
+    if (result.reason === "loop_not_found") return jsonError(c, 404, "not found");
+    return c.json({ enqueued: false, reason: "running_exists" }, 200);
   });
 
   return app;
