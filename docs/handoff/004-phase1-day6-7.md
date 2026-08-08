@@ -9,7 +9,7 @@
 > `kimi-handoff-day67-plan-review.md`，裁决回填于目标文档「目标review反馈」表）。
 > 实现按 step 逐提交交付；随后完成一轮代码评审修复（`c079071` 时间戳契约收紧 +
 > `40f320d` 观察查询有界化 + `3cb6790` 投影补齐至 loops/machines）。测试基线更新为
-> **309 全绿（88 protocol + 43 daemon + 178 server）**。
+> **310 全绿（88 protocol + 43 daemon + 179 server）**。
 
 ---
 
@@ -101,7 +101,7 @@ Phase 1 的用户可操作闭环已打通：daemon 首次 poll 自注册 Machine
 ## 完成验证（分支 HEAD）
 
 - `pnpm -r typecheck` ✅（server 脚本自带 protocol/daemon 构建前置）
-- `pnpm -r test` ✅ **309 全绿**（88 protocol + 43 daemon + 178 server）
+- `pnpm -r test` ✅ **310 全绿**（88 protocol + 43 daemon + 179 server）
 - `pnpm -r build` ✅
 - `pnpm --filter @loopzhb/server db:check` ✅（No schema changes——ADR-003 未动）
 - `git diff --check` ✅

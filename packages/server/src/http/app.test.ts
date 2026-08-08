@@ -494,6 +494,66 @@ describe("GET observation surface", () => {
 
     await expectJsonError(await app.request("/api/loops/loop-nope/runs"), 404, { error: "not found" });
   });
+
+  it("never exposes unopened Run columns through lastRun or the Run list", async () => {
+    await fresh();
+    await seedMachine(db, "m-test");
+    await seedLoop(db, { id: "loop-1" });
+    await seedRun(db, {
+      id: "run-1",
+      loopId: "loop-1",
+      phase: "done",
+      outcome: "exec",
+      ts: "2026-07-01T00:00:01.000Z",
+      state: { marker: "run-state-secret" },
+      sessionId: "run-session-secret",
+      costUsd: 987654.321,
+      usage: { inputTokens: 999991 },
+      artifacts: [{ path: "run-artifact-secret", kind: "created" }],
+      transcript: [{ kind: "text", text: "run-transcript-secret" }],
+    });
+
+    const expectedRun = {
+      id: "run-1",
+      loopId: "loop-1",
+      machineId: "m-test",
+      phase: "done",
+      role: "exec",
+      ts: "2026-07-01T00:00:01.000Z",
+      outcome: "exec",
+      status: null,
+      message: null,
+      error: null,
+      durationMs: null,
+      progress: null,
+    };
+
+    const loopsResponse = await app.request("/api/loops");
+    expect(loopsResponse.status).toBe(200);
+    const loopsText = await loopsResponse.text();
+    const loopsJson = JSON.parse(loopsText) as { loops: Array<{ lastRun: unknown }> };
+    expect(loopsJson.loops[0]!.lastRun).toEqual(expectedRun);
+    expect(() => loopListResponseSchema.parse(loopsJson)).not.toThrow();
+
+    const runsResponse = await app.request("/api/loops/loop-1/runs");
+    expect(runsResponse.status).toBe(200);
+    const runsText = await runsResponse.text();
+    const runsJson = JSON.parse(runsText) as { runs: unknown[] };
+    expect(runsJson.runs).toEqual([expectedRun]);
+    expect(() => runListResponseSchema.parse(runsJson)).not.toThrow();
+
+    for (const sentinel of [
+      "run-state-secret",
+      "run-session-secret",
+      "987654.321",
+      "999991",
+      "run-artifact-secret",
+      "run-transcript-secret",
+    ]) {
+      expect(loopsText).not.toContain(sentinel);
+      expect(runsText).not.toContain(sentinel);
+    }
+  });
 });
 
 describe("unified error surface", () => {
