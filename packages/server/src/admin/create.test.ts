@@ -122,11 +122,4 @@ describe("createLoop", () => {
     ).rejects.toBeInstanceOf(LoopValidationError);
     expect(await snapshotLoops(db)).toEqual([]);
   });
-
-  it("loopExists reflects the created row", async () => {
-    await seeded();
-    expect(await admin.loopExists("loop-1")).toBe(false);
-    await admin.createLoop({ machineId: "m-0123456789abcdef" });
-    expect(await admin.loopExists("loop-1")).toBe(true);
-  });
 });

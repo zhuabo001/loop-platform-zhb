@@ -80,6 +80,14 @@ describe("listMachines", () => {
 });
 
 describe("listLoops", () => {
+  it("breaks equal updatedAt ties by id ASC", async () => {
+    await fresh();
+    await seedLoop(db, { id: "loop-b", updatedAt: iso(5) });
+    await seedLoop(db, { id: "loop-a", updatedAt: iso(5) });
+
+    expect((await admin.listLoops()).map((loop) => loop.id)).toEqual(["loop-a", "loop-b"]);
+  });
+
   it("sorts updatedAt DESC then id ASC; lastRun is the latest EXEC run only", async () => {
     await fresh();
     await seedLoop(db, { id: "loop-old", updatedAt: iso(1) });

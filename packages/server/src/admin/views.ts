@@ -12,6 +12,24 @@ import type { LoopSummary, MachineSummary, RunSummary } from "@loopzhb/protocol"
 
 import type { Loop, Machine, Run } from "../db/schema.js";
 
+/** The deliberately narrow row shape observation queries may load. Large or
+ *  unopened Run columns are excluded before data leaves the database. */
+export type RunSummaryRow = Pick<
+  Run,
+  | "id"
+  | "loopId"
+  | "machineId"
+  | "phase"
+  | "role"
+  | "ts"
+  | "outcome"
+  | "status"
+  | "message"
+  | "error"
+  | "durationMs"
+  | "progress"
+>;
+
 export function toMachineSummary(row: Machine): MachineSummary {
   return {
     id: row.id,
@@ -25,7 +43,7 @@ export function toMachineSummary(row: Machine): MachineSummary {
   };
 }
 
-export function toRunSummary(row: Run): RunSummary {
+export function toRunSummary(row: RunSummaryRow): RunSummary {
   return {
     id: row.id,
     loopId: row.loopId,

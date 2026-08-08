@@ -21,12 +21,12 @@ import { and, asc, desc, eq, inArray } from "drizzle-orm";
 import type { CreateLoopRequest, LoopSummary, MachineSummary, RunSummary } from "@loopzhb/protocol";
 
 import type { Db } from "../db/index.js";
-import { loops, machines, runs, type Run } from "../db/schema.js";
+import { loops, machines, runs } from "../db/schema.js";
 import { getMachine } from "../store/machines.js";
 import { getLoop } from "../store/runs.js";
 import type { Clock } from "../time.js";
 import { LoopValidationError } from "./errors.js";
-import { toLoopSummary, toMachineSummary, toRunSummary } from "./views.js";
+import { toLoopSummary, toMachineSummary, toRunSummary, type RunSummaryRow } from "./views.js";
 
 /** Server-side length ceilings (goal §2). Exceeding ⇒ LoopValidationError. */
 export const LOOP_NAME_CAP = 255;
@@ -38,6 +38,23 @@ export const LOOP_PATH_CAP = 4096;
 export const MACHINE_LIST_CAP = 100;
 export const LOOP_LIST_CAP = 100;
 export const RUN_LIST_CAP = 50;
+
+/** Explicit DB projection for the JSON observation surface. In particular,
+ *  transcript/artifacts/usage/session/state never enter application memory. */
+const runSummaryColumns = {
+  id: runs.id,
+  loopId: runs.loopId,
+  machineId: runs.machineId,
+  phase: runs.phase,
+  role: runs.role,
+  ts: runs.ts,
+  outcome: runs.outcome,
+  status: runs.status,
+  message: runs.message,
+  error: runs.error,
+  durationMs: runs.durationMs,
+  progress: runs.progress,
+};
 
 export interface LoopAdminDeps {
   db: Db;
@@ -99,11 +116,6 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
       return { created: true as const, loop: toLoopSummary(inserted[0]!, null) };
     },
 
-    /** Existence check for routes that 404 on an unknown loop. */
-    async loopExists(loopId: string): Promise<boolean> {
-      return (await getLoop(deps.db, loopId)) !== undefined;
-    },
-
     /** `name ASC, id ASC`, capped — the machine picker for loop creation. */
     async listMachines(): Promise<MachineSummary[]> {
       const rows = await deps.db
@@ -116,10 +128,11 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
 
     /**
      * `updatedAt DESC, id ASC`, capped. Each loop's `lastRun` is its latest
-     * EXEC run by `ts DESC, id DESC` (one extra ordered query for the page's
-     * loops; first row per loop wins). Non-exec roles never appear — they are
-     * Phase 3's surface, and `ts` is the last TRANSITION time (ADR-003 决策 6),
-     * so a run re-enters the top of the list after every lifecycle write.
+     * EXEC run by `ts DESC, id DESC`. PostgreSQL DISTINCT ON performs the
+     * top-1-per-loop selection in the database, so this query returns at most
+     * LOOP_LIST_CAP rows regardless of Run history size. Non-exec roles never
+     * appear — they are Phase 3's surface, and `ts` is the last TRANSITION time
+     * (ADR-003 决策 6), so a run re-enters the top after a lifecycle write.
      */
     async listLoops(): Promise<LoopSummary[]> {
       const loopRows = await deps.db
@@ -130,7 +143,7 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
       if (loopRows.length === 0) return [];
 
       const runRows = await deps.db
-        .select()
+        .selectDistinctOn([runs.loopId], runSummaryColumns)
         .from(runs)
         .where(
           and(
@@ -141,11 +154,8 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
             eq(runs.role, "exec"),
           ),
         )
-        .orderBy(desc(runs.ts), desc(runs.id));
-      const latestByLoop = new Map<string, Run>();
-      for (const row of runRows) {
-        if (!latestByLoop.has(row.loopId)) latestByLoop.set(row.loopId, row);
-      }
+        .orderBy(asc(runs.loopId), desc(runs.ts), desc(runs.id));
+      const latestByLoop = new Map<string, RunSummaryRow>(runRows.map((row) => [row.loopId, row]));
       return loopRows.map((row) => {
         const lastRun = latestByLoop.get(row.id);
         return toLoopSummary(row, lastRun ? toRunSummary(lastRun) : null);
@@ -158,7 +168,7 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
     async listRuns(loopId: string): Promise<RunSummary[] | undefined> {
       if ((await getLoop(deps.db, loopId)) === undefined) return undefined;
       const rows = await deps.db
-        .select()
+        .select(runSummaryColumns)
         .from(runs)
         .where(eq(runs.loopId, loopId))
         .orderBy(desc(runs.ts), desc(runs.id))
