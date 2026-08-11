@@ -9,3 +9,8 @@ dist/
 
 # local MCP tooling state
 .serena/
+
+# Session handoff media are ephemeral — distilled into ADR/roadmap/Issues at
+# phase close (see AGENTS.md). Already-tracked Phase 1 files remain as legacy;
+# new handoff files must not be committed.
+docs/handoff/

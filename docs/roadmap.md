@@ -88,6 +88,9 @@ claude-code 或 codex 选一：子进程 spawn、进程组 kill、timeout、env 
 |---|
 | 一条真实 Agent E2E 绿；agent 无法越出允许的根目录 |
 
+顺手收口：[Issue #10](https://github.com/zhuabo001/loop-platform-zhb/issues/10)
+（Day 8–10 二次审查右移项，不影响正确性）。
+
 ## Phase 3 — cron 与离线恢复（第 5–6 周）
 
 cron（croner）+ loop 时区 + DST + 离线 pending 保留 + 重叠保护（下一次触发
@@ -120,6 +123,10 @@ Postgres（托管分层）/R2、迁移预检、body/rate/storage caps、SSRF 防
 健康检查、部署形态，以及**真实 Postgres 的并发验证**：使用多个物理连接验证行锁
 竞争、隔离级别、死锁与重试（PGlite 在 Phase 1 只验证应用层交错编排与真实事务提交，
 不代表托管 PG 的并发语义）。
+
+**显式阻塞项**：[Issue #11](https://github.com/zhuabo001/loop-platform-zhb/issues/11)
+——Day 8–10 report/reclaim 竞态防护的多物理连接并发验收（ADR-001 修订记录
+2026-08-11），关闭前不得进入真实 Postgres。
 
 ## Phase 7 — 高阶能力（按需）
 
