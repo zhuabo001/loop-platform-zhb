@@ -56,6 +56,10 @@ export async function getLoop(db: Db, loopId: string): Promise<Loop | undefined>
   return (await db.select().from(loops).where(eq(loops.id, loopId)))[0];
 }
 
+export async function getRun(db: Db, runId: string): Promise<Run | undefined> {
+  return (await db.select().from(runs).where(eq(runs.id, runId)))[0];
+}
+
 /**
  * T7 atomic supersede: create the loop's next pending exec run.
  *

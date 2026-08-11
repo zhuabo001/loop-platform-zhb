@@ -19,10 +19,12 @@
  */
 import { afterEach, describe, expect, it } from "vitest";
 
+import { eq } from "drizzle-orm";
+
 import { sha256 } from "@loopzhb/protocol/node";
 
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
-import type { NewRun } from "../db/schema.js";
+import { runLeases, type NewRun } from "../db/schema.js";
 import { cancelRunTx, RECLAIM_RUN_ERROR, reclaimStaleRunTx } from "../store/runs.js";
 import * as leasesStore from "../store/leases.js";
 import * as reportStore from "../store/report.js";
@@ -193,6 +195,89 @@ describe("reclaimStaleRun primitive (sweep-only)", () => {
     for (const mod of [runsStore, leasesStore, reportStore]) {
       expect(Object.keys(mod)).not.toContain("terminalizeLease");
     }
+  });
+});
+
+describe("terminal-grace fail-closed expiry (Day 8–10 plan §1)", () => {
+  it("a terminal-grace lease with a MISSING expiresAt is dead: 401 + lazy cleanup, zero run writes", async () => {
+    await fresh();
+    await seedRun(db, { id: "run-1", machineId, phase: "error", outcome: "error", error: RECLAIM_RUN_ERROR });
+    await seedLease(db, {
+      tokenHash: sha256(SEED_CRED),
+      runId: "run-1",
+      machineId,
+      state: "terminal-grace",
+      expiresAt: null,
+    });
+    const runsBefore = await snapshotRuns(db);
+
+    await expect(coordinator.report(SEED_CRED, { ok: true })).rejects.toMatchObject({
+      name: "RunCapabilityInvalidError",
+      reason: "unknown_or_expired",
+    });
+    expect(await snapshotLeases(db)).toEqual([]); // fail-closed cleanup committed
+    expect(await snapshotRuns(db)).toEqual(runsBefore);
+  });
+
+  it("a terminal-grace lease with an UNPARSEABLE expiresAt is dead: 401 + lazy cleanup", async () => {
+    await fresh();
+    await seedRun(db, { id: "run-1", machineId, phase: "error", outcome: "error", error: RECLAIM_RUN_ERROR });
+    await seedLease(db, {
+      tokenHash: sha256(SEED_CRED),
+      runId: "run-1",
+      machineId,
+      state: "terminal-grace",
+      expiresAt: "not-a-date",
+    });
+
+    await expect(coordinator.report(SEED_CRED, { ok: true })).rejects.toMatchObject({
+      name: "RunCapabilityInvalidError",
+      reason: "unknown_or_expired",
+    });
+    expect(await snapshotLeases(db)).toEqual([]);
+  });
+
+  it("the in-transaction re-check catches a window corrupted AFTER the read-side resolve", async () => {
+    let openGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      openGate = resolve;
+    });
+    let markResolved!: () => void;
+    const resolved = new Promise<void>((resolve) => {
+      markResolved = resolve;
+    });
+    await fresh({
+      hooks: {
+        afterReportResolve: async () => {
+          markResolved();
+          await gate;
+        },
+      },
+    });
+    // A HEALTHY swept run: terminal-grace well inside its 24h window.
+    await seedRun(db, { id: "run-1", machineId, phase: "error", outcome: "error", error: RECLAIM_RUN_ERROR });
+    await seedLease(db, {
+      tokenHash: sha256(SEED_CRED),
+      runId: "run-1",
+      machineId,
+      state: "terminal-grace",
+      expiresAt: new Date(clock.now().getTime() + 24 * 60 * 60_000).toISOString(),
+    });
+    const runsBefore = await snapshotRuns(db);
+
+    const reportPromise = coordinator.report(SEED_CRED, { ok: true });
+    await resolved;
+    // The window stamp is corrupted while the report is parked: the write
+    // transaction's re-check must apply the SAME fail-closed rule.
+    await db.update(runLeases).set({ expiresAt: "corrupted" }).where(eq(runLeases.runId, "run-1"));
+    openGate();
+
+    await expect(reportPromise).rejects.toMatchObject({
+      name: "RunCapabilityInvalidError",
+      reason: "unknown_or_expired",
+    });
+    expect(await snapshotLeases(db)).toEqual([]); // cleanup commits, the 401 rides after
+    expect(await snapshotRuns(db)).toEqual(runsBefore);
   });
 });
 

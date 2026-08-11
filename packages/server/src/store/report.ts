@@ -21,6 +21,7 @@ import type { ReportRequest } from "@loopzhb/protocol";
 import { RunCapabilityInvalidError } from "../coordinator/errors.js";
 import type { Db } from "../db/index.js";
 import { runLeases, runs, type NewRun, type Run } from "../db/schema.js";
+import { isLeaseDead } from "./leases.js";
 import type { Clock } from "../time.js";
 
 export interface ReportStoreDeps {
@@ -118,12 +119,13 @@ export async function executeReportTx(
     const lease = (await tx.select().from(runLeases).where(eq(runLeases.tokenHash, input.tokenHash)))[0];
     if (!lease) return { kind: "denied", reason: "consumed_or_revoked" };
 
-    // Re-validate expiry INSIDE the transaction against the same clock
+    // Re-validate deadness INSIDE the transaction against the same clock
     // snapshot (review #4): the read-side resolve happened before this tx —
-    // the grace window may have closed in between. `now >= expiresAt` ⇒ dead
-    // (the boundary is pinned: a lease dies AT its expiresAt). The cleanup
-    // delete commits; the 401 is thrown after.
-    if (lease.expiresAt != null && now.getTime() >= Date.parse(lease.expiresAt)) {
+    // the grace window may have closed (or been corrupted) in between. The
+    // SAME fail-closed predicate as the read side (store/leases.ts): a
+    // terminal-grace lease with a missing/unparseable window is dead on
+    // sight. The cleanup delete commits; the 401 is thrown after.
+    if (isLeaseDead(lease, now.getTime())) {
       await tx.delete(runLeases).where(eq(runLeases.tokenHash, input.tokenHash));
       return { kind: "denied", reason: "unknown_or_expired" };
     }

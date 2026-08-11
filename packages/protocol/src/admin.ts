@@ -152,6 +152,24 @@ export const machineListResponseSchema = z.object({
 });
 export type MachineListResponse = z.infer<typeof machineListResponseSchema>;
 
+// ---- POST /api/runs/:id/cancel ----
+
+/** POST /api/runs/:id/cancel — currently NO business params: `{}` (and the
+ *  empty body, normalized to `{}` at the HTTP edge) is the whole request;
+ *  unknown keys strip away (ADR-002 决策 1). Future cancel options arrive as
+ *  additive optional fields only (演进只增不减). */
+export const cancelRunRequestSchema = z.object({});
+export type CancelRunRequest = z.infer<typeof cancelRunRequestSchema>;
+
+/** POST /api/runs/:id/cancel — both outcomes are 200: `not_cancelable` means
+ *  the run was ALREADY terminal, so a repeat cancel stays effect-idempotent.
+ *  A MISSING run never rides this body: it is the flat 404 (apiErrorSchema). */
+export const cancelRunResponseSchema = z.union([
+  z.object({ canceled: z.literal(true) }),
+  z.object({ canceled: z.literal(false), reason: z.literal("not_cancelable") }),
+]);
+export type CancelRunResponse = z.infer<typeof cancelRunResponseSchema>;
+
 export const loopListResponseSchema = z.object({
   loops: z.array(loopSummarySchema),
 });

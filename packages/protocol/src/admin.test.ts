@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  cancelRunRequestSchema,
+  cancelRunResponseSchema,
   createLoopRequestSchema,
   createLoopResponseSchema,
   loopListResponseSchema,
@@ -196,5 +198,27 @@ describe("response envelopes", () => {
     expect(() =>
       triggerRunResponseSchema.parse({ enqueued: false, reason: "loop_not_found" }),
     ).toThrow();
+  });
+
+  it("cancelRunResponse covers exactly the canceled and not_cancelable bodies", () => {
+    expect(cancelRunResponseSchema.parse({ canceled: true })).toEqual({ canceled: true });
+    const noop = { canceled: false as const, reason: "not_cancelable" as const };
+    expect(cancelRunResponseSchema.parse(noop)).toEqual(noop);
+    // A MISSING run is NOT a success body — it is the flat 404 apiError; and a
+    // missing discriminant never parses.
+    expect(() => cancelRunResponseSchema.parse({ canceled: false, reason: "not_found" })).toThrow();
+    expect(() => cancelRunResponseSchema.parse({ canceled: false })).toThrow();
+  });
+});
+
+describe("cancelRunRequestSchema", () => {
+  it("accepts the empty body — Phase 1 has NO cancel business params", () => {
+    expect(cancelRunRequestSchema.parse({})).toEqual({});
+  });
+
+  it("rejects non-object bodies (malformed ⇒ 400 at the boundary)", () => {
+    for (const bad of [null, 42, "boom", true, []]) {
+      expect(cancelRunRequestSchema.safeParse(bad).success).toBe(false);
+    }
   });
 });

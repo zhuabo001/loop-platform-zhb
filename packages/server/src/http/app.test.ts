@@ -13,6 +13,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   apiErrorSchema,
+  cancelRunResponseSchema,
   createLoopResponseSchema,
   deliverySchema,
   loopListResponseSchema,
@@ -28,6 +29,7 @@ import { eq } from "drizzle-orm";
 import { createLoopAdmin, type LoopAdmin } from "../admin/index.js";
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
 import { machines } from "../db/schema.js";
+import { createOwnerControl, type OwnerControl } from "../owner/index.js";
 import {
   FakeClock,
   seedLease,
@@ -54,6 +56,7 @@ let db: Db;
 let clock: FakeClock;
 let coordinator: RunCoordinator;
 let admin: LoopAdmin;
+let ownerControl: OwnerControl;
 let app: ReturnType<typeof createServerApp>;
 
 async function fresh(): Promise<void> {
@@ -64,7 +67,8 @@ async function fresh(): Promise<void> {
   coordinator = createRunCoordinator(testDeps(db, clock));
   let loopN = 0;
   admin = createLoopAdmin({ db, clock, newLoopId: () => `loop-${++loopN}` });
-  app = createServerApp(coordinator, admin);
+  ownerControl = createOwnerControl({ db, clock });
+  app = createServerApp(coordinator, admin, ownerControl);
 }
 
 async function pollReq(body: unknown = {}, token: string | null = TOKEN): Promise<Response> {
@@ -106,6 +110,15 @@ async function triggerReq(loopId: string, body?: unknown): Promise<Response> {
   });
 }
 
+/** `body` ABSENT means no request body at all (the empty-body case). */
+async function cancelReq(runId: string, body?: unknown): Promise<Response> {
+  return app.request(`/api/runs/${runId}/cancel`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    ...(body === undefined ? {} : { body: typeof body === "string" ? body : JSON.stringify(body) }),
+  });
+}
+
 async function expectJsonError(res: Response, status: number, body: { error: string; code?: string }): Promise<void> {
   expect(res.status).toBe(status);
   expect(res.headers.get("content-type")).toMatch(/application\/json/);
@@ -117,7 +130,7 @@ async function expectJsonError(res: Response, status: number, body: { error: str
 describe("createServerApp: seam properties", () => {
   it("returns an independent app per call and constructs with no DB/env/listener side effects", async () => {
     await fresh();
-    const other = createServerApp(coordinator, admin);
+    const other = createServerApp(coordinator, admin, ownerControl);
     expect(other).not.toBe(app);
     // Both serve independently.
     expect((await app.request("/api/machine/poll", { method: "GET" })).status).toBe(404);
@@ -394,6 +407,80 @@ describe("POST /api/loops/:id/run", () => {
   });
 });
 
+describe("POST /api/runs/:id/cancel", () => {
+  it("200 {canceled:true} on a running run — the capability is revoked in the same transaction (T6's HTTP face)", async () => {
+    await fresh();
+    const machineId = await seedMachineForToken(db, TOKEN);
+    await seedLoop(db, { id: "loop-1" });
+    await seedRun(db, { id: "run-1", machineId });
+    const runToken = pollResponseSchema.parse(await (await pollReq()).json()).deliveries[0]!.runToken;
+
+    const res = await cancelReq("run-1"); // NO body at all — normalizes to {}
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(cancelRunResponseSchema.parse(json)).toBeTruthy();
+    expect(json).toEqual({ canceled: true });
+
+    // phase + ts only: no outcome/message/error late-write ever lands.
+    expect((await snapshotRuns(db))[0]).toMatchObject({
+      phase: "canceled",
+      ts: clock.iso(),
+      outcome: null,
+      message: null,
+      error: null,
+    });
+    // The revoked credential meets the unified coded 401.
+    await expectJsonError(await reportReq({ ok: true }, runToken), 401, {
+      error: "invalid or expired run capability",
+      code: "run_capability_invalid",
+    });
+  });
+
+  it("200 {canceled:true} on a pending run (no lease existed)", async () => {
+    await fresh();
+    await seedRun(db, { id: "run-1", phase: "pending" });
+    const res = await cancelReq("run-1", { futureField: 1 }); // unknown keys strip away
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ canceled: true });
+    expect((await snapshotRuns(db))[0]).toMatchObject({ phase: "canceled", ts: clock.iso() });
+  });
+
+  it("200 {canceled:false,not_cancelable} for an already-terminal run — the repeat cancel is idempotent, zero writes", async () => {
+    await fresh();
+    await seedRun(db, { id: "run-1", phase: "done", outcome: "exec", message: "finished" });
+    const before = await snapshotRuns(db);
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const res = await cancelReq("run-1", {});
+      expect(res.status).toBe(200);
+      const json = await res.json();
+      expect(cancelRunResponseSchema.parse(json)).toBeTruthy();
+      expect(json).toEqual({ canceled: false, reason: "not_cancelable" });
+    }
+    expect(await snapshotRuns(db)).toEqual(before);
+  });
+
+  it("404 + not found for an unknown run", async () => {
+    await fresh();
+    await expectJsonError(await cancelReq("run-ghost", {}), 404, { error: "not found" });
+  });
+
+  it("400 for malformed or non-object JSON, zero writes", async () => {
+    await fresh();
+    await seedRun(db, { id: "run-1", phase: "running" });
+    for (const body of ["{", "[1]", '"str"', "null"]) {
+      await expectJsonError(await cancelReq("run-1", body), 400, { error: "invalid request" });
+    }
+    expect((await snapshotRuns(db))[0]).toMatchObject({ phase: "running" }); // untouched
+  });
+
+  it("413 over the shared 2 MiB body cap", async () => {
+    await fresh();
+    const huge = JSON.stringify({ pad: "x".repeat(3 * 1024 * 1024) });
+    await expectJsonError(await cancelReq("run-1", huge), 413, { error: "request body too large" });
+  });
+});
+
 describe("GET observation surface", () => {
   it("GET /api/machines returns schema-valid summaries without tokenHash/roots", async () => {
     await fresh();
@@ -573,6 +660,7 @@ describe("unified error surface", () => {
         },
       },
       admin,
+      ownerControl,
     );
     const res = await sabotaged.request("/api/machine/poll", {
       method: "POST",
