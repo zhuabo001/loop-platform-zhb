@@ -124,8 +124,10 @@ export function createInactivitySweep(deps: InactivitySweepDeps): InactivitySwee
       const heartbeatClass = classifyHeartbeatWatermark(machine?.lastSeen ?? null, nowMs);
       const heartbeatAge = heartbeatAgeMs(machine?.lastSeen ?? null, nowMs);
       diagnostic = `machineHeartbeat=${heartbeatClass}${heartbeatAge === null ? "" : ` ageMs=${heartbeatAge}`}`;
-    } catch (err) {
-      diagnostic = `machineHeartbeat=unavailable error=${err instanceof Error ? err.message : String(err)}`;
+    } catch {
+      // Driver errors and injected values can contain connection details or
+      // newlines. This diagnostic channel promises IDs + classifications only.
+      diagnostic = "machineHeartbeat=unavailable";
     }
 
     try {
@@ -140,11 +142,11 @@ export function createInactivitySweep(deps: InactivitySweepDeps): InactivitySwee
         `[sweep] reclaim run=${run.id} loop=${run.loopId} machine=${run.machineId}` +
           ` inactiveMs=${activityMs === null ? "unknown" : nowMs - activityMs} ${diagnostic}`,
       );
-    } catch (err) {
+    } catch {
       // A conjunctive-guard violation (running WITHOUT an active lease) rolls
       // its own transaction back — count it, log it, keep sweeping.
       stats.failed += 1;
-      log(`[sweep] reclaim FAILED run=${run.id}: ${err instanceof Error ? err.message : String(err)}`);
+      log(`[sweep] reclaim FAILED run=${run.id} classification=reclaim_failed`);
     }
   }
 
@@ -250,7 +252,16 @@ export function armInactivitySweep(
     if (stopped) return; // a queued tick firing mid-drain must not start a new pass
     inFlight = sweep.runOnce().then(
       () => undefined,
-      (err: unknown) => onError(`[sweep] pass failed: ${err instanceof Error ? err.message : String(err)}`),
+      () => {
+        // Logging must never turn a handled sweep failure into an unhandled
+        // rejection that prevents shutdown from draining.
+        try {
+          onError("[sweep] pass failed classification=sweep_pass_failed");
+        } catch {
+          // Preserve the timer and ordered shutdown guarantees even when an
+          // injected logger fails.
+        }
+      },
     );
   };
   tick();

@@ -13,8 +13,8 @@ import type { Clock } from "../time.js";
 export interface LeaseStoreDeps {
   db: Db;
   clock: Clock;
-  /** Invariant-violation lines (ids + classifications only — NEVER
-   *  credentials). Defaults to console.warn in production. */
+  /** Invariant lines: IDs + fixed classifications only — NEVER credentials
+   * or untrusted database text. */
   log?: (line: string) => void;
 }
 
@@ -36,8 +36,8 @@ export interface LeaseStoreDeps {
  * manufacture a `running` run with NO active lease: an orphan that fails the
  * reclaim's conjunctive guard every pass and never self-heals. Treating it
  * as LIVE lets a normal report finalize the run (self-healing); the anomaly
- * is surfaced via `isActiveLeaseAnomalous` + a credential-free invariant log
- * at the resolve/report call sites.
+ * is surfaced via `isActiveLeaseAnomalous` and one credential-free invariant
+ * log at the report resolver boundary (before a retrying transaction starts).
  */
 export function isLeaseDead(lease: Pick<RunLeaseRow, "state" | "expiresAt">, nowMs: number): boolean {
   if (lease.state === "terminal-grace") {
@@ -54,11 +54,19 @@ export function isActiveLeaseAnomalous(lease: Pick<RunLeaseRow, "state" | "expir
   return lease.state === "active" && lease.expiresAt != null;
 }
 
+/** A safe invariant line: expiry text is database input, so it is never
+ * interpolated. This is the single vocabulary source for the report-side
+ * anomaly event. */
+export function activeLeaseAnomalyLine(runId: string): string {
+  return `[lease] invariant violation run=${runId} classification=active_lease_has_expiry kept_live=true`;
+}
+
 /**
  * Resolve a lease by credential hash. A dead lease (expired window, or a
  * fail-closed terminal-grace) is dropped lazily on resolve — it can never be
  * reused — and reported as not-found. An ANOMALOUS active lease (non-null
- * expiresAt) stays live and logs a credential-free invariant line.
+ * expiresAt) stays live and logs one credential-free invariant event before
+ * the report transaction may retry.
  */
 export async function resolveLiveLease(deps: LeaseStoreDeps, tokenHash: string): Promise<RunLeaseRow | undefined> {
   const row = (await deps.db.select().from(runLeases).where(eq(runLeases.tokenHash, tokenHash)))[0];
@@ -67,10 +75,6 @@ export async function resolveLiveLease(deps: LeaseStoreDeps, tokenHash: string):
     await deps.db.delete(runLeases).where(eq(runLeases.tokenHash, tokenHash));
     return undefined;
   }
-  if (isActiveLeaseAnomalous(row)) {
-    (deps.log ?? console.warn)(
-      `[lease] invariant violation: active lease with non-null expiresAt run=${row.runId} expiresAt=${row.expiresAt} — kept LIVE (never time-killed)`,
-    );
-  }
+  if (isActiveLeaseAnomalous(row)) (deps.log ?? console.warn)(activeLeaseAnomalyLine(row.runId));
   return row;
 }

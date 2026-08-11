@@ -315,7 +315,7 @@ describe("active lease is never time-killed (review)", () => {
     expect(isActiveLeaseAnomalous({ state: "active", expiresAt: null })).toBe(false);
   });
 
-  it("an active lease with a PAST expiresAt stays live: the report finalizes the run (self-healing) and the anomaly is logged WITHOUT credentials", async () => {
+  it("an active lease with an anomalous expiresAt stays live: the report self-heals and emits one safe invariant log", async () => {
     const logs: string[] = [];
     await fresh({ log: (line) => logs.push(line) });
     await seedRun(db, { id: "run-1", machineId, phase: "running" });
@@ -327,7 +327,7 @@ describe("active lease is never time-killed (review)", () => {
       runId: "run-1",
       machineId,
       state: "active",
-      expiresAt: new Date(clock.now().getTime() - 60_000).toISOString(),
+      expiresAt: "untrusted-expiry\nrk_should_not_log",
     });
 
     await expect(coordinator.report(SEED_CRED, { ok: true, message: "recovered" })).resolves.toEqual({ ok: true });
@@ -335,8 +335,11 @@ describe("active lease is never time-killed (review)", () => {
     expect((await snapshotRuns(db))[0]).toMatchObject({ phase: "done", outcome: "exec", message: "recovered" });
     expect(await snapshotLeases(db)).toEqual([]); // the REPORT retired it — never time
     const violations = logs.filter((l) => l.includes("invariant violation") && l.includes("run-1"));
-    expect(violations.length).toBeGreaterThan(0);
-    expect(violations.every((l) => !l.includes(SEED_CRED) && !l.includes(sha256(SEED_CRED)))).toBe(true); // never credentials
+    expect(violations).toHaveLength(1);
+    expect(violations[0]).toContain("classification=active_lease_has_expiry");
+    expect(violations.every((l) => !l.includes(SEED_CRED) && !l.includes(sha256(SEED_CRED)) && !l.includes("rk_should_not_log"))).toBe(
+      true,
+    );
   });
 });
 

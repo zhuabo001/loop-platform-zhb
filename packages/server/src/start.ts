@@ -91,7 +91,10 @@ export async function main(): Promise<void> {
     // Ordered (plan §1 + review): block new sweep ticks and DRAIN the
     // in-flight pass → HTTP → DB. A pass mid-transaction settles before
     // closeDb runs — it never outlives the database it transacts on.
-    void sweepTimer.stopAndDrain().then(() => {
+    // Drain failures must not strand the HTTP listener/DB. armInactivitySweep
+    // contains ordinary pass and logger failures, but this final boundary is
+    // deliberately defensive for any future timer implementation.
+    void sweepTimer.stopAndDrain().catch(() => {}).then(() => {
       server.close(async () => {
         await closeDb(handle).catch(() => {});
         process.exit(0);

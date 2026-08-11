@@ -37,15 +37,12 @@ import type { ReportRequest } from "@loopzhb/protocol";
 import { ReportRaceLostError, RunCapabilityInvalidError } from "../coordinator/errors.js";
 import type { Db } from "../db/index.js";
 import { runLeases, runs, type NewRun, type Run } from "../db/schema.js";
-import { isActiveLeaseAnomalous, isLeaseDead } from "./leases.js";
+import { isLeaseDead } from "./leases.js";
 import type { Clock } from "../time.js";
 
 export interface ReportStoreDeps {
   db: Db;
   clock: Clock;
-  /** Invariant-violation lines (ids + classifications only — NEVER
-   *  credentials). Defaults to console.warn in production. */
-  log?: (line: string) => void;
 }
 
 /** Text caps for daemon-supplied columns (mirror the reference). */
@@ -182,10 +179,30 @@ async function runReportTx(
     // ONE clock snapshot for the whole transaction: the expiry re-check and
     // the transition stamp must agree.
     const now = clock.now();
-    // In-transaction re-resolve: a cancel that committed since the read-side
-    // resolve shows up HERE (the lease is gone) — never write against it.
-    const lease = (await tx.select().from(runLeases).where(eq(runLeases.tokenHash, input.tokenHash)))[0];
-    if (!lease) return { kind: "denied", reason: "consumed_or_revoked" };
+    // Read the lease and Run in ONE statement. Under Postgres READ COMMITTED,
+    // separate SELECTs may observe `active lease` before a sweep and `error
+    // run` after it, manufacture a false stale-phase 401, and lose an
+    // unconsumed report. A joined snapshot makes every branch-table decision
+    // coherent; all subsequent writes retain their conditional guards.
+    const state = (
+      await tx
+        .select({ lease: runLeases, run: runs })
+        .from(runLeases)
+        .leftJoin(runs, eq(runs.id, runLeases.runId))
+        .where(eq(runLeases.tokenHash, input.tokenHash))
+    )[0];
+    if (!state) return { kind: "denied", reason: "consumed_or_revoked" };
+    const { lease, run } = state;
+
+    /** Delete only the lease state this coherent snapshot observed. A state
+     * transition after the read is a CAS loss, never a terminal 401. */
+    const deleteObservedLease = async (): Promise<void> => {
+      const deleted = await tx
+        .delete(runLeases)
+        .where(and(eq(runLeases.tokenHash, input.tokenHash), eq(runLeases.state, lease.state)))
+        .returning({ tokenHash: runLeases.tokenHash });
+      if (deleted.length !== 1) throw new ReportCasLostError(lease.runId);
+    };
 
     // Re-validate deadness INSIDE the transaction against the same clock
     // snapshot (review #4): the read-side resolve happened before this tx —
@@ -194,24 +211,18 @@ async function runReportTx(
     // terminal-grace lease with a missing/unparseable window is dead on
     // sight. The cleanup delete commits; the 401 is thrown after.
     if (isLeaseDead(lease, now.getTime())) {
-      await tx.delete(runLeases).where(eq(runLeases.tokenHash, input.tokenHash));
+      await deleteObservedLease();
       return { kind: "denied", reason: "unknown_or_expired" };
     }
 
     // An anomalous ACTIVE lease (non-null expiresAt) is NEVER time-killed —
     // it proceeds through the normal active state machine below so the report
-    // finalizes the run (self-healing), and the violation is logged WITHOUT
-    // any credential material.
-    if (isActiveLeaseAnomalous(lease)) {
-      (deps.log ?? console.warn)(
-        `[lease] invariant violation: active lease with non-null expiresAt run=${lease.runId} expiresAt=${lease.expiresAt} — kept LIVE (never time-killed)`,
-      );
-    }
+    // finalizes the run (self-healing). The resolver emitted the one safe
+    // invariant event before this retrying transaction began.
 
-    const run = (await tx.select().from(runs).where(eq(runs.id, lease.runId)))[0];
     if (!run) {
       // Orphaned capability (A-14): drop the orphan, no loop writes, 401.
-      await tx.delete(runLeases).where(eq(runLeases.tokenHash, input.tokenHash));
+      await deleteObservedLease();
       return { kind: "denied", reason: "orphaned_run" };
     }
 
@@ -220,7 +231,7 @@ async function runReportTx(
     if (!finalize && !reconcile) {
       // Stale phase — incl. the Phase 1 "done + active lease" combo that has
       // no legitimate source: drop the residual lease, zero Run/Loop writes.
-      await tx.delete(runLeases).where(eq(runLeases.tokenHash, input.tokenHash));
+      await deleteObservedLease();
       return { kind: "denied", reason: "stale_phase" };
     }
 
@@ -242,7 +253,7 @@ async function runReportTx(
     await input.insideTxHook?.(run.id);
     const deleted = await tx
       .delete(runLeases)
-      .where(eq(runLeases.tokenHash, input.tokenHash))
+      .where(and(eq(runLeases.tokenHash, input.tokenHash), eq(runLeases.state, lease.state)))
       .returning({ tokenHash: runLeases.tokenHash });
     if (deleted.length !== 1) throw new ReportCasLostError(run.id);
     return { kind: "ok", result: reconcile ? { ok: true as const, reconciled: true as const } : { ok: true as const } };

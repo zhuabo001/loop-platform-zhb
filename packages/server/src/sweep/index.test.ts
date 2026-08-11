@@ -211,7 +211,7 @@ describe("reclaim semantics through the sweep", () => {
       db,
       clock,
       log: (line) => logs.push(line),
-      readMachineForDiagnostic: () => Promise.reject(new Error("pg boom")),
+      readMachineForDiagnostic: () => Promise.reject(new Error("password=rk_should_not_log\ninjected")),
     });
 
     const stats = await broken.runOnce();
@@ -220,6 +220,7 @@ describe("reclaim semantics through the sweep", () => {
     expect(stats).toMatchObject({ scanned: 1, reclaimed: 1, failed: 0 });
     expect((await snapshotRuns(db))[0]).toMatchObject({ phase: "error", outcome: "error" });
     expect(logs.some((l) => l.includes("run-1") && l.includes("machineHeartbeat=unavailable"))).toBe(true);
+    expect(logs.join("\n")).not.toContain("rk_should_not_log");
   });
 
   it("a progress heartbeat landing BETWEEN scan and reclaim turns the reclaim into a benign skip (review: scan/reclaim TOCTOU)", async () => {
@@ -325,7 +326,8 @@ describe("armInactivitySweep timer wiring", () => {
       await vi.advanceTimersByTimeAsync(1000); // tick 2 rejects — caught, logged
       expect(calls).toBe(2);
       expect(errors).toHaveLength(1);
-      expect(errors[0]).toContain("boom");
+      expect(errors[0]).toContain("classification=sweep_pass_failed");
+      expect(errors[0]).not.toContain("boom");
 
       await vi.advanceTimersByTimeAsync(1000); // a failed pass never kills later ticks
       expect(calls).toBe(3);
@@ -369,6 +371,25 @@ describe("armInactivitySweep timer wiring", () => {
 
       await vi.advanceTimersByTimeAsync(5000); // and no tick ever fires again
       expect(calls).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("contains an error logger failure so shutdown can still drain and close", async () => {
+    vi.useFakeTimers();
+    try {
+      const stub: InactivitySweep = {
+        runOnce: vi.fn(async () => {
+          throw new Error("runner failed");
+        }),
+      };
+      const timer = armInactivitySweep(stub, 1000, () => {
+        throw new Error("logger failed");
+      });
+
+      await vi.advanceTimersByTimeAsync(0);
+      await expect(timer.stopAndDrain()).resolves.toBeUndefined();
     } finally {
       vi.useRealTimers();
     }

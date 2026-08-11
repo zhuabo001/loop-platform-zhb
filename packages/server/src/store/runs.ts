@@ -9,7 +9,7 @@
  *    ONE transaction;
  *  - report finalize (Step 3): run UPDATE + lease DELETE in ONE transaction.
  */
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull } from "drizzle-orm";
 
 import { sha256 } from "@loopzhb/protocol/node";
 import type { RunRole } from "@loopzhb/protocol";
@@ -251,7 +251,11 @@ export type ReclaimOutcome =
   /** A fresh ts/progress.at landed between the scan and this transaction —
    *  the in-transaction re-validation vetoes the reclaim (Phase 2 progress
    *  heartbeats make this reachable). */
-  | "activity_fresh";
+  | "activity_fresh"
+  /** The row's activity evidence changed after this transaction read it, so
+   *  the conditional reclaim deliberately gave up. A later sweep may inspect
+   *  the new value; this pass must never overwrite it. */
+  | "activity_changed";
 
 /**
  * Owner cancel (Phase 1: NO HTTP route — the future owner adapter calls
@@ -329,12 +333,34 @@ export async function reclaimStaleRunTx(
     if (activityMs !== null && nowMs - activityMs < input.runInactivityMs) return "activity_fresh" as const;
 
     const nowIso = now.toISOString();
+    const progressGuard = candidate.progress === null ? isNull(runs.progress) : eq(runs.progress, candidate.progress);
     const updated = await tx
       .update(runs)
       .set({ phase: "error", outcome: "error", error: RECLAIM_RUN_ERROR, ts: nowIso })
-      .where(and(eq(runs.id, input.runId), eq(runs.phase, "running")))
+      // Carry the exact activity snapshot through the write. A heartbeat that
+      // lands after the read changes ts/progress and makes this a benign CAS
+      // loser rather than an erroneous reclaim.
+      .where(
+        and(
+          eq(runs.id, input.runId),
+          eq(runs.phase, "running"),
+          eq(runs.ts, candidate.ts),
+          progressGuard,
+        ),
+      )
       .returning({ id: runs.id });
-    if (updated.length === 0) return "not_running" as const; // row-lock race loser — benign
+    if (updated.length === 0) {
+      const current = (
+        await tx
+          .select({ phase: runs.phase, ts: runs.ts, progress: runs.progress })
+          .from(runs)
+          .where(eq(runs.id, input.runId))
+      )[0];
+      if (!current || current.phase !== "running") return "not_running" as const;
+      const currentActivityMs = lastRunActivityMs({ ts: current.ts, progress: current.progress }, nowMs);
+      if (currentActivityMs !== null && nowMs - currentActivityMs < input.runInactivityMs) return "activity_fresh" as const;
+      return "activity_changed" as const;
+    }
     const terminalized = await tx
       .update(runLeases)
       .set({ state: "terminal-grace", expiresAt: new Date(nowMs + TERMINAL_GRACE_MS).toISOString() })
