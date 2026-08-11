@@ -68,7 +68,9 @@ async function fresh(depsOverrides: Parameters<typeof testDeps>[2] = {}): Promis
 /** Store-level lifecycle primitives under test (deliberately NOT on the
  *  coordinator interface — A-02). */
 const cancel = (runId: string) => cancelRunTx({ db, clock }, runId);
-const reclaim = (runId: string) => reclaimStaleRunTx({ db, clock }, runId);
+// Threshold 0: any activity age reads as stale — these tests drive the
+// transition directly; the threshold semantics are pinned at the sweep level.
+const reclaim = (runId: string) => reclaimStaleRunTx({ db, clock }, { runId, runInactivityMs: 0 });
 
 async function seedActiveRun(runOverrides: Partial<NewRun> = {}): Promise<string> {
   await seedRun(db, { id: "run-1", machineId, phase: "running", ...runOverrides });
@@ -123,7 +125,7 @@ describe("reclaimStaleRun primitive (sweep-only)", () => {
   it("atomically errors the run and terminalizes the lease with the first now+24h window", async () => {
     await fresh();
     await seedActiveRun({ progress: { step: 2, label: "working" } });
-    expect(await reclaim("run-1")).toBe(true);
+    expect(await reclaim("run-1")).toBe("reclaimed");
 
     expect((await snapshotRuns(db))[0]).toMatchObject({
       phase: "error",
@@ -146,7 +148,7 @@ describe("reclaimStaleRun primitive (sweep-only)", () => {
     const first = (await snapshotLeases(db))[0]!;
 
     clock.advance(60_000);
-    expect(await reclaim("run-1")).toBe(false);
+    expect(await reclaim("run-1")).toBe("not_running");
     const again = (await snapshotLeases(db))[0]!;
     expect(again.expiresAt).toBe(first.expiresAt); // untouched first window
   });
@@ -159,16 +161,31 @@ describe("reclaimStaleRun primitive (sweep-only)", () => {
     const before = await snapshotRuns(db);
 
     for (const id of ["run-pending", "run-done", "run-failed", "run-ghost"]) {
-      expect(await reclaim(id)).toBe(false);
+      expect(await reclaim(id)).toBe("not_running");
     }
     expect(await snapshotRuns(db)).toEqual(before); // zero writes
     expect(await snapshotLeases(db)).toEqual([]); // no terminal-grace created
   });
 
+  it("vetoes the reclaim when the in-transaction recheck finds FRESH activity (review: scan/reclaim TOCTOU)", async () => {
+    await fresh();
+    // ts seeded NOW: with a real inactivity threshold the in-tx re-validation
+    // sees a live run — the scan's stale hint is only a hint, and a Phase 2
+    // progress heartbeat that landed in between turns the reclaim into a
+    // benign skip (NOT reclaimed, NOT failed).
+    await seedActiveRun({ ts: clock.iso() });
+    await expect(
+      reclaimStaleRunTx(testDeps(db, clock), { runId: "run-1", runInactivityMs: 20 * 60_000 }),
+    ).resolves.toBe("activity_fresh");
+    // Zero writes: no error-ization, no terminal-grace window.
+    expect((await snapshotRuns(db))[0]).toMatchObject({ phase: "running", outcome: null });
+    expect((await snapshotLeases(db))[0]).toMatchObject({ state: "active", expiresAt: null });
+  });
+
   it("refuses a running run with NO lease: guard error, the whole transaction rolls back (review #6)", async () => {
     await fresh();
     await seedRun(db, { id: "run-no-lease", machineId, phase: "running" });
-    await expect(reclaimStaleRunTx(testDeps(db, clock), "run-no-lease")).rejects.toMatchObject({
+    await expect(reclaimStaleRunTx(testDeps(db, clock), { runId: "run-no-lease", runInactivityMs: 0 })).rejects.toMatchObject({
       name: "ReclaimGuardLostError",
     });
     // Zero writes: the run was NOT error-ized without a grace window.
@@ -181,7 +198,7 @@ describe("reclaimStaleRun primitive (sweep-only)", () => {
     await seedRun(db, { id: "run-1", machineId, phase: "running" });
     const expiry = new Date(clock.now().getTime() + 60_000).toISOString();
     await seedLease(db, { tokenHash: sha256("rk_tg"), runId: "run-1", machineId, state: "terminal-grace", expiresAt: expiry });
-    await expect(reclaimStaleRunTx(testDeps(db, clock), "run-1")).rejects.toMatchObject({
+    await expect(reclaimStaleRunTx(testDeps(db, clock), { runId: "run-1", runInactivityMs: 0 })).rejects.toMatchObject({
       name: "ReclaimGuardLostError",
     });
     expect((await snapshotRuns(db))[0]).toMatchObject({ phase: "running", outcome: null });
@@ -305,7 +322,7 @@ describe("transaction guards", () => {
 
     // The machine vanishes; the sweep reclaims the orphaned running run.
     clock.advance(15 * 60_000);
-    expect(await reclaim("run-1")).toBe(true);
+    expect(await reclaim("run-1")).toBe("reclaimed");
 
     // Still no re-dispatch — the run left the surface at claim time.
     const after = await coordinator.poll(TOKEN, {});

@@ -36,13 +36,8 @@ import { and, asc, eq, gt } from "drizzle-orm";
 
 import type { Db } from "../db/index.js";
 import { runLeases, runs, type RunProgressRow } from "../db/schema.js";
-import {
-  classifyHeartbeatWatermark,
-  getMachine,
-  heartbeatAgeMs,
-  isHeartbeatWatermarkAnomalous,
-} from "../store/machines.js";
-import { reclaimStaleRunTx } from "../store/runs.js";
+import { classifyHeartbeatWatermark, getMachine, heartbeatAgeMs } from "../store/machines.js";
+import { lastRunActivityMs, reclaimStaleRunTx } from "../store/runs.js";
 import type { Clock } from "../time.js";
 
 /** Production thresholds (plan §1): a run silent for 20 minutes is stale;
@@ -91,28 +86,6 @@ const terminalGraceColumns = {
   expiresAt: runLeases.expiresAt,
 } as const;
 
-/**
- * The run's last-activity evidence, in epoch ms — `max(run.ts, progress.at)`
- * restricted to VALID stamps: unparseable values are skipped, and stamps
- * further than the shared skew slack into the future are pollution (the SAME
- * predicate the machine-watermark consumers use — "anomalous" can never drift
- * between surfaces). `null` = no evidence at all; the caller fails CLOSED.
- */
-export function lastRunActivityMs(
-  run: { ts: string; progress: RunProgressRow | null },
-  nowMs: number,
-): number | null {
-  let best: number | null = null;
-  for (const raw of [run.ts, run.progress?.at] as const) {
-    if (raw == null) continue;
-    const ms = Date.parse(raw);
-    if (Number.isNaN(ms)) continue;
-    if (isHeartbeatWatermarkAnomalous(ms, nowMs)) continue;
-    best = best === null ? ms : Math.max(best, ms);
-  }
-  return best;
-}
-
 export function createInactivitySweep(deps: InactivitySweepDeps): InactivitySweep {
   const runInactivityMs = deps.runInactivityMs ?? DEFAULT_RUN_INACTIVITY_MS;
   const pageSize = deps.pageSize ?? DEFAULT_SWEEP_PAGE_SIZE;
@@ -136,8 +109,12 @@ export function createInactivitySweep(deps: InactivitySweepDeps): InactivitySwee
     const diagnostic = `machineHeartbeat=${heartbeatClass}${heartbeatAge === null ? "" : ` ageMs=${heartbeatAge}`}`;
 
     try {
-      const reclaimed = await reclaimStaleRunTx({ db: deps.db, clock: deps.clock }, run.id);
-      if (!reclaimed) return; // left `running` between scan and reclaim — benign race
+      // The scan's staleness decision is a HINT: reclaimStaleRunTx
+      // re-validates the activity watermark INSIDE its transaction (review:
+      // scan/reclaim TOCTOU) — a Phase 2 progress heartbeat that landed in
+      // between turns this into a benign "activity_fresh" skip.
+      const outcome = await reclaimStaleRunTx({ db: deps.db, clock: deps.clock }, { runId: run.id, runInactivityMs });
+      if (outcome !== "reclaimed") return; // left `running` / fresh activity — benign race
       stats.reclaimed += 1;
       log(
         `[sweep] reclaim run=${run.id} loop=${run.loopId} machine=${run.machineId}` +
