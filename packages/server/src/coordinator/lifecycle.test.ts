@@ -26,6 +26,7 @@ import { sha256 } from "@loopzhb/protocol/node";
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
 import { runLeases, type NewRun } from "../db/schema.js";
 import { cancelRunTx, RECLAIM_RUN_ERROR, reclaimStaleRunTx } from "../store/runs.js";
+import { isActiveLeaseAnomalous, isLeaseDead } from "../store/leases.js";
 import * as leasesStore from "../store/leases.js";
 import * as reportStore from "../store/report.js";
 import * as runsStore from "../store/runs.js";
@@ -295,6 +296,47 @@ describe("terminal-grace fail-closed expiry (Day 8–10 plan §1)", () => {
     });
     expect(await snapshotLeases(db)).toEqual([]); // cleanup commits, the 401 rides after
     expect(await snapshotRuns(db)).toEqual(runsBefore);
+  });
+});
+
+describe("active lease is never time-killed (review)", () => {
+  it("the shared predicate: active stays LIVE with past, future or null expiresAt; only the anomaly flag differs", () => {
+    const nowMs = Date.parse("2026-08-01T00:00:00.000Z");
+    const past = "2020-01-01T00:00:00.000Z";
+    const future = "2030-01-01T00:00:00.000Z";
+    expect(isLeaseDead({ state: "active", expiresAt: past }, nowMs)).toBe(false);
+    expect(isLeaseDead({ state: "active", expiresAt: future }, nowMs)).toBe(false);
+    expect(isLeaseDead({ state: "active", expiresAt: null }, nowMs)).toBe(false);
+    // …while terminal-grace keeps its fail-closed rule.
+    expect(isLeaseDead({ state: "terminal-grace", expiresAt: past }, nowMs)).toBe(true);
+    expect(isLeaseDead({ state: "terminal-grace", expiresAt: null }, nowMs)).toBe(true);
+    expect(isLeaseDead({ state: "terminal-grace", expiresAt: future }, nowMs)).toBe(false);
+    expect(isActiveLeaseAnomalous({ state: "active", expiresAt: past })).toBe(true);
+    expect(isActiveLeaseAnomalous({ state: "active", expiresAt: null })).toBe(false);
+  });
+
+  it("an active lease with a PAST expiresAt stays live: the report finalizes the run (self-healing) and the anomaly is logged WITHOUT credentials", async () => {
+    const logs: string[] = [];
+    await fresh({ log: (line) => logs.push(line) });
+    await seedRun(db, { id: "run-1", machineId, phase: "running" });
+    // Anomalous legacy data: an ACTIVE lease carrying an expiry (the schema
+    // doesn't forbid it; every normal writer stores null). Time-killing it
+    // would orphan the running run forever — instead it stays LIVE.
+    await seedLease(db, {
+      tokenHash: sha256(SEED_CRED),
+      runId: "run-1",
+      machineId,
+      state: "active",
+      expiresAt: new Date(clock.now().getTime() - 60_000).toISOString(),
+    });
+
+    await expect(coordinator.report(SEED_CRED, { ok: true, message: "recovered" })).resolves.toEqual({ ok: true });
+
+    expect((await snapshotRuns(db))[0]).toMatchObject({ phase: "done", outcome: "exec", message: "recovered" });
+    expect(await snapshotLeases(db)).toEqual([]); // the REPORT retired it — never time
+    const violations = logs.filter((l) => l.includes("invariant violation") && l.includes("run-1"));
+    expect(violations.length).toBeGreaterThan(0);
+    expect(violations.every((l) => !l.includes(SEED_CRED) && !l.includes(sha256(SEED_CRED)))).toBe(true); // never credentials
   });
 });
 

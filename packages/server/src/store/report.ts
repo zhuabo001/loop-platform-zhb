@@ -37,12 +37,15 @@ import type { ReportRequest } from "@loopzhb/protocol";
 import { ReportRaceLostError, RunCapabilityInvalidError } from "../coordinator/errors.js";
 import type { Db } from "../db/index.js";
 import { runLeases, runs, type NewRun, type Run } from "../db/schema.js";
-import { isLeaseDead } from "./leases.js";
+import { isActiveLeaseAnomalous, isLeaseDead } from "./leases.js";
 import type { Clock } from "../time.js";
 
 export interface ReportStoreDeps {
   db: Db;
   clock: Clock;
+  /** Invariant-violation lines (ids + classifications only — NEVER
+   *  credentials). Defaults to console.warn in production. */
+  log?: (line: string) => void;
 }
 
 /** Text caps for daemon-supplied columns (mirror the reference). */
@@ -193,6 +196,16 @@ async function runReportTx(
     if (isLeaseDead(lease, now.getTime())) {
       await tx.delete(runLeases).where(eq(runLeases.tokenHash, input.tokenHash));
       return { kind: "denied", reason: "unknown_or_expired" };
+    }
+
+    // An anomalous ACTIVE lease (non-null expiresAt) is NEVER time-killed —
+    // it proceeds through the normal active state machine below so the report
+    // finalizes the run (self-healing), and the violation is logged WITHOUT
+    // any credential material.
+    if (isActiveLeaseAnomalous(lease)) {
+      (deps.log ?? console.warn)(
+        `[lease] invariant violation: active lease with non-null expiresAt run=${lease.runId} expiresAt=${lease.expiresAt} — kept LIVE (never time-killed)`,
+      );
     }
 
     const run = (await tx.select().from(runs).where(eq(runs.id, lease.runId)))[0];
