@@ -74,6 +74,8 @@ describe("loopback policy", () => {
     const warning = unauthenticatedExposureWarning("0.0.0.0");
     expect(warning).toContain("0.0.0.0");
     expect(warning).toMatch(/NO authentication/);
+    // The Day 8–10 cancel route is part of the unauthenticated surface.
+    expect(warning).toContain("/api/runs*");
     expect(unauthenticatedExposureWarning("192.168.1.10")).not.toBeNull();
   });
 });

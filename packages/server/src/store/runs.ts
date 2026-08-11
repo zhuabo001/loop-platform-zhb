@@ -9,13 +9,14 @@
  *    ONE transaction;
  *  - report finalize (Step 3): run UPDATE + lease DELETE in ONE transaction.
  */
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull } from "drizzle-orm";
 
 import { sha256 } from "@loopzhb/protocol/node";
 import type { RunRole } from "@loopzhb/protocol";
 
 import type { Db } from "../db/index.js";
-import { loops, runLeases, runs, type Loop, type Run } from "../db/schema.js";
+import { loops, runLeases, runs, type Loop, type Run, type RunProgressRow } from "../db/schema.js";
+import { isHeartbeatWatermarkAnomalous } from "./machines.js";
 import type { Clock } from "../time.js";
 
 /** The slice of coordinator dependencies the run store needs. */
@@ -54,6 +55,10 @@ export class EnqueueGuardLostError extends Error {
 
 export async function getLoop(db: Db, loopId: string): Promise<Loop | undefined> {
   return (await db.select().from(loops).where(eq(loops.id, loopId)))[0];
+}
+
+export async function getRun(db: Db, runId: string): Promise<Run | undefined> {
+  return (await db.select().from(runs).where(eq(runs.id, runId)))[0];
 }
 
 /**
@@ -211,6 +216,48 @@ export interface LifecycleStoreDeps {
 export const TERMINAL_GRACE_MS = 24 * 60 * 60 * 1000;
 
 /**
+ * The run's last-activity evidence, in epoch ms — `max(run.ts, progress.at)`
+ * restricted to VALID stamps: unparseable values are skipped, and stamps
+ * further than the shared skew slack into the future are pollution (the SAME
+ * predicate the machine-watermark consumers use — "anomalous" can never drift
+ * between surfaces). `null` = no evidence at all; the caller fails CLOSED.
+ *
+ * THE shared staleness rule: the sweep's candidate scan AND reclaimStaleRunTx's
+ * in-transaction re-validation both compute activity through THIS function —
+ * the rule cannot drift between the hint and the guard.
+ */
+export function lastRunActivityMs(
+  run: { ts: string; progress: RunProgressRow | null },
+  nowMs: number,
+): number | null {
+  let best: number | null = null;
+  for (const raw of [run.ts, run.progress?.at] as const) {
+    if (raw == null) continue;
+    const ms = Date.parse(raw);
+    if (Number.isNaN(ms)) continue;
+    if (isHeartbeatWatermarkAnomalous(ms, nowMs)) continue;
+    best = best === null ? ms : Math.max(best, ms);
+  }
+  return best;
+}
+
+/** The outcome of a reclaim attempt (review: scan/reclaim TOCTOU). Anything
+ *  other than "reclaimed" is a BENIGN race — the sweep neither logs it as a
+ *  failure nor counts it: the run simply no longer matches the scan's hint. */
+export type ReclaimOutcome =
+  | "reclaimed"
+  /** Left `running` between the scan and this transaction. */
+  | "not_running"
+  /** A fresh ts/progress.at landed between the scan and this transaction —
+   *  the in-transaction re-validation vetoes the reclaim (Phase 2 progress
+   *  heartbeats make this reachable). */
+  | "activity_fresh"
+  /** The row's activity evidence changed after this transaction read it, so
+   *  the conditional reclaim deliberately gave up. A later sweep may inspect
+   *  the new value; this pass must never overwrite it. */
+  | "activity_changed";
+
+/**
  * Owner cancel (Phase 1: NO HTTP route — the future owner adapter calls
  * THIS store primitive directly; A-02 keeps it off the coordinator's
  * three-method interface). Run → `canceled` and the lease DELETE land in ONE transaction
@@ -246,10 +293,17 @@ export class ReclaimGuardLostError extends Error {
 /**
  * Sweep reclaim — SWEEP-ORCHESTRATION ONLY (report, cancel, normal failure
  * and admin paths must never call this: they must not manufacture reconcile
- * eligibility). In ONE transaction: a still-running run goes error/error with
- * the generic reclaim reason (the wake-report replaces it with the truth),
- * `ts` is stamped, and the lease flips active → terminal-grace with the FIRST
- * `now + 24h` window.
+ * eligibility). In ONE transaction: re-validate the staleness decision (below),
+ * a still-running run goes error/error with the generic reclaim reason (the
+ * wake-report replaces it with the truth), `ts` is stamped, and the lease
+ * flips active → terminal-grace with the FIRST `now + 24h` window.
+ *
+ * The activity re-validation (review: scan/reclaim TOCTOU): the sweep's scan
+ * decided staleness from a snapshot; a `ts`/`progress.at` write that landed
+ * since (Phase 2 progress heartbeats) must veto the reclaim. The transaction
+ * re-reads the run and recomputes `lastRunActivityMs` — the SAME shared
+ * predicate as the scan — against a FRESH clock snapshot: still-fresh →
+ * "activity_fresh", a benign skip that is neither reclaimed nor failed.
  *
  * The eligibility guard is CONJUNCTIVE (plan §事务守卫 — review #6): only
  * `running run + active lease` reclaims. The lease flip must affect EXACTLY
@@ -261,22 +315,58 @@ export class ReclaimGuardLostError extends Error {
  * tests). Guards: only a `running` run reclaims (a repeat reclaim is a no-op
  * and can NEVER extend the first window), and only an `active` lease flips.
  */
-export async function reclaimStaleRunTx(deps: LifecycleStoreDeps, runId: string): Promise<boolean> {
+export async function reclaimStaleRunTx(
+  deps: LifecycleStoreDeps,
+  input: { runId: string; runInactivityMs: number },
+): Promise<ReclaimOutcome> {
   return deps.db.transaction(async (tx) => {
     const now = deps.clock.now();
+    const nowMs = now.getTime();
+    const candidate = (
+      await tx
+        .select({ phase: runs.phase, ts: runs.ts, progress: runs.progress })
+        .from(runs)
+        .where(eq(runs.id, input.runId))
+    )[0];
+    if (!candidate || candidate.phase !== "running") return "not_running" as const;
+    const activityMs = lastRunActivityMs({ ts: candidate.ts, progress: candidate.progress }, nowMs);
+    if (activityMs !== null && nowMs - activityMs < input.runInactivityMs) return "activity_fresh" as const;
+
     const nowIso = now.toISOString();
+    const progressGuard = candidate.progress === null ? isNull(runs.progress) : eq(runs.progress, candidate.progress);
     const updated = await tx
       .update(runs)
       .set({ phase: "error", outcome: "error", error: RECLAIM_RUN_ERROR, ts: nowIso })
-      .where(and(eq(runs.id, runId), eq(runs.phase, "running")))
+      // Carry the exact activity snapshot through the write. A heartbeat that
+      // lands after the read changes ts/progress and makes this a benign CAS
+      // loser rather than an erroneous reclaim.
+      .where(
+        and(
+          eq(runs.id, input.runId),
+          eq(runs.phase, "running"),
+          eq(runs.ts, candidate.ts),
+          progressGuard,
+        ),
+      )
       .returning({ id: runs.id });
-    if (updated.length === 0) return false;
+    if (updated.length === 0) {
+      const current = (
+        await tx
+          .select({ phase: runs.phase, ts: runs.ts, progress: runs.progress })
+          .from(runs)
+          .where(eq(runs.id, input.runId))
+      )[0];
+      if (!current || current.phase !== "running") return "not_running" as const;
+      const currentActivityMs = lastRunActivityMs({ ts: current.ts, progress: current.progress }, nowMs);
+      if (currentActivityMs !== null && nowMs - currentActivityMs < input.runInactivityMs) return "activity_fresh" as const;
+      return "activity_changed" as const;
+    }
     const terminalized = await tx
       .update(runLeases)
-      .set({ state: "terminal-grace", expiresAt: new Date(now.getTime() + TERMINAL_GRACE_MS).toISOString() })
-      .where(and(eq(runLeases.runId, runId), eq(runLeases.state, "active")))
+      .set({ state: "terminal-grace", expiresAt: new Date(nowMs + TERMINAL_GRACE_MS).toISOString() })
+      .where(and(eq(runLeases.runId, input.runId), eq(runLeases.state, "active")))
       .returning({ tokenHash: runLeases.tokenHash });
-    if (terminalized.length !== 1) throw new ReclaimGuardLostError(runId);
-    return true;
+    if (terminalized.length !== 1) throw new ReclaimGuardLostError(input.runId);
+    return "reclaimed" as const;
   });
 }

@@ -19,11 +19,14 @@
  */
 import { afterEach, describe, expect, it } from "vitest";
 
+import { eq } from "drizzle-orm";
+
 import { sha256 } from "@loopzhb/protocol/node";
 
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
-import type { NewRun } from "../db/schema.js";
+import { runLeases, type NewRun } from "../db/schema.js";
 import { cancelRunTx, RECLAIM_RUN_ERROR, reclaimStaleRunTx } from "../store/runs.js";
+import { isActiveLeaseAnomalous, isLeaseDead } from "../store/leases.js";
 import * as leasesStore from "../store/leases.js";
 import * as reportStore from "../store/report.js";
 import * as runsStore from "../store/runs.js";
@@ -66,7 +69,9 @@ async function fresh(depsOverrides: Parameters<typeof testDeps>[2] = {}): Promis
 /** Store-level lifecycle primitives under test (deliberately NOT on the
  *  coordinator interface — A-02). */
 const cancel = (runId: string) => cancelRunTx({ db, clock }, runId);
-const reclaim = (runId: string) => reclaimStaleRunTx({ db, clock }, runId);
+// Threshold 0: any activity age reads as stale — these tests drive the
+// transition directly; the threshold semantics are pinned at the sweep level.
+const reclaim = (runId: string) => reclaimStaleRunTx({ db, clock }, { runId, runInactivityMs: 0 });
 
 async function seedActiveRun(runOverrides: Partial<NewRun> = {}): Promise<string> {
   await seedRun(db, { id: "run-1", machineId, phase: "running", ...runOverrides });
@@ -121,7 +126,7 @@ describe("reclaimStaleRun primitive (sweep-only)", () => {
   it("atomically errors the run and terminalizes the lease with the first now+24h window", async () => {
     await fresh();
     await seedActiveRun({ progress: { step: 2, label: "working" } });
-    expect(await reclaim("run-1")).toBe(true);
+    expect(await reclaim("run-1")).toBe("reclaimed");
 
     expect((await snapshotRuns(db))[0]).toMatchObject({
       phase: "error",
@@ -144,7 +149,7 @@ describe("reclaimStaleRun primitive (sweep-only)", () => {
     const first = (await snapshotLeases(db))[0]!;
 
     clock.advance(60_000);
-    expect(await reclaim("run-1")).toBe(false);
+    expect(await reclaim("run-1")).toBe("not_running");
     const again = (await snapshotLeases(db))[0]!;
     expect(again.expiresAt).toBe(first.expiresAt); // untouched first window
   });
@@ -157,16 +162,31 @@ describe("reclaimStaleRun primitive (sweep-only)", () => {
     const before = await snapshotRuns(db);
 
     for (const id of ["run-pending", "run-done", "run-failed", "run-ghost"]) {
-      expect(await reclaim(id)).toBe(false);
+      expect(await reclaim(id)).toBe("not_running");
     }
     expect(await snapshotRuns(db)).toEqual(before); // zero writes
     expect(await snapshotLeases(db)).toEqual([]); // no terminal-grace created
   });
 
+  it("vetoes the reclaim when the in-transaction recheck finds FRESH activity (review: scan/reclaim TOCTOU)", async () => {
+    await fresh();
+    // ts seeded NOW: with a real inactivity threshold the in-tx re-validation
+    // sees a live run — the scan's stale hint is only a hint, and a Phase 2
+    // progress heartbeat that landed in between turns the reclaim into a
+    // benign skip (NOT reclaimed, NOT failed).
+    await seedActiveRun({ ts: clock.iso() });
+    await expect(
+      reclaimStaleRunTx(testDeps(db, clock), { runId: "run-1", runInactivityMs: 20 * 60_000 }),
+    ).resolves.toBe("activity_fresh");
+    // Zero writes: no error-ization, no terminal-grace window.
+    expect((await snapshotRuns(db))[0]).toMatchObject({ phase: "running", outcome: null });
+    expect((await snapshotLeases(db))[0]).toMatchObject({ state: "active", expiresAt: null });
+  });
+
   it("refuses a running run with NO lease: guard error, the whole transaction rolls back (review #6)", async () => {
     await fresh();
     await seedRun(db, { id: "run-no-lease", machineId, phase: "running" });
-    await expect(reclaimStaleRunTx(testDeps(db, clock), "run-no-lease")).rejects.toMatchObject({
+    await expect(reclaimStaleRunTx(testDeps(db, clock), { runId: "run-no-lease", runInactivityMs: 0 })).rejects.toMatchObject({
       name: "ReclaimGuardLostError",
     });
     // Zero writes: the run was NOT error-ized without a grace window.
@@ -179,7 +199,7 @@ describe("reclaimStaleRun primitive (sweep-only)", () => {
     await seedRun(db, { id: "run-1", machineId, phase: "running" });
     const expiry = new Date(clock.now().getTime() + 60_000).toISOString();
     await seedLease(db, { tokenHash: sha256("rk_tg"), runId: "run-1", machineId, state: "terminal-grace", expiresAt: expiry });
-    await expect(reclaimStaleRunTx(testDeps(db, clock), "run-1")).rejects.toMatchObject({
+    await expect(reclaimStaleRunTx(testDeps(db, clock), { runId: "run-1", runInactivityMs: 0 })).rejects.toMatchObject({
       name: "ReclaimGuardLostError",
     });
     expect((await snapshotRuns(db))[0]).toMatchObject({ phase: "running", outcome: null });
@@ -193,6 +213,133 @@ describe("reclaimStaleRun primitive (sweep-only)", () => {
     for (const mod of [runsStore, leasesStore, reportStore]) {
       expect(Object.keys(mod)).not.toContain("terminalizeLease");
     }
+  });
+});
+
+describe("terminal-grace fail-closed expiry (Day 8–10 plan §1)", () => {
+  it("a terminal-grace lease with a MISSING expiresAt is dead: 401 + lazy cleanup, zero run writes", async () => {
+    await fresh();
+    await seedRun(db, { id: "run-1", machineId, phase: "error", outcome: "error", error: RECLAIM_RUN_ERROR });
+    await seedLease(db, {
+      tokenHash: sha256(SEED_CRED),
+      runId: "run-1",
+      machineId,
+      state: "terminal-grace",
+      expiresAt: null,
+    });
+    const runsBefore = await snapshotRuns(db);
+
+    await expect(coordinator.report(SEED_CRED, { ok: true })).rejects.toMatchObject({
+      name: "RunCapabilityInvalidError",
+      reason: "unknown_or_expired",
+    });
+    expect(await snapshotLeases(db)).toEqual([]); // fail-closed cleanup committed
+    expect(await snapshotRuns(db)).toEqual(runsBefore);
+  });
+
+  it("a terminal-grace lease with an UNPARSEABLE expiresAt is dead: 401 + lazy cleanup", async () => {
+    await fresh();
+    await seedRun(db, { id: "run-1", machineId, phase: "error", outcome: "error", error: RECLAIM_RUN_ERROR });
+    await seedLease(db, {
+      tokenHash: sha256(SEED_CRED),
+      runId: "run-1",
+      machineId,
+      state: "terminal-grace",
+      expiresAt: "not-a-date",
+    });
+
+    await expect(coordinator.report(SEED_CRED, { ok: true })).rejects.toMatchObject({
+      name: "RunCapabilityInvalidError",
+      reason: "unknown_or_expired",
+    });
+    expect(await snapshotLeases(db)).toEqual([]);
+  });
+
+  it("the in-transaction re-check catches a window corrupted AFTER the read-side resolve", async () => {
+    let openGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      openGate = resolve;
+    });
+    let markResolved!: () => void;
+    const resolved = new Promise<void>((resolve) => {
+      markResolved = resolve;
+    });
+    await fresh({
+      hooks: {
+        afterReportResolve: async () => {
+          markResolved();
+          await gate;
+        },
+      },
+    });
+    // A HEALTHY swept run: terminal-grace well inside its 24h window.
+    await seedRun(db, { id: "run-1", machineId, phase: "error", outcome: "error", error: RECLAIM_RUN_ERROR });
+    await seedLease(db, {
+      tokenHash: sha256(SEED_CRED),
+      runId: "run-1",
+      machineId,
+      state: "terminal-grace",
+      expiresAt: new Date(clock.now().getTime() + 24 * 60 * 60_000).toISOString(),
+    });
+    const runsBefore = await snapshotRuns(db);
+
+    const reportPromise = coordinator.report(SEED_CRED, { ok: true });
+    await resolved;
+    // The window stamp is corrupted while the report is parked: the write
+    // transaction's re-check must apply the SAME fail-closed rule.
+    await db.update(runLeases).set({ expiresAt: "corrupted" }).where(eq(runLeases.runId, "run-1"));
+    openGate();
+
+    await expect(reportPromise).rejects.toMatchObject({
+      name: "RunCapabilityInvalidError",
+      reason: "unknown_or_expired",
+    });
+    expect(await snapshotLeases(db)).toEqual([]); // cleanup commits, the 401 rides after
+    expect(await snapshotRuns(db)).toEqual(runsBefore);
+  });
+});
+
+describe("active lease is never time-killed (review)", () => {
+  it("the shared predicate: active stays LIVE with past, future or null expiresAt; only the anomaly flag differs", () => {
+    const nowMs = Date.parse("2026-08-01T00:00:00.000Z");
+    const past = "2020-01-01T00:00:00.000Z";
+    const future = "2030-01-01T00:00:00.000Z";
+    expect(isLeaseDead({ state: "active", expiresAt: past }, nowMs)).toBe(false);
+    expect(isLeaseDead({ state: "active", expiresAt: future }, nowMs)).toBe(false);
+    expect(isLeaseDead({ state: "active", expiresAt: null }, nowMs)).toBe(false);
+    // …while terminal-grace keeps its fail-closed rule.
+    expect(isLeaseDead({ state: "terminal-grace", expiresAt: past }, nowMs)).toBe(true);
+    expect(isLeaseDead({ state: "terminal-grace", expiresAt: null }, nowMs)).toBe(true);
+    expect(isLeaseDead({ state: "terminal-grace", expiresAt: future }, nowMs)).toBe(false);
+    expect(isActiveLeaseAnomalous({ state: "active", expiresAt: past })).toBe(true);
+    expect(isActiveLeaseAnomalous({ state: "active", expiresAt: null })).toBe(false);
+  });
+
+  it("an active lease with an anomalous expiresAt stays live: the report self-heals and emits one safe invariant log", async () => {
+    const logs: string[] = [];
+    await fresh({ log: (line) => logs.push(line) });
+    await seedRun(db, { id: "run-1", machineId, phase: "running" });
+    // Anomalous legacy data: an ACTIVE lease carrying an expiry (the schema
+    // doesn't forbid it; every normal writer stores null). Time-killing it
+    // would orphan the running run forever — instead it stays LIVE.
+    await seedLease(db, {
+      tokenHash: sha256(SEED_CRED),
+      runId: "run-1",
+      machineId,
+      state: "active",
+      expiresAt: "untrusted-expiry\nrk_should_not_log",
+    });
+
+    await expect(coordinator.report(SEED_CRED, { ok: true, message: "recovered" })).resolves.toEqual({ ok: true });
+
+    expect((await snapshotRuns(db))[0]).toMatchObject({ phase: "done", outcome: "exec", message: "recovered" });
+    expect(await snapshotLeases(db)).toEqual([]); // the REPORT retired it — never time
+    const violations = logs.filter((l) => l.includes("invariant violation") && l.includes("run-1"));
+    expect(violations).toHaveLength(1);
+    expect(violations[0]).toContain("classification=active_lease_has_expiry");
+    expect(violations.every((l) => !l.includes(SEED_CRED) && !l.includes(sha256(SEED_CRED)) && !l.includes("rk_should_not_log"))).toBe(
+      true,
+    );
   });
 });
 
@@ -220,7 +367,7 @@ describe("transaction guards", () => {
 
     // The machine vanishes; the sweep reclaims the orphaned running run.
     clock.advance(15 * 60_000);
-    expect(await reclaim("run-1")).toBe(true);
+    expect(await reclaim("run-1")).toBe("reclaimed");
 
     // Still no re-dispatch — the run left the surface at claim time.
     const after = await coordinator.poll(TOKEN, {});

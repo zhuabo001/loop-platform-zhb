@@ -1,22 +1,25 @@
 /**
- * The HTTP adapter (plan §HTTP). `createServerApp(coordinator, admin)` is a
- * PURE assembly seam — it wires the two machine routes plus the local
- * management routes (loop creation, manual trigger, JSON observation
- * surface) onto a standalone Hono app and returns it. It never reads env
- * vars, opens a DB, listens on a port, registers signals or holds a global
- * singleton; each call is an independent instance (tests drive it via
- * app.request; boot wires exactly one).
+ * The HTTP adapter (plan §HTTP). `createServerApp(coordinator, admin,
+ * ownerControl)` is a PURE assembly seam — it wires the two machine routes
+ * plus the local management routes (loop creation, manual trigger, run
+ * cancel, JSON observation surface) onto a standalone Hono app and returns
+ * it. It never reads env vars, opens a DB, listens on a port, registers
+ * signals or holds a global singleton; each call is an independent instance
+ * (tests drive it via app.request; boot wires exactly one).
  *
  * Routes do exactly four things: extract the Bearer credential, parse the
- * JSON body against the protocol DTO, call the coordinator/admin module,
- * shape the response. Every response — success or any error branch — is JSON
- * that validates against `apiErrorSchema` / the response schemas; Zod issues,
- * exception messages, stacks and DB details go to the server log only.
+ * JSON body against the protocol DTO, call the coordinator/admin/owner-control
+ * module, shape the response. Every response — success or any error branch —
+ * is JSON that validates against `apiErrorSchema` / the response schemas;
+ * Zod issues, exception messages, stacks and DB details go to the server log
+ * only.
  *
  * The management routes carry NO credential at all (Phase 1: localhost /
  * trusted network is the whole security boundary — see config.ts's
  * unauthenticated-exposure warning). The trigger route owns no lifecycle
- * logic: it delegates to `coordinator.enqueueExecRun` (ADR-001 T7).
+ * logic: it delegates to `coordinator.enqueueExecRun` (ADR-001 T7); the
+ * cancel route delegates to `ownerControl.cancelRun` (ADR-001 T6) — the
+ * coordinator's three-method interface is NOT the HTTP permission surface.
  *
  * Unified taxonomy (G-04): 400 invalid request / 401 invalid machine
  * credential / 401 + run_capability_invalid / 413 too large / 404 not found /
@@ -27,6 +30,7 @@ import { bodyLimit } from "hono/body-limit";
 import { Hono, type Context } from "hono";
 
 import {
+  cancelRunRequestSchema,
   createLoopRequestSchema,
   pollRequestSchema,
   reportRequestSchema,
@@ -38,6 +42,7 @@ import { LoopValidationError } from "../admin/errors.js";
 import type { LoopAdmin } from "../admin/index.js";
 import { InvalidMachineCredentialError, RunCapabilityInvalidError } from "../coordinator/errors.js";
 import type { RunCoordinator } from "../coordinator/index.js";
+import type { OwnerControl } from "../owner/index.js";
 
 /** Both machine endpoints share one wire body cap (plan §HTTP). */
 const BODY_CAP_BYTES = 2 * 1024 * 1024;
@@ -75,7 +80,7 @@ async function parseJsonBodyOrEmpty(c: Context): Promise<unknown> {
   }
 }
 
-export function createServerApp(coordinator: RunCoordinator, admin: LoopAdmin): Hono {
+export function createServerApp(coordinator: RunCoordinator, admin: LoopAdmin, ownerControl: OwnerControl): Hono {
   const app = new Hono();
 
   app.onError((err, c) => {
@@ -180,6 +185,21 @@ export function createServerApp(coordinator: RunCoordinator, admin: LoopAdmin): 
     }
     if (result.reason === "loop_not_found") return jsonError(c, 404, "not found");
     return c.json({ enqueued: false, reason: "running_exists" }, 200);
+  });
+
+  app.post("/api/runs/:id/cancel", cap, async (c) => {
+    const raw = await parseJsonBodyOrEmpty(c);
+    if (raw === undefined) return jsonError(c, 400, "invalid request");
+    const parsed = cancelRunRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      console.warn("[http] cancel DTO rejected", parsed.error.issues);
+      return jsonError(c, 400, "invalid request");
+    }
+    // T6 lives in the owner-control module — this route only maps its result.
+    const result = await ownerControl.cancelRun(c.req.param("id"));
+    if (result.canceled) return c.json({ canceled: true }, 200);
+    if (result.reason === "not_found") return jsonError(c, 404, "not found");
+    return c.json({ canceled: false, reason: "not_cancelable" }, 200);
   });
 
   return app;

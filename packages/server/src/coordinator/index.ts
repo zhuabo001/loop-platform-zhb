@@ -21,7 +21,9 @@
  *    Pglite is single-connection, so the plan's race tests orchestrate real
  *    committed competitor writes at the APP level via these gates; real
  *    multi-connection lock contention stays with Phase 6 (ADR-001's honesty
- *    note).
+ *    note);
+ *  - `log` (optional): invariant-violation lines from the store layer (ids +
+ *    classifications only — NEVER credentials); defaults to console.warn.
  *
  * Deterministic derivations (sha256, machineIdFromToken) are plain imports,
  * not injected.
@@ -63,6 +65,8 @@ export interface RunCoordinatorDependencies extends RunStoreDeps {
   /** Mint a fresh run-lease wire token (`rk_…` in production). The store only
    *  ever persists its sha256 — the plaintext rides the Delivery. */
   mintRunCredential(): string;
+  /** Store-layer invariant-violation lines (NEVER credentials). */
+  log?: (line: string) => void;
   hooks?: CoordinatorHooks;
 }
 

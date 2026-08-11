@@ -69,7 +69,7 @@ supersede 与 insert 是分离写入。ZHB 保留 per-loop 进程内串行化作
 | T2 | 重复 poll 不重复执行 | daemon 已领取 run 后网络重试同一 poll | 再次 poll | 不返回已 running 的 run，不生成第二条 run 行 |
 | T3 | 重复 report 效果幂等 | 第一次 report 已成功落库、lease 已 retire | 同一 token 再次 `report` | resolve 处 401；run/loop 状态与全部副作用（通知/游标）保持不变 |
 | T4 | server 重启不丢在途 run | run 处于 running，lease 已落库 | server 进程重启 | run 不被误判失败；daemon 后续 report 正常受理 |
-| T5 | 休眠迟到 report 翻正误判 | run 被 sweep 回收为失败（lease=terminal-grace） | daemon 醒来上报真实成功结果 | run 翻正为 done，记录消息/产物，lease 销毁；第二次迟到 report 在 resolve 处 401 |
+| T5 | 休眠迟到 report 翻正误判 | run 被 sweep 回收为失败（lease=terminal-grace） | daemon 醒来上报真实成功结果 | run 翻正为 done，记录消息（Phase 1 只写基础终态字段与 message——artifact 随其所属阶段落地，见 Day 3–4 A-08 裁决），lease 销毁；第二次迟到 report 在 resolve 处 401 |
 | T6 | 取消的 run 迟到 report 被拦截 | owner cancel：run 转 `canceled` 且 lease 在同一事务中撤销 | 迟到 report 到达 | token resolve 或事务锁/CAS guard 处失败；游标/任务文件/loop 配置/通知均不变；cancel 后 run-token 的一切写操作失效（Phase 1 的 run-token 表面只有 report；set-\*/reschedule/finish 随其所在阶段落地时继承此规则） |
 | T7 | 下一次触发原子 supersede 陈旧 pending | pending run 一直未被领取 | 下一次触发到达（Phase 1 为手动 trigger，coordinator 级测试；cron 阶段继承同一语义） | 同一事务中旧 pending 转为 skipped（不计失败、不告警）且恰好一个新 pending 入队；存在 running、phase guard 输给 Poll 或写入失败时不得留下部分结果 |
 
@@ -99,3 +99,14 @@ supersede 与 insert 是分离写入。ZHB 保留 per-loop 进程内串行化作
 - 2026-07-29：T7 明确为原子 Supersede：running 阻止触发；否则旧 pending exec 的
   `canceled/skipped` 转换与恰好一个新 pending exec 的插入处于同一事务。保留参考
   实现的单进程 per-loop 串行化，但不继承其 supersede 与 insert 分离提交窗口。
+- 2026-08-11（Day 8–10 代码审查后修订）：（1）T5 措辞修订——「记录消息/产物」
+  收窄为 Phase 1 的基础终态字段与 message：Day 3–4 的 A-08 已裁定本阶段不消费
+  `artifacts`，产物随 Phase 5 artifact 同步落地。此为 ADR 措辞未跟随后续裁决的
+  文档漂移，非实现漂移。（2）两个竞态窗口的应用层防护落位，并在此明示其 Phase 6
+  证明义务：**sweep/report 交错**下 report 的 CAS 失败做有界重解析（sweep 赢则
+  reconcile；cancel/另一 report 赢则 coded 401；重试再败返回非终态 500——未被
+  消费的报告不得获得 daemon 视为终态确认的 coded 401）；**scan/reclaim 交错**下
+  回收事务内复核活跃度 watermark（Phase 2 progress heartbeat 写入前的前置防护，
+  扫描后变活跃即 benign skip）。两者在 PGlite 单连接上原理性不可复现（写事务持
+  连接期间竞争者只能排队），应用层分支逻辑已确定性钉测，**真实多物理连接交错
+  证明是 Phase 6 的显式阻塞项**。

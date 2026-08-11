@@ -52,8 +52,8 @@ export function unauthenticatedExposureWarning(host: string): string | null {
   return [
     `⚠️  LOOPZHB_HOST=${host}: listening on a NON-loopback address.`,
     "⚠️  Phase 1 has NO authentication on /api/machine/* or the management surface",
-    "⚠️  (/api/machines, /api/loops*) — any reachable client can enroll machines,",
-    "⚠️  create loops and drive runs.",
+    "⚠️  (/api/machines, /api/loops*, /api/runs*) — any reachable client can enroll",
+    "⚠️  machines, create loops, drive runs and CANCEL them.",
     "⚠️  Expose this only on a trusted network / inside a container until Phase 5 auth lands.",
   ].join("\n");
 }

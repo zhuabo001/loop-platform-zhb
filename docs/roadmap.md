@@ -35,7 +35,7 @@
 
 | 里程碑 | 到达标志 |
 |---|---|
-| 学习骨架 | Phase 1 完成：T1–T6 绿，手动触发端到端跑通 |
+| 学习骨架 | ✅ Phase 1 完成（2026-08-11）：T1–T6 绿，手动触发端到端跑通 |
 | 可演示 MVP | Phase 2 完成：一条真实 Agent E2E |
 | 可靠单用户 | Phase 5 完成：artifact 同步 + 单用户使用闭环 |
 | 可公开部署多用户 | Phase 6 生产硬化完成 + auth 上线 |
@@ -58,6 +58,10 @@ docs/adr/     # 架构决策记录
 ---
 
 ## Phase 1 — 心脏（第 1–2 周）
+
+> 状态：✅ **已完成**（2026-08-11，`feat/day8-10-fault-injection`）——T1–T6 全绿、
+> T7 coordinator 测试绿，三条精确承诺成立；完成记录见
+> `docs/handoff/005-phase1-day8-10.md`。
 
 目标：端到端闭环跑通，ADR-001 心脏测试全绿。**本阶段不写一行 cron。**
 
@@ -83,6 +87,9 @@ claude-code 或 codex 选一：子进程 spawn、进程组 kill、timeout、env 
 | 验收 |
 |---|
 | 一条真实 Agent E2E 绿；agent 无法越出允许的根目录 |
+
+顺手收口：[Issue #10](https://github.com/zhuabo001/loop-platform-zhb/issues/10)
+（Day 8–10 二次审查右移项，不影响正确性）。
 
 ## Phase 3 — cron 与离线恢复（第 5–6 周）
 
@@ -116,6 +123,10 @@ Postgres（托管分层）/R2、迁移预检、body/rate/storage caps、SSRF 防
 健康检查、部署形态，以及**真实 Postgres 的并发验证**：使用多个物理连接验证行锁
 竞争、隔离级别、死锁与重试（PGlite 在 Phase 1 只验证应用层交错编排与真实事务提交，
 不代表托管 PG 的并发语义）。
+
+**显式阻塞项**：[Issue #11](https://github.com/zhuabo001/loop-platform-zhb/issues/11)
+——Day 8–10 report/reclaim 竞态防护的多物理连接并发验收（ADR-001 修订记录
+2026-08-11），关闭前不得进入真实 Postgres。
 
 ## Phase 7 — 高阶能力（按需）
 

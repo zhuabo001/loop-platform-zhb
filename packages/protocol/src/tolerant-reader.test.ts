@@ -3,6 +3,8 @@ import type { z } from "zod";
 
 import { apiErrorSchema } from "./errors.js";
 import {
+  cancelRunRequestSchema,
+  cancelRunResponseSchema,
   createLoopRequestSchema,
   createLoopResponseSchema,
   loopListResponseSchema,
@@ -127,6 +129,13 @@ const CASES: ReadonlyArray<readonly [string, z.ZodTypeAny, Record<string, unknow
     triggerRunResponseSchema,
     { enqueued: false, reason: "running_exists" },
   ],
+  ["cancelRunRequestSchema", cancelRunRequestSchema, {}],
+  ["cancelRunResponseSchema(canceled)", cancelRunResponseSchema, { canceled: true }],
+  [
+    "cancelRunResponseSchema(not-cancelable)",
+    cancelRunResponseSchema,
+    { canceled: false, reason: "not_cancelable" },
+  ],
   ["machineListResponseSchema", machineListResponseSchema, { machines: [] }],
   ["loopListResponseSchema", loopListResponseSchema, { loops: [] }],
   ["runListResponseSchema", runListResponseSchema, { runs: [] }],
@@ -144,6 +153,6 @@ describe("tolerant reader: EVERY exported object schema strips unknown keys", ()
   it("covers every object schema — adding a new one requires a row here", () => {
     // Guard against a FUTURE schema silently escaping this suite: the case list
     // is reviewed whenever a schema is added (CI review checklist, ADR-002).
-    expect(CASES.length).toBe(23);
+    expect(CASES.length).toBe(26);
   });
 });
