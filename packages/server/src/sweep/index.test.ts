@@ -23,7 +23,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { sha256 } from "@loopzhb/protocol/node";
 
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
-import { machines } from "../db/schema.js";
+import { machines, runs } from "../db/schema.js";
 import { eq } from "drizzle-orm";
 import { RECLAIM_RUN_ERROR, TERMINAL_GRACE_MS } from "../store/runs.js";
 import { FakeClock, seedLease, seedLoop, seedMachine, seedRun, snapshotLeases, snapshotRuns } from "../testkit/index.js";
@@ -204,6 +204,51 @@ describe("reclaim semantics through the sweep", () => {
     expect(logs.some((l) => l.includes("run-a-bad") && l.includes("FAILED"))).toBe(true);
   });
 
+  it("a THROWING diagnostic read never aborts the pass — the reclaim proceeds with the hole marked unavailable (review: candidate-level isolation)", async () => {
+    await fresh();
+    await seedRunningCandidate("run-1", iso(nowMs() - TWENTY_MIN));
+    const broken = createInactivitySweep({
+      db,
+      clock,
+      log: (line) => logs.push(line),
+      readMachineForDiagnostic: () => Promise.reject(new Error("pg boom")),
+    });
+
+    const stats = await broken.runOnce();
+    // The diagnostic failure is NOT the candidate's reclaim failure: the
+    // reclaim ran, `failed` stayed 0, and the pass completed normally.
+    expect(stats).toMatchObject({ scanned: 1, reclaimed: 1, failed: 0 });
+    expect((await snapshotRuns(db))[0]).toMatchObject({ phase: "error", outcome: "error" });
+    expect(logs.some((l) => l.includes("run-1") && l.includes("machineHeartbeat=unavailable"))).toBe(true);
+  });
+
+  it("a progress heartbeat landing BETWEEN scan and reclaim turns the reclaim into a benign skip (review: scan/reclaim TOCTOU)", async () => {
+    await fresh();
+    await seedRunningCandidate("run-1", iso(nowMs() - TWENTY_MIN));
+    const interposed = createInactivitySweep({
+      db,
+      clock,
+      log: (line) => logs.push(line),
+      // The diagnostic read fires after the scan's stale decision and before
+      // the reclaim transaction — the deterministic seam for the window a
+      // Phase 2 progress write would race through.
+      readMachineForDiagnostic: async () => {
+        await db
+          .update(runs)
+          .set({ progress: { step: 2, label: "working", at: clock.iso() } })
+          .where(eq(runs.id, "run-1"));
+        return undefined;
+      },
+    });
+
+    const stats = await interposed.runOnce();
+    // Benign skip: NOT reclaimed, NOT failed — the just-proven-live run is
+    // left running with its active lease intact.
+    expect(stats).toMatchObject({ scanned: 1, reclaimed: 0, failed: 0 });
+    expect((await snapshotRuns(db))[0]).toMatchObject({ phase: "running", outcome: null });
+    expect((await snapshotLeases(db))[0]).toMatchObject({ state: "active", expiresAt: null });
+  });
+
   it("never scans non-running phases (pending waits for T7 supersede, terminals are settled)", async () => {
     await fresh();
     await seedRun(db, { id: "run-pending", phase: "pending" });
@@ -262,7 +307,7 @@ describe("terminal-grace lease prune", () => {
 });
 
 describe("armInactivitySweep timer wiring", () => {
-  it("runs one pass immediately, swallows a failing pass into the log, keeps ticking, and stop() ends it", async () => {
+  it("runs one pass immediately, swallows a failing pass into the log, keeps ticking, and stopAndDrain() ends it", async () => {
     vi.useFakeTimers();
     try {
       let calls = 0;
@@ -285,9 +330,45 @@ describe("armInactivitySweep timer wiring", () => {
       await vi.advanceTimersByTimeAsync(1000); // a failed pass never kills later ticks
       expect(calls).toBe(3);
 
-      timer.stop();
+      await timer.stopAndDrain();
       await vi.advanceTimersByTimeAsync(5000);
       expect(calls).toBe(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stopAndDrain blocks new ticks and waits for the IN-FLIGHT pass before resolving (review: shutdown drain)", async () => {
+    vi.useFakeTimers();
+    try {
+      let release!: () => void;
+      let calls = 0;
+      const stub: InactivitySweep = {
+        runOnce: vi.fn(
+          () =>
+            new Promise<SweepStats>((resolve) => {
+              calls += 1;
+              release = () => resolve({ scanned: 0, reclaimed: 0, pruned: 0, failed: 0 });
+            }),
+        ),
+      };
+      const timer = armInactivitySweep(stub, 1000, () => {});
+      expect(calls).toBe(1); // the immediate pass is IN FLIGHT
+
+      let drained = false;
+      const draining = timer.stopAndDrain().then(() => {
+        drained = true;
+      });
+      // The drain must NOT resolve while the pass hangs — closeDb comes later.
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(drained).toBe(false);
+
+      release(); // the in-flight pass settles → the drain resolves
+      await draining;
+      expect(drained).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(5000); // and no tick ever fires again
+      expect(calls).toBe(1);
     } finally {
       vi.useRealTimers();
     }

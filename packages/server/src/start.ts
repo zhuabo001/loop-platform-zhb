@@ -7,7 +7,8 @@
  * logic, and the start script runs the BUILT artifact (`node
  * --enable-source-maps dist/start.js`) — no implicit build lifecycle.
  *
- * Shutdown is idempotent and ordered: HTTP server first, then the DB.
+ * Shutdown is idempotent and ordered: the sweep timer blocks new ticks and
+ * drains its in-flight pass, then the HTTP server closes, then the DB.
  */
 import fs from "node:fs";
 import os from "node:os";
@@ -86,12 +87,15 @@ export async function main(): Promise<void> {
   const shutdown = (signal: string): void => {
     if (closing) return; // idempotent across SIGINT+SIGTERM races
     closing = true;
-    console.log(`received ${signal} — stopping sweep, closing HTTP server, then DB`);
-    // Ordered (plan §1): sweep timer → HTTP → DB.
-    sweepTimer.stop();
-    server.close(async () => {
-      await closeDb(handle).catch(() => {});
-      process.exit(0);
+    console.log(`received ${signal} — draining the sweep, closing HTTP server, then DB`);
+    // Ordered (plan §1 + review): block new sweep ticks and DRAIN the
+    // in-flight pass → HTTP → DB. A pass mid-transaction settles before
+    // closeDb runs — it never outlives the database it transacts on.
+    void sweepTimer.stopAndDrain().then(() => {
+      server.close(async () => {
+        await closeDb(handle).catch(() => {});
+        process.exit(0);
+      });
     });
   };
   process.on("SIGINT", shutdown);

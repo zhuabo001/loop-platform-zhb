@@ -15,19 +15,23 @@
  *     LINE ONLY — a fresh machine NEVER vetoes reclaiming its own timed-out
  *     run (ADR-001: a lost Delivery response must converge to an observable
  *     error even while the daemon keeps polling).
- *  2. LEASE PRUNE: terminal-grace leases past their window (`now >=
- *     expiresAt` — a lease dies AT its expiresAt, the boundary pinned with
- *     store/leases.ts) are deleted; a terminal-grace lease with a MISSING or
- *     UNPARSEABLE expiresAt is deleted on sight (fail closed — it must never
- *     linger as a reusable credential). ACTIVE leases are never time-pruned:
+ *  2. LEASE PRUNE: dead terminal-grace leases are deleted, where "dead" is
+ *     THE shared `isLeaseDead` predicate (store/leases.ts — the SAME rule the
+ *     read-side resolve and the report transaction's re-check use: past
+ *     window, or a missing/unparseable one, fail closed). Only ACTUAL
+ *     deletions count toward `pruned`. ACTIVE leases are never time-pruned:
  *     only report, cancel or reclaim may retire them.
  *
  * Pass discipline: ONE clock snapshot per pass; a candidate that loses its
- * race (left `running` between scan and reclaim) is benign — neither
+ * race (left `running` between scan and reclaim, or proved FRESH activity to
+ * the reclaim transaction's in-tx re-validation) is benign — neither
  * reclaimed nor failed; a candidate that THROWS (the conjunctive-guard
  * invariant) increments `failed`, is logged WITHOUT credentials, and never
- * blocks the rest of the batch. Overlapping runOnce() calls coalesce into the
- * single in-flight pass — a slow pass never stacks a second concurrent scan.
+ * blocks the rest of the batch. The machine-heartbeat DIAGNOSTIC read is
+ * fail-open under the same isolation: a throwing read marks the log line
+ * `machineHeartbeat=unavailable` and the reclaim proceeds. Overlapping
+ * runOnce() calls coalesce into the single in-flight pass — a slow pass
+ * never stacks a second concurrent scan.
  *
  * All lifecycle timestamps read the injected Clock; thresholds arrive by
  * constructor injection (NO new env vars in this batch — plan §1).
@@ -36,6 +40,7 @@ import { and, asc, eq, gt } from "drizzle-orm";
 
 import type { Db } from "../db/index.js";
 import { runLeases, runs, type RunProgressRow } from "../db/schema.js";
+import { isLeaseDead } from "../store/leases.js";
 import { classifyHeartbeatWatermark, getMachine, heartbeatAgeMs } from "../store/machines.js";
 import { lastRunActivityMs, reclaimStaleRunTx } from "../store/runs.js";
 import type { Clock } from "../time.js";
@@ -68,6 +73,10 @@ export interface InactivitySweepDeps {
   pageSize?: number;
   /** Receives safe log lines (ids + classifications only — NEVER credentials). */
   log?: (line: string) => void;
+  /** TEST-ONLY seam: override the diagnostic machine read (fault injection —
+   *  proves a throwing diagnostic never aborts the pass). Production never
+   *  sets this; the real read is store/machines.getMachine. */
+  readMachineForDiagnostic?: (db: Db, machineId: string) => Promise<{ lastSeen: string | null } | undefined>;
 }
 
 /** Explicit candidate projection (plan §1): exactly the columns the decision
@@ -83,6 +92,7 @@ const runCandidateColumns = {
 const terminalGraceColumns = {
   tokenHash: runLeases.tokenHash,
   runId: runLeases.runId,
+  state: runLeases.state,
   expiresAt: runLeases.expiresAt,
 } as const;
 
@@ -90,6 +100,7 @@ export function createInactivitySweep(deps: InactivitySweepDeps): InactivitySwee
   const runInactivityMs = deps.runInactivityMs ?? DEFAULT_RUN_INACTIVITY_MS;
   const pageSize = deps.pageSize ?? DEFAULT_SWEEP_PAGE_SIZE;
   const log = deps.log ?? ((line: string) => console.warn(line));
+  const readMachine = deps.readMachineForDiagnostic ?? getMachine;
 
   async function considerCandidate(
     run: { id: string; loopId: string; machineId: string; ts: string; progress: RunProgressRow | null },
@@ -102,11 +113,20 @@ export function createInactivitySweep(deps: InactivitySweepDeps): InactivitySwee
 
     // Diagnostic ONLY (plan §1): the machine's watermark explains WHY the run
     // may have been orphaned (machine vanished vs delivery lost while the
-    // daemon kept polling) — it never changes the decision.
-    const machine = await getMachine(deps.db, run.machineId);
-    const heartbeatClass = classifyHeartbeatWatermark(machine?.lastSeen ?? null, nowMs);
-    const heartbeatAge = heartbeatAgeMs(machine?.lastSeen ?? null, nowMs);
-    const diagnostic = `machineHeartbeat=${heartbeatClass}${heartbeatAge === null ? "" : ` ageMs=${heartbeatAge}`}`;
+    // daemon kept polling) — it never changes the decision. Fail-OPEN under
+    // candidate-level isolation (review): a throwing diagnostic read must
+    // neither abort the whole pass nor count as the candidate's reclaim
+    // failure — the reclaim proceeds with the diagnostic hole marked
+    // `unavailable`.
+    let diagnostic: string;
+    try {
+      const machine = await readMachine(deps.db, run.machineId);
+      const heartbeatClass = classifyHeartbeatWatermark(machine?.lastSeen ?? null, nowMs);
+      const heartbeatAge = heartbeatAgeMs(machine?.lastSeen ?? null, nowMs);
+      diagnostic = `machineHeartbeat=${heartbeatClass}${heartbeatAge === null ? "" : ` ageMs=${heartbeatAge}`}`;
+    } catch (err) {
+      diagnostic = `machineHeartbeat=unavailable error=${err instanceof Error ? err.message : String(err)}`;
+    }
 
     try {
       // The scan's staleness decision is a HINT: reclaimStaleRunTx
@@ -139,11 +159,19 @@ export function createInactivitySweep(deps: InactivitySweepDeps): InactivitySwee
         .limit(pageSize);
       if (page.length === 0) return;
       for (const lease of page) {
-        const expiryMs = lease.expiresAt === null ? null : Date.parse(lease.expiresAt);
-        // Fail closed: missing/unparseable windows and `now >= expiresAt` are
-        // all dead. The keyset cursor advances past deleted rows safely.
-        if (expiryMs !== null && !Number.isNaN(expiryMs) && nowMs < expiryMs) continue;
-        await deps.db.delete(runLeases).where(eq(runLeases.tokenHash, lease.tokenHash));
+        // THE shared deadness predicate (review: no third copy of the rule —
+        // read-side resolve, the report transaction's re-check and this prune
+        // MUST agree on "dead"). The keyset cursor advances past deleted
+        // rows safely.
+        if (!isLeaseDead(lease, nowMs)) continue;
+        // Count only ACTUAL deletions (review): on multi-connection Postgres
+        // a concurrent report may consume the lease between the page read
+        // and this delete — a 0-row delete must not inflate `pruned`.
+        const deleted = await deps.db
+          .delete(runLeases)
+          .where(eq(runLeases.tokenHash, lease.tokenHash))
+          .returning({ tokenHash: runLeases.tokenHash });
+        if (deleted.length === 0) continue;
         stats.pruned += 1;
         log(`[sweep] prune terminal-grace lease run=${lease.runId}`);
       }
@@ -199,7 +227,10 @@ export function createInactivitySweep(deps: InactivitySweepDeps): InactivitySwee
 }
 
 export interface SweepTimer {
-  stop(): void;
+  /** Block new ticks and wait for the in-flight pass (if any) to settle —
+   *  shutdown drains BEFORE closing HTTP/DB (review): a slow pass must never
+   *  outlive the database it transacts on. */
+  stopAndDrain(): Promise<void>;
 }
 
 /**
@@ -213,15 +244,26 @@ export function armInactivitySweep(
   intervalMs: number = DEFAULT_SWEEP_INTERVAL_MS,
   onError: (line: string) => void = (line) => console.error(line),
 ): SweepTimer {
+  let stopped = false;
+  let inFlight: Promise<void> | null = null;
   const tick = (): void => {
-    void sweep
-      .runOnce()
-      .catch((err: unknown) => onError(`[sweep] pass failed: ${err instanceof Error ? err.message : String(err)}`));
+    if (stopped) return; // a queued tick firing mid-drain must not start a new pass
+    inFlight = sweep.runOnce().then(
+      () => undefined,
+      (err: unknown) => onError(`[sweep] pass failed: ${err instanceof Error ? err.message : String(err)}`),
+    );
   };
   tick();
   const timer = setInterval(tick, intervalMs);
   timer.unref();
   return {
-    stop: () => clearInterval(timer),
+    // tick() catches its own errors, so this await never rejects. The drain
+    // has no timeout of its own: a wedged pass means wedged DB queries, and
+    // closeDb would hang on them anyway.
+    stopAndDrain: async () => {
+      stopped = true;
+      clearInterval(timer);
+      await inFlight;
+    },
   };
 }
