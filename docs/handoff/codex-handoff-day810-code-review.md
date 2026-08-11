@@ -256,3 +256,25 @@ Sweep 的 delete 影响 0 行仍会增加 `pruned`，造成观测统计虚报。
 - Phase 1 状态：可保留“当前 PGlite / 单进程范围内完成”，无需撤回 roadmap 标记；
 - 提交建议：先关闭执行清单 A；清单 B 是 Phase 2 前置，清单 C 是 Phase 6 前置。T4
   仅收窄文档，不新增双进程验收门。
+
+## 后续修复状态（2026-08-11）
+
+提交 `42d67af` 已关闭上述审查后续暴露的应用层缺口，后续代理无需重复实现：
+
+1. `reclaimStaleRunTx` 的 reclaim UPDATE 现在同时 CAS `phase`、读取到的 `ts` 与
+   `progress`；读取后的 heartbeat 不能再被 sweep 覆盖。CAS 落空会重读并作为
+   `activity_fresh` / `activity_changed` 的 benign skip 返回。因此执行清单 **B-7 已关闭**。
+2. report 事务以单条 `RunLease LEFT JOIN Run` 获得一致状态快照，避免
+   READ COMMITTED 下先读 active Lease、后读 error Run 的混合快照；所有 Lease 删除都
+   以已观察到的 state 作为 CAS，guard-loss 进入既有的一次有界重解析。因此执行清单
+   **C-8 的应用层实现已关闭**。
+3. Sweep 与 Lease 异常日志只保留 ID 与固定 classification；active Lease anomaly 在
+   resolver 一次记录，事务重试不重复记录。timer logger 抛错被隔离，shutdown 对 drain
+   失败也有关闭兜底。
+
+验证：`pnpm -r test` 通过 **360/360**（94 protocol + 43 daemon + 223 server）；
+`pnpm -r build`、`pnpm --filter @loopzhb/server db:check` 与
+`git diff --check 6d4e9bd...HEAD` 均通过。
+
+仍保留 **C-9 / Phase 6**：使用多个真实 PostgreSQL 物理连接证明隔离级别、锁与重试
+交错。PGlite 的单连接测试不能替代该最终并发验收。
