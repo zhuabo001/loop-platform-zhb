@@ -399,3 +399,197 @@ describe("shutdown", () => {
     await first;
   });
 });
+
+describe("execution decoupling (Phase 2 batch 1)", () => {
+  /** A runner whose every call blocks until the test releases it. */
+  function gatedRunner() {
+    const calls: { delivery: Delivery; release: (report: RunnerReport) => void }[] = [];
+    const runner: AgentRunner = {
+      run: (d: Delivery) =>
+        new Promise<RunnerReport>((resolve) => {
+          calls.push({ delivery: d, release: resolve });
+        }),
+    };
+    return { runner, calls };
+  }
+
+  it("keeps polling while the runner is blocked; busy polls carry availableSlots:0 + progress, idle polls availableSlots:1 with no progress key", async () => {
+    const gated = gatedRunner();
+    const { rt, client } = makeRuntime({ runner: gated.runner });
+    client.pollQueue.push({ kind: "ok", deliveries: [delivery("run-1")] });
+
+    await rt.pollOnce();
+    expect(client.polls[0]).toMatchObject({ availableSlots: 1 });
+    expect(client.polls[0]).not.toHaveProperty("progress");
+    expect(gated.calls).toHaveLength(1); // the runner started in the BACKGROUND
+
+    // The runner is still blocked — the next poll is not.
+    await rt.pollOnce();
+    expect(client.polls).toHaveLength(2);
+    expect(client.polls[1]).toMatchObject({ availableSlots: 0 });
+    expect(client.polls[1]!.progress).toEqual([{ runId: "run-1", step: 1, label: "starting claude-code" }]);
+
+    gated.calls[0]!.release(OK_RUNNER);
+    await rt.executionSettled();
+    expect(rt.inFlightCount()).toBe(0);
+    expect(rt.pendingCount()).toBe(0);
+
+    await rt.pollOnce();
+    expect(client.polls[2]).toMatchObject({ availableSlots: 1 });
+    expect(client.polls[2]).not.toHaveProperty("progress");
+  });
+
+  it("queues a batch delivery locally and runs it FIFO, one at a time — a redelivered queued runId is not enqueued twice (defensive behavior, NO liveness promise)", async () => {
+    const gated = gatedRunner();
+    const { rt, client } = makeRuntime({ runner: gated.runner });
+    client.pollQueue.push({ kind: "ok", deliveries: [delivery("run-1"), delivery("run-2")] });
+
+    await rt.pollOnce();
+    expect(gated.calls.map((c) => c.delivery.runId)).toEqual(["run-1"]); // ONE started, one queued
+
+    // An old server may redeliver the still-queued run — it stays ONE entry.
+    client.pollQueue.push({ kind: "ok", deliveries: [delivery("run-2")] });
+    await rt.pollOnce();
+
+    gated.calls[0]!.release(OK_RUNNER); // run-1 done → report confirmed → run-2 starts
+    await flush();
+    await flush();
+    expect(gated.calls.map((c) => c.delivery.runId)).toEqual(["run-1", "run-2"]);
+
+    gated.calls[1]!.release(OK_RUNNER);
+    await rt.executionSettled();
+    expect(gated.calls).toHaveLength(2); // the redelivery never created a second queue entry
+    expect(rt.pendingCount()).toBe(0);
+  });
+
+  it("does not start the queued run while a report is unconfirmed — capacity is inFlight ∪ queue ∪ pendingReports", async () => {
+    const gated = gatedRunner();
+    const { rt, client, clock } = makeRuntime({ runner: gated.runner });
+    client.pollQueue.push({ kind: "ok", deliveries: [delivery("run-1"), delivery("run-2")] });
+    client.reportQueue.push({ kind: "retry", reason: "HTTP 503" }, { kind: "confirmed" });
+
+    await rt.pollOnce();
+    gated.calls[0]!.release(OK_RUNNER); // run-1's first report attempt → retry
+    await flush();
+    await flush();
+    expect(rt.pendingCount()).toBe(1);
+    expect(gated.calls).toHaveLength(1); // run-2 held by the backpressure gate
+
+    clock.fireNext(); // the retry confirms → capacity releases → run-2 starts
+    await flush();
+    await flush();
+    expect(gated.calls.map((c) => c.delivery.runId)).toEqual(["run-1", "run-2"]);
+
+    gated.calls[1]!.release(OK_RUNNER);
+    await rt.executionSettled();
+    expect(rt.pendingCount()).toBe(0);
+  });
+
+  it("advertises busy + 'reporting result' while a report retries, then returns to availableSlots:1 with progress gone", async () => {
+    const gated = gatedRunner();
+    const { rt, client, clock } = makeRuntime({ runner: gated.runner });
+    client.pollQueue.push({ kind: "ok", deliveries: [delivery("run-1")] });
+    client.reportQueue.push({ kind: "retry", reason: "HTTP 503" }, { kind: "confirmed" });
+
+    await rt.pollOnce();
+    gated.calls[0]!.release(OK_RUNNER);
+    await rt.executionSettled(); // settles WITH the report still pending — the outbox is never drained
+    expect(rt.pendingCount()).toBe(1);
+
+    await rt.pollOnce();
+    expect(client.polls.at(-1)).toMatchObject({ availableSlots: 0 });
+    expect(client.polls.at(-1)!.progress).toEqual([{ runId: "run-1", step: 2, label: "reporting result" }]);
+
+    clock.fireNext();
+    await flush();
+    await flush();
+    expect(rt.pendingCount()).toBe(0);
+
+    await rt.pollOnce();
+    expect(client.polls.at(-1)).toMatchObject({ availableSlots: 1 });
+    expect(client.polls.at(-1)).not.toHaveProperty("progress");
+  });
+
+  it("keeps a run's step non-decreasing and increments it only on state transitions", async () => {
+    const gated = gatedRunner();
+    const { rt, client, clock } = makeRuntime({ runner: gated.runner });
+    client.pollQueue.push({ kind: "ok", deliveries: [delivery("run-1")] });
+    client.reportQueue.push({ kind: "retry", reason: "HTTP 503" }, { kind: "confirmed" });
+
+    await rt.pollOnce(); // claims → executing
+    await rt.pollOnce(); // still executing — same step
+    gated.calls[0]!.release(OK_RUNNER); // → reporting (retry pending)
+    await flush();
+    await flush();
+    await rt.pollOnce();
+    clock.fireNext(); // confirmed
+    await flush();
+    await flush();
+    await rt.pollOnce(); // drained — no progress at all
+
+    const steps = client.polls.flatMap((p) =>
+      (p.progress ?? []).filter((e) => e.runId === "run-1").map((e) => e.step),
+    );
+    expect(steps).toEqual([1, 1, 2]); // non-decreasing; same-state repeats keep the step
+  });
+
+  it("round-robins queued progress entries within the 20-entry budget while the executing entry rides every poll (healthy-network, bounded-backlog fairness)", async () => {
+    const gated = gatedRunner();
+    const { rt, client } = makeRuntime({ runner: gated.runner });
+    const batch = Array.from({ length: 25 }, (_, i) => delivery(`run-${i + 1}`));
+    client.pollQueue.push({ kind: "ok", deliveries: batch });
+
+    await rt.pollOnce();
+    expect(gated.calls).toHaveLength(1);
+    const executingId = gated.calls[0]!.delivery.runId;
+
+    const seen = new Set<string>();
+    for (let i = 0; i < 3; i += 1) {
+      await rt.pollOnce();
+      const entries = client.polls.at(-1)!.progress ?? [];
+      expect(entries.length).toBeLessThanOrEqual(20);
+      expect(entries.some((e) => e.runId === executingId)).toBe(true); // executing rides EVERY poll
+      for (const e of entries) seen.add(e.runId);
+    }
+    expect(seen.size).toBe(25); // 24 queued rotate through 19 slots/poll → all refreshed by poll 2
+  });
+
+  it("joins the active pipeline on shutdown: run() resolves only after the runner actually exits; queued work never starts; pendingReports is not drained", async () => {
+    const gated = gatedRunner();
+    const { rt, client } = makeRuntime({ runner: gated.runner });
+    client.pollQueue.push({ kind: "ok", deliveries: [delivery("run-1"), delivery("run-2")] });
+
+    const ctl = new AbortController();
+    let resolved = false;
+    const done = rt.run(ctl.signal).then(() => {
+      resolved = true;
+    });
+    await flush(); // first poll dispatched: run-1 executing (blocked), run-2 queued
+    expect(gated.calls).toHaveLength(1);
+
+    ctl.abort();
+    await flush();
+    expect(resolved).toBe(false); // JOIN: the blocked runner still holds run() open
+
+    gated.calls[0]!.release(OK_RUNNER); // the runner finally exits
+    await done;
+    expect(resolved).toBe(true);
+    expect(gated.calls).toHaveLength(1); // run-2 never started
+    expect(client.reports).toHaveLength(0); // the first report is NOT sent during shutdown…
+    expect(rt.pendingCount()).toBe(1); // …but the entry is kept, never drained
+  });
+
+  it("surfaces a background report fatal on the NEXT pollOnce — a report fatal can no longer reject an already-returned pollOnce", async () => {
+    const gated = gatedRunner();
+    const { rt, client } = makeRuntime({ runner: gated.runner });
+    client.pollQueue.push({ kind: "ok", deliveries: [delivery("run-1")] });
+    client.reportQueue.push({ kind: "fatal", reason: "report HTTP 400" });
+
+    await rt.pollOnce(); // returns BEFORE the background pipeline reports — must NOT throw
+    gated.calls[0]!.release(OK_RUNNER);
+    await rt.executionSettled(); // the background report ran and classified fatal
+    expect(rt.pendingCount()).toBe(1); // the entry stays pending for postmortem
+
+    await expect(rt.pollOnce()).rejects.toThrow(FatalDaemonError);
+  });
+});
