@@ -127,9 +127,11 @@ describe("daemon E2E: the full HTTP user chain", () => {
     if (!trigger.enqueued) throw new Error("expected the trigger to enqueue");
     expect(trigger.supersededRunIds).toEqual([]);
 
-    // 5. The daemon's next poll claims, fake-runs and reports.
+    // 5. The daemon's next poll claims, fake-runs and reports (poll+dispatch:
+    //    pollOnce returns after dispatch — the settle seam joins the pipeline).
     await runtime.pollOnce();
     expect(runnerCalls).toBe(1);
+    await runtime.executionSettled();
     expect(runtime.pendingCount()).toBe(0);
 
     // 6. The observation surface shows the terminal result. done/exec is the
@@ -166,5 +168,96 @@ describe("daemon E2E: the full HTTP user chain", () => {
     // 7. At-most-once: a second poll claims nothing, re-executes nothing.
     await runtime.pollOnce();
     expect(runnerCalls).toBe(1);
+  });
+
+  it("capacity 1→0→1: an idle poll claims exactly ONE of two pendings, a busy poll delivers nothing while the heartbeat stays observable, and the next idle poll claims the second", async () => {
+    const b = await boot();
+    const client = createMachineClient({
+      baseUrl: "http://e2e.local",
+      machineCredential: TOKEN,
+      fetchImpl: appFetch(b.app),
+    });
+    // Every runner call blocks until the test releases it.
+    const calls: { runId: string; release: () => void }[] = [];
+    const gatedRunner: AgentRunner = {
+      run: (delivery) =>
+        new Promise((resolve) => {
+          calls.push({
+            runId: delivery.runId,
+            release: () =>
+              resolve({ ok: true, outcome: "exec", message: `finished ${delivery.runId}`, durationMs: 0 }),
+          });
+        }),
+    };
+    const runtime = createDaemonRuntime({
+      client,
+      runner: gatedRunner,
+      identity: { host: "e2e-host", platform: "test", arch: "test", version: "0.1.0" },
+      pollMs: 3000,
+      machineCredential: TOKEN,
+    });
+
+    const machineId = machineIdFromToken(TOKEN);
+    await runtime.pollOnce(); // register only
+
+    // Two loops → two pending runs (a second trigger on the SAME loop would
+    // supersede the first pending, T7). Dispatch order between them is the
+    // server's ts/id rule — pinned elsewhere — so this test stays
+    // order-agnostic about WHICH runs first.
+    async function createAndTrigger(name: string): Promise<{ loopId: string; runId: string }> {
+      const createRes = await b.app.request("/api/loops", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ machineId, name, workdir: "/srv/project" }),
+      });
+      expect(createRes.status).toBe(201);
+      const { loop } = createLoopResponseSchema.parse(await createRes.json());
+      const triggerRes = await b.app.request(`/api/loops/${loop.id}/run`, { method: "POST" });
+      const trigger = triggerRunResponseSchema.parse(await triggerRes.json());
+      if (!trigger.enqueued) throw new Error("expected the trigger to enqueue");
+      return { loopId: loop.id, runId: trigger.runId };
+    }
+    async function runsOf(loopId: string) {
+      const res = await b.app.request(`/api/loops/${loopId}/runs`);
+      expect(res.status).toBe(200);
+      return runListResponseSchema.parse(await res.json()).runs;
+    }
+    const a = await createAndTrigger("e2e-loop-a");
+    const second = await createAndTrigger("e2e-loop-b");
+
+    // Idle poll (availableSlots:1): exactly ONE of the two pendings is claimed.
+    await runtime.pollOnce();
+    expect(calls).toHaveLength(1);
+    expect([a.runId, second.runId]).toContain(calls[0]!.runId);
+    const claimed = calls[0]!.runId === a.runId ? a : second;
+    const waiting = claimed === a ? second : a;
+
+    // Busy poll (availableSlots:0) while the runner is blocked: nothing new is
+    // delivered — but the progress heartbeat lands on the observation surface,
+    // and the other run stays pending (not claimed, not failed).
+    await runtime.pollOnce();
+    expect(calls).toHaveLength(1);
+    const midClaimed = await runsOf(claimed.loopId);
+    expect(midClaimed[0]).toMatchObject({ id: claimed.runId, phase: "running" });
+    expect(midClaimed[0]!.progress).toMatchObject({ step: 1, label: "starting claude-code" });
+    expect(typeof midClaimed[0]!.progress?.at).toBe("string");
+    const midWaiting = await runsOf(waiting.loopId);
+    expect(midWaiting[0]).toMatchObject({ id: waiting.runId, phase: "pending" });
+
+    // The runner finishes: done/exec and the progress snapshot clears.
+    calls[0]!.release();
+    await runtime.executionSettled();
+    expect(runtime.pendingCount()).toBe(0);
+    const doneClaimed = await runsOf(claimed.loopId);
+    expect(doneClaimed[0]).toMatchObject({ id: claimed.runId, phase: "done", outcome: "exec", progress: null });
+
+    // Back to idle (availableSlots:1): the next poll claims the second run.
+    await runtime.pollOnce();
+    expect(calls).toHaveLength(2);
+    expect(calls[1]!.runId).toBe(waiting.runId);
+    calls[1]!.release();
+    await runtime.executionSettled();
+    const doneWaiting = await runsOf(waiting.loopId);
+    expect(doneWaiting[0]).toMatchObject({ id: waiting.runId, phase: "done", outcome: "exec" });
   });
 });
