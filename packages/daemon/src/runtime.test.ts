@@ -1,12 +1,17 @@
 /**
  * Runtime pins (goal doc test list 2/3/4 + review rulings): runId ownership,
- * dedupe across inFlight/pendingReports, same-credential same-body retries
- * with 1s→30s backoff that never block poll, the lost-response → coded-401
- * self-heal, Runner-throw synthesis (sanitized, no outcome), fatal
- * propagation, and shutdown semantics.
+ * dedupe via the activity snapshot (queued ∪ executing ∪ reporting),
+ * same-credential same-body retries with 1s→30s backoff that never block
+ * poll, the lost-response → coded-401 self-heal, Runner-throw synthesis
+ * (sanitized, no outcome), fatal propagation, and shutdown semantics.
+ * Phase 2 batch 1 adds the decoupling contract: poll keeps its cadence while
+ * the runner executes in the background, availableSlots/progress ride every
+ * poll body, an unconfirmed report is occupied capacity (backpressure gate),
+ * and shutdown JOINS the active pipeline without draining the report outbox.
  *
  * Time is a manual sleep queue; the client is a stub — transport-level
- * classification lives in client.test.ts.
+ * classification lives in client.test.ts. Assertions that depend on the
+ * background pipeline synchronize on `executionSettled()`.
  */
 import { describe, expect, it } from "vitest";
 
@@ -124,6 +129,7 @@ describe("happy path", () => {
     client.pollQueue.push({ kind: "ok", deliveries: [delivery("run-1")] });
 
     await rt.pollOnce();
+    await rt.executionSettled();
 
     expect(runnerCalls).toHaveLength(1);
     expect(runnerCalls[0]!.delivery.runId).toBe("run-1");
@@ -144,6 +150,7 @@ describe("happy path", () => {
     client.pollQueue.push({ kind: "ok", deliveries: [delivery("run-1")] });
 
     await rt.pollOnce();
+    await rt.executionSettled();
 
     const body = JSON.parse(client.reports[0]!.body.json) as ReportRequest;
     expect(body.runId).toBe("run-1");
@@ -157,6 +164,7 @@ describe("dedupe", () => {
     client.pollQueue.push({ kind: "ok", deliveries: [sameDelivery, sameDelivery] });
 
     await rt.pollOnce();
+    await rt.executionSettled();
 
     expect(runnerCalls).toHaveLength(1);
     expect(client.reports).toHaveLength(1);
@@ -167,6 +175,7 @@ describe("dedupe", () => {
     client.pollQueue.push({ kind: "ok", deliveries: [delivery("run-1")] });
     client.reportQueue.push({ kind: "retry", reason: "HTTP 503" });
     await rt.pollOnce();
+    await rt.executionSettled();
     expect(rt.pendingCount()).toBe(1);
 
     // Server redelivers the SAME runId while its report is still unconfirmed.
@@ -187,6 +196,7 @@ describe("report retry", () => {
     client.reportQueue.push({ kind: "retry", reason: "HTTP 503" }, { kind: "confirmed" });
 
     await rt.pollOnce();
+    await rt.executionSettled();
     cost.usd = 9;
     clock.fireNext();
     await flush();
@@ -203,6 +213,7 @@ describe("report retry", () => {
     client.reportQueue.push({ kind: "retry", reason: "HTTP 503" }, { kind: "retry", reason: "HTTP 503" });
 
     await rt.pollOnce();
+    await rt.executionSettled();
     expect(client.reports).toHaveLength(1);
     expect(clock.calls.map((c) => c.ms)).toEqual([1000]);
 
@@ -236,6 +247,7 @@ describe("report retry", () => {
       { kind: "retry", reason: "x" },
     );
     await rt.pollOnce();
+    await rt.executionSettled();
     for (let i = 0; i < 5; i += 1) {
       clock.fireNext();
       await flush();
@@ -253,6 +265,7 @@ describe("report retry", () => {
     client.reportQueue.push({ kind: "retry", reason: "request timeout after 10000ms" }, { kind: "confirmed" });
 
     await rt.pollOnce();
+    await rt.executionSettled();
     expect(rt.pendingCount()).toBe(1);
     clock.fireNext();
     await flush();
@@ -270,6 +283,7 @@ describe("Runner failure synthesis", () => {
     client.pollQueue.push({ kind: "ok", deliveries: [delivery("run-1")] });
 
     await expect(rt.pollOnce()).resolves.toBeUndefined();
+    await rt.executionSettled();
 
     const body = JSON.parse(client.reports[0]!.body.json) as ReportRequest;
     expect(body).toEqual({
@@ -288,6 +302,7 @@ describe("Runner failure synthesis", () => {
     client.pollQueue.push({ kind: "ok", deliveries: [d] });
 
     await rt.pollOnce();
+    await rt.executionSettled();
 
     const body = JSON.parse(client.reports[0]!.body.json) as ReportRequest;
     expect(body.ok).toBe(false);
@@ -516,8 +531,9 @@ describe("execution decoupling (Phase 2 batch 1)", () => {
     client.pollQueue.push({ kind: "ok", deliveries: [delivery("run-1")] });
     client.reportQueue.push({ kind: "retry", reason: "HTTP 503" }, { kind: "confirmed" });
 
-    await rt.pollOnce(); // claims → executing
-    await rt.pollOnce(); // still executing — same step
+    await rt.pollOnce(); // body built BEFORE dispatch — idle, no progress yet
+    await rt.pollOnce(); // executing — step 1
+    await rt.pollOnce(); // still executing — same step, no increment
     gated.calls[0]!.release(OK_RUNNER); // → reporting (retry pending)
     await flush();
     await flush();
