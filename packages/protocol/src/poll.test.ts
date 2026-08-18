@@ -73,6 +73,35 @@ describe("pollRequestSchema", () => {
   it("rejects a non-integer progress step", () => {
     expect(() => runProgressSchema.parse({ runId: "r", step: 1.5, label: "x" })).toThrow();
   });
+
+  it("round-trips availableSlots 0 and 1 (Phase 2 cooperative backpressure signal)", () => {
+    expect(pollRequestSchema.parse({ availableSlots: 0 })).toEqual({ availableSlots: 0 });
+    expect(pollRequestSchema.parse({ availableSlots: 1 })).toEqual({ availableSlots: 1 });
+  });
+
+  it("leaves availableSlots undefined when absent (old daemon ⇒ server keeps batch claim)", () => {
+    expect(pollRequestSchema.parse({}).availableSlots).toBeUndefined();
+  });
+
+  it("rejects non-literal availableSlots values (0|1 only — same style as wait:true)", () => {
+    for (const availableSlots of [2, -1, 0.5, true, "1"]) {
+      expect(() => pollRequestSchema.parse({ availableSlots })).toThrow();
+    }
+  });
+
+  it("keeps progress caps OUT of the schema (ADR-002: protocol pins shape, server pins size)", () => {
+    // A 10KB label and 50 entries must still PARSE — a schema-level .max()
+    // would turn an oversized heartbeat into a 400 and kill the daemon's poll
+    // loop. Size policy lives server-side, cleaned before the DB write.
+    const entries = Array.from({ length: 50 }, (_, i) => ({
+      runId: `r_${i}`,
+      step: i,
+      label: "x".repeat(10 * 1024),
+    }));
+    const parsed = pollRequestSchema.parse({ progress: entries });
+    expect(parsed.progress).toHaveLength(50);
+    expect(parsed.progress?.[0]?.label).toHaveLength(10 * 1024);
+  });
 });
 
 describe("deliverySchema", () => {
