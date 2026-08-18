@@ -38,6 +38,7 @@ import { resolveLiveLease } from "../store/leases.js";
 import { applyMachinePollContact, getMachine, registerMachineOnPoll } from "../store/machines.js";
 import { executeReportTx, type ReportTxResult } from "../store/report.js";
 import {
+  applyRunProgress,
   claimRunWithLeaseTx,
   enqueueExecRunTx,
   getLoop,
@@ -52,6 +53,11 @@ export interface CoordinatorHooks {
    *  lets a test commit a competing claim on the (then-idle) single pglite
    *  connection, proving the in-transaction re-check skips/rolls back. */
   beforeEnqueueTx?(loopId: string): void | Promise<void>;
+  /** Runs after the loop lookup, BEFORE the candidate's claim transaction —
+   *  lets a test commit a competing claim so the in-poll claim loses the race
+   *  (pins the break-on-success-only rule: a guard loss must not end a
+   *  capacity-1 poll). */
+  beforeClaimTx?(runId: string): void | Promise<void>;
   /** Runs after the report's read-side lease resolve, BEFORE the write
    *  transaction opens — the report/cancel interleaving gate (lets a test
    *  commit a real cancel in between). */
@@ -117,9 +123,15 @@ export function createRunCoordinator(deps: RunCoordinatorDependencies) {
      * Order matters: cheap shape filter → derived-id + full-hash verification
      * (self-registering on first contact) → heartbeat/identity write (OUTSIDE
      * any claim transaction — confirmed contact survives a lost claim race) →
-     * the per-candidate atomic claims. `progress`/`wait` are parse-only in
-     * Phase 1. Throws InvalidMachineCredentialError on any credential
-     * failure; the HTTP adapter maps that to the unified 401.
+     * progress heartbeats → capacity gate → the per-candidate atomic claims.
+     * `progress` is LIVE since Phase 2 (the sweep's liveness evidence; it must
+     * land BEFORE the gate — busy is exactly when heartbeats matter most);
+     * `wait` stays parse-only. `availableSlots` (Phase 2) is a cooperative
+     * backpressure signal: 0 = busy (skip the claim scan), 1 = at most one
+     * claim, ABSENT (old daemon) = keep the Phase 1 batch — it is a signal,
+     * not a security boundary, and the server does not validate it. Throws
+     * InvalidMachineCredentialError on any credential failure; the HTTP
+     * adapter maps that to the unified 401.
      */
     async poll(deviceToken: string, body: PollRequest): Promise<{ deliveries: Delivery[] }> {
       if (!isDeviceTokenShape(deviceToken)) throw new InvalidMachineCredentialError();
@@ -137,10 +149,18 @@ export function createRunCoordinator(deps: RunCoordinatorDependencies) {
         machine = await registerMachineOnPoll(deps, { machineId, tokenHash, identity: body });
       }
 
+      if (body.progress !== undefined && body.progress.length > 0) {
+        await applyRunProgress(deps, { machineId, entries: body.progress });
+      }
+      if (body.availableSlots === 0) return { deliveries: [] }; // busy: skip the claim scan
+
       const deliveries: Delivery[] = [];
+      // NO limit on the candidate scan (A-05): a LIMIT would impersonate
+      // concurrency control — the availableSlots break below is the gate.
       for (const candidate of await pendingExecRunsForMachine(deps.db, machineId)) {
         const loop = await getLoop(deps.db, candidate.loopId);
         if (!loop) continue; // undeliverable: stays pending, never fails the batch
+        await deps.hooks?.beforeClaimTx?.(candidate.id);
         const claimed = await claimRunWithLeaseTx(deps, {
           runId: candidate.id,
           loopId: loop.id,
@@ -149,6 +169,9 @@ export function createRunCoordinator(deps: RunCoordinatorDependencies) {
         });
         if (!claimed) continue; // race loser — another poll owns this run now
         deliveries.push(buildDelivery({ loop, run: claimed.run, roots: machine.roots ?? [], runToken: claimed.runToken }));
+        // Capacity 1 stops AFTER a success only — a guard loss above must
+        // never end the poll, or a lost race would starve this cycle.
+        if (body.availableSlots === 1) break;
       }
       return { deliveries };
     },
