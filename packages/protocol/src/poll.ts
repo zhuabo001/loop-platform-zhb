@@ -35,6 +35,10 @@ export const pollRequestSchema = z.object({
    *  flight keeps the short ~3s cadence so the progress heartbeat flows). Old
    *  servers ignore it and answer instantly; both sides degrade gracefully. */
   wait: z.literal(true).optional(),
+  /** Cooperative backpressure (Phase 2): 1 ⇒ deliver at most one run, 0 ⇒ busy,
+   *  skip the claim scan. ABSENT (old daemon) ⇒ server keeps Phase 1 batch
+   *  claim. A signal, not a security boundary — the server does not validate it. */
+  availableSlots: z.union([z.literal(0), z.literal(1)]).optional(),
 });
 export type PollRequest = z.infer<typeof pollRequestSchema>;
 
