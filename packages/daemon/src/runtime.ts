@@ -88,9 +88,10 @@ export interface DaemonRuntime {
    *  enqueues any deliveries, and RETURNS. It does NOT wait for execution or
    *  the first report. A poll-fatal outcome throws immediately; a BACKGROUND
    *  fatal (a report's fatal classification lands after dispatch) surfaces
-   *  here on the NEXT pollOnce — BEFORE the poll and again after a transient
-   *  (abort) outcome, since the fatal aborts the runtime signal and the real
-   *  client classifies that abort as transient — or via run(). */
+   *  here on the NEXT pollOnce — BEFORE the poll, and again IMMEDIATELY
+   *  after it resolves (before any outcome/delivery handling, since the
+   *  fatal aborts the runtime signal and a raced successful response must
+   *  never refill the dropped queue) — or via run(). */
   pollOnce(): Promise<void>;
   /** The foreground loop: pollOnce, sleep pollMs, repeat until the signal
    *  aborts (clean return) or a fatal error surfaces (throw). On exit it
@@ -224,14 +225,22 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
       });
   }
 
+  /** The shared execution-idle sub-predicate: nothing running, no unconfirmed
+   *  report. The queue conjunct is deliberately NOT in here — the dispatch
+   *  gate needs a non-empty queue (work to start) while the wire signal needs
+   *  an empty one (nothing waiting) to advertise a free slot; those two
+   *  conjuncts have OPPOSITE polarity by design and must not be merged. */
+  function executionIdle(): boolean {
+    return inFlight.size === 0 && pendingReports.size === 0;
+  }
+
   /** THE capacity gate (fixed concurrency 1): a queued run starts only when
    *  nothing is executing AND no report awaits confirmation — an unconfirmed
    *  report is occupied capacity, not idle time. Without the pendingReports
    *  conjunct, an old server's batch delivery (or a flaky report route) would
    *  pile up unconfirmed reports while new runs keep starting. */
   function maybeStartNext(): void {
-    if (fatal || signal.aborted) return;
-    if (inFlight.size > 0 || pendingReports.size > 0 || queue.length === 0) return;
+    if (fatal || signal.aborted || !executionIdle() || queue.length === 0) return;
     const next = queue.shift()!;
     inFlight.add(next.runId);
     activities.set(next.runId, { step: STEP_STARTING, label: "starting claude-code" });
@@ -344,26 +353,26 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
   }
 
   function buildPollBody(): PollRequest {
-    // The SAME capacity state as the gate: idle ⇔ nothing executing, nothing
-    // queued, no unconfirmed report.
-    const availableSlots = inFlight.size === 0 && queue.length === 0 && pendingReports.size === 0 ? (1 as const) : (0 as const);
+    // Idle ⇔ executionIdle AND nothing queued (the wire polarity of the queue
+    // conjunct — see executionIdle's comment).
+    const availableSlots = executionIdle() && queue.length === 0 ? (1 as const) : (0 as const);
     const progress = collectProgress();
     return { ...deps.identity, availableSlots, ...(progress.length > 0 ? { progress } : {}) };
   }
 
   async function pollOnce(): Promise<void> {
     // A background fatal set since the last poll surfaces BEFORE touching the
-    // wire: the signal is already aborted, a real client would classify the
-    // poll as transient, and the check below would never be reached
-    // (code-review round 1, P1).
+    // wire (code-review round 1, P1).
     if (fatal) throw fatal;
     const outcome = await deps.client.poll(buildPollBody(), signal);
+    // A fatal that landed WHILE the poll was in flight surfaces BEFORE any
+    // outcome or delivery handling: the real client classifies the abort as
+    // transient (round 1, P1), and a SUCCESSFUL response must never dispatch
+    // into the dropped queue — refilling it would hang executionSettled()
+    // (round 2, P2).
+    if (fatal) throw fatal;
     if (outcome.kind === "fatal") throw setFatal(new FatalDaemonError(outcome.reason));
     if (outcome.kind === "transient") {
-      // A fatal that landed WHILE this poll was in flight aborted the signal:
-      // the client classifies that abort as transient — surface the fatal
-      // before the early return swallows it.
-      if (fatal) throw fatal;
       log(`poll: ${outcome.reason} — next cycle`);
       return;
     }
@@ -378,9 +387,9 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
       if (activities.has(delivery.runId)) continue;
       enqueue(delivery);
     }
-    // A BACKGROUND fatal (e.g. a report's fatal classification) set since the
-    // last poll surfaces here — pollOnce no longer spans execution, so it
-    // cannot throw for its own cycle's report.
+    // Defensive: no suspension point exists between the check above and the
+    // dispatch loop, so a fatal cannot interleave here today — keep the
+    // trailing check so a future synchronous fatal path still surfaces.
     if (fatal) throw fatal;
   }
 
