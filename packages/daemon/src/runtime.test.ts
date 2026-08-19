@@ -658,6 +658,34 @@ describe("execution decoupling (Phase 2 batch 1)", () => {
     await expect(inFlightPoll).rejects.toThrow(FatalDaemonError);
   });
 
+  it("never dispatches a delivery that arrives AFTER a background fatal — an in-flight poll resolving ok past the fatal must not refill the dropped queue (round-2 P2)", async () => {
+    const gated = gatedRunner();
+    const { rt, client } = makeRuntime({ runner: gated.runner });
+    client.pollQueue.push({ kind: "ok", deliveries: [delivery("run-1")] });
+    client.reportQueue.push({ kind: "fatal", reason: "report HTTP 400" });
+
+    await rt.pollOnce(); // claims run-1; runner blocked
+    expect(gated.calls).toHaveLength(1);
+
+    // poll #2 stays on the wire until the test releases it — meanwhile run-1's
+    // report classifies fatal and the queue is dropped.
+    let releasePoll!: (outcome: PollOutcome) => void;
+    client.poll = () =>
+      new Promise<PollOutcome>((resolve) => {
+        releasePoll = resolve;
+      });
+    const inFlightPoll = rt.pollOnce();
+
+    gated.calls[0]!.release(OK_RUNNER); // report → fatal → setFatal drops the queue
+    await rt.executionSettled(); // settles with the queue empty
+
+    // The poll resolves SUCCESSFULLY, one fatal too late.
+    releasePoll({ kind: "ok", deliveries: [delivery("run-2")] });
+    await expect(inFlightPoll).rejects.toThrow(FatalDaemonError);
+    await rt.executionSettled(); // MUST resolve — run-2 must NOT refill the dropped queue
+    expect(gated.calls.map((c) => c.delivery.runId)).toEqual(["run-1"]); // run-2 never started
+  });
+
   it("drops the never-started queue on a background fatal so executionSettled() resolves — no permanent hang; the pending report survives as postmortem", async () => {
     const gated = gatedRunner();
     const { rt, client } = makeRuntime({ runner: gated.runner });
