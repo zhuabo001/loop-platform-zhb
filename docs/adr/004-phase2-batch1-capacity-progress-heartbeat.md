@@ -21,7 +21,7 @@ Phase 2 把 daemon 从「串行 poll→执行」改为「poll/heartbeat 与执�
    - 条数/label 上限在 server 侧（`PROGRESS_ENTRIES_CAP=20`、label 200/兜底 "working"），不进 schema（ADR-002 决策 4；schema 层 `.max()` 会把超限变成 400 → poll fatal）。
    - 写失败传播（fail-closed，同 `applyMachinePollContact` 先例）——静默吞心跳会让长跑 agent 被 sweep 误回收。
 4. **兼容矩阵**：Phase 2 server + Phase 1 daemon = 兼容（不发新字段，保留批量）；Phase 2 daemon + Phase 1 server = **不承诺长任务与批量队列 liveness**（旧 server 忽略 `availableSlots` 与 progress，排队 Run 可能被 sweep 回收）；升级顺序**先 server 后 daemon**。daemon 收到批量 delivery 后本地顺序排队（FIFO、跨周期去重）仅作防御行为，不称完整兼容（plan-review 一轮修订 1）。
-5. **daemon `pollOnce()` 契约 = poll + dispatch**：发 poll、enqueue、返回，不等待执行与首报。fatal 传播收敛为：poll fatal 同步抛出；后台 report fatal 经 `setFatal`（abort 运行时 signal）→ 下一次 `pollOnce()` 抛出（**poll 前检查 + transient 分支后检查**——abort 会被真实客户端归类为 transient，提前 return 不得吞掉 fatal；code-review 一轮 P1 修复）或 `run()` 循环顶抛出。
+5. **daemon `pollOnce()` 契约 = poll + dispatch**：发 poll、enqueue、返回，不等待执行与首报。fatal 传播收敛为：poll fatal 同步抛出；后台 report fatal 经 `setFatal`（abort 运行时 signal）→ 下一次 `pollOnce()` 抛出（**poll 前检查 + poll await 返回后立即检查、先于任何 outcome/delivery 处理**——abort 会被真实客户端归类为 transient（一轮 P1），且竞态到达的成功响应绝不可重新填充已丢弃的 queue（二轮 P2））或 `run()` 循环顶抛出。
 6. **fatal 终止语义**：fatal 转换时统一丢弃 never-started queue 并通知 settle waiters（code-review 一轮 P2 修复）——`executionSettled()` 因此必然 settle，不永久挂起；未确认 report 保留作 postmortem，不 drain。
 7. **`executionSettled()` 是唯一新增公开 lifecycle seam**：`run()` 的 shutdown join（先 abort、join 活动 pipeline、不 drain report outbox、queue 清空且永不启动）与测试同步共用；仅在执行管线静止时 resolve，不因 abort alone resolve（plan-review 一轮修订 3、二轮 P1 最终裁定）。
 8. **progress 发送采用 daemon 轮转**：executing/reporting 条目每轮必发（sweep 误回收风险最高），queued 条目在剩余 ≤20 条预算内轮转（游标推进）；承诺边界为「健康网络 + 有界积压」前提下的公平刷新，对旧 server 的无界批量交付不承诺 liveness（plan-review 一轮修订 4、二轮 P2）。
@@ -31,3 +31,4 @@ Phase 2 把 daemon 从「串行 poll→执行」改为「poll/heartbeat 与执�
 ## 修订记录
 
 - 2026-08-19：初始 Accepted。决策 1–10 含 plan-review 两轮（P1 pollOnce 契约、P2 轮转承诺边界、P3 availableSlots 最坏后果）与 code-review 第一轮（P1 transient 吞 fatal、P2 executionSettled 挂起）的修复裁决。
+- 2026-08-19（code-review 二轮复审）：决策 5 的 fatal 检查点定稿为「poll 前 + poll await 返回后立即」（原「poll 前 + transient 分支后」——竞态到达的 `ok + delivery` 响应会绕过后者重新 enqueue，使 `executionSettled()` 再次永久挂起）。另：复审建议抽取统一容量谓词经测试**证伪**——dispatch 门控与 wire 谓词的 queue 合取极性相反（门控要非空、wire 要空），朴素合并会直接破坏运行时（被套件当场捕获）；仅抽取真正共享的 `executionIdle()` 子谓词（inFlight 空且 pendingReports 空）。
