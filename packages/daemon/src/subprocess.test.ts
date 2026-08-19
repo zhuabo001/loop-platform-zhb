@@ -327,3 +327,37 @@ describe("spawnWithTimeout — first-wins determinism gap (round-2)", () => {
     }
   });
 });
+
+describe("spawnWithTimeout — kill failure propagation (round-2 P1)", () => {
+  it("S19: a non-ESRCH kill failure rejects PROMPTLY instead of hanging until the child exits", async () => {
+    // Round-2 reproduction: EPERM injected at the group probe/signal used to
+    // be captured yet only surfaced at 'close' — this sleeper outlives the
+    // failure by ~30s, so a close-waiter hangs. The module must reject at
+    // once and detach; we then kill the orphan ourselves for hygiene.
+    let attackedGroup = 0;
+    const killImpl: typeof process.kill = (pid, signal) => {
+      if (pid < 0) {
+        attackedGroup = -pid;
+        throw Object.assign(new Error("kill EPERM"), { code: "EPERM" });
+      }
+      return process.kill(pid, signal);
+    };
+    try {
+      const startedAt = Date.now();
+      await expect(
+        spawnWithTimeout(opts({ args: [FIXTURE, "sleep", "30000"], timeoutMs: 150, killImpl })),
+      ).rejects.toThrow(/EPERM/);
+      // The child would hold a close-waiter ~30s; anything near that is the
+      // old hang. 5s gives absurd headroom for CI scheduling.
+      expect(Date.now() - startedAt).toBeLessThan(5000);
+    } finally {
+      if (attackedGroup > 0) {
+        try {
+          process.kill(-attackedGroup, "SIGKILL");
+        } catch {
+          /* already gone */
+        }
+      }
+    }
+  });
+});

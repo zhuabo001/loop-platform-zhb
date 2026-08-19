@@ -38,6 +38,11 @@ export interface SpawnOptions {
    *  (ADR-005 决策 6/修订): production call sites never set this — the fixed
    *  5000ms policy applies; tests shrink it to keep the suite fast. */
   graceMs?: number;
+  /** Replaces `process.kill` for the group probe/signals. TEST-ONLY seam
+   *  (round-2 P1, same standing as graceMs): POSIX offers no portable way to
+   *  make kill(2) fail with EPERM on demand, so deterministic kill-failure
+   *  tests inject it here. Production call sites never set this. */
+  killImpl?: typeof process.kill;
 }
 
 export type SpawnCompletion =
