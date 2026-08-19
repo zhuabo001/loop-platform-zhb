@@ -75,7 +75,7 @@ function isContinuationByte(byte: number): boolean {
  *  bytes (round-1 P2): the head cut backs off ≤3 bytes (the straddling char
  *  flows into the tail), the tail front advances past continuation bytes —
  *  so text() never synthesizes U+FFFD and re-encoding never exceeds the cap. */
-class CappedStream {
+export class CappedStream {
   private headParts: Buffer[] = [];
   private headBytes = 0;
   private tailParts: Buffer[] = [];

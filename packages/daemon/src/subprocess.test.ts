@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-import { spawnWithTimeout, type SpawnOptions } from "./subprocess.js";
+import { CappedStream, MAX_STREAM_BYTES, spawnWithTimeout, type SpawnOptions } from "./subprocess.js";
 
 const FIXTURE = fileURLToPath(new URL("../test-fixtures/spawn-fixture.mjs", import.meta.url));
 const NODE = process.execPath;
@@ -259,5 +259,51 @@ describe("spawnWithTimeout — UTF-8 safe truncation (round-1 fix)", () => {
     expect(Buffer.byteLength(result.stdout, "utf8")).toBeLessThanOrEqual(1024 * 1024);
     expect(result.stdout.startsWith("界界界")).toBe(true);
     expect(result.stdout.endsWith("界界界")).toBe(true);
+  });
+});
+
+describe("CappedStream — byte-level determinism (round-2)", () => {
+  const MIB = MAX_STREAM_BYTES;
+
+  /** Feed `payload` in slices whose boundaries split multibyte chars — pipe
+   *  reads deliver arbitrary byte chunks (65536 % 3 ≠ 0 for CJK), and
+   *  correctness must not depend on where they fall (round-2 P1: S18 flaked
+   *  4/5 because the old cut logic only realigned WITHIN one chunk). */
+  const pushSliced = (stream: CappedStream, payload: Buffer, slice: number): void => {
+    for (let off = 0; off < payload.length; off += slice) {
+      stream.push(payload.subarray(off, Math.min(off + slice, payload.length)));
+    }
+  };
+
+  it("CS1: a char straddling the head cut is dropped whole — no U+FFFD, re-encode stays within the cap", () => {
+    const stream = new CappedStream();
+    const payload = Buffer.from("界".repeat(400_000), "utf8"); // 1.2 MB of 3-byte CJK
+    pushSliced(stream, payload, 4096);
+    expect(stream.truncated).toBe(true);
+    const text = stream.text();
+    expect(text).not.toContain("�");
+    expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(MIB);
+    expect(text.startsWith("界界界")).toBe(true);
+    expect(text.endsWith("界界界")).toBe(true);
+  });
+
+  it("CS2: exactly 1 MiB is NOT marked truncated and loses no byte", () => {
+    const stream = new CappedStream();
+    const payload = Buffer.from("0123456789".repeat(MIB / 10), "utf8"); // exactly the cap
+    pushSliced(stream, payload, 4096);
+    expect(stream.truncated).toBe(false);
+    expect(stream.text()).toBe(payload.toString("utf8"));
+  });
+
+  it("CS3: a long multibyte flood rolls the tail window on char boundaries", () => {
+    const stream = new CappedStream();
+    const payload = Buffer.from("界".repeat(MIB), "utf8"); // 3 MiB
+    pushSliced(stream, payload, 4096);
+    expect(stream.truncated).toBe(true);
+    const text = stream.text();
+    expect(text).not.toContain("�");
+    expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(MIB);
+    expect(text.startsWith("界界界")).toBe(true);
+    expect(text.endsWith("界界界")).toBe(true);
   });
 });
