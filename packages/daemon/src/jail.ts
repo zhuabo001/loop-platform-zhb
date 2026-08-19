@@ -111,8 +111,27 @@ export async function createWorkdirJail(config: {
       if (input.workdir === null) {
         throw new JailError("per-run scratch workdir is not implemented yet");
       }
-      // Containment against effectiveRoots is pinned by the J6–J13 pair.
-      const cwd = await fs.realpath(input.workdir);
+      // Boundary discipline (J6–J13): realpath FIRST (collapses `..` and
+      // symlinks), then containment against the canonical effectiveRoots via
+      // path.relative() — never a string-prefix check. A symlink pointing
+      // inside resolves inside and passes; one pointing outside resolves
+      // outside and is rejected. Every failure is a JailError (fail-closed).
+      const workdir = input.workdir;
+      if (!path.isAbsolute(workdir)) {
+        throw new JailError(`workdir must be an absolute path: ${JSON.stringify(workdir)}`);
+      }
+      let cwd: string;
+      try {
+        cwd = await fs.realpath(workdir);
+      } catch {
+        throw new JailError(`workdir does not exist: ${JSON.stringify(workdir)}`);
+      }
+      if (!(await fs.stat(cwd)).isDirectory()) {
+        throw new JailError(`workdir is not a directory: ${JSON.stringify(workdir)}`);
+      }
+      if (!effectiveRoots.some((root) => isWithinOrEqual(root, cwd))) {
+        throw new JailError(`workdir escapes every effective root: ${JSON.stringify(workdir)}`);
+      }
       return { cwd, effectiveRoots, scratchDir: null };
     },
     release: () => Promise.reject(new JailError("release is not implemented yet")),
