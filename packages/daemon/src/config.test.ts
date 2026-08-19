@@ -9,14 +9,19 @@ import { DaemonConfigError, loadDaemonConfig } from "./config.js";
 const VALID = {
   LOOPZHB_SERVER_URL: "http://127.0.0.1:3000",
   LOOPZHB_MACHINE_CREDENTIAL: "dk_test_machine",
+  // Required since Phase 2 batch 2 (C1): a minimal valid config carries roots.
+  LOOPZHB_ALLOWED_ROOTS: JSON.stringify(["/tmp/loopzhb-test-root"]),
 };
 
 describe("loadDaemonConfig", () => {
-  it("parses a minimal valid config and defaults pollMs to 3000", () => {
+  it("parses a minimal valid config and applies the defaults (pollMs, claudeBin, agentTimeoutMs)", () => {
     expect(loadDaemonConfig(VALID)).toEqual({
       serverUrl: "http://127.0.0.1:3000",
       machineCredential: "dk_test_machine",
       pollMs: 3000,
+      allowedRoots: ["/tmp/loopzhb-test-root"],
+      claudeBin: "claude",
+      agentTimeoutMs: 1800000,
     });
   });
 
@@ -168,7 +173,7 @@ describe("loadDaemonConfig — Phase 2 batch 2 fields", () => {
 
   it("C16: new parse errors never echo the machine credential", () => {
     const secret = "dk_secret_b2_credential";
-    const triggers: Array<Partial<typeof VALID_B2>> = [
+    const triggers: Array<Record<string, string>> = [
       { LOOPZHB_ALLOWED_ROOTS: "not-json" },
       { LOOPZHB_ALLOWED_ROOTS: '["relative"]' },
       { LOOPZHB_AGENT_TIMEOUT_MS: "abc" },
