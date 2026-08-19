@@ -4,7 +4,7 @@
  * is realpath'd up front because macOS tmpdir() is itself behind a symlink
  * (/var → /private/var), and the jail speaks only canonical paths.
  */
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -194,5 +194,82 @@ describe("resolve — workdir boundary against effective roots", () => {
     await expect(
       (await jail()).resolve({ workdir: "relative/dir", serverRoots: [], loopId: "loop-1", runId: "run-1" }),
     ).rejects.toThrow(JailError);
+  });
+});
+
+describe("resolve/release — per-run scratch lifecycle", () => {
+  let root: string;
+  let scratch: string;
+
+  beforeEach(() => {
+    root = path.join(base, "root");
+    mkdirSync(root);
+    scratch = scratchParent();
+  });
+
+  const jail = () => createWorkdirJail({ allowedRoots: [root], scratchParent: scratch });
+  const resolveNull = (j: Awaited<ReturnType<typeof jail>>, runId: string) =>
+    j.resolve({ workdir: null, serverRoots: [], loopId: "loop-1", runId });
+
+  it("J20: null workdir mints a per-run scratch dir as cwd (and the factory requires an absolute scratchParent)", async () => {
+    await expect(createWorkdirJail({ allowedRoots: [root], scratchParent: "relative/scratch" })).rejects.toThrow(
+      JailError,
+    );
+    const resolved = await resolveNull(await jail(), "run-1");
+    expect(resolved.scratchDir).not.toBeNull();
+    expect(resolved.cwd).toBe(resolved.scratchDir);
+    expect(resolved.effectiveRoots).toEqual([realpathSync(root)]);
+    expect(realpathSync(resolved.scratchDir!)).toBe(resolved.scratchDir); // exists & canonical
+    expect(path.dirname(resolved.scratchDir!)).toBe(realpathSync(scratch));
+  });
+
+  it("J21: scratch dirs are unique per run and never reused", async () => {
+    const j = await jail();
+    const a = await resolveNull(j, "run-1");
+    const b = await resolveNull(j, "run-2");
+    const c = await resolveNull(j, "run-1"); // same runId: still a fresh dir
+    const dirs = [a.scratchDir, b.scratchDir, c.scratchDir];
+    expect(new Set(dirs).size).toBe(3);
+  });
+
+  it("J22: scratch dir permissions are 0700", async () => {
+    const resolved = await resolveNull(await jail(), "run-1");
+    const { mode } = statSync(resolved.scratchDir!);
+    expect(mode & 0o777).toBe(0o700);
+  });
+
+  it("J23: release() deletes the minted scratch dir; a double release throws", async () => {
+    const j = await jail();
+    const resolved = await resolveNull(j, "run-1");
+    await j.release(resolved);
+    expect(existsSync(resolved.scratchDir!)).toBe(false);
+    await expect(j.release(resolved)).rejects.toThrow(JailError);
+  });
+
+  it("J24: release() on a scratch path swapped for a symlink throws and deletes NOTHING", async () => {
+    const j = await jail();
+    const resolved = await resolveNull(j, "run-1");
+    const dir = resolved.scratchDir!;
+    rmSync(dir, { recursive: true });
+    const target = path.join(base, "sentinel-target");
+    mkdirSync(target);
+    writeFileSync(path.join(target, "sentinel.txt"), "must survive");
+    symlinkSync(target, dir, "dir");
+    await expect(j.release(resolved)).rejects.toThrow(JailError);
+    expect(readFileSync(path.join(target, "sentinel.txt"), "utf8")).toBe("must survive");
+  });
+
+  it("J25: release() refuses dirs this jail did not mint (forged, non-direct-child, foreign)", async () => {
+    const j = await jail();
+    const forged = { cwd: "/", effectiveRoots: [], scratchDir: path.join(scratch, "forged-dir") };
+    await expect(j.release(forged)).rejects.toThrow(JailError);
+    const deep = { cwd: "/", effectiveRoots: [], scratchDir: path.join(scratch, "nested", "deep") };
+    await expect(j.release(deep)).rejects.toThrow(JailError);
+    const otherJail = await jail();
+    const foreign = await resolveNull(otherJail, "run-9");
+    await expect(j.release(foreign)).rejects.toThrow(JailError);
+    // a non-scratch resolution has nothing to release: a documented no-op
+    const plain = await j.resolve({ workdir: root, serverRoots: [], loopId: "loop-1", runId: "run-1" });
+    await expect(j.release(plain)).resolves.toBeUndefined();
   });
 });

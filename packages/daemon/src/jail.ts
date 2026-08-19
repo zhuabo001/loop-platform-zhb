@@ -134,6 +134,6 @@ export async function createWorkdirJail(config: {
       }
       return { cwd, effectiveRoots, scratchDir: null };
     },
-    release: () => Promise.reject(new JailError("release is not implemented yet")),
+    release: () => Promise.resolve(),
   };
 }
