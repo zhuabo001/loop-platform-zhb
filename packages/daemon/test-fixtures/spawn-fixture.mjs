@@ -66,11 +66,13 @@ async function main() {
     case "grandchild": {
       // Same process group (detached: false), unref'd so WE exit while the
       // grandchild keeps the group alive — the module must reap the group.
+      // The grandchild's pid rides stdout so the test can verify its death.
       const grandchild = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], {
         detached: false,
         stdio: "ignore",
       });
       grandchild.unref();
+      await writeAll(process.stdout, `${grandchild.pid}\n`);
       process.exitCode = 0;
       return;
     }

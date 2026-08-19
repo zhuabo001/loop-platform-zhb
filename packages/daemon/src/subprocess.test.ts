@@ -110,3 +110,72 @@ describe("spawnWithTimeout — stdio capture, caps and chunk callbacks", () => {
     expect(result.durationMs).toBeLessThan(3000);
   });
 });
+
+describe("spawnWithTimeout — termination triggers", () => {
+  it("S4: an already-aborted signal returns aborted WITHOUT spawning", async () => {
+    const ctl = new AbortController();
+    ctl.abort();
+    const result = await spawnWithTimeout(opts({ args: [FIXTURE, "exit", "0"], signal: ctl.signal }));
+    expect(result.completion.kind).toBe("aborted");
+    expect(result.durationMs).toBeLessThan(500);
+  });
+
+  it("S5: timeout SIGTERMs the group; a cooperative child dies by SIGTERM", async () => {
+    const result = await spawnWithTimeout(opts({ args: [FIXTURE, "sleep", "3000"], timeoutMs: 150 }));
+    expect(result.completion).toEqual({ kind: "timed-out", finalSignal: "SIGTERM" });
+    expect(result.durationMs).toBeLessThan(2500);
+  });
+
+  it("S6: a SIGTERM-ignoring child is SIGKILLed after the grace window", async () => {
+    const result = await spawnWithTimeout(
+      opts({ args: [FIXTURE, "ignore-term", "30000"], timeoutMs: 150, graceMs: 100 }),
+    );
+    expect(result.completion).toEqual({ kind: "timed-out", finalSignal: "SIGKILL" });
+    expect(result.durationMs).toBeLessThan(2500);
+  });
+
+  it("S7: aborting mid-execution returns aborted and reaps the group", async () => {
+    const ctl = new AbortController();
+    setTimeout(() => ctl.abort(), 150);
+    const result = await spawnWithTimeout(opts({ args: [FIXTURE, "sleep", "3000"], signal: ctl.signal }));
+    expect(result.completion).toEqual({ kind: "aborted", finalSignal: "SIGTERM" });
+    expect(result.durationMs).toBeLessThan(2500);
+  });
+
+  it("S8: a timeout/abort race lets the FIRST trigger decide the kind", async () => {
+    const ctl = new AbortController();
+    setTimeout(() => ctl.abort(), 80);
+    const result = await spawnWithTimeout(
+      opts({ args: [FIXTURE, "sleep", "3000"], timeoutMs: 80, signal: ctl.signal }),
+    );
+    expect(["timed-out", "aborted"]).toContain(result.completion.kind);
+    expect(result.durationMs).toBeLessThan(2500);
+  });
+
+  it("S9: a surviving grandchild in the group is reaped after the child exits", async () => {
+    const result = await spawnWithTimeout(opts({ args: [FIXTURE, "grandchild"] }));
+    expect(result.completion).toEqual({ kind: "exited", exitCode: 0 });
+    const grandchildPid = Number(result.stdout.trim());
+    expect(grandchildPid).toBeGreaterThan(0);
+    try {
+      // The module must not return while the group lives; double-check the
+      // orphan is really gone (poll briefly for the reaper to collect it).
+      let alive = true;
+      for (let i = 0; i < 100 && alive; i += 1) {
+        try {
+          process.kill(grandchildPid, 0);
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        } catch {
+          alive = false;
+        }
+      }
+      expect(alive).toBe(false);
+    } finally {
+      try {
+        process.kill(grandchildPid, "SIGKILL"); // hygiene if the pin fails
+      } catch {
+        /* already dead */
+      }
+    }
+  });
+});
