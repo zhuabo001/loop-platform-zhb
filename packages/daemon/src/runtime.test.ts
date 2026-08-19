@@ -608,4 +608,70 @@ describe("execution decoupling (Phase 2 batch 1)", () => {
 
     await expect(rt.pollOnce()).rejects.toThrow(FatalDaemonError);
   });
+
+  it("surfaces a background fatal that lands WHILE a poll is in flight — the REAL client classifies the abort as transient, and pollOnce must still throw (abort-isolation regression)", async () => {
+    const gated = gatedRunner();
+    // Real MachineClient over a scripted transport that honors the runtime
+    // signal exactly like fetch does: an in-flight poll rejects when the
+    // signal aborts, and the client maps that to `transient`. A fatal set by
+    // the background report must NOT be swallowed by that transient branch.
+    let pollCount = 0;
+    const client = createMachineClient({
+      baseUrl: "http://server.test",
+      machineCredential: MACHINE_CRED,
+      fetchImpl: (_input, init) => {
+        const requestSignal = init?.signal as AbortSignal;
+        return new Promise<Response>((resolve, reject) => {
+          const onAbort = () => reject(requestSignal.reason);
+          requestSignal.addEventListener("abort", onAbort, { once: true });
+          if (requestSignal.aborted) {
+            reject(requestSignal.reason);
+            return;
+          }
+          const url = String(_input);
+          if (url.includes("/api/machine/poll")) {
+            pollCount += 1;
+            if (pollCount === 1) {
+              queueMicrotask(() =>
+                resolve(new Response(JSON.stringify({ deliveries: [delivery("run-1")] }), { status: 200 })),
+              );
+            }
+            // poll #2: block until the runtime abort lands — the real
+            // transport's in-flight behavior.
+          } else {
+            // /api/machine/report → other 4xx = protocol-fatal.
+            queueMicrotask(() =>
+              resolve(new Response(JSON.stringify({ error: "bad request" }), { status: 400 })),
+            );
+          }
+        });
+      },
+    });
+    const { rt } = makeRuntime({ client, runner: gated.runner });
+
+    await rt.pollOnce(); // poll #1 delivers run-1 → runner blocked
+    expect(gated.calls).toHaveLength(1);
+
+    const inFlightPoll = rt.pollOnce(); // poll #2 blocks on the wire…
+    gated.calls[0]!.release(OK_RUNNER); // …run-1's report classifies fatal → runtime aborts
+    // The abort rejects poll #2 as transient; the background fatal must still surface.
+    await expect(inFlightPoll).rejects.toThrow(FatalDaemonError);
+  });
+
+  it("drops the never-started queue on a background fatal so executionSettled() resolves — no permanent hang; the pending report survives as postmortem", async () => {
+    const gated = gatedRunner();
+    const { rt, client } = makeRuntime({ runner: gated.runner });
+    client.pollQueue.push({ kind: "ok", deliveries: [delivery("run-1"), delivery("run-2")] });
+    client.reportQueue.push({ kind: "fatal", reason: "report HTTP 400" });
+
+    await rt.pollOnce();
+    expect(gated.calls.map((c) => c.delivery.runId)).toEqual(["run-1"]); // run-2 queued
+
+    gated.calls[0]!.release(OK_RUNNER);
+    await rt.executionSettled(); // MUST resolve — the fatal drops the never-started queue
+    expect(rt.pendingCount()).toBe(1); // postmortem kept, never drained
+    expect(gated.calls.map((c) => c.delivery.runId)).toEqual(["run-1"]); // run-2 never started
+
+    await expect(rt.pollOnce()).rejects.toThrow(FatalDaemonError); // and the fatal is visible
+  });
 });
