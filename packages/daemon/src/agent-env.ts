@@ -71,7 +71,13 @@ export function buildAgentEnv(source: NodeJS.ProcessEnv): AgentEnv {
   return { env, secretValues: normalizeSecrets(secrets) };
 }
 
+/** Replace every occurrence of every secret with [REDACTED]. Normalizes
+ *  (longest-first, deduped, empties dropped) at the door so external callers
+ *  get the same guarantees as buildAgentEnv's own output. */
 export function redactSecrets(text: string, secretValues: string[]): string {
-  void secretValues;
-  return text;
+  let out = text;
+  for (const secret of normalizeSecrets(secretValues)) {
+    out = out.split(secret).join("[REDACTED]");
+  }
+  return out;
 }
