@@ -23,7 +23,9 @@ import { createDaemonRuntime } from "./runtime.js";
 export async function createStartupJail(config: DaemonConfig): Promise<WorkdirJail> {
   return await createWorkdirJail({
     allowedRoots: config.allowedRoots,
-    scratchParent: path.join(os.tmpdir(), "loopzhb-runs"),
+    // The factory mints an unpredictable per-start 0700 scratch root INSIDE
+    // this base (round-1 P1) — never pass a predictable leaf directory.
+    scratchBase: os.tmpdir(),
   });
 }
 

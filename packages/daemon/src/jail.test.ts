@@ -21,27 +21,27 @@ afterEach(() => {
   rmSync(base, { recursive: true, force: true });
 });
 
-const scratchParent = (): string => path.join(base, "scratch");
+const scratchBase = (): string => path.join(base, "scratch");
 
 describe("createWorkdirJail — root canonicalization", () => {
   it("J1: rejects a non-existent root and an empty roots array", async () => {
     await expect(
-      createWorkdirJail({ allowedRoots: [path.join(base, "missing")], scratchParent: scratchParent() }),
+      createWorkdirJail({ allowedRoots: [path.join(base, "missing")], scratchBase: scratchBase() }),
     ).rejects.toThrow(JailError);
-    await expect(createWorkdirJail({ allowedRoots: [], scratchParent: scratchParent() })).rejects.toThrow(JailError);
+    await expect(createWorkdirJail({ allowedRoots: [], scratchBase: scratchBase() })).rejects.toThrow(JailError);
   });
 
   it("J2: rejects a root that is a file, not a directory", async () => {
     const file = path.join(base, "a-file");
     writeFileSync(file, "x");
-    await expect(createWorkdirJail({ allowedRoots: [file], scratchParent: scratchParent() })).rejects.toThrow(
+    await expect(createWorkdirJail({ allowedRoots: [file], scratchBase: scratchBase() })).rejects.toThrow(
       JailError,
     );
   });
 
   it("J3: rejects relative roots", async () => {
     for (const bad of ["relative/dir", "./also-relative", ""]) {
-      await expect(createWorkdirJail({ allowedRoots: [bad], scratchParent: scratchParent() }), bad).rejects.toThrow(
+      await expect(createWorkdirJail({ allowedRoots: [bad], scratchBase: scratchBase() }), bad).rejects.toThrow(
         JailError,
       );
     }
@@ -49,7 +49,7 @@ describe("createWorkdirJail — root canonicalization", () => {
 
   it("J4: rejects roots containing .. segments", async () => {
     const withDotDot = path.join(base, "sub", "..", "other");
-    await expect(createWorkdirJail({ allowedRoots: [withDotDot], scratchParent: scratchParent() })).rejects.toThrow(
+    await expect(createWorkdirJail({ allowedRoots: [withDotDot], scratchBase: scratchBase() })).rejects.toThrow(
       JailError,
     );
   });
@@ -61,7 +61,7 @@ describe("createWorkdirJail — root canonicalization", () => {
     symlinkSync(real, alias, "dir");
     const jail = await createWorkdirJail({
       allowedRoots: [real, alias, real],
-      scratchParent: scratchParent(),
+      scratchBase: scratchBase(),
     });
     expect(jail.daemonRoots).toEqual([realpathSync(real)]);
   });
@@ -84,13 +84,13 @@ describe("resolve — daemon ∩ server root intersection", () => {
   ) => jail.resolve({ workdir, serverRoots, loopId: "loop-1", runId: "run-1" });
 
   it("J14: a server root INSIDE a daemon root narrows to the server root", async () => {
-    const jail = await createWorkdirJail({ allowedRoots: [daemonA], scratchParent: scratchParent() });
+    const jail = await createWorkdirJail({ allowedRoots: [daemonA], scratchBase: scratchBase() });
     const resolved = await resolveWith(jail, daemonAChild, [daemonAChild]);
     expect(resolved.effectiveRoots).toEqual([realpathSync(daemonAChild)]);
   });
 
   it("J15: a server root CONTAINING a daemon root narrows to the daemon root", async () => {
-    const jail = await createWorkdirJail({ allowedRoots: [daemonA], scratchParent: scratchParent() });
+    const jail = await createWorkdirJail({ allowedRoots: [daemonA], scratchBase: scratchBase() });
     const resolved = await resolveWith(jail, daemonA, [base]); // base ⊃ daemonA
     expect(resolved.effectiveRoots).toEqual([realpathSync(daemonA)]);
   });
@@ -98,12 +98,12 @@ describe("resolve — daemon ∩ server root intersection", () => {
   it("J16: fully disjoint server roots → JailError (no permitted workdir)", async () => {
     const disjoint = path.join(base, "disjoint");
     mkdirSync(disjoint);
-    const jail = await createWorkdirJail({ allowedRoots: [daemonA], scratchParent: scratchParent() });
+    const jail = await createWorkdirJail({ allowedRoots: [daemonA], scratchBase: scratchBase() });
     await expect(resolveWith(jail, daemonA, [disjoint])).rejects.toThrow(JailError);
   });
 
   it("J17: empty server roots impose no narrowing; cwd realpaths, scratchDir stays null", async () => {
-    const jail = await createWorkdirJail({ allowedRoots: [daemonA], scratchParent: scratchParent() });
+    const jail = await createWorkdirJail({ allowedRoots: [daemonA], scratchBase: scratchBase() });
     const resolved = await resolveWith(jail, daemonA, []);
     expect(resolved.effectiveRoots).toEqual([realpathSync(daemonA)]);
     expect(resolved.cwd).toBe(realpathSync(daemonA));
@@ -111,7 +111,7 @@ describe("resolve — daemon ∩ server root intersection", () => {
   });
 
   it("J18: missing, non-directory and relative server roots → JailError (never trusted pre-normalized)", async () => {
-    const jail = await createWorkdirJail({ allowedRoots: [daemonA], scratchParent: scratchParent() });
+    const jail = await createWorkdirJail({ allowedRoots: [daemonA], scratchBase: scratchBase() });
     await expect(resolveWith(jail, daemonA, [path.join(base, "missing")])).rejects.toThrow(JailError);
     const file = path.join(base, "srv-file");
     writeFileSync(file, "x");
@@ -120,7 +120,7 @@ describe("resolve — daemon ∩ server root intersection", () => {
   });
 
   it("J19: intersection dedupes and drops children already covered by a parent root", async () => {
-    const jail = await createWorkdirJail({ allowedRoots: [daemonA, daemonAChild], scratchParent: scratchParent() });
+    const jail = await createWorkdirJail({ allowedRoots: [daemonA, daemonAChild], scratchBase: scratchBase() });
     const resolved = await resolveWith(jail, daemonAChild, [daemonA]);
     expect(resolved.effectiveRoots).toEqual([realpathSync(daemonA)]);
   });
@@ -134,7 +134,7 @@ describe("resolve — workdir boundary against effective roots", () => {
     mkdirSync(root);
   });
 
-  const jail = () => createWorkdirJail({ allowedRoots: [root], scratchParent: scratchParent() });
+  const jail = () => createWorkdirJail({ allowedRoots: [root], scratchBase: scratchBase() });
   const resolveWith = (j: Awaited<ReturnType<typeof jail>>, workdir: string) =>
     j.resolve({ workdir, serverRoots: [], loopId: "loop-1", runId: "run-1" });
 
@@ -204,15 +204,15 @@ describe("resolve/release — per-run scratch lifecycle", () => {
   beforeEach(() => {
     root = path.join(base, "root");
     mkdirSync(root);
-    scratch = scratchParent();
+    scratch = scratchBase();
   });
 
-  const jail = () => createWorkdirJail({ allowedRoots: [root], scratchParent: scratch });
+  const jail = () => createWorkdirJail({ allowedRoots: [root], scratchBase: scratch });
   const resolveNull = (j: Awaited<ReturnType<typeof jail>>, runId: string) =>
     j.resolve({ workdir: null, serverRoots: [], loopId: "loop-1", runId });
 
   it("J20: null workdir mints a per-run scratch dir inside an UNPREDICTABLE per-jail root (round-1 hardening)", async () => {
-    await expect(createWorkdirJail({ allowedRoots: [root], scratchParent: "relative/scratch" })).rejects.toThrow(
+    await expect(createWorkdirJail({ allowedRoots: [root], scratchBase: "relative/scratch" })).rejects.toThrow(
       JailError,
     );
     const resolved = await resolveNull(await jail(), "run-1");

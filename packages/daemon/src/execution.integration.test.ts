@@ -26,7 +26,7 @@ beforeEach(async () => {
   base = mkdtempSync(path.join(realpathSync(tmpdir()), "loopzhb-exec-int-"));
   root = path.join(base, "root");
   mkdirSync(root);
-  jail = await createWorkdirJail({ allowedRoots: [root], scratchParent: path.join(base, "scratch") });
+  jail = await createWorkdirJail({ allowedRoots: [root], scratchBase: path.join(base, "scratch") });
 });
 
 afterEach(() => {

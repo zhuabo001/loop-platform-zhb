@@ -95,17 +95,24 @@ function intersectRoots(daemonRoots: readonly string[], serverRoots: string[]): 
 
 export async function createWorkdirJail(config: {
   allowedRoots: string[];
-  scratchParent: string;
+  /** Base directory the scratch ROOT is minted INSIDE. Never used directly
+   *  as the scratch parent: a predictable pre-existing path could be
+   *  pre-occupied or symlink-swapped by another local user (round-1 P1). */
+  scratchBase: string;
 }): Promise<WorkdirJail> {
   const daemonRoots = await canonicalizeRoots(config.allowedRoots, "allowed root");
-  // The scratch parent is DAEMON-OWNED and independent of the allowed roots:
-  // create it up front (fail-fast startup), then canonicalize so every later
-  // parent/child comparison is exact.
-  if (!path.isAbsolute(config.scratchParent)) {
-    throw new JailError(`scratchParent must be an absolute path: ${JSON.stringify(config.scratchParent)}`);
+  if (!path.isAbsolute(config.scratchBase)) {
+    throw new JailError(`scratchBase must be an absolute path: ${JSON.stringify(config.scratchBase)}`);
   }
-  await fs.mkdir(config.scratchParent, { recursive: true, mode: 0o700 });
-  const scratchParent = await fs.realpath(config.scratchParent);
+  await fs.mkdir(config.scratchBase, { recursive: true });
+  const scratchBase = await fs.realpath(config.scratchBase);
+  // The scratch ROOT is minted per jail (≈ per daemon start): unpredictable
+  // mkdtemp name, 0700 — it cannot collide, be pre-occupied, or be swapped
+  // ahead of time. Stale roots from earlier starts are accepted tmp residue
+  // (the OS janitor reaps them); runs never write into a previous start's
+  // root.
+  const scratchRoot = await fs.mkdtemp(path.join(scratchBase, "loopzhb-runs-"));
+  await fs.chmod(scratchRoot, 0o700);
   /** Every scratch dir THIS jail minted — release() deletes nothing else. */
   const mintedScratch = new Set<string>();
   return {
@@ -123,7 +130,7 @@ export async function createWorkdirJail(config: {
         // never-reused directory. chmod defends the 0700 contract beyond
         // POSIX mkdtemp's own guarantee.
         const prefix = createHash("sha256").update(`${input.loopId} ${input.runId}`).digest("hex").slice(0, 16);
-        const scratchDir = await fs.mkdtemp(path.join(scratchParent, `${prefix}-`));
+        const scratchDir = await fs.mkdtemp(path.join(scratchRoot, `${prefix}-`));
         await fs.chmod(scratchDir, 0o700);
         mintedScratch.add(scratchDir);
         return { cwd: scratchDir, effectiveRoots, scratchDir };
@@ -155,9 +162,9 @@ export async function createWorkdirJail(config: {
       const dir = resolved.scratchDir;
       if (dir === null) return; // a non-scratch resolution owns nothing
       // Fail-closed (J23–J25): only delete a directory THIS jail minted, that
-      // is STILL a direct child of the canonical scratchParent, and that has
+      // is STILL a direct child of this jail's scratch root, and that has
       // not been swapped for a symlink. lstat (not stat) sees the swap.
-      if (!mintedScratch.has(dir) || path.dirname(dir) !== scratchParent) {
+      if (!mintedScratch.has(dir) || path.dirname(dir) !== scratchRoot) {
         throw new JailError(`refusing to release a path this jail did not mint here: ${JSON.stringify(dir)}`);
       }
       let stat;
