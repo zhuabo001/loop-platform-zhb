@@ -64,9 +64,17 @@ export const SIGTERM_GRACE_MS = 5000;
 
 const HALF_CAP = MAX_STREAM_BYTES / 2;
 
+/** True for UTF-8 continuation bytes (10xxxxxx). */
+function isContinuationByte(byte: number): boolean {
+  return (byte & 0xc0) === 0x80;
+}
+
 /** Rolling head+tail capture. While the total fits the cap, head and tail
  *  stay CONTIGUOUS (text() is the exact stream); the first byte that must be
- *  dropped flips `truncated` for good. */
+ *  dropped flips `truncated` for good. Both cut points align to UTF-8 LEAD
+ *  bytes (round-1 P2): the head cut backs off ≤3 bytes (the straddling char
+ *  flows into the tail), the tail front advances past continuation bytes —
+ *  so text() never synthesizes U+FFFD and re-encoding never exceeds the cap. */
 class CappedStream {
   private headParts: Buffer[] = [];
   private headBytes = 0;
@@ -77,7 +85,11 @@ class CappedStream {
   push(chunk: Buffer): void {
     let rest = chunk;
     if (this.headBytes < HALF_CAP) {
-      const take = Math.min(HALF_CAP - this.headBytes, rest.length);
+      let take = Math.min(HALF_CAP - this.headBytes, rest.length);
+      if (take < rest.length) {
+        // Cutting mid-chunk: back off to the straddling char's lead byte.
+        while (take > 0 && isContinuationByte(rest[take]!)) take -= 1;
+      }
       this.headParts.push(Buffer.from(rest.subarray(0, take)));
       this.headBytes += take;
       rest = rest.subarray(take);
@@ -95,6 +107,20 @@ class CappedStream {
       } else {
         this.tailParts[0] = first.subarray(excess);
         this.tailBytes -= excess;
+      }
+    }
+    if (this.truncated) {
+      // The rollover cut can leave the front mid-sequence: advance to the
+      // next lead byte (bounded by UTF-8's 4-byte max).
+      while (this.tailParts.length > 0) {
+        const first = this.tailParts[0]!;
+        if (first.length === 0) {
+          this.tailParts.shift();
+          continue;
+        }
+        if (!isContinuationByte(first[0]!)) break;
+        this.tailParts[0] = first.subarray(1);
+        this.tailBytes -= 1;
       }
     }
   }

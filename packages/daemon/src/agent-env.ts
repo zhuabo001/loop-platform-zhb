@@ -71,13 +71,23 @@ export function buildAgentEnv(source: NodeJS.ProcessEnv): AgentEnv {
   return { env, secretValues: normalizeSecrets(secrets) };
 }
 
-/** Replace every occurrence of every secret with [REDACTED]. Normalizes
- *  (longest-first, deduped, empties dropped) at the door so external callers
- *  get the same guarantees as buildAgentEnv's own output. */
+/** Replace every occurrence of every secret with [REDACTED] — in BOTH its
+ *  raw and its JSON-escaped form: a secret containing newlines, quotes or
+ *  backslashes appears ESCAPED inside serialized JSON (structured logs,
+ *  report bodies), and a raw-only replace would miss it there (round-1 P2).
+ *  All forms are normalized together (longest-first, deduped, empties
+ *  dropped). Caller contract: redact BEFORE serializing structured fields,
+ *  and raw child env/stdout never enters logs unscrubbed. */
 export function redactSecrets(text: string, secretValues: string[]): string {
-  let out = text;
+  const forms = new Set<string>();
   for (const secret of normalizeSecrets(secretValues)) {
-    out = out.split(secret).join("[REDACTED]");
+    forms.add(secret);
+    const escaped = JSON.stringify(secret).slice(1, -1); // body without quotes
+    if (escaped !== secret) forms.add(escaped);
+  }
+  let out = text;
+  for (const form of [...forms].sort((a, b) => b.length - a.length)) {
+    out = out.split(form).join("[REDACTED]");
   }
   return out;
 }
