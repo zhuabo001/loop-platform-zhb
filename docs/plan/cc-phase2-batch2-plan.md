@@ -1,5 +1,12 @@
 # Phase 2 Batch 2 开发计划：本机执行与强隔离
 
+> **状态：未采用，仅作早期方案与测试矩阵参考。**
+> Batch 2 的实施与验收依据是
+> [`codex-phase2-batch2-plan.md`](./codex-phase2-batch2-plan.md) 和
+> [`ADR-005`](../adr/005-phase2-batch2-execution-isolation-primitives.md)。本文中删除
+> Fake Runner、接入 Claude Runner 以及 binary shell 探测等方案均未被实施，
+> 也不构成 Batch 2 的完成条件。
+
 ## 背景与上下文
 
 **Phase 2 目标**：将 daemon 从假 runner 转变为真实的本机 subprocess 执行，具备完整的安全隔离机制。

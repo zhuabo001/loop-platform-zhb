@@ -9,9 +9,10 @@
  *  - triggers: timeout, AbortSignal, or a throwing chunk consumer — the
  *    FIRST one writes the single `winner` field and alone decides the
  *    completion kind; later triggers still terminate but never re-decide;
- *  - terminate() NEVER rejects: a kill failure (e.g. EPERM from the group
- *    liveness probe) is captured — there is no floating-rejection window
- *    between trigger and 'close' — and surfaced by ONE settle path: a
+ *  - terminate() NEVER rejects: a real TERM/KILL failure is captured —
+ *    there is no floating-rejection window between trigger and 'close' —
+ *    and surfaced by ONE settle path; signal-0 probe EPERM is conservatively
+ *    retried and only becomes fatal if the bounded reap cannot finish: a
  *    mid-termination failure rejects IMMEDIATELY and detaches (failFatally,
  *    round-2 P1: a child we cannot signal must not hang the caller waiting
  *    for a 'close' we may never bring about); a close-time failure rejects
@@ -82,10 +83,32 @@ function isContinuationByte(byte: number): boolean {
  *  out-of-range leads report 1 (each decodes as its own U+FFFD). */
 function utf8SequenceLength(byte: number): number {
   if (byte < 0x80) return 1;
-  if ((byte & 0xe0) === 0xc0) return 2;
-  if ((byte & 0xf0) === 0xe0) return 3;
-  if ((byte & 0xf8) === 0xf0) return 4;
+  if (byte >= 0xc2 && byte <= 0xdf) return 2;
+  if (byte >= 0xe0 && byte <= 0xef) return 3;
+  if (byte >= 0xf0 && byte <= 0xf4) return 4;
   return 1;
+}
+
+/** Whether the bytes already present after a valid lead can still become a
+ *  valid UTF-8 scalar. Invalid/overlong/surrogate prefixes must be retained
+ *  so the decoder reports their honest U+FFFD instead of our cut hiding
+ *  them. */
+function isCompletableUtf8Prefix(buf: Buffer, lead: number, needed: number): boolean {
+  const present = buf.length - lead;
+  if (present >= needed) return false;
+  if (present === 1) return true;
+
+  const leadByte = buf[lead]!;
+  const second = buf[lead + 1]!;
+  if (!isContinuationByte(second)) return false;
+  if (leadByte === 0xe0 && second < 0xa0) return false;
+  if (leadByte === 0xed && second > 0x9f) return false;
+  if (leadByte === 0xf0 && second < 0x90) return false;
+  if (leadByte === 0xf4 && second > 0x8f) return false;
+  for (let index = lead + 2; index < buf.length; index += 1) {
+    if (!isContinuationByte(buf[index]!)) return false;
+  }
+  return true;
 }
 
 /** Head cut on RAW BYTES: if the buffer ends mid-sequence, drop the whole
@@ -101,7 +124,7 @@ function dropTrailingPartialSequence(buf: Buffer): Buffer {
   }
   if (lead < 0) return buf.subarray(0, 0);
   const needed = utf8SequenceLength(buf[lead]!);
-  return buf.length - lead < needed ? buf.subarray(0, lead) : buf;
+  return needed > 1 && isCompletableUtf8Prefix(buf, lead, needed) ? buf.subarray(0, lead) : buf;
 }
 
 /** Tail cut on RAW BYTES: the rolling window can OPEN mid-sequence — its
@@ -136,9 +159,12 @@ export class CappedStream {
   truncated = false;
 
   push(chunk: Buffer): void {
+    // Streams and consumers own their input buffers. Capture an immutable
+    // byte snapshot so later reuse/mutation cannot rewrite subprocess output.
+    const ownedChunk = Buffer.from(chunk);
     if (this.wholeParts !== null) {
-      this.wholeParts.push(chunk);
-      this.wholeBytes += chunk.length;
+      this.wholeParts.push(ownedChunk);
+      this.wholeBytes += ownedChunk.length;
       if (this.wholeBytes <= MAX_STREAM_BYTES) return;
       // First byte past the cap: split the over-cap whole into the frozen
       // head and the rolling tail window — disjoint, since the whole is
@@ -151,8 +177,8 @@ export class CappedStream {
       this.tailBytes = HALF_CAP;
       return;
     }
-    this.tailParts.push(chunk);
-    this.tailBytes += chunk.length;
+    this.tailParts.push(ownedChunk);
+    this.tailBytes += ownedChunk.length;
     while (this.tailBytes > HALF_CAP) {
       const excess = this.tailBytes - HALF_CAP;
       const first = this.tailParts[0]!;
@@ -224,6 +250,7 @@ export async function spawnWithTimeout(opts: SpawnOptions): Promise<SpawnResult>
     let terminationDone: Promise<void> | null = null;
     let terminatedBy: NodeJS.Signals | null = null;
     let killError: Error | null = null;
+    let lastProbeError: Error | null = null;
     /** Single-settle guard: exactly one of resolve/reject ever fires — the
      *  normal close settle, or failFatally on an unrecoverable kill error. */
     let settled = false;
@@ -233,14 +260,27 @@ export async function spawnWithTimeout(opts: SpawnOptions): Promise<SpawnResult>
     const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
     /** Group liveness via kill(-pgid, 0): ESRCH ⇒ gone (NOT an error —
-     *  S16); any other kill failure propagates via the settle path. */
+     *  S16). EPERM from this null-signal probe is conservative evidence that
+     *  the group may still exist, not proof that an actual TERM/KILL failed;
+     *  macOS can report it transiently while a signalled child is exiting.
+     *  We therefore keep reaping and let the next real signal be definitive.
+     *  Persistent probe errors are surfaced after the bounded KILL reap. */
     const groupAlive = (): boolean => {
       if (child.pid === undefined) return false;
       try {
         kill(-child.pid, 0);
+        lastProbeError = null;
         return true;
       } catch (err) {
-        if ((err as NodeJS.ErrnoException).code === "ESRCH") return false;
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === "ESRCH") {
+          lastProbeError = null;
+          return false;
+        }
+        if (code === "EPERM") {
+          lastProbeError = err instanceof Error ? err : new Error(String(err));
+          return true;
+        }
         throw err;
       }
     };
@@ -252,6 +292,14 @@ export async function spawnWithTimeout(opts: SpawnOptions): Promise<SpawnResult>
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "ESRCH") throw err;
       }
+    };
+
+    const waitForGroupExit = async (deadline: number): Promise<boolean> => {
+      while (Date.now() < deadline) {
+        if (!groupAlive()) return true;
+        await sleep(10);
+      }
+      return !groupAlive();
     };
 
     /** Idempotent TERM → grace → KILL against the WHOLE group. NEVER rejects:
@@ -268,13 +316,17 @@ export async function spawnWithTimeout(opts: SpawnOptions): Promise<SpawnResult>
           signalGroup("SIGTERM");
           const graceMs = opts.graceMs ?? SIGTERM_GRACE_MS;
           const deadline = Date.now() + graceMs;
-          while (groupAlive() && Date.now() < deadline) await sleep(10);
-          if (!groupAlive()) {
+          if (await waitForGroupExit(deadline)) {
             terminatedBy = "SIGTERM";
             return;
           }
           signalGroup("SIGKILL");
-          while (groupAlive()) await sleep(10);
+          if (!(await waitForGroupExit(Date.now() + graceMs))) {
+            if (lastProbeError !== null) throw lastProbeError;
+            throw Object.assign(new Error("process group did not exit after SIGKILL"), {
+              code: "ETIMEDOUT",
+            });
+          }
           terminatedBy = "SIGKILL";
         } catch (err) {
           killError = err instanceof Error ? err : new Error(String(err));
@@ -325,7 +377,10 @@ export async function spawnWithTimeout(opts: SpawnOptions): Promise<SpawnResult>
         if (settled) return;
         if (winner === null && callback !== undefined) {
           try {
-            callback(chunk);
+            // The consumer gets its own view: callbacks run before capture by
+            // contract, but mutating that view must not alter the child bytes
+            // retained below (synchronously or after this handler returns).
+            callback(Buffer.from(chunk));
           } catch (err) {
             winner = "consumer-error";
             consumerErrorMessage = err instanceof Error ? err.message : String(err);

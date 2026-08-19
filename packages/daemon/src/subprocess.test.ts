@@ -109,6 +109,17 @@ describe("spawnWithTimeout — stdio capture, caps and chunk callbacks", () => {
     expect((result.completion as { message: string }).message).toContain("consumer boom");
     expect(result.durationMs).toBeLessThan(3000);
   });
+
+  it("S20: a consumer cannot mutate the bytes retained for the final stdout snapshot", async () => {
+    const result = await spawnWithTimeout(
+      opts({
+        args: [FIXTURE, "exit", "0"],
+        onStdout: (chunk) => Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength).fill(0x58),
+      }),
+    );
+    expect(result.completion).toEqual({ kind: "exited", exitCode: 0 });
+    expect(result.stdout).toBe("stdout-from-exit-0\n");
+  });
 });
 
 describe("spawnWithTimeout — termination triggers", () => {
@@ -306,6 +317,26 @@ describe("CappedStream — byte-level determinism (round-2)", () => {
     expect(text.startsWith("界界界")).toBe(true);
     expect(text.endsWith("界界界")).toBe(true);
   });
+
+  it("CS4: push snapshots caller-owned buffers before they can be mutated", () => {
+    const stream = new CappedStream();
+    const chunk = Buffer.from("original", "utf8");
+    stream.push(chunk);
+    chunk.fill(0x58);
+    expect(stream.text()).toBe("original");
+  });
+
+  it.each([0xc0, 0xf5])(
+    "CS5: invalid UTF-8 lead 0x%s at the head boundary is preserved as U+FFFD",
+    (invalidLead) => {
+      const stream = new CappedStream();
+      const payload = Buffer.alloc(MIB + 1, 0x61);
+      payload[MIB / 2 - 1] = invalidLead;
+      pushSliced(stream, payload, 4096);
+      expect(stream.truncated).toBe(true);
+      expect(stream.text()).toContain("�");
+    },
+  );
 });
 
 describe("spawnWithTimeout — first-wins determinism gap (round-2)", () => {
@@ -354,6 +385,34 @@ describe("spawnWithTimeout — kill failure propagation (round-2 P1)", () => {
       if (attackedGroup > 0) {
         try {
           process.kill(-attackedGroup, "SIGKILL");
+        } catch {
+          /* already gone */
+        }
+      }
+    }
+  });
+
+  it("S21: a transient EPERM from signal-0 probing does not override successful group signals", async () => {
+    let groupPid = 0;
+    let injectedProbeFailure = false;
+    const killImpl: typeof process.kill = (pid, signal) => {
+      if (pid < 0) groupPid = -pid;
+      if (pid < 0 && signal === 0 && !injectedProbeFailure) {
+        injectedProbeFailure = true;
+        throw Object.assign(new Error("transient probe EPERM"), { code: "EPERM" });
+      }
+      return process.kill(pid, signal);
+    };
+    try {
+      const result = await spawnWithTimeout(
+        opts({ args: [FIXTURE, "sleep", "3000"], timeoutMs: 150, killImpl }),
+      );
+      expect(injectedProbeFailure).toBe(true);
+      expect(result.completion).toEqual({ kind: "timed-out", finalSignal: "SIGTERM" });
+    } finally {
+      if (groupPid > 0) {
+        try {
+          process.kill(-groupPid, "SIGKILL");
         } catch {
           /* already gone */
         }
