@@ -307,3 +307,23 @@ describe("CappedStream — byte-level determinism (round-2)", () => {
     expect(text.endsWith("界界界")).toBe(true);
   });
 });
+
+describe("spawnWithTimeout — first-wins determinism gap (round-2)", () => {
+  it("F3: a timeout clearly EARLIER than a later abort keeps kind timed-out (S8's missing deterministic half)", async () => {
+    // S8 only proves near-simultaneous arrival tolerance; this half pins the
+    // ordering: timeout at 80ms decides, the 400ms abort lands on a settled
+    // winner and must not flip the kind. (Pin: the single-write winner
+    // already behaves this way — the gap was evidence, not behavior.)
+    const ctl = new AbortController();
+    const abortTimer = setTimeout(() => ctl.abort(), 400);
+    try {
+      const result = await spawnWithTimeout(
+        opts({ args: [FIXTURE, "sleep", "3000"], timeoutMs: 80, signal: ctl.signal }),
+      );
+      expect(result.completion).toEqual({ kind: "timed-out", finalSignal: "SIGTERM" });
+      expect(result.durationMs).toBeLessThan(2500);
+    } finally {
+      clearTimeout(abortTimer);
+    }
+  });
+});
