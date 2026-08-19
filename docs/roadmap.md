@@ -95,7 +95,13 @@ claude-code 或 codex 选一：子进程 spawn、进程组 kill、timeout、env 
   - server：poll 携带 progress 心跳转正（server 独占 `at`、machine+phase 守卫、last-wins、绝不碰 `ts`）；`availableSlots` 门控（0 跳过扫描、1 成功即停、缺省保持批量）。
   - daemon：poll/heartbeat 与执行解耦；容量固定 1（`inFlight ∪ queue ∪ pendingReports` 背压）；轮转 progress 快照；fatal 终止时丢弃队列、join 活动 pipeline。
   - 兼容：Phase 2 server + Phase 1 daemon 兼容；Phase 2 daemon + Phase 1 server 不承诺长任务/批量队列 liveness；升级先 server 后 daemon。
-- **Batch 2 — 本机执行与强隔离（Day 3–5）：未开始**（roots 校验、workdir jail、进程组/subprocess、env 白名单）。
+- **Batch 2 — 本机执行隔离原语（Day 3–5）：已完成**（2026-08-19，分支 `feat/phase2-batch2`，ADR-005）
+  - 配置：`LOOPZHB_ALLOWED_ROOTS` 必填（纯语法解析，零 FS 副作用）+ `LOOPZHB_CLAUDE_BIN` / `LOOPZHB_AGENT_TIMEOUT_MS` 默认值。
+  - jail：daemon roots 启动 canonicalize；server roots 逐 Delivery 重校验；`path.relative()` 交集（只窄不宽）；per-run scratch（0700、永不复用、release fail-closed）。
+  - subprocess：一 spawn 一进程组；TERM → 5s → KILL；先到触发器定 kind；返回前 reap 残留孙进程；stdio 1 MiB 头尾各半 + 有序 chunk 回调。
+  - env：allow-list 白名单（`LOOPZHB_*` 与云/CI 密钥天然排除）；secretValues 长度降序脱敏。
+  - 边界：**不切换生产 Runner**（Fake Runner 保持，I6 守护）；jail 只选 cwd，不是运行时安全边界——Batch 3 的 OS sandbox 才是。
+- **Batch 3 — Claude Code adapter 与生产切换（Day 6–8）：未开始**（真实 Runner、fail-closed OS sandbox、stream-json 解析、runner 事件接入 progress）。
 
 ### 右移项
 

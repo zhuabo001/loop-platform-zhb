@@ -11,7 +11,13 @@
 | 可执行右移项 / 阻塞项 | 直到关闭 | GitHub Issues（label：`phase-N`、`phase-6-blocker`）；roadmap 对应阶段只放一行指针，不复制细节 |
 | 会话物流（进度交接、计划/审查来回） | 当批 | `docs/handoff/`——**不进库**（已 gitignore；存量为 Phase 1 旧制，不追溯清理） |
 
+> 例外（2026-08-19 裁决，ADR-005 修订记录第 8 条）：携带测试用例 ID 编组等长期引用锚点的当批**计划**可入库至 `docs/plan/`；进度交接、审查来回等纯物流仍只归 `docs/handoff/`，不进库。
+
 判断口诀：**这条信息在下一阶段还有用吗？** 有用就不许只写在 handoff 里。
+
+## Issue Tracker 与审查记录
+
+GitHub Issues 是所有**未关闭、需执行的问题**的当前状态与关闭条件的唯一权威来源；`docs/agents/issue-tracker.md` 规定创建、关联、核销和关闭的工作流。代理必须优先使用 `gh` 创建、查询、更新和关闭 Issue；若 CLI、认证或权限不可用，必须报告阻塞，不能伪造 Issue 编号。`docs/handoff/` 的 code-review 文档仍为 append-only 审查证据：每轮只追加 Issue 链接、核销结果和结论，不重复维护 Issue 的完整描述或状态。
 
 ## 阶段收口仪式（每批开发结束时执行）
 

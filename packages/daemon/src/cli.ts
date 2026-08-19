@@ -6,14 +6,33 @@
  * run() (exit 0); config failure or a protocol-fatal poll/report rejects
  * main() and the direct-run wrapper exits non-zero.
  */
+import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { createMachineClient } from "./client.js";
-import { loadDaemonConfig } from "./config.js";
+import { loadDaemonConfig, type DaemonConfig } from "./config.js";
 import { machineIdentity } from "./identity.js";
-import { createFakeRunner } from "./runner.js";
+import { createWorkdirJail, type WorkdirJail } from "./jail.js";
+import { createFakeRunner, type AgentRunner } from "./runner.js";
 import { createDaemonRuntime } from "./runtime.js";
+
+/** Batch-2 startup seam: canonicalize + verify the isolation roots BEFORE
+ *  any resource opens (fail-fast, fail-closed). The returned jail is NOT
+ *  wired to a Runner yet — batch 3's sandboxed adapter receives it. */
+export async function createStartupJail(config: DaemonConfig): Promise<WorkdirJail> {
+  return await createWorkdirJail({
+    allowedRoots: config.allowedRoots,
+    // The factory mints an unpredictable per-start 0700 scratch root INSIDE
+    // this base (round-1 P1) — never pass a predictable leaf directory.
+    scratchBase: os.tmpdir(),
+  });
+}
+
+/** The production Runner seam stays the Fake Runner for ALL of batch 2: no
+ *  Delivery ever spawns a real subprocess until batch 3's sandboxed adapter
+ *  lands (plan §2.5, pin I6). */
+export const productionRunnerFactory: () => AgentRunner = createFakeRunner;
 
 export type ShutdownSignal = "SIGINT" | "SIGTERM";
 
@@ -46,13 +65,16 @@ export function registerShutdownSignals(
 
 export async function main(): Promise<void> {
   const config = loadDaemonConfig(process.env);
+  // Fail fast on bad isolation roots BEFORE the first poll: a misconfigured
+  // daemon never talks to the server (fail-closed, plan §2.1).
+  await createStartupJail(config);
   const client = createMachineClient({
     baseUrl: config.serverUrl,
     machineCredential: config.machineCredential,
   });
   const runtime = createDaemonRuntime({
     client,
-    runner: createFakeRunner(),
+    runner: productionRunnerFactory(),
     identity: machineIdentity(),
     pollMs: config.pollMs,
     machineCredential: config.machineCredential,
