@@ -6,6 +6,7 @@
  * cwd resolves inside the daemon ∩ server root intersection, or inside an
  * isolated per-run scratch directory owned by the daemon.
  */
+import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
@@ -97,7 +98,16 @@ export async function createWorkdirJail(config: {
   scratchParent: string;
 }): Promise<WorkdirJail> {
   const daemonRoots = await canonicalizeRoots(config.allowedRoots, "allowed root");
-  const scratchParent = config.scratchParent;
+  // The scratch parent is DAEMON-OWNED and independent of the allowed roots:
+  // create it up front (fail-fast startup), then canonicalize so every later
+  // parent/child comparison is exact.
+  if (!path.isAbsolute(config.scratchParent)) {
+    throw new JailError(`scratchParent must be an absolute path: ${JSON.stringify(config.scratchParent)}`);
+  }
+  await fs.mkdir(config.scratchParent, { recursive: true, mode: 0o700 });
+  const scratchParent = await fs.realpath(config.scratchParent);
+  /** Every scratch dir THIS jail minted — release() deletes nothing else. */
+  const mintedScratch = new Set<string>();
   return {
     daemonRoots,
     async resolve(input: ResolveWorkdirInput): Promise<ResolvedWorkdir> {
@@ -107,9 +117,16 @@ export async function createWorkdirJail(config: {
       if (effectiveRoots.length === 0) {
         throw new JailError("server roots are disjoint from every daemon root — no permitted workdir");
       }
-      void scratchParent;
       if (input.workdir === null) {
-        throw new JailError("per-run scratch workdir is not implemented yet");
+        // Per-RUN scratch (J20–J22): hash(loopId+runId) is only the prefix —
+        // mkdtemp's random suffix means even a repeated runId gets a fresh,
+        // never-reused directory. chmod defends the 0700 contract beyond
+        // POSIX mkdtemp's own guarantee.
+        const prefix = createHash("sha256").update(`${input.loopId} ${input.runId}`).digest("hex").slice(0, 16);
+        const scratchDir = await fs.mkdtemp(path.join(scratchParent, `${prefix}-`));
+        await fs.chmod(scratchDir, 0o700);
+        mintedScratch.add(scratchDir);
+        return { cwd: scratchDir, effectiveRoots, scratchDir };
       }
       // Boundary discipline (J6–J13): realpath FIRST (collapses `..` and
       // symlinks), then containment against the canonical effectiveRoots via
@@ -134,6 +151,26 @@ export async function createWorkdirJail(config: {
       }
       return { cwd, effectiveRoots, scratchDir: null };
     },
-    release: () => Promise.resolve(),
+    async release(resolved: ResolvedWorkdir): Promise<void> {
+      const dir = resolved.scratchDir;
+      if (dir === null) return; // a non-scratch resolution owns nothing
+      // Fail-closed (J23–J25): only delete a directory THIS jail minted, that
+      // is STILL a direct child of the canonical scratchParent, and that has
+      // not been swapped for a symlink. lstat (not stat) sees the swap.
+      if (!mintedScratch.has(dir) || path.dirname(dir) !== scratchParent) {
+        throw new JailError(`refusing to release a path this jail did not mint here: ${JSON.stringify(dir)}`);
+      }
+      let stat;
+      try {
+        stat = await fs.lstat(dir);
+      } catch {
+        throw new JailError(`scratch dir vanished before release: ${JSON.stringify(dir)}`);
+      }
+      if (stat.isSymbolicLink() || !stat.isDirectory()) {
+        throw new JailError(`scratch dir was replaced (symlink or non-directory) — deleting nothing: ${JSON.stringify(dir)}`);
+      }
+      await fs.rm(dir, { recursive: true });
+      mintedScratch.delete(dir);
+    },
   };
 }
