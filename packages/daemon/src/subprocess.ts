@@ -5,15 +5,19 @@
  * parser rides onStdout/onStderr), and a discriminated-union completion so
  * the runner never has to guess how a child died.
  *
- * Termination contract:
+ * Termination contract (ADR-005 决策 6, round-1 hardened):
  *  - triggers: timeout, AbortSignal, or a throwing chunk consumer — the
- *    FIRST one decides the completion kind;
+ *    FIRST one writes the single `winner` field and alone decides the
+ *    completion kind; later triggers still terminate but never re-decide;
+ *  - terminate() NEVER rejects: a kill failure (e.g. EPERM from the group
+ *    liveness probe) is captured and surfaced by the unified settle path —
+ *    there is no floating-rejection window between trigger and 'close';
  *  - the routine is idempotent: SIGTERM to the process GROUP, grace, then
  *    SIGKILL; ESRCH means "already gone" and is never an error;
  *  - after the direct child's 'close' the group is checked once more —
  *    orphaned grandchildren get the same TERM → KILL before we return;
- *  - a kill error other than ESRCH REJECTS the promise (propagates, never
- *    silently misreports liveness).
+ *  - chunk callbacks stop firing once any winner exists (the stream is
+ *    doomed; the consumer's result will be discarded anyway).
  *
  * POSIX only (macOS / Linux / WSL2): native Windows gets an explicit
  * unsupported-platform spawn-error. `shell: false` always — args are never
@@ -30,8 +34,9 @@ export interface SpawnOptions {
   signal: AbortSignal;
   onStdout?: (chunk: Uint8Array) => void;
   onStderr?: (chunk: Uint8Array) => void;
-  /** Grace between SIGTERM and SIGKILL to the process group. Default 5000;
-   *  tests shrink it — production never sets this. */
+  /** Grace between SIGTERM and SIGKILL to the process group. TEST-ONLY seam
+   *  (ADR-005 决策 6/修订): production call sites never set this — the fixed
+   *  5000ms policy applies; tests shrink it to keep the suite fast. */
   graceMs?: number;
 }
 
@@ -138,15 +143,20 @@ export async function spawnWithTimeout(opts: SpawnOptions): Promise<SpawnResult>
     const stdoutCap = new CappedStream();
     const stderrCap = new CappedStream();
     let spawnError: { code?: string; message: string } | null = null;
-    let consumerError: string | null = null;
-    /** The FIRST trigger to fire — decides the completion kind (S8). */
-    let trigger: "timed-out" | "aborted" | null = null;
-    let terminationPromise: Promise<NodeJS.Signals> | null = null;
+    /** THE trigger state: the FIRST of timeout / abort / consumer-throw wins
+     *  and alone decides the completion kind. Later triggers still join the
+     *  (idempotent) termination but never re-decide the outcome. */
+    let winner: "timed-out" | "aborted" | "consumer-error" | null = null;
+    let consumerErrorMessage: string | null = null;
+    let terminationStarted = false;
+    let terminationDone: Promise<void> | null = null;
+    let terminatedBy: NodeJS.Signals | null = null;
+    let killError: Error | null = null;
 
     const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
     /** Group liveness via kill(-pgid, 0): ESRCH ⇒ gone (NOT an error —
-     *  S16); any other kill failure propagates to the caller. */
+     *  S16); any other kill failure propagates via the settle path. */
     const groupAlive = (): boolean => {
       if (child.pid === undefined) return false;
       try {
@@ -167,32 +177,42 @@ export async function spawnWithTimeout(opts: SpawnOptions): Promise<SpawnResult>
       }
     };
 
-    /** Idempotent TERM → grace → KILL against the WHOLE group; resolves with
-     *  the signal that actually ended it. Memoized: every trigger and the
-     *  post-close reap share one routine. */
-    const terminate = (): Promise<NodeJS.Signals> => {
-      terminationPromise ??= (async () => {
-        signalGroup("SIGTERM");
-        const graceMs = opts.graceMs ?? SIGTERM_GRACE_MS;
-        const deadline = Date.now() + graceMs;
-        while (groupAlive() && Date.now() < deadline) await sleep(10);
-        if (!groupAlive()) return "SIGTERM";
-        signalGroup("SIGKILL");
-        while (groupAlive()) await sleep(10);
-        return "SIGKILL";
+    /** Idempotent TERM → grace → KILL against the WHOLE group. NEVER rejects:
+     *  a kill failure is captured into killError and surfaced by settle —
+     *  attaching a handler only at 'close' would leave a floating-rejection
+     *  window that can crash the daemon under strict unhandled-rejection
+     *  settings (round-1 P1). */
+    const terminate = (): void => {
+      if (terminationStarted) return;
+      terminationStarted = true;
+      terminationDone = (async () => {
+        try {
+          signalGroup("SIGTERM");
+          const graceMs = opts.graceMs ?? SIGTERM_GRACE_MS;
+          const deadline = Date.now() + graceMs;
+          while (groupAlive() && Date.now() < deadline) await sleep(10);
+          if (!groupAlive()) {
+            terminatedBy = "SIGTERM";
+            return;
+          }
+          signalGroup("SIGKILL");
+          while (groupAlive()) await sleep(10);
+          terminatedBy = "SIGKILL";
+        } catch (err) {
+          killError = err instanceof Error ? err : new Error(String(err));
+        }
       })();
-      return terminationPromise;
     };
 
     const onTimeout = (): void => {
-      if (trigger !== null) return;
-      trigger = "timed-out";
-      void terminate();
+      if (winner !== null) return;
+      winner = "timed-out";
+      terminate();
     };
     const onAbort = (): void => {
-      if (trigger !== null) return;
-      trigger = "aborted";
-      void terminate();
+      if (winner !== null) return;
+      winner = "aborted";
+      terminate();
     };
     const timer = setTimeout(onTimeout, opts.timeoutMs);
     opts.signal.addEventListener("abort", onAbort, { once: true });
@@ -200,12 +220,16 @@ export async function spawnWithTimeout(opts: SpawnOptions): Promise<SpawnResult>
     const onChunk =
       (cap: CappedStream, callback: ((chunk: Uint8Array) => void) | undefined) =>
       (chunk: Buffer): void => {
-        if (consumerError === null && callback !== undefined) {
+        // Callbacks stop once ANY winner exists: the stream is doomed and
+        // the consumer's output will be discarded (round-1: this also keeps
+        // a repeatedly-throwing consumer from firing during grace).
+        if (winner === null && callback !== undefined) {
           try {
             callback(chunk);
           } catch (err) {
-            consumerError = err instanceof Error ? err.message : String(err);
-            void terminate();
+            winner = "consumer-error";
+            consumerErrorMessage = err instanceof Error ? err.message : String(err);
+            terminate();
           }
         }
         cap.push(chunk);
@@ -219,32 +243,35 @@ export async function spawnWithTimeout(opts: SpawnOptions): Promise<SpawnResult>
     });
 
     // 'close' (not 'exit'): stdio is drained by the time it fires. settle()
-    // runs synchronously up to the reap, so the trigger set is FROZEN by
+    // runs synchronously up to the reap, so the winner is FROZEN by
     // clearTimeout/removeEventListener before any await — a timer landing
     // mid-reap can never flip an already-exited child to timed-out.
     child.on("close", (code, signal) => {
       const settle = async (): Promise<void> => {
         clearTimeout(timer);
         opts.signal.removeEventListener("abort", onAbort);
-        let finalSignal: NodeJS.Signals | null = null;
         try {
           // S9: the direct child is done, but its group may hold orphaned
           // grandchildren — they get the same TERM → grace → KILL.
-          if (groupAlive()) await terminate();
-          if (terminationPromise !== null) finalSignal = await terminationPromise;
+          if (groupAlive()) terminate();
+          if (terminationDone !== null) await terminationDone;
         } catch (err) {
           rejectPromise(err instanceof Error ? err : new Error(String(err)));
+          return;
+        }
+        if (killError !== null) {
+          rejectPromise(killError);
           return;
         }
         const completion: SpawnCompletion =
           spawnError !== null
             ? { kind: "spawn-error", ...spawnError }
-            : consumerError !== null
-              ? { kind: "consumer-error", message: consumerError }
-              : trigger === "timed-out"
-                ? { kind: "timed-out", finalSignal: finalSignal ?? signal ?? "SIGTERM" }
-                : trigger === "aborted"
-                  ? { kind: "aborted", finalSignal: finalSignal ?? signal ?? "SIGTERM" }
+            : winner === "consumer-error"
+              ? { kind: "consumer-error", message: consumerErrorMessage ?? "chunk consumer failed" }
+              : winner === "timed-out"
+                ? { kind: "timed-out", finalSignal: terminatedBy ?? signal ?? "SIGTERM" }
+                : winner === "aborted"
+                  ? { kind: "aborted", finalSignal: terminatedBy ?? signal ?? "SIGTERM" }
                   : code !== null
                     ? { kind: "exited", exitCode: code }
                     : { kind: "signaled", signal: signal ?? "SIGTERM" };

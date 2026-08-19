@@ -142,7 +142,7 @@ describe("spawnWithTimeout — termination triggers", () => {
     expect(result.durationMs).toBeLessThan(2500);
   });
 
-  it("S8: a timeout/abort race lets the FIRST trigger decide the kind", async () => {
+  it("S8: a near-simultaneous timeout/abort race still settles promptly (arrival tolerance only — first-wins evidence is S5/S7/F1/F2)", async () => {
     const ctl = new AbortController();
     setTimeout(() => ctl.abort(), 80);
     const result = await spawnWithTimeout(
@@ -207,18 +207,18 @@ describe("spawnWithTimeout — completion kinds and return guarantees", () => {
 });
 
 describe("spawnWithTimeout — first-trigger-wins (round-1 fixes)", () => {
-  it("F1: timeout wins over a LATER consumer throw during the grace window", async () => {
-    // Timeout fires at 100ms; the consumer throws only on the 3rd chunk
-    // (~150ms) — the winner is already timed-out, so the late throw must NOT
-    // flip the completion to consumer-error (round-1 P1 minimal repro).
+  it("F1: timeout wins, and a would-be late consumer throw is never even delivered", async () => {
+    // drip-ignore-term survives the timeout's SIGTERM and keeps producing
+    // chunks through the grace window. Chunks land at ~0/200/400ms; the
+    // timeout fires at 300ms. Round-1's repro (a consumer throw during grace
+    // flipping the kind) is shut TWICE: the winner field is single-write,
+    // AND callbacks stop once a winner exists — the 3rd chunk is never
+    // delivered to the consumer at all.
     let chunks = 0;
     const result = await spawnWithTimeout(
       opts({
-        // ignores SIGTERM → survives the timeout TERM and keeps dripping
-        // through the grace window, so the 3rd-chunk throw lands AFTER the
-        // timeout trigger has already won.
-        args: [FIXTURE, "drip-ignore-term", "30", "50"],
-        timeoutMs: 100,
+        args: [FIXTURE, "drip-ignore-term", "30", "200"],
+        timeoutMs: 300,
         graceMs: 500,
         onStdout: () => {
           chunks += 1;
@@ -226,7 +226,7 @@ describe("spawnWithTimeout — first-trigger-wins (round-1 fixes)", () => {
         },
       }),
     );
-    expect(chunks).toBeGreaterThanOrEqual(3); // the throw really happened inside grace
+    expect(chunks).toBe(2); // chunks at 0/200ms delivered; 400ms+ suppressed
     expect(result.completion.kind).toBe("timed-out");
   });
 
