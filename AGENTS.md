@@ -15,6 +15,10 @@
 
 判断口诀：**这条信息在下一阶段还有用吗？** 有用就不许只写在 handoff 里。
 
+## Issue Tracker 与审查记录
+
+GitHub Issues 是所有**未关闭、需执行的问题**的当前状态与关闭条件的唯一权威来源；`docs/agents/issue-tracker.md` 规定创建、关联、核销和关闭的工作流。代理必须优先使用 `gh` 创建、查询、更新和关闭 Issue；若 CLI、认证或权限不可用，必须报告阻塞，不能伪造 Issue 编号。`docs/handoff/` 的 code-review 文档仍为 append-only 审查证据：每轮只追加 Issue 链接、核销结果和结论，不重复维护 Issue 的完整描述或状态。
+
 ## 阶段收口仪式（每批开发结束时执行）
 
 1. 裁决 → 蒸馏进 ADR（新 ADR 或修订记录）；
