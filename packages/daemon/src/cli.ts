@@ -10,10 +10,24 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { createMachineClient } from "./client.js";
-import { loadDaemonConfig } from "./config.js";
+import { loadDaemonConfig, type DaemonConfig } from "./config.js";
 import { machineIdentity } from "./identity.js";
-import { createFakeRunner } from "./runner.js";
+import type { WorkdirJail } from "./jail.js";
+import { createFakeRunner, type AgentRunner } from "./runner.js";
 import { createDaemonRuntime } from "./runtime.js";
+
+/** Batch-2 startup seam: canonicalize + verify the isolation roots BEFORE
+ *  any resource opens (fail-fast, fail-closed). The returned jail is NOT
+ *  wired to a Runner yet — batch 3's sandboxed adapter receives it. */
+export async function createStartupJail(config: DaemonConfig): Promise<WorkdirJail> {
+  void config;
+  throw new Error("createStartupJail is not implemented yet");
+}
+
+/** The production Runner seam stays the Fake Runner for ALL of batch 2: no
+ *  Delivery ever spawns a real subprocess until batch 3's sandboxed adapter
+ *  lands (plan §2.5, pin I6). */
+export const productionRunnerFactory: () => AgentRunner = createFakeRunner;
 
 export type ShutdownSignal = "SIGINT" | "SIGTERM";
 
