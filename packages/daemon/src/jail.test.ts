@@ -211,7 +211,7 @@ describe("resolve/release — per-run scratch lifecycle", () => {
   const resolveNull = (j: Awaited<ReturnType<typeof jail>>, runId: string) =>
     j.resolve({ workdir: null, serverRoots: [], loopId: "loop-1", runId });
 
-  it("J20: null workdir mints a per-run scratch dir as cwd (and the factory requires an absolute scratchParent)", async () => {
+  it("J20: null workdir mints a per-run scratch dir inside an UNPREDICTABLE per-jail root (round-1 hardening)", async () => {
     await expect(createWorkdirJail({ allowedRoots: [root], scratchParent: "relative/scratch" })).rejects.toThrow(
       JailError,
     );
@@ -220,16 +220,26 @@ describe("resolve/release — per-run scratch lifecycle", () => {
     expect(resolved.cwd).toBe(resolved.scratchDir);
     expect(resolved.effectiveRoots).toEqual([realpathSync(root)]);
     expect(realpathSync(resolved.scratchDir!)).toBe(resolved.scratchDir); // exists & canonical
-    expect(path.dirname(resolved.scratchDir!)).toBe(realpathSync(scratch));
+    // The direct parent is a per-jail mkdtemp root INSIDE the given base:
+    // unpredictable (not pre-occupiable), 0700, named loopzhb-runs-*.
+    const parent = path.dirname(resolved.scratchDir!);
+    expect(path.dirname(parent)).toBe(realpathSync(scratch));
+    expect(path.basename(parent)).toMatch(/^loopzhb-runs-/);
+    expect(statSync(parent).mode & 0o777).toBe(0o700);
   });
 
-  it("J21: scratch dirs are unique per run and never reused", async () => {
+  it("J21: scratch dirs are unique per run and never reused; each jail gets its own scratch root", async () => {
     const j = await jail();
     const a = await resolveNull(j, "run-1");
     const b = await resolveNull(j, "run-2");
     const c = await resolveNull(j, "run-1"); // same runId: still a fresh dir
     const dirs = [a.scratchDir, b.scratchDir, c.scratchDir];
     expect(new Set(dirs).size).toBe(3);
+    // Two jail instances (≈ two daemon starts) never share a scratch root —
+    // a stale directory from an earlier start is never written into.
+    const other = await jail();
+    const d = await resolveNull(other, "run-1");
+    expect(path.dirname(d.scratchDir!)).not.toBe(path.dirname(a.scratchDir!));
   });
 
   it("J22: scratch dir permissions are 0700", async () => {
