@@ -88,7 +88,9 @@ export interface DaemonRuntime {
    *  enqueues any deliveries, and RETURNS. It does NOT wait for execution or
    *  the first report. A poll-fatal outcome throws immediately; a BACKGROUND
    *  fatal (a report's fatal classification lands after dispatch) surfaces
-   *  here on the NEXT pollOnce, or via run(). */
+   *  here on the NEXT pollOnce — BEFORE the poll and again after a transient
+   *  (abort) outcome, since the fatal aborts the runtime signal and the real
+   *  client classifies that abort as transient — or via run(). */
   pollOnce(): Promise<void>;
   /** The foreground loop: pollOnce, sleep pollMs, repeat until the signal
    *  aborts (clean return) or a fatal error surfaces (throw). On exit it
@@ -175,7 +177,20 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
   function setFatal(err: FatalDaemonError): FatalDaemonError {
     fatal ??= err;
     stopCtl.abort();
+    // The never-started queue can never run after a fatal — drop it so the
+    // execution seam settles instead of waiting on a pipeline that will
+    // never start (code-review round 1, P2). The pending report outbox
+    // survives as postmortem.
+    dropNeverStartedQueue();
     return fatal;
+  }
+
+  /** The claimed-but-never-started backlog: dropped on fatal and on shutdown.
+   *  Its server-side residue is the sweep's job (reclaim), never re-run. */
+  function dropNeverStartedQueue(): void {
+    for (const d of queue) activities.delete(d.runId);
+    queue.length = 0;
+    notifySettle();
   }
 
   function pipelineQuiescent(): boolean {
@@ -337,9 +352,18 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
   }
 
   async function pollOnce(): Promise<void> {
+    // A background fatal set since the last poll surfaces BEFORE touching the
+    // wire: the signal is already aborted, a real client would classify the
+    // poll as transient, and the check below would never be reached
+    // (code-review round 1, P1).
+    if (fatal) throw fatal;
     const outcome = await deps.client.poll(buildPollBody(), signal);
     if (outcome.kind === "fatal") throw setFatal(new FatalDaemonError(outcome.reason));
     if (outcome.kind === "transient") {
+      // A fatal that landed WHILE this poll was in flight aborted the signal:
+      // the client classifies that abort as transient — surface the fatal
+      // before the early return swallows it.
+      if (fatal) throw fatal;
       log(`poll: ${outcome.reason} — next cycle`);
       return;
     }
@@ -383,9 +407,7 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
         // is joined: batch 2's real Claude subprocess must not outlive the
         // daemon process. Unconfirmed reports are NOT drained (no cap, no
         // persistence — the contract above is unchanged).
-        for (const d of queue) activities.delete(d.runId);
-        queue.length = 0;
-        notifySettle();
+        dropNeverStartedQueue();
         await executionSettled();
         running = false;
       }
