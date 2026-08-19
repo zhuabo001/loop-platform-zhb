@@ -125,3 +125,74 @@ describe("resolve — daemon ∩ server root intersection", () => {
     expect(resolved.effectiveRoots).toEqual([realpathSync(daemonA)]);
   });
 });
+
+describe("resolve — workdir boundary against effective roots", () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = path.join(base, "root");
+    mkdirSync(root);
+  });
+
+  const jail = () => createWorkdirJail({ allowedRoots: [root], scratchParent: scratchParent() });
+  const resolveWith = (j: Awaited<ReturnType<typeof jail>>, workdir: string) =>
+    j.resolve({ workdir, serverRoots: [], loopId: "loop-1", runId: "run-1" });
+
+  it("J6: the effective root itself is a valid workdir", async () => {
+    const resolved = await resolveWith(await jail(), root);
+    expect(resolved.cwd).toBe(realpathSync(root));
+    expect(resolved.scratchDir).toBeNull();
+  });
+
+  it("J7: a subdirectory of an effective root is a valid workdir", async () => {
+    const sub = path.join(root, "sub");
+    mkdirSync(sub);
+    const resolved = await resolveWith(await jail(), sub);
+    expect(resolved.cwd).toBe(realpathSync(sub));
+  });
+
+  it("J8: a similar-prefix sibling (/root vs /root-sibling) is REJECTED", async () => {
+    const sibling = path.join(base, "root-sibling");
+    mkdirSync(sibling);
+    await expect(resolveWith(await jail(), sibling)).rejects.toThrow(JailError);
+  });
+
+  it("J9: a .. escape attempt is REJECTED (containment after realpath)", async () => {
+    const outside = path.join(base, "outside");
+    mkdirSync(outside);
+    await expect(resolveWith(await jail(), path.join(root, "..", "outside"))).rejects.toThrow(JailError);
+  });
+
+  it("J10: a symlink pointing INSIDE the roots is allowed", async () => {
+    const sub = path.join(root, "sub");
+    mkdirSync(sub);
+    const link = path.join(root, "link-inside");
+    symlinkSync(sub, link, "dir");
+    const resolved = await resolveWith(await jail(), link);
+    expect(resolved.cwd).toBe(realpathSync(sub));
+  });
+
+  it("J11: a symlink pointing OUTSIDE the roots is REJECTED", async () => {
+    const outside = path.join(base, "outside");
+    mkdirSync(outside);
+    const link = path.join(root, "link-outside");
+    symlinkSync(outside, link, "dir");
+    await expect(resolveWith(await jail(), link)).rejects.toThrow(JailError);
+  });
+
+  it("J12: a non-existent workdir is REJECTED with a JailError", async () => {
+    await expect(resolveWith(await jail(), path.join(root, "missing"))).rejects.toThrow(JailError);
+  });
+
+  it("J13: a workdir that is a file is REJECTED", async () => {
+    const file = path.join(root, "a-file");
+    writeFileSync(file, "x");
+    await expect(resolveWith(await jail(), file)).rejects.toThrow(JailError);
+  });
+
+  it("J9b: a relative workdir is REJECTED outright", async () => {
+    await expect(
+      (await jail()).resolve({ workdir: "relative/dir", serverRoots: [], loopId: "loop-1", runId: "run-1" }),
+    ).rejects.toThrow(JailError);
+  });
+});
