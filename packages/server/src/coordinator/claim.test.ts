@@ -263,3 +263,85 @@ describe("poll claim: delivery content", () => {
     expect(deliveries[0]!.roots).toEqual([]);
   });
 });
+
+describe("poll claim: availableSlots capacity gating (Phase 2)", () => {
+  it("availableSlots:0 short-circuits the claim scan — zero deliveries, pendings untouched, nothing minted — but progress heartbeats still land", async () => {
+    await fresh();
+    await seedExec("run-1");
+    await seedExec("run-2");
+    await seedExec("run-running", { phase: "running" });
+    const before = await snapshotRuns(db);
+
+    const { deliveries } = await coordinator.poll(TOKEN, {
+      availableSlots: 0,
+      progress: [{ runId: "run-running", step: 2, label: "busy" }],
+    });
+    expect(deliveries).toEqual([]);
+
+    // Only the running run's progress changed; every other row/column (ts
+    // included) is byte-identical, and no lease was minted.
+    expect(await snapshotRuns(db)).toEqual(
+      before.map((r) =>
+        r.id === "run-running" ? { ...r, progress: { step: 2, label: "busy", at: clock.iso() } } : r,
+      ),
+    );
+    expect(await leaseRows()).toEqual([]);
+    expect(mintCount).toBe(0);
+  });
+
+  it("availableSlots:1 delivers exactly ONE run (oldest ts first); a follow-up poll claims the next", async () => {
+    await fresh();
+    await seedExec("run-2", { ts: "2026-07-01T00:00:02.000Z" });
+    await seedExec("run-1", { ts: "2026-07-01T00:00:01.000Z" });
+
+    const first = await coordinator.poll(TOKEN, { availableSlots: 1 });
+    expect(first.deliveries.map((d) => d.runId)).toEqual(["run-1"]);
+
+    const second = await coordinator.poll(TOKEN, { availableSlots: 1 });
+    expect(second.deliveries.map((d) => d.runId)).toEqual(["run-2"]);
+
+    expect((await snapshotRuns(db)).every((r) => r.phase === "running")).toBe(true);
+    expect(await leaseRows()).toHaveLength(2);
+  });
+
+  it("availableSlots:1 continues past a lost claim race and delivers the NEXT candidate (break-on-success-only)", async () => {
+    await fresh();
+    await seedExec("run-1", { ts: "2026-07-01T00:00:01.000Z" });
+    await seedExec("run-2", { ts: "2026-07-01T00:00:02.000Z" });
+
+    let raced = false;
+    const hooked = createRunCoordinator(
+      testDeps(db, clock, {
+        hooks: {
+          beforeClaimTx: async (runId) => {
+            if (runId !== "run-1" || raced) return;
+            raced = true;
+            // A competitor claims the first candidate between this poll's scan
+            // and its claim transaction (app-level gate — single-connection
+            // pglite, same pattern as beforeEnqueueTx).
+            const won = await claimRunWithLeaseTx(
+              { db, clock, newRunId: () => "race-run", mintRunCredential: () => "rk_race_competitor" },
+              { runId: "run-1", loopId: "loop-1", machineId, role: "exec" },
+            );
+            expect(won).toBeDefined();
+          },
+        },
+      }),
+    );
+
+    const { deliveries } = await hooked.poll(TOKEN, { availableSlots: 1 });
+    // The guard loss on run-1 must NOT end the capacity-1 poll: run-2 is delivered.
+    expect(raced).toBe(true);
+    expect(deliveries.map((d) => d.runId)).toEqual(["run-2"]);
+    expect(await leaseRows()).toHaveLength(2);
+  });
+
+  it("keeps Phase 1 BATCH claim when availableSlots is absent (old-daemon regression pin)", async () => {
+    await fresh();
+    await seedExec("run-1");
+    await seedExec("run-2");
+    const { deliveries } = await coordinator.poll(TOKEN, {});
+    expect(deliveries.map((d) => d.runId)).toEqual(["run-1", "run-2"]);
+    expect(await leaseRows()).toHaveLength(2);
+  });
+});

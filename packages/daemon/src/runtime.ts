@@ -1,6 +1,7 @@
 /**
- * The daemon runtime (plan §3): single-poll orchestration plus the foreground
- * loop, the two dedupe sets, and the background report-retry machinery.
+ * The daemon runtime (plan §3): poll/heartbeat orchestration DECOUPLED from
+ * background execution (Phase 2 batch 1), the local queue, the activity
+ * snapshot, and the report-retry machinery.
  *
  * Reliability contract (ADR-001, goal doc "可靠性约束"):
  *  - run identity belongs to the ORCHESTRATION layer: the final ReportRequest
@@ -12,13 +13,26 @@
  *  - `pendingReports` has NO size limit: a long server outage grows it, and
  *    that is explicitly accepted — throttling by DROPPING claimed reports is
  *    forbidden (capacity/backpressure is the real-Agent phase's design);
- *  - background retries never block the poll loop;
- *  - shutdown stops the poll sleep, in-flight HTTP and pending retries. It
- *    does NOT drain or persist unconfirmed reports.
+ *  - poll/heartbeat and execution are decoupled: the poll loop keeps its
+ *    cadence while the runner executes in the background, and every poll
+ *    advertises capacity (`availableSlots` — cooperative backpressure, NOT a
+ *    security boundary) plus a progress snapshot of every activity
+ *    (queued ∪ executing ∪ reporting);
+ *  - capacity is FIXED at 1: a queued run starts only when nothing is
+ *    executing AND no report awaits confirmation — an unconfirmed report is
+ *    occupied capacity, not idle time (the backpressure gate). A batch
+ *    delivery from an old server queues locally and runs FIFO; that queueing
+ *    is DEFENSIVE behavior only — against a Phase 1 server (which ignores
+ *    `availableSlots` and progress) there is NO liveness promise for queued
+ *    or long-running runs;
+ *  - shutdown stops the poll sleep, in-flight HTTP and pending retries,
+ *    drops the never-started queue, and JOINS the active execution pipeline
+ *    (batch 2's real Claude subprocess must not outlive the daemon). It does
+ *    NOT drain or persist unconfirmed reports.
  *
  * Time is injectable (`sleep`) so tests drive the backoff deterministically.
  */
-import type { Delivery, PollRequest } from "@loopzhb/protocol";
+import type { Delivery, PollRequest, RunProgress } from "@loopzhb/protocol";
 
 import { serializeReportRequest, type MachineClient, type SerializedReportRequest } from "./client.js";
 import type { AgentRunner, RunnerReport } from "./runner.js";
@@ -33,6 +47,17 @@ export class FatalDaemonError extends Error {
 export const ERROR_CAP = 2000;
 export const RETRY_BASE_MS = 1000;
 export const RETRY_CAP_MS = 30_000;
+
+/** Progress entries per poll — aligned with the server's defensive cap. */
+export const PROGRESS_SEND_CAP = 20;
+
+/** Runtime-owned activity steps (Phase 2 batch 1; batch 3's runner events
+ *  continue the counter past 2). NON-DECREASING per run, incremented only on
+ *  a state transition — a repeated heartbeat for the same state repeats the
+ *  same step. */
+export const STEP_QUEUED = 0;
+export const STEP_STARTING = 1;
+export const STEP_REPORTING = 2;
 
 export interface PendingReport {
   runId: string;
@@ -58,12 +83,26 @@ export interface DaemonRuntimeDeps {
 }
 
 export interface DaemonRuntime {
-  /** One poll → execute → report cycle. Throws FatalDaemonError on a
-   *  protocol-fatal outcome (poll 401/malformed, report fatal 4xx). */
+  /** Poll + dispatch (Phase 2 contract): sends ONE poll — the progress
+   *  heartbeat and the availableSlots backpressure signal ride the body —
+   *  enqueues any deliveries, and RETURNS. It does NOT wait for execution or
+   *  the first report. A poll-fatal outcome throws immediately; a BACKGROUND
+   *  fatal (a report's fatal classification lands after dispatch) surfaces
+   *  here on the NEXT pollOnce — BEFORE the poll, and again IMMEDIATELY
+   *  after it resolves (before any outcome/delivery handling, since the
+   *  fatal aborts the runtime signal and a raced successful response must
+   *  never refill the dropped queue) — or via run(). */
   pollOnce(): Promise<void>;
   /** The foreground loop: pollOnce, sleep pollMs, repeat until the signal
-   *  aborts (clean return) or a fatal error surfaces (throw). */
+   *  aborts (clean return) or a fatal error surfaces (throw). On exit it
+   *  aborts in-flight waits, drops the never-started queue, and JOINS the
+   *  active execution pipeline — it never drains pendingReports. */
   run(signal: AbortSignal): Promise<void>;
+  /** Resolves once the execution pipeline is quiescent (queue empty, nothing
+   *  in flight, no active pipeline) — the production shutdown join AND the
+   *  deterministic test sync point. Never resolves on abort alone (the
+   *  runner must actually exit); never waits on pendingReports. */
+  executionSettled(): Promise<void>;
   /** Test/observability accessors. */
   pendingCount(): number;
   inFlightCount(): number;
@@ -107,10 +146,24 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
   const sleep = deps.sleep ?? defaultSleep;
   const log = deps.log ?? ((): void => {});
 
-  /** Runs the Runner has started but not finished. */
+  /** Claimed runs waiting for their turn (old-server batch deliveries). */
+  const queue: Delivery[] = [];
+  /** Runs the Runner has started but not finished (≤ 1 — fixed concurrency). */
   const inFlight = new Set<string>();
   /** Runs the Runner finished but whose report lacks terminal confirmation. */
   const pendingReports = new Map<string, PendingReport>();
+  /** THE activity snapshot — queued ∪ executing ∪ reporting — and the ONE
+   *  cross-cycle dedupe set (it covers both live sets above). Steps/labels
+   *  are runtime-owned; batch 3's runner events keep incrementing them. */
+  const activities = new Map<string, { step: number; label: string }>();
+
+  /** The currently active execution pipeline, tracked so shutdown can JOIN
+   *  it (and tests can synchronize on real quiescence). */
+  let activePipeline: Promise<void> | null = null;
+  const settleWaiters = new Set<() => void>();
+
+  /** Round-robin cursor over the QUEUED activity slice (see collectProgress). */
+  let rotationCursor = 0;
 
   /** One controller for EVERYTHING the daemon waits on: the CLI's signal
    *  aborts it via run(); a fatal error aborts it directly. pollOnce() is
@@ -125,7 +178,38 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
   function setFatal(err: FatalDaemonError): FatalDaemonError {
     fatal ??= err;
     stopCtl.abort();
+    // The never-started queue can never run after a fatal — drop it so the
+    // execution seam settles instead of waiting on a pipeline that will
+    // never start (code-review round 1, P2). The pending report outbox
+    // survives as postmortem.
+    dropNeverStartedQueue();
     return fatal;
+  }
+
+  /** The claimed-but-never-started backlog: dropped on fatal and on shutdown.
+   *  Its server-side residue is the sweep's job (reclaim), never re-run. */
+  function dropNeverStartedQueue(): void {
+    for (const d of queue) activities.delete(d.runId);
+    queue.length = 0;
+    notifySettle();
+  }
+
+  function pipelineQuiescent(): boolean {
+    return queue.length === 0 && inFlight.size === 0 && activePipeline === null;
+  }
+
+  function notifySettle(): void {
+    if (!pipelineQuiescent()) return;
+    const waiters = [...settleWaiters];
+    settleWaiters.clear();
+    for (const resolve of waiters) resolve();
+  }
+
+  function executionSettled(): Promise<void> {
+    if (pipelineQuiescent()) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      settleWaiters.add(resolve);
+    });
   }
 
   function scheduleRetry(entry: PendingReport): void {
@@ -141,6 +225,49 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
       });
   }
 
+  /** The shared execution-idle sub-predicate: nothing running, no unconfirmed
+   *  report. The queue conjunct is deliberately NOT in here — the dispatch
+   *  gate needs a non-empty queue (work to start) while the wire signal needs
+   *  an empty one (nothing waiting) to advertise a free slot; those two
+   *  conjuncts have OPPOSITE polarity by design and must not be merged. */
+  function executionIdle(): boolean {
+    return inFlight.size === 0 && pendingReports.size === 0;
+  }
+
+  /** THE capacity gate (fixed concurrency 1): a queued run starts only when
+   *  nothing is executing AND no report awaits confirmation — an unconfirmed
+   *  report is occupied capacity, not idle time. Without the pendingReports
+   *  conjunct, an old server's batch delivery (or a flaky report route) would
+   *  pile up unconfirmed reports while new runs keep starting. */
+  function maybeStartNext(): void {
+    if (fatal || signal.aborted || !executionIdle() || queue.length === 0) return;
+    const next = queue.shift()!;
+    inFlight.add(next.runId);
+    activities.set(next.runId, { step: STEP_STARTING, label: "starting claude-code" });
+    const p = pipeline(next);
+    activePipeline = p;
+    void p
+      .catch((err: unknown) => {
+        setFatal(
+          new FatalDaemonError(
+            `execution pipeline failed for run ${next.runId}: ${err instanceof Error ? err.message : String(err)}`,
+          ),
+        );
+      })
+      .finally(() => {
+        // Identity check: a report confirmed INSIDE p may have re-entered
+        // maybeStartNext and installed the next pipeline already.
+        if (activePipeline === p) activePipeline = null;
+        notifySettle();
+      });
+  }
+
+  function enqueue(delivery: Delivery): void {
+    activities.set(delivery.runId, { step: STEP_QUEUED, label: "queued" });
+    queue.push(delivery);
+    maybeStartNext();
+  }
+
   async function attemptReport(entry: PendingReport): Promise<void> {
     entry.attempt += 1;
     const outcome = await deps.client.report(entry.credential, entry.body, signal);
@@ -149,7 +276,11 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
     switch (outcome.kind) {
       case "confirmed":
         pendingReports.delete(entry.runId);
+        activities.delete(entry.runId);
         log(`run ${entry.runId}: report confirmed`);
+        // Capacity released — a queued run may start now. (A retry keeps the
+        // gate closed; a later confirmation re-enters through here.)
+        maybeStartNext();
         break;
       case "retry":
         log(`run ${entry.runId}: report attempt ${entry.attempt} failed (${outcome.reason}) — will retry`);
@@ -161,8 +292,7 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
     }
   }
 
-  async function execute(delivery: Delivery): Promise<void> {
-    inFlight.add(delivery.runId);
+  async function pipeline(delivery: Delivery): Promise<void> {
     let report: RunnerReport;
     try {
       report = await deps.runner.run(delivery, signal);
@@ -171,6 +301,8 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
     } finally {
       inFlight.delete(delivery.runId);
     }
+    // The runner settled: the run now waits on report confirmation.
+    activities.set(delivery.runId, { step: STEP_REPORTING, label: "reporting result" });
     // runId is the orchestration layer's, ALWAYS — a Runner-supplied value
     // (only possible via a type lie) is overwritten.
     let body: SerializedReportRequest;
@@ -188,11 +320,57 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
     }
     const entry: PendingReport = { runId: delivery.runId, credential: delivery.runToken, body, attempt: 0 };
     pendingReports.set(entry.runId, entry);
+    // Shutdown keeps the first report pending rather than sending it — the
+    // entry is never dropped, and skipping the send lets the pipeline settle.
+    if (signal.aborted) return;
     await attemptReport(entry);
   }
 
+  /** The per-poll progress snapshot: executing/reporting entries ride EVERY
+   *  poll (they carry the highest sweep-misreclaim risk); queued entries
+   *  round-robin through the remaining budget so a >cap backlog still
+   *  refreshes every entry within ceil(n/budget) polls. The promise holds
+   *  under a healthy network and a BOUNDED backlog only — against a Phase 1
+   *  server's unbounded batch delivery there is no liveness promise (the
+   *  compat matrix). */
+  function collectProgress(): RunProgress[] {
+    const must: RunProgress[] = [];
+    const queued: RunProgress[] = [];
+    for (const [runId, a] of activities) {
+      (a.step === STEP_QUEUED ? queued : must).push({ runId, step: a.step, label: a.label });
+    }
+    const out = [...must];
+    const room = PROGRESS_SEND_CAP - out.length;
+    if (room > 0 && queued.length > 0) {
+      const start = rotationCursor % queued.length;
+      const count = Math.min(room, queued.length);
+      for (let i = 0; i < count; i += 1) {
+        out.push(queued[(start + i) % queued.length]!);
+      }
+      rotationCursor = (start + count) % queued.length;
+    }
+    return out;
+  }
+
+  function buildPollBody(): PollRequest {
+    // Idle ⇔ executionIdle AND nothing queued (the wire polarity of the queue
+    // conjunct — see executionIdle's comment).
+    const availableSlots = executionIdle() && queue.length === 0 ? (1 as const) : (0 as const);
+    const progress = collectProgress();
+    return { ...deps.identity, availableSlots, ...(progress.length > 0 ? { progress } : {}) };
+  }
+
   async function pollOnce(): Promise<void> {
-    const outcome = await deps.client.poll(deps.identity, signal);
+    // A background fatal set since the last poll surfaces BEFORE touching the
+    // wire (code-review round 1, P1).
+    if (fatal) throw fatal;
+    const outcome = await deps.client.poll(buildPollBody(), signal);
+    // A fatal that landed WHILE the poll was in flight surfaces BEFORE any
+    // outcome or delivery handling: the real client classifies the abort as
+    // transient (round 1, P1), and a SUCCESSFUL response must never dispatch
+    // into the dropped queue — refilling it would hang executionSettled()
+    // (round 2, P2).
+    if (fatal) throw fatal;
     if (outcome.kind === "fatal") throw setFatal(new FatalDaemonError(outcome.reason));
     if (outcome.kind === "transient") {
       log(`poll: ${outcome.reason} — next cycle`);
@@ -204,12 +382,15 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
       // runId within one response even if the first report confirms immediately.
       if (seenRunIds.has(delivery.runId)) continue;
       seenRunIds.add(delivery.runId);
-      // Across poll cycles, the server never re-delivers a claimed run; these
-      // two live sets cover the only legitimate unconfirmed windows.
-      if (inFlight.has(delivery.runId) || pendingReports.has(delivery.runId)) continue;
-      await execute(delivery);
-      if (fatal) throw fatal;
+      // Across poll cycles, the server never re-delivers a claimed run; the
+      // activity snapshot covers every legitimate unconfirmed window.
+      if (activities.has(delivery.runId)) continue;
+      enqueue(delivery);
     }
+    // Defensive: no suspension point exists between the check above and the
+    // dispatch loop, so a fatal cannot interleave here today — keep the
+    // trailing check so a future synchronous fatal path still surfaces.
+    if (fatal) throw fatal;
   }
 
   return {
@@ -230,9 +411,18 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
       } finally {
         outer.removeEventListener("abort", onOuterAbort);
         stopCtl.abort();
+        // Never start queued work after stop: the backlog is dropped (its
+        // server-side residue is the sweep's job) — but the ACTIVE pipeline
+        // is joined: batch 2's real Claude subprocess must not outlive the
+        // daemon process. Unconfirmed reports are NOT drained (no cap, no
+        // persistence — the contract above is unchanged).
+        dropNeverStartedQueue();
+        await executionSettled();
         running = false;
       }
     },
+
+    executionSettled,
 
     pendingCount: () => pendingReports.size,
     inFlightCount: () => inFlight.size,

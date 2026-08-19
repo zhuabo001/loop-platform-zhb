@@ -1,8 +1,8 @@
 /**
- * The daemon's Machine identity, fixed at startup and sent (unchanged) on
- * every poll. Only these four identity fields are ever sent — NO `wait`
- * (Day 5 is fixed short-polling) and no `progress` (that heartbeat arrives
- * with the real AgentRunner in Phase 2).
+ * The daemon's Machine identity: the four STATIC fields, fixed at startup.
+ * The runtime merges them into every poll body together with the dynamic
+ * `availableSlots`/`progress` it synthesizes per poll (Phase 2 batch 1) —
+ * this module deliberately stays static. NO `wait` (fixed short-polling).
  */
 import os from "node:os";
 

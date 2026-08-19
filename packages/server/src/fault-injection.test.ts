@@ -125,6 +125,10 @@ function createGatedRunner(): {
 
 interface DaemonHarness {
   pollOnce(): Promise<void>;
+  /** Deterministic sync point for the background execution pipeline (Phase 2
+   *  poll+dispatch contract): resolves once the queue is empty, nothing is
+   *  in flight and no pipeline is active — never waits on pendingReports. */
+  executionSettled(): Promise<void>;
   pendingCount(): number;
   runnerCalls(): number;
 }
@@ -155,7 +159,12 @@ function createDaemon(
     pollMs: 3000,
     machineCredential: TOKEN,
   });
-  return { pollOnce: () => runtime.pollOnce(), pendingCount: () => runtime.pendingCount(), runnerCalls: () => runnerCalls };
+  return {
+    pollOnce: () => runtime.pollOnce(),
+    executionSettled: () => runtime.executionSettled(),
+    pendingCount: () => runtime.pendingCount(),
+    runnerCalls: () => runnerCalls,
+  };
 }
 
 /** Create a loop on the daemon's machine and manually trigger its exec run. */
@@ -200,9 +209,11 @@ describe("T5 — the sleeping daemon's late report reconciles the sweep's misjud
     expect(midRuns[0]).toMatchObject({ id: runId, phase: "error", outcome: "error", error: RECLAIM_RUN_ERROR });
 
     // The laptop wakes; the daemon reports the REAL success with the original
-    // credential and sees the report confirmed.
+    // credential and sees the report confirmed. (poll+dispatch: the claiming
+    // pollOnce returned long ago — the settle seam joins the pipeline.)
     gate.release({ ok: true, message: "slept through the sweep, finished fine" });
     await claimPromise;
+    await daemon.executionSettled();
     expect(daemon.pendingCount()).toBe(0);
     expect(seenReports).toEqual([{ ok: true, reconciled: true }]);
 
@@ -256,6 +267,7 @@ describe("T6 — a canceled run's late report is intercepted", () => {
     // retried forever.
     gate.release({ ok: true, message: "finished after the cancel" });
     await claimPromise;
+    await daemon.executionSettled();
     expect(daemon.pendingCount()).toBe(0);
 
     // The run stays canceled: no late terminal write reaches the run's
@@ -349,6 +361,7 @@ describe("T4 — a server restart never loses an in-flight run", () => {
     // credential and is confirmed.
     gate.release({ ok: true, message: "across the restart" });
     await claimPromise;
+    await daemon.executionSettled();
     expect(daemon.pendingCount()).toBe(0);
 
     const runsRes = await b.app.request(`/api/loops/${loopId}/runs`);

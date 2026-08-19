@@ -12,7 +12,7 @@
 import { and, asc, eq, inArray, isNull } from "drizzle-orm";
 
 import { sha256 } from "@loopzhb/protocol/node";
-import type { RunRole } from "@loopzhb/protocol";
+import type { RunProgress, RunRole } from "@loopzhb/protocol";
 
 import type { Db } from "../db/index.js";
 import { loops, runLeases, runs, type Loop, type Run, type RunProgressRow } from "../db/schema.js";
@@ -369,4 +369,65 @@ export async function reclaimStaleRunTx(
     if (terminalized.length !== 1) throw new ReclaimGuardLostError(input.runId);
     return "reclaimed" as const;
   });
+}
+
+// ---- poll-carried progress heartbeats (Phase 2) ----
+
+/** Server-side size policy (ADR-002: the protocol pins SHAPE, the server pins
+ *  SIZE — a schema-level cap would turn an oversized heartbeat into a 400 and
+ *  kill the daemon's poll loop). The entries cap is DEFENSE-ONLY: fairness
+ *  across >20 activities is the daemon's round-robin duty, not this slice's. */
+export const PROGRESS_ENTRIES_CAP = 20;
+export const PROGRESS_LABEL_CAP = 200;
+/** A blank-after-cleaning label still refreshes the liveness stamp. */
+export const PROGRESS_LABEL_FALLBACK = "working";
+
+/** NUL-strip → trim → blank-fallback → cap (same family as cleanIdentityField).
+ *  runId is deliberately NOT cleaned: it is only a WHERE key — no match, zero
+ *  rows. */
+function cleanProgressLabel(raw: string): string {
+  const cleaned = raw.replace(/\0/g, "").trim();
+  if (!cleaned) return PROGRESS_LABEL_FALLBACK;
+  return cleaned.slice(0, PROGRESS_LABEL_CAP);
+}
+
+/**
+ * Apply poll-carried progress heartbeats: ONE conditional UPDATE per entry —
+ * `SET progress = {step, label, at} WHERE id=? AND machineId=? AND
+ * phase='running'`.
+ *
+ *  - `at` comes from the injected clock (ONE snapshot for the whole batch —
+ *    the daemon never supplies it). It is the sweep's liveness evidence via
+ *    `lastRunActivityMs`, and because ONLY the server writes it, the
+ *    anomalous-future guard there degrades to pure defense-in-depth.
+ *  - The write NEVER touches `ts` — claim and report/reclaim CAS guards read
+ *    `ts` as transition-time only.
+ *  - The `machineId` conjunct is the authorization boundary; the `phase`
+ *    conjunct makes late (done/canceled/reclaimed), foreign and unknown
+ *    runIds all benign zero-row writes. Silence is the norm, not an error.
+ *  - Deliberately NO transaction and NO CAS: arrival-order last-wins is the
+ *    accepted semantic (a machine's healthy deployment has ONE daemon polling
+ *    serially; same-token concurrent daemons are a misconfiguration, and
+ *    per-step anti-rollback would buy nothing there). Duplicate runIds within
+ *    one batch dedup last-wins via the Map; the first-20 slice is the
+ *    defensive cap above.
+ *  - A write failure PROPAGATES (fail-closed, same precedent as
+ *    applyMachinePollContact): a silently swallowed heartbeat lets the sweep
+ *    reclaim a long-running agent.
+ */
+export async function applyRunProgress(
+  deps: LifecycleStoreDeps,
+  input: { machineId: string; entries: RunProgress[] },
+): Promise<void> {
+  const byRunId = new Map<string, RunProgress>();
+  for (const entry of input.entries) byRunId.set(entry.runId, entry);
+  const at = deps.clock.now().toISOString();
+  for (const entry of [...byRunId.values()].slice(0, PROGRESS_ENTRIES_CAP)) {
+    await deps.db
+      .update(runs)
+      .set({ progress: { step: entry.step, label: cleanProgressLabel(entry.label), at } })
+      .where(
+        and(eq(runs.id, entry.runId), eq(runs.machineId, input.machineId), eq(runs.phase, "running")),
+      );
+  }
 }
