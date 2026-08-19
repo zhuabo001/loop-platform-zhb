@@ -69,36 +69,82 @@ function isContinuationByte(byte: number): boolean {
   return (byte & 0xc0) === 0x80;
 }
 
-/** Rolling head+tail capture. While the total fits the cap, head and tail
- *  stay CONTIGUOUS (text() is the exact stream); the first byte that must be
- *  dropped flips `truncated` for good. Both cut points align to UTF-8 LEAD
- *  bytes (round-1 P2): the head cut backs off ≤3 bytes (the straddling char
- *  flows into the tail), the tail front advances past continuation bytes —
- *  so text() never synthesizes U+FFFD and re-encoding never exceeds the cap. */
+/** Bytes a UTF-8 sequence needs, from its lead byte; continuation bytes and
+ *  out-of-range leads report 1 (each decodes as its own U+FFFD). */
+function utf8SequenceLength(byte: number): number {
+  if (byte < 0x80) return 1;
+  if ((byte & 0xe0) === 0xc0) return 2;
+  if ((byte & 0xf0) === 0xe0) return 3;
+  if ((byte & 0xf8) === 0xf0) return 4;
+  return 1;
+}
+
+/** Head cut on RAW BYTES: if the buffer ends mid-sequence, drop the whole
+ *  partial character (back off ≤3 bytes to its lead) so a split char never
+ *  decodes to U+FFFD. Genuinely invalid bytes are kept — their U+FFFD is
+ *  the honest decode of bad input, not an artifact of our cut. */
+function dropTrailingPartialSequence(buf: Buffer): Buffer {
+  let lead = buf.length - 1;
+  let continuationBytes = 0;
+  while (lead >= 0 && continuationBytes < 3 && isContinuationByte(buf[lead]!)) {
+    lead -= 1;
+    continuationBytes += 1;
+  }
+  if (lead < 0) return buf.subarray(0, 0);
+  const needed = utf8SequenceLength(buf[lead]!);
+  return buf.length - lead < needed ? buf.subarray(0, lead) : buf;
+}
+
+/** Tail cut on RAW BYTES: the rolling window can OPEN mid-sequence — its
+ *  first bytes continue a character whose lead fell into the elided middle.
+ *  Skip ≤3 leading continuation bytes (a valid char has at most 3) so the
+ *  tail starts on a lead byte. */
+function skipLeadingContinuationBytes(buf: Buffer): Buffer {
+  let start = 0;
+  while (start < buf.length && start < 3 && isContinuationByte(buf[start]!)) start += 1;
+  return buf.subarray(start);
+}
+
+/** Rolling head+tail capture that keeps RAW BYTES until the very end
+ *  (round-2 P1 rewrite). While the total fits the cap the whole stream is
+ *  retained (text() is byte-exact and never marked truncated — CS2); the
+ *  first byte past the cap flips `truncated` forever, freezing head at the
+ *  first half and rolling tail as the last half, so memory stays bounded no
+ *  matter how much the child writes. Decoding happens ONCE in text():
+ *  multibyte chars split across pipe chunks reassemble losslessly because
+ *  every kept byte is still contiguous, and both cut points are aligned on
+ *  the raw bytes — OS chunk boundaries are irrelevant to correctness
+ *  (CS1/CS3: no synthesized U+FFFD, re-encoding never exceeds the cap). */
 export class CappedStream {
-  private headParts: Buffer[] = [];
-  private headBytes = 0;
+  /** Every byte, while total ≤ cap; null once truncated. */
+  private wholeParts: Buffer[] | null = [];
+  private wholeBytes = 0;
+  /** First HALF_CAP bytes, frozen at truncation. */
+  private head: Buffer | null = null;
+  /** Rolling last HALF_CAP bytes. */
   private tailParts: Buffer[] = [];
   private tailBytes = 0;
   truncated = false;
 
   push(chunk: Buffer): void {
-    let rest = chunk;
-    if (this.headBytes < HALF_CAP) {
-      let take = Math.min(HALF_CAP - this.headBytes, rest.length);
-      if (take < rest.length) {
-        // Cutting mid-chunk: back off to the straddling char's lead byte.
-        while (take > 0 && isContinuationByte(rest[take]!)) take -= 1;
-      }
-      this.headParts.push(Buffer.from(rest.subarray(0, take)));
-      this.headBytes += take;
-      rest = rest.subarray(take);
-    }
-    if (rest.length === 0) return;
-    this.tailParts.push(Buffer.from(rest));
-    this.tailBytes += rest.length;
-    while (this.tailBytes > HALF_CAP) {
+    if (this.wholeParts !== null) {
+      this.wholeParts.push(chunk);
+      this.wholeBytes += chunk.length;
+      if (this.wholeBytes <= MAX_STREAM_BYTES) return;
+      // First byte past the cap: split the over-cap whole into the frozen
+      // head and the rolling tail window — disjoint, since the whole is
+      // longer than 2 × HALF_CAP at this point.
+      const whole = Buffer.concat(this.wholeParts, this.wholeBytes);
+      this.wholeParts = null;
       this.truncated = true;
+      this.head = whole.subarray(0, HALF_CAP);
+      this.tailParts = [whole.subarray(whole.length - HALF_CAP)];
+      this.tailBytes = HALF_CAP;
+      return;
+    }
+    this.tailParts.push(chunk);
+    this.tailBytes += chunk.length;
+    while (this.tailBytes > HALF_CAP) {
       const excess = this.tailBytes - HALF_CAP;
       const first = this.tailParts[0]!;
       if (first.length <= excess) {
@@ -109,24 +155,15 @@ export class CappedStream {
         this.tailBytes -= excess;
       }
     }
-    if (this.truncated) {
-      // The rollover cut can leave the front mid-sequence: advance to the
-      // next lead byte (bounded by UTF-8's 4-byte max).
-      while (this.tailParts.length > 0) {
-        const first = this.tailParts[0]!;
-        if (first.length === 0) {
-          this.tailParts.shift();
-          continue;
-        }
-        if (!isContinuationByte(first[0]!)) break;
-        this.tailParts[0] = first.subarray(1);
-        this.tailBytes -= 1;
-      }
-    }
   }
 
   text(): string {
-    return Buffer.concat([...this.headParts, ...this.tailParts]).toString("utf8");
+    if (!this.truncated) {
+      return Buffer.concat(this.wholeParts ?? [], this.wholeBytes).toString("utf8");
+    }
+    const head = dropTrailingPartialSequence(this.head ?? Buffer.alloc(0));
+    const tail = skipLeadingContinuationBytes(Buffer.concat(this.tailParts, this.tailBytes));
+    return head.toString("utf8") + tail.toString("utf8");
   }
 }
 
