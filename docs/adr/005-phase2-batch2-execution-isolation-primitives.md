@@ -42,5 +42,5 @@
   5. **`docs/plan` 入库裁决同步权威规则**（审查 P2）：正式修订 AGENTS.md 四层分流——携带测试用例 ID 编组等长期引用锚点的当批计划可入库 `docs/plan/`（纯物流仍归 handoff 不进库）；两份批次二计划正文同步现行接口（`scratchBase` + 工厂 mkdtemp 不可预测 per-jail 根目录）与收口标准措辞。
 - 2026-08-20（Round 3 代码审查修复）：
   1. **区分存活探测与真实发信失败**（审查 P1）：macOS 实测中 `kill(-pgid, 0)` 在成功发送 SIGTERM 后会偶发瞬时 `EPERM`。signal 0 不发送信号，该结果改为保守地继续收口；若进程组仍存活，宽限期后的真实 SIGKILL 成为权威结果——它的非 `ESRCH` 错误仍立即传播。SIGKILL 后轮询增加一个宽限期上限，持续探测错误或进程组不退出会 reject，不无限等待。S21 确定性覆盖“首次探测 EPERM，真实信号成功”，S19 继续覆盖真实发信 EPERM 立即 reject。
-  2. **CappedStream 所有权与非法 UTF-8**（审查 P2）：入队时复制 caller-owned Buffer，chunk consumer 收到独立副本，关闭同步/异步改写已捕获输出的别名路径（CS4/S20）。UTF-8 尾部对齐只丢弃“仍可补全为合法 Unicode scalar”的残缺前缀；`C0/C1`、`F5-F7`、overlong 与 surrogate 前缀均保留，由 UTF-8 decoder 诚实产生 `U+FFFD`（CS5）。
+  2. **CappedStream 所有权与非法 UTF-8**（审查 P2）：入队时复制 caller-owned Buffer，chunk consumer 收到独立副本，关闭同步/异步改写已捕获输出的别名路径（CS4/S20）。UTF-8 head 对齐只丢弃“仍可补全为合法 Unicode scalar”的残缺前缀；`C0/C1`、`F5-F7`、overlong 与 surrogate 前缀均保留，由 UTF-8 decoder 诚实产生 `U+FFFD`（CS5）。Round 4 又补齐 tail 对称性：内部滚动窗口多保留切口前 3 字节上下文，只有确认切口穿过完整合法 scalar 时才跳过 tail 前导 continuation；独立非法 `0x80` 保留为 `U+FFFD`（CS6）。
   3. **cc 计划定性**（审查观察项）：`cc-phase2-batch2-plan.md` 未被用作实施或验收规范，只可能参考了其测试矩阵；文档顶部现明示标记“未采用”并指向 codex 计划与本 ADR，其中真实 Claude/Fake Runner 切换方案不构成 Batch 2 DoD。

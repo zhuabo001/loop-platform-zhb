@@ -326,17 +326,30 @@ describe("CappedStream — byte-level determinism (round-2)", () => {
     expect(stream.text()).toBe("original");
   });
 
-  it.each([0xc0, 0xf5])(
-    "CS5: invalid UTF-8 lead 0x%s at the head boundary is preserved as U+FFFD",
-    (invalidLead) => {
+  it.each([
+    { name: "C0", byte: 0xc0 },
+    { name: "F5", byte: 0xf5 },
+  ])(
+    "CS5: invalid UTF-8 lead 0x$name at the head boundary is preserved as U+FFFD",
+    ({ byte }) => {
       const stream = new CappedStream();
       const payload = Buffer.alloc(MIB + 1, 0x61);
-      payload[MIB / 2 - 1] = invalidLead;
+      payload[MIB / 2 - 1] = byte;
       pushSliced(stream, payload, 4096);
       expect(stream.truncated).toBe(true);
       expect(stream.text()).toContain("�");
     },
   );
+
+  it("CS6: an independent invalid continuation byte at the tail boundary is preserved as U+FFFD", () => {
+    const stream = new CappedStream();
+    const payload = Buffer.alloc(MIB + 1, 0x61);
+    const tailStart = payload.length - MIB / 2;
+    payload[tailStart] = 0x80;
+    pushSliced(stream, payload, 4096);
+    expect(stream.truncated).toBe(true);
+    expect(stream.text()).toContain("�");
+  });
 });
 
 describe("spawnWithTimeout — first-wins determinism gap (round-2)", () => {

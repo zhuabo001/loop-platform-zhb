@@ -73,6 +73,7 @@ export const MAX_STREAM_BYTES = 1024 * 1024;
 export const SIGTERM_GRACE_MS = 5000;
 
 const HALF_CAP = MAX_STREAM_BYTES / 2;
+const TAIL_CAPTURE_BYTES = HALF_CAP + 3;
 
 /** True for UTF-8 continuation bytes (10xxxxxx). */
 function isContinuationByte(byte: number): boolean {
@@ -89,6 +90,15 @@ function utf8SequenceLength(byte: number): number {
   return 1;
 }
 
+function isValidUtf8SecondByte(lead: number, second: number): boolean {
+  if (!isContinuationByte(second)) return false;
+  if (lead === 0xe0) return second >= 0xa0;
+  if (lead === 0xed) return second <= 0x9f;
+  if (lead === 0xf0) return second >= 0x90;
+  if (lead === 0xf4) return second <= 0x8f;
+  return true;
+}
+
 /** Whether the bytes already present after a valid lead can still become a
  *  valid UTF-8 scalar. Invalid/overlong/surrogate prefixes must be retained
  *  so the decoder reports their honest U+FFFD instead of our cut hiding
@@ -100,11 +110,7 @@ function isCompletableUtf8Prefix(buf: Buffer, lead: number, needed: number): boo
 
   const leadByte = buf[lead]!;
   const second = buf[lead + 1]!;
-  if (!isContinuationByte(second)) return false;
-  if (leadByte === 0xe0 && second < 0xa0) return false;
-  if (leadByte === 0xed && second > 0x9f) return false;
-  if (leadByte === 0xf0 && second < 0x90) return false;
-  if (leadByte === 0xf4 && second > 0x8f) return false;
+  if (!isValidUtf8SecondByte(leadByte, second)) return false;
   for (let index = lead + 2; index < buf.length; index += 1) {
     if (!isContinuationByte(buf[index]!)) return false;
   }
@@ -127,14 +133,25 @@ function dropTrailingPartialSequence(buf: Buffer): Buffer {
   return needed > 1 && isCompletableUtf8Prefix(buf, lead, needed) ? buf.subarray(0, lead) : buf;
 }
 
-/** Tail cut on RAW BYTES: the rolling window can OPEN mid-sequence — its
- *  first bytes continue a character whose lead fell into the elided middle.
- *  Skip ≤3 leading continuation bytes (a valid char has at most 3) so the
- *  tail starts on a lead byte. */
-function skipLeadingContinuationBytes(buf: Buffer): Buffer {
-  let start = 0;
-  while (start < buf.length && start < 3 && isContinuationByte(buf[start]!)) start += 1;
-  return buf.subarray(start);
+/** Tail cut on RAW BYTES with ≤3 bytes of preceding context. Skip leading
+ *  continuation bytes only when that context proves the cut split a complete
+ *  valid scalar. An independent invalid continuation byte must remain so the
+ *  decoder reports its honest U+FFFD (CS6). */
+function alignTailToUtf8Scalar(buf: Buffer, tailStart: number): Buffer {
+  if (!isContinuationByte(buf[tailStart]!)) return buf.subarray(tailStart);
+
+  let lead = tailStart - 1;
+  while (lead >= 0 && tailStart - lead <= 3 && isContinuationByte(buf[lead]!)) lead -= 1;
+  if (lead < 0) return buf.subarray(tailStart);
+
+  const needed = utf8SequenceLength(buf[lead]!);
+  const end = lead + needed;
+  if (needed === 1 || end <= tailStart || end > buf.length) return buf.subarray(tailStart);
+  if (!isValidUtf8SecondByte(buf[lead]!, buf[lead + 1]!)) return buf.subarray(tailStart);
+  for (let index = lead + 2; index < end; index += 1) {
+    if (!isContinuationByte(buf[index]!)) return buf.subarray(tailStart);
+  }
+  return buf.subarray(end);
 }
 
 /** Rolling head+tail capture that keeps RAW BYTES until the very end
@@ -153,7 +170,7 @@ export class CappedStream {
   private wholeBytes = 0;
   /** First HALF_CAP bytes, frozen at truncation. */
   private head: Buffer | null = null;
-  /** Rolling last HALF_CAP bytes. */
+  /** Rolling last HALF_CAP bytes plus ≤3 bytes of cut context. */
   private tailParts: Buffer[] = [];
   private tailBytes = 0;
   truncated = false;
@@ -173,14 +190,14 @@ export class CappedStream {
       this.wholeParts = null;
       this.truncated = true;
       this.head = whole.subarray(0, HALF_CAP);
-      this.tailParts = [whole.subarray(whole.length - HALF_CAP)];
-      this.tailBytes = HALF_CAP;
+      this.tailParts = [whole.subarray(Math.max(0, whole.length - TAIL_CAPTURE_BYTES))];
+      this.tailBytes = this.tailParts[0]!.length;
       return;
     }
     this.tailParts.push(ownedChunk);
     this.tailBytes += ownedChunk.length;
-    while (this.tailBytes > HALF_CAP) {
-      const excess = this.tailBytes - HALF_CAP;
+    while (this.tailBytes > TAIL_CAPTURE_BYTES) {
+      const excess = this.tailBytes - TAIL_CAPTURE_BYTES;
       const first = this.tailParts[0]!;
       if (first.length <= excess) {
         this.tailParts.shift();
@@ -197,7 +214,8 @@ export class CappedStream {
       return Buffer.concat(this.wholeParts ?? [], this.wholeBytes).toString("utf8");
     }
     const head = dropTrailingPartialSequence(this.head ?? Buffer.alloc(0));
-    const tail = skipLeadingContinuationBytes(Buffer.concat(this.tailParts, this.tailBytes));
+    const tailWithContext = Buffer.concat(this.tailParts, this.tailBytes);
+    const tail = alignTailToUtf8Scalar(tailWithContext, tailWithContext.length - HALF_CAP);
     return head.toString("utf8") + tail.toString("utf8");
   }
 }
