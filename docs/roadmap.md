@@ -99,7 +99,7 @@ claude-code 或 codex 选一：子进程 spawn、进程组 kill、timeout、env 
 
 ### 右移项
 
-- [ ] **跨层 round-robin liveness 验收**（Batch 1 代码评审测试缺口）：>20 queued → daemon 轮转 → HTTP/store → sweep 不误回收的集成测试。当前 daemon 轮转与 server sweep 分开测试，尚无跨层盲区验证。
+- [ ] **跨层 round-robin liveness 验收**：[Issue #12](https://github.com/zhuabo001/loop-platform-zhb/issues/12)（Batch 1 代码评审测试缺口）。
 
 顺手收口：[Issue #10](https://github.com/zhuabo001/loop-platform-zhb/issues/10)
 （Day 8–10 二次审查右移项，不影响正确性）。
