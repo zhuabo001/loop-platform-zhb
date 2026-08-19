@@ -42,7 +42,15 @@ async function main() {
       process.exitCode = 0;
       return;
     }
+    case "drip-ignore-term": {
+      // Keep dripping while ignoring SIGTERM — lets tests put a consumer throw
+      // INSIDE the post-timeout grace window (round-1 first-wins repro).
+      process.on("SIGTERM", () => {});
+      rest.unshift("drip");
+    }
+    // falls through into drip
     case "drip": {
+      if (rest[0] === "drip") rest.shift();
       const count = Number(rest[0]);
       const intervalMs = Number(rest[1]);
       for (let i = 0; i < count; i += 1) {

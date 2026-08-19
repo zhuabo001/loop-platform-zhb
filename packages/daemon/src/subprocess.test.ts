@@ -205,3 +205,46 @@ describe("spawnWithTimeout — completion kinds and return guarantees", () => {
     expect(result.stdoutTruncated).toBe(false);
   });
 });
+
+describe("spawnWithTimeout — first-trigger-wins (round-1 fixes)", () => {
+  it("F1: timeout wins over a LATER consumer throw during the grace window", async () => {
+    // Timeout fires at 100ms; the consumer throws only on the 3rd chunk
+    // (~150ms) — the winner is already timed-out, so the late throw must NOT
+    // flip the completion to consumer-error (round-1 P1 minimal repro).
+    let chunks = 0;
+    const result = await spawnWithTimeout(
+      opts({
+        // ignores SIGTERM → survives the timeout TERM and keeps dripping
+        // through the grace window, so the 3rd-chunk throw lands AFTER the
+        // timeout trigger has already won.
+        args: [FIXTURE, "drip-ignore-term", "30", "50"],
+        timeoutMs: 100,
+        graceMs: 500,
+        onStdout: () => {
+          chunks += 1;
+          if (chunks >= 3) throw new Error("late consumer boom");
+        },
+      }),
+    );
+    expect(chunks).toBeGreaterThanOrEqual(3); // the throw really happened inside grace
+    expect(result.completion.kind).toBe("timed-out");
+  });
+
+  it("F2: an EARLY consumer throw wins over a much later timeout/abort", async () => {
+    const ctl = new AbortController();
+    setTimeout(() => ctl.abort(), 5000); // far in the future — must never decide
+    const result = await spawnWithTimeout(
+      opts({
+        args: [FIXTURE, "drip", "30", "50"],
+        timeoutMs: 5000,
+        signal: ctl.signal,
+        onStdout: () => {
+          throw new Error("early consumer boom");
+        },
+      }),
+    );
+    expect(result.completion.kind).toBe("consumer-error");
+    expect((result.completion as { message: string }).message).toContain("early consumer boom");
+    expect(result.durationMs).toBeLessThan(2500);
+  });
+});
