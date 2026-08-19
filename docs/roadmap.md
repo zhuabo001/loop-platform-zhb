@@ -88,6 +88,19 @@ claude-code 或 codex 选一：子进程 spawn、进程组 kill、timeout、env 
 |---|
 | 一条真实 Agent E2E 绿；agent 无法越出允许的根目录 |
 
+### 状态
+
+- **Batch 1 — 执行容量与 progress 心跳（Day 1–2）：已完成**（2026-08-19，分支 `codex/phase2-day-1-2`，ADR-004）
+  - 协议：`PollRequest.availableSlots?: 0|1` 协作式背压（additive，无 migration）。
+  - server：poll 携带 progress 心跳转正（server 独占 `at`、machine+phase 守卫、last-wins、绝不碰 `ts`）；`availableSlots` 门控（0 跳过扫描、1 成功即停、缺省保持批量）。
+  - daemon：poll/heartbeat 与执行解耦；容量固定 1（`inFlight ∪ queue ∪ pendingReports` 背压）；轮转 progress 快照；fatal 终止时丢弃队列、join 活动 pipeline。
+  - 兼容：Phase 2 server + Phase 1 daemon 兼容；Phase 2 daemon + Phase 1 server 不承诺长任务/批量队列 liveness；升级先 server 后 daemon。
+- **Batch 2 — 本机执行与强隔离（Day 3–5）：未开始**（roots 校验、workdir jail、进程组/subprocess、env 白名单）。
+
+### 右移项
+
+- [ ] **跨层 round-robin liveness 验收**（Batch 1 代码评审测试缺口）：>20 queued → daemon 轮转 → HTTP/store → sweep 不误回收的集成测试。当前 daemon 轮转与 server sweep 分开测试，尚无跨层盲区验证。
+
 顺手收口：[Issue #10](https://github.com/zhuabo001/loop-platform-zhb/issues/10)
 （Day 8–10 二次审查右移项，不影响正确性）。
 
