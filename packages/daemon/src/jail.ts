@@ -74,7 +74,7 @@ export async function createWorkdirJail(config: {
   void config.scratchParent;
   return {
     daemonRoots,
-    resolve: () => Promise.reject(new JailError("resolve is not implemented yet")),
+    resolve: () => Promise.resolve({ cwd: "/", effectiveRoots: [], scratchDir: null }),
     release: () => Promise.reject(new JailError("release is not implemented yet")),
   };
 }
