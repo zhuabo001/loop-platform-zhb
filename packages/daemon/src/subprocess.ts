@@ -9,6 +9,7 @@
  * unsupported-platform spawn-error. `shell: false` always — args are never
  * reparsed by a shell.
  */
+import { spawn } from "node:child_process";
 
 export interface SpawnOptions {
   command: string;
@@ -47,13 +48,63 @@ export const MAX_STREAM_BYTES = 1024 * 1024;
 export const SIGTERM_GRACE_MS = 5000;
 
 export async function spawnWithTimeout(opts: SpawnOptions): Promise<SpawnResult> {
-  void opts;
-  return {
-    completion: { kind: "spawn-error", message: "spawnWithTimeout is not implemented yet" },
-    stdout: "",
-    stderr: "",
+  const startedAt = Date.now();
+  const build = (completion: SpawnCompletion, stdout: string, stderr: string): SpawnResult => ({
+    completion,
+    stdout,
+    stderr,
     stdoutTruncated: false,
     stderrTruncated: false,
-    durationMs: 0,
-  };
+    durationMs: Date.now() - startedAt,
+  });
+
+  if (process.platform === "win32") {
+    return build(
+      {
+        kind: "spawn-error",
+        code: "UNSUPPORTED_PLATFORM",
+        message: "native Windows is not supported (process-group semantics are POSIX) — use WSL2",
+      },
+      "",
+      "",
+    );
+  }
+
+  return await new Promise<SpawnResult>((resolvePromise) => {
+    // detached: true ⇒ the child leads its OWN process group, so
+    // process.kill(-pid, …) reaches every grandchild it forgot about.
+    const child = spawn(opts.command, opts.args, {
+      cwd: opts.cwd,
+      env: opts.env,
+      shell: false,
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    child.stdout.on("data", (chunk: Buffer) => stdoutChunks.push(chunk));
+    child.stderr.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
+
+    let spawnError: { code?: string; message: string } | null = null;
+    child.on("error", (err: NodeJS.ErrnoException) => {
+      // ENOENT & friends surface here; 'close' still fires afterwards and
+      // does the actual settle below.
+      spawnError = { ...(err.code !== undefined ? { code: err.code } : {}), message: err.message };
+    });
+
+    // 'close' (not 'exit'): stdio is drained by the time it fires, so the
+    // captured text is complete.
+    child.on("close", (code, signal) => {
+      const stdout = Buffer.concat(stdoutChunks).toString("utf8");
+      const stderr = Buffer.concat(stderrChunks).toString("utf8");
+      if (spawnError !== null) {
+        resolvePromise(build({ kind: "spawn-error", ...spawnError }, stdout, stderr));
+      } else if (code !== null) {
+        resolvePromise(build({ kind: "exited", exitCode: code }, stdout, stderr));
+      } else {
+        resolvePromise(build({ kind: "signaled", signal: signal ?? "SIGTERM" }, stdout, stderr));
+      }
+    });
+  });
 }
