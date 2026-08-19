@@ -33,12 +33,11 @@ async function main() {
     case "big": {
       const stream = rest[0] === "stderr" ? process.stderr : process.stdout;
       const total = Number(rest[1]);
-      const pattern = "0123456789";
-      let left = total;
-      while (left > 0) {
-        const piece = pattern.repeat(Math.ceil(Math.min(left, 4096) / 10)).slice(0, Math.min(left, 4096));
-        left -= piece.length;
-        await writeAll(stream, piece);
+      // ONE continuous digit cycle — the tests compare head/tail slices
+      // against this exact sequence, so piece boundaries must not restart it.
+      const whole = "0123456789".repeat(Math.ceil(total / 10)).slice(0, total);
+      for (let off = 0; off < whole.length; off += 65536) {
+        await writeAll(stream, whole.slice(off, off + 65536));
       }
       process.exitCode = 0;
       return;
