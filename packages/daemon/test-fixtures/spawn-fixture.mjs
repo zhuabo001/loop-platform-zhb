@@ -42,6 +42,17 @@ async function main() {
       process.exitCode = 0;
       return;
     }
+    case "big-utf8": {
+      // big-utf8 <chars>: <chars> copies of a 3-byte CJK character — byte-cut
+      // truncation would split sequences and produce U+FFFD (round-1 P2).
+      const total = Number(rest[0]);
+      const whole = "界".repeat(total);
+      for (let off = 0; off < whole.length; off += 4096) {
+        await writeAll(process.stdout, whole.slice(off, off + 4096));
+      }
+      process.exitCode = 0;
+      return;
+    }
     case "drip-ignore-term": {
       // Keep dripping while ignoring SIGTERM — lets tests put a consumer throw
       // INSIDE the post-timeout grace window (round-1 first-wins repro).

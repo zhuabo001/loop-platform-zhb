@@ -139,3 +139,15 @@ describe("secretValues and redactSecrets", () => {
     }
   });
 });
+
+describe("redactSecrets — serialized forms (round-1 hardening)", () => {
+  it("E15: secrets containing newlines/quotes/backslashes are redacted in JSON-escaped form too", () => {
+    const secret = 'sk-line1\nline2"q"\\back';
+    const serialized = JSON.stringify({ token: secret, note: "keep-me" });
+    const out = redactSecrets(serialized, [secret]);
+    expect(out).not.toContain("line1");
+    expect(out).not.toContain("line2");
+    expect(out).toContain("[REDACTED]");
+    expect(out).toContain("keep-me"); // non-secret content survives
+  });
+});

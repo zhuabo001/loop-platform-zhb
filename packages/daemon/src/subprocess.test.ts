@@ -248,3 +248,16 @@ describe("spawnWithTimeout — first-trigger-wins (round-1 fixes)", () => {
     expect(result.durationMs).toBeLessThan(2500);
   });
 });
+
+describe("spawnWithTimeout — UTF-8 safe truncation (round-1 fix)", () => {
+  it("S18: multibyte output truncates on char boundaries — no U+FFFD, re-encode stays within the cap", async () => {
+    const chars = 400_000; // 1.2 MB of 3-byte CJK
+    const result = await spawnWithTimeout(opts({ args: [FIXTURE, "big-utf8", String(chars)] }));
+    expect(result.completion).toEqual({ kind: "exited", exitCode: 0 });
+    expect(result.stdoutTruncated).toBe(true);
+    expect(result.stdout).not.toContain("�");
+    expect(Buffer.byteLength(result.stdout, "utf8")).toBeLessThanOrEqual(1024 * 1024);
+    expect(result.stdout.startsWith("界界界")).toBe(true);
+    expect(result.stdout.endsWith("界界界")).toBe(true);
+  });
+});
