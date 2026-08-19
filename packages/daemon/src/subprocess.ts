@@ -5,6 +5,16 @@
  * parser rides onStdout/onStderr), and a discriminated-union completion so
  * the runner never has to guess how a child died.
  *
+ * Termination contract:
+ *  - triggers: timeout, AbortSignal, or a throwing chunk consumer — the
+ *    FIRST one decides the completion kind;
+ *  - the routine is idempotent: SIGTERM to the process GROUP, grace, then
+ *    SIGKILL; ESRCH means "already gone" and is never an error;
+ *  - after the direct child's 'close' the group is checked once more —
+ *    orphaned grandchildren get the same TERM → KILL before we return;
+ *  - a kill error other than ESRCH REJECTS the promise (propagates, never
+ *    silently misreports liveness).
+ *
  * POSIX only (macOS / Linux / WSL2): native Windows gets an explicit
  * unsupported-platform spawn-error. `shell: false` always — args are never
  * reparsed by a shell.
@@ -91,23 +101,30 @@ class CappedStream {
 
 export async function spawnWithTimeout(opts: SpawnOptions): Promise<SpawnResult> {
   const startedAt = Date.now();
+  const empty = (completion: SpawnCompletion): SpawnResult => ({
+    completion,
+    stdout: "",
+    stderr: "",
+    stdoutTruncated: false,
+    stderrTruncated: false,
+    durationMs: Date.now() - startedAt,
+  });
 
   if (process.platform === "win32") {
-    return {
-      completion: {
-        kind: "spawn-error",
-        code: "UNSUPPORTED_PLATFORM",
-        message: "native Windows is not supported (process-group semantics are POSIX) — use WSL2",
-      },
-      stdout: "",
-      stderr: "",
-      stdoutTruncated: false,
-      stderrTruncated: false,
-      durationMs: Date.now() - startedAt,
-    };
+    return empty({
+      kind: "spawn-error",
+      code: "UNSUPPORTED_PLATFORM",
+      message: "native Windows is not supported (process-group semantics are POSIX) — use WSL2",
+    });
   }
 
-  return await new Promise<SpawnResult>((resolvePromise) => {
+  // S4: abort-before-spawn never creates a process. The finalSignal is
+  // NOMINAL — nothing was signalled because nothing exists.
+  if (opts.signal.aborted) {
+    return empty({ kind: "aborted", finalSignal: "SIGTERM" });
+  }
+
+  return await new Promise<SpawnResult>((resolvePromise, rejectPromise) => {
     // detached: true ⇒ the child leads its OWN process group, so
     // process.kill(-pid, …) reaches every grandchild it forgot about.
     const child = spawn(opts.command, opts.args, {
@@ -122,12 +139,14 @@ export async function spawnWithTimeout(opts: SpawnOptions): Promise<SpawnResult>
     const stderrCap = new CappedStream();
     let spawnError: { code?: string; message: string } | null = null;
     let consumerError: string | null = null;
-    let terminationStarted = false;
+    /** The FIRST trigger to fire — decides the completion kind (S8). */
+    let trigger: "timed-out" | "aborted" | null = null;
+    let terminationPromise: Promise<NodeJS.Signals> | null = null;
 
     const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
     /** Group liveness via kill(-pgid, 0): ESRCH ⇒ gone (NOT an error —
-     *  S16); any other kill failure must propagate, never be swallowed. */
+     *  S16); any other kill failure propagates to the caller. */
     const groupAlive = (): boolean => {
       if (child.pid === undefined) return false;
       try {
@@ -148,27 +167,35 @@ export async function spawnWithTimeout(opts: SpawnOptions): Promise<SpawnResult>
       }
     };
 
-    /** Idempotent TERM → grace → KILL against the WHOLE process group. The
-     *  timeout/abort triggers (pair 3) and the group reap on normal exit
-     *  (S9) reuse this same routine. */
-    const terminate = (): void => {
-      if (terminationStarted) return;
-      terminationStarted = true;
-      void (async () => {
-        try {
-          signalGroup("SIGTERM");
-          const graceMs = opts.graceMs ?? SIGTERM_GRACE_MS;
-          const deadline = Date.now() + graceMs;
-          while (groupAlive() && Date.now() < deadline) await sleep(10);
-          if (groupAlive()) {
-            signalGroup("SIGKILL");
-            while (groupAlive()) await sleep(10);
-          }
-        } catch {
-          // kill-error propagation is pinned with the pair-3 termination kinds
-        }
+    /** Idempotent TERM → grace → KILL against the WHOLE group; resolves with
+     *  the signal that actually ended it. Memoized: every trigger and the
+     *  post-close reap share one routine. */
+    const terminate = (): Promise<NodeJS.Signals> => {
+      terminationPromise ??= (async () => {
+        signalGroup("SIGTERM");
+        const graceMs = opts.graceMs ?? SIGTERM_GRACE_MS;
+        const deadline = Date.now() + graceMs;
+        while (groupAlive() && Date.now() < deadline) await sleep(10);
+        if (!groupAlive()) return "SIGTERM";
+        signalGroup("SIGKILL");
+        while (groupAlive()) await sleep(10);
+        return "SIGKILL";
       })();
+      return terminationPromise;
     };
+
+    const onTimeout = (): void => {
+      if (trigger !== null) return;
+      trigger = "timed-out";
+      void terminate();
+    };
+    const onAbort = (): void => {
+      if (trigger !== null) return;
+      trigger = "aborted";
+      void terminate();
+    };
+    const timer = setTimeout(onTimeout, opts.timeoutMs);
+    opts.signal.addEventListener("abort", onAbort, { once: true });
 
     const onChunk =
       (cap: CappedStream, callback: ((chunk: Uint8Array) => void) | undefined) =>
@@ -178,7 +205,7 @@ export async function spawnWithTimeout(opts: SpawnOptions): Promise<SpawnResult>
             callback(chunk);
           } catch (err) {
             consumerError = err instanceof Error ? err.message : String(err);
-            terminate();
+            void terminate();
           }
         }
         cap.push(chunk);
@@ -191,25 +218,46 @@ export async function spawnWithTimeout(opts: SpawnOptions): Promise<SpawnResult>
       spawnError = { ...(err.code !== undefined ? { code: err.code } : {}), message: err.message };
     });
 
-    // 'close' (not 'exit'): stdio is drained by the time it fires, so the
-    // captured text is complete.
+    // 'close' (not 'exit'): stdio is drained by the time it fires. settle()
+    // runs synchronously up to the reap, so the trigger set is FROZEN by
+    // clearTimeout/removeEventListener before any await — a timer landing
+    // mid-reap can never flip an already-exited child to timed-out.
     child.on("close", (code, signal) => {
-      const completion: SpawnCompletion =
-        spawnError !== null
-          ? { kind: "spawn-error", ...spawnError }
-          : consumerError !== null
-            ? { kind: "consumer-error", message: consumerError }
-            : code !== null
-              ? { kind: "exited", exitCode: code }
-              : { kind: "signaled", signal: signal ?? "SIGTERM" };
-      resolvePromise({
-        completion,
-        stdout: stdoutCap.text(),
-        stderr: stderrCap.text(),
-        stdoutTruncated: stdoutCap.truncated,
-        stderrTruncated: stderrCap.truncated,
-        durationMs: Date.now() - startedAt,
-      });
+      const settle = async (): Promise<void> => {
+        clearTimeout(timer);
+        opts.signal.removeEventListener("abort", onAbort);
+        let finalSignal: NodeJS.Signals | null = null;
+        try {
+          // S9: the direct child is done, but its group may hold orphaned
+          // grandchildren — they get the same TERM → grace → KILL.
+          if (groupAlive()) await terminate();
+          if (terminationPromise !== null) finalSignal = await terminationPromise;
+        } catch (err) {
+          rejectPromise(err instanceof Error ? err : new Error(String(err)));
+          return;
+        }
+        const completion: SpawnCompletion =
+          spawnError !== null
+            ? { kind: "spawn-error", ...spawnError }
+            : consumerError !== null
+              ? { kind: "consumer-error", message: consumerError }
+              : trigger === "timed-out"
+                ? { kind: "timed-out", finalSignal: finalSignal ?? signal ?? "SIGTERM" }
+                : trigger === "aborted"
+                  ? { kind: "aborted", finalSignal: finalSignal ?? signal ?? "SIGTERM" }
+                  : code !== null
+                    ? { kind: "exited", exitCode: code }
+                    : { kind: "signaled", signal: signal ?? "SIGTERM" };
+        resolvePromise({
+          completion,
+          stdout: stdoutCap.text(),
+          stderr: stderrCap.text(),
+          stdoutTruncated: stdoutCap.truncated,
+          stderrTruncated: stderrCap.truncated,
+          durationMs: Date.now() - startedAt,
+        });
+      };
+      void settle();
     });
   });
 }
