@@ -5,6 +5,14 @@
  * touching paths outside its roots. The jail only guarantees that the spawn
  * cwd resolves inside the daemon ∩ server root intersection, or inside an
  * isolated per-run scratch directory owned by the daemon.
+ *
+ * POINT-IN-TIME semantics (round-1 P1, contract downgrade accepted by
+ * review): resolve() validates the canonical path AT RESOLVE TIME. Between
+ * resolve() and spawn() a hostile rename/symlink swap can redirect the cwd
+ * outside the roots (TOCTOU) — Node's spawn cwd is a path string, so no
+ * handle-based atomicity is available at this layer. Batch 3 MUST therefore
+ * (a) re-validate the cwd immediately before spawning, and (b) treat the
+ * fail-closed OS sandbox — not this module — as the real boundary.
  */
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";

@@ -2,7 +2,7 @@
 
 - 状态：Accepted
 - 日期：2026-08-19
-- 关联：docs/roadmap.md Phase 2 批次二（Day 3–5）；ADR-001（可靠性约束）；ADR-004（批次一）；docs/plan/codex-phase2-batch2-plan.md（当批计划，不进库）
+- 关联：docs/roadmap.md Phase 2 批次二（Day 3–5）；ADR-001（可靠性约束）；ADR-004（批次一）
 - 实现：分支 `feat/phase2-batch2`，red→green 成对提交
 
 ## 背景
@@ -25,3 +25,12 @@
 ## 修订记录
 
 - 2026-08-19：初始 Accepted。
+- 2026-08-19（Round 1 代码审查修复，审查结论「不通过」后的返工）：
+  1. **终止路径重构**（审查 P1）：timeout/abort/consumer 三类触发器改为对单一 `winner` 字段的一次写入，先到者唯一决定 completion kind（原实现中 grace 期内的 consumer 抛错会把已定的 timed-out/aborted 误判为 consumer-error）；winner 存在后 chunk 回调停止触发，该误判路径在结构上不可达。`terminate()` 内部捕获全部 kill 错误（含审查复现的 `kill(-pgid,0) → EPERM`）、绝不 reject 自身 Promise，统一由 settle 传播——消除 trigger 与 close 之间的 unhandled rejection 窗口。EPERM 无 POSIX 便携注入手段，修复以结构保证落地，环境复验留给 Round 2。
+  2. **scratch root 不可预测化**（审查 P1）：工厂不再直接使用调用方给定的可预测目录（`/tmp/loopzhb-runs` 可被其他本机用户预占/符号链接替换），改为在给定 base 内 mkdtemp 每 jail（≈每次 daemon 启动）一个 `loopzhb-runs-*` 0700 目录；配置字段相应更名 `scratchBase`。旧 start 的残留 root 接受为 tmp 残渣，由 OS 清理。
+  3. **resolve→spawn TOCTOU 降级表述**（审查 P1，采纳审查的「降级契约」选项）：jail 的保证是 **resolve 时刻的时点正确性**；Node spawn 的 cwd 是字符串路径，句柄级原子化不可用。批次三义务写入 jail 模块文档：spawn 前必须重新校验 cwd，且 fail-closed OS sandbox 是唯一真正的运行时边界。
+  4. **脱敏覆盖序列化形式**（审查 P2）：`redactSecrets` 同时替换 secret 的原始形式与 JSON 转义形式（含换行/引号/反斜杠的 secret 在结构化日志中只以转义形式出现）；调用契约钉死在模块文档——先脱敏后序列化，原始 child env/stdout 不进日志。
+  5. **UTF-8 边界截断**（审查 P2）：CappedStream 的 head 切口回退、tail 前沿对齐到字符边界，不再合成 U+FFFD，重编码不超 1 MiB。
+  6. **公共接口 seam 确权**（审查 P3，采纳「修订契约」选项）：`WorkdirJail.daemonRoots` 是 canonical roots 的有意可观察口（J5 断言与批次三 sandbox 设置都需要）；`SpawnOptions.graceMs` 是**测试专用注入口**（生产调用方不得设置，固定 5 秒策略不变），模块注释已强化。
+  7. **S8 重定性**：近同时竞态用例只证明到达容错（任一 kind + 快速收口），first-wins 证据由 S5/S7/F1/F2 承担（consumer×trigger 双向竞态为新增确定性用例）。
+  8. **当批计划入库**：`docs/plan/` 两份批次二计划随本批提交入库。这是对 AGENTS.md「handoff 物流不进库」的有意偏差，理由：本批计划带有测试用例 ID 编组（C/J/S/E/I/F），是 red→green 提交信息与审查核销的引用锚点，入库保证这些引用可追溯；后续批次的纯物流计划仍归 `docs/handoff/`，不入库。
