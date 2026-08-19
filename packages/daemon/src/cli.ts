@@ -6,13 +6,14 @@
  * run() (exit 0); config failure or a protocol-fatal poll/report rejects
  * main() and the direct-run wrapper exits non-zero.
  */
+import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { createMachineClient } from "./client.js";
 import { loadDaemonConfig, type DaemonConfig } from "./config.js";
 import { machineIdentity } from "./identity.js";
-import type { WorkdirJail } from "./jail.js";
+import { createWorkdirJail, type WorkdirJail } from "./jail.js";
 import { createFakeRunner, type AgentRunner } from "./runner.js";
 import { createDaemonRuntime } from "./runtime.js";
 
@@ -20,8 +21,10 @@ import { createDaemonRuntime } from "./runtime.js";
  *  any resource opens (fail-fast, fail-closed). The returned jail is NOT
  *  wired to a Runner yet — batch 3's sandboxed adapter receives it. */
 export async function createStartupJail(config: DaemonConfig): Promise<WorkdirJail> {
-  void config;
-  throw new Error("createStartupJail is not implemented yet");
+  return await createWorkdirJail({
+    allowedRoots: config.allowedRoots,
+    scratchParent: path.join(os.tmpdir(), "loopzhb-runs"),
+  });
 }
 
 /** The production Runner seam stays the Fake Runner for ALL of batch 2: no
@@ -60,13 +63,16 @@ export function registerShutdownSignals(
 
 export async function main(): Promise<void> {
   const config = loadDaemonConfig(process.env);
+  // Fail fast on bad isolation roots BEFORE the first poll: a misconfigured
+  // daemon never talks to the server (fail-closed, plan §2.1).
+  await createStartupJail(config);
   const client = createMachineClient({
     baseUrl: config.serverUrl,
     machineCredential: config.machineCredential,
   });
   const runtime = createDaemonRuntime({
     client,
-    runner: createFakeRunner(),
+    runner: productionRunnerFactory(),
     identity: machineIdentity(),
     pollMs: config.pollMs,
     machineCredential: config.machineCredential,
