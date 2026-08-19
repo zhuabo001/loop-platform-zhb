@@ -10,8 +10,12 @@
  *    FIRST one writes the single `winner` field and alone decides the
  *    completion kind; later triggers still terminate but never re-decide;
  *  - terminate() NEVER rejects: a kill failure (e.g. EPERM from the group
- *    liveness probe) is captured and surfaced by the unified settle path —
- *    there is no floating-rejection window between trigger and 'close';
+ *    liveness probe) is captured — there is no floating-rejection window
+ *    between trigger and 'close' — and surfaced by ONE settle path: a
+ *    mid-termination failure rejects IMMEDIATELY and detaches (failFatally,
+ *    round-2 P1: a child we cannot signal must not hang the caller waiting
+ *    for a 'close' we may never bring about); a close-time failure rejects
+ *    at settle;
  *  - the routine is idempotent: SIGTERM to the process GROUP, grace, then
  *    SIGKILL; ESRCH means "already gone" and is never an error;
  *  - after the direct child's 'close' the group is checked once more —
@@ -220,6 +224,11 @@ export async function spawnWithTimeout(opts: SpawnOptions): Promise<SpawnResult>
     let terminationDone: Promise<void> | null = null;
     let terminatedBy: NodeJS.Signals | null = null;
     let killError: Error | null = null;
+    /** Single-settle guard: exactly one of resolve/reject ever fires — the
+     *  normal close settle, or failFatally on an unrecoverable kill error. */
+    let settled = false;
+    /** Test-only seam (never set by production): see SpawnOptions.killImpl. */
+    const kill = opts.killImpl ?? process.kill;
 
     const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -228,7 +237,7 @@ export async function spawnWithTimeout(opts: SpawnOptions): Promise<SpawnResult>
     const groupAlive = (): boolean => {
       if (child.pid === undefined) return false;
       try {
-        process.kill(-child.pid, 0);
+        kill(-child.pid, 0);
         return true;
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code === "ESRCH") return false;
@@ -239,17 +248,18 @@ export async function spawnWithTimeout(opts: SpawnOptions): Promise<SpawnResult>
     const signalGroup = (signal: NodeJS.Signals): void => {
       if (child.pid === undefined) return;
       try {
-        process.kill(-child.pid, signal);
+        kill(-child.pid, signal);
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "ESRCH") throw err;
       }
     };
 
     /** Idempotent TERM → grace → KILL against the WHOLE group. NEVER rejects:
-     *  a kill failure is captured into killError and surfaced by settle —
-     *  attaching a handler only at 'close' would leave a floating-rejection
-     *  window that can crash the daemon under strict unhandled-rejection
-     *  settings (round-1 P1). */
+     *  a kill failure is captured into killError and surfaced by failFatally
+     *  (immediate reject + detach) — attaching a handler only at 'close'
+     *  would leave a floating-rejection window that can crash the daemon
+     *  under strict unhandled-rejection settings (round-1 P1), and waiting
+     *  for 'close' can hang forever when every kill fails (round-2 P1). */
     const terminate = (): void => {
       if (terminationStarted) return;
       terminationStarted = true;
@@ -268,6 +278,7 @@ export async function spawnWithTimeout(opts: SpawnOptions): Promise<SpawnResult>
           terminatedBy = "SIGKILL";
         } catch (err) {
           killError = err instanceof Error ? err : new Error(String(err));
+          failFatally(killError);
         }
       })();
     };
@@ -285,12 +296,33 @@ export async function spawnWithTimeout(opts: SpawnOptions): Promise<SpawnResult>
     const timer = setTimeout(onTimeout, opts.timeoutMs);
     opts.signal.addEventListener("abort", onAbort, { once: true });
 
+    /** Fatal termination failure (round-2 P1): we can no longer manage the
+     *  process group (e.g. EPERM on every kill), so awaiting 'close' could
+     *  hang forever — reject NOW and detach: timer and abort listener
+     *  dropped, stdio destroyed, child unref'd (the daemon's event loop must
+     *  not be held by a process we cannot control). The late 'close' handler
+     *  and every other settle path no-op via `settled`. */
+    const failFatally = (err: Error): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      opts.signal.removeEventListener("abort", onAbort);
+      child.stdout.destroy();
+      child.stderr.destroy();
+      child.unref();
+      rejectPromise(err);
+    };
+
     const onChunk =
       (cap: CappedStream, callback: ((chunk: Uint8Array) => void) | undefined) =>
       (chunk: Buffer): void => {
         // Callbacks stop once ANY winner exists: the stream is doomed and
         // the consumer's output will be discarded (round-1: this also keeps
-        // a repeatedly-throwing consumer from firing during grace).
+        // a repeatedly-throwing consumer from firing during grace). They
+        // also stop once settled — a fatal reject has detached us and the
+        // consumer's result is gone (belt-and-braces: failFatally destroys
+        // the streams anyway).
+        if (settled) return;
         if (winner === null && callback !== undefined) {
           try {
             callback(chunk);
@@ -324,9 +356,12 @@ export async function spawnWithTimeout(opts: SpawnOptions): Promise<SpawnResult>
           if (groupAlive()) terminate();
           if (terminationDone !== null) await terminationDone;
         } catch (err) {
-          rejectPromise(err instanceof Error ? err : new Error(String(err)));
-          return;
+          killError = err instanceof Error ? err : new Error(String(err));
         }
+        // A mid-termination kill failure already rejected and detached via
+        // failFatally — possibly while we were awaiting terminationDone.
+        if (settled) return;
+        settled = true;
         if (killError !== null) {
           rejectPromise(killError);
           return;
