@@ -81,3 +81,61 @@ describe("buildAgentEnv — whitelist", () => {
     expect(env).toEqual({});
   });
 });
+
+describe("secretValues and redactSecrets", () => {
+  it("E9: secretValues collect non-empty ANTHROPIC_*, the OAuth token and proxy values", () => {
+    const { secretValues } = buildAgentEnv({
+      ANTHROPIC_API_KEY: "sk-ant-secret",
+      ANTHROPIC_BASE_URL: "https://api.anthropic.com",
+      CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
+      HTTPS_PROXY: "https://user:proxy-pass@proxy:8443",
+      PATH: "/usr/bin",
+    });
+    expect(secretValues).toContain("sk-ant-secret");
+    expect(secretValues).toContain("oauth-secret");
+    expect(secretValues).toContain("https://user:proxy-pass@proxy:8443");
+    // plan §2.4: EVERY non-empty ANTHROPIC_* value is treated as a secret —
+    // redacting a URL is harmless, missing a credential is fatal.
+    expect(secretValues).toContain("https://api.anthropic.com");
+  });
+
+  it("E10: PATH/HOME/LANG are never treated as secrets", () => {
+    const { env, secretValues } = buildAgentEnv({ PATH: "/usr/bin", HOME: "/home/x", LANG: "C" });
+    expect(Object.keys(env)).toHaveLength(3);
+    for (const value of Object.values(env)) expect(secretValues).not.toContain(value);
+  });
+
+  it("E11: an empty-string secret never participates in replacement", () => {
+    const { secretValues } = buildAgentEnv({ ANTHROPIC_API_KEY: "" });
+    expect(secretValues).toEqual([]);
+    // replacing "" would inject [REDACTED] between every character — pinned shut
+    expect(redactSecrets("hello world", ["", ""])).toBe("hello world");
+  });
+
+  it("E12: overlapping secrets redact longest-first (no partial leftovers)", () => {
+    const out = redactSecrets("token=sk-abcdef", ["sk-abc", "sk-abcdef"]);
+    expect(out).toBe("token=[REDACTED]");
+  });
+
+  it("E13: every secret in a multi-secret text is redacted, duplicates included", () => {
+    const text = "key=sk-ant-secret oauth=oauth-secret again=sk-ant-secret proxy=proxy-pass";
+    const out = redactSecrets(text, ["oauth-secret", "sk-ant-secret", "sk-ant-secret", "proxy-pass"]);
+    expect(out).toBe("key=[REDACTED] oauth=[REDACTED] again=[REDACTED] proxy=[REDACTED]");
+  });
+
+  it("E14: machine credential, run token and server URL never reach the child env", () => {
+    const credential = "dk_secret_machine";
+    const runToken = "rt_secret_run";
+    const serverUrl = "http://127.0.0.1:3000";
+    const { env } = buildAgentEnv({
+      LOOPZHB_MACHINE_CREDENTIAL: credential,
+      LOOPZHB_SERVER_URL: serverUrl,
+      RUN_TOKEN: runToken,
+      PATH: "/usr/bin",
+    });
+    expect(env).toEqual({ PATH: "/usr/bin" });
+    for (const sensitive of [credential, runToken, serverUrl]) {
+      expect(Object.values(env)).not.toContain(sensitive);
+    }
+  });
+});
