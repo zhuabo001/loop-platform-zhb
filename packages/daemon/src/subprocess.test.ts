@@ -179,3 +179,29 @@ describe("spawnWithTimeout — termination triggers", () => {
     }
   });
 });
+
+describe("spawnWithTimeout — completion kinds and return guarantees", () => {
+  it("S15: a self-signalled child reports signaled with the killing signal", async () => {
+    // SIGUSR2, not SIGUSR1: Node reserves USR1 for the debugger and swallows it.
+    const result = await spawnWithTimeout(opts({ args: [FIXTURE, "self-signal", "SIGUSR2"] }));
+    expect(result.completion).toEqual({ kind: "signaled", signal: "SIGUSR2" });
+  });
+
+  it("S16: an already-gone process group (ESRCH) is treated as ended, never as an error", async () => {
+    // Any fast clean exit exercises the settle-time group liveness check:
+    // kill(-pgid, 0) → ESRCH → done. A misread here would reject or hang.
+    const result = await spawnWithTimeout(opts({ args: [FIXTURE, "exit", "0"] }));
+    expect(result.completion).toEqual({ kind: "exited", exitCode: 0 });
+  });
+
+  it("S17: return implies close fired, stdio fully drained, and the group is gone", async () => {
+    // 200 KiB (under the cap): if 'close' settled before the streams drained,
+    // the tail would be missing; if the group lingered, return would stall.
+    const total = 200 * 1024;
+    const expected = "0123456789".repeat(Math.ceil(total / 10)).slice(0, total);
+    const result = await spawnWithTimeout(opts({ args: [FIXTURE, "big", "stdout", String(total)] }));
+    expect(result.completion).toEqual({ kind: "exited", exitCode: 0 });
+    expect(result.stdout).toBe(expected);
+    expect(result.stdoutTruncated).toBe(false);
+  });
+});
