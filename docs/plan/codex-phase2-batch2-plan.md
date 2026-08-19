@@ -66,7 +66,7 @@ interface WorkdirJail {
 
 function createWorkdirJail(config: {
   allowedRoots: string[];
-  scratchParent: string;
+  scratchBase: string;
 }): Promise<WorkdirJail>;
 ```
 
@@ -77,8 +77,8 @@ function createWorkdirJail(config: {
 - 两组 roots 逐对求目录树交集：一方包含另一方时取更窄路径；使用 `path.relative()` 判断边界，禁止字符串前缀判断。
 - 交集结果去重并消除被父 root 覆盖的冗余子 root；空交集抛 `JailError`。
 - 非空 workdir 必须是绝对、存在的目录；realpath 后必须位于至少一个 effective root 内。指向根内的符号链接允许，指向根外的符号链接拒绝。
-- null workdir 创建 per-run scratch：在 daemon-owned scratch parent 下以 `loopId + runId` 哈希作为前缀调用 `mkdtemp`，目录权限 `0700`，不同 Run 永不复用。
-- `release()` 只允许删除当前 jail 创建、位于 scratch parent 直接子树下且未被替换为符号链接的目录；校验或删除失败必须抛错。
+- null workdir 创建 per-run scratch：工厂先在 `scratchBase` 内 mkdtemp 一个不可预测的 per-jail `loopzhb-runs-*` 0700 根目录（防预占/符号链接替换，Round 1 审查），再以 `loopId + runId` 哈希为前缀在其内 mkdtemp per-run 目录，权限 `0700`，不同 Run 永不复用。
+- `release()` 只允许删除当前 jail 创建、位于 per-jail scratch 根目录直接子树下且未被替换为符号链接的目录；校验或删除失败必须抛错。
 - 模块文档明确：jail 只保证 cwd 选择正确，不是运行时文件系统安全边界。Batch 3 的 OS sandbox 才负责阻止进程越界访问。
 
 ### 2.3 Subprocess 生命周期模块
@@ -156,7 +156,7 @@ function redactSecrets(text: string, secretValues: string[]): string;
 - 使用 Node fixture executable 直接集成测试 jail + env + subprocess，不通过 Delivery 或生产 runtime 启动。
 - 保留现有 server daemon E2E 的 Fake Runner 行为。
 - 新增 ADR，记录“workdir jail 不是安全边界”、roots 交集、per-run scratch、进程组收口、环境白名单及生产切换推迟到严格 sandbox。
-- 当批详细计划应放在 ignored 的 `docs/handoff/`；合并后只更新 ADR、roadmap 和 README。
+- 当批详细计划经裁决入库至 `docs/plan/`（测试用例 ID 编组是 red→green 提交与审查核销的引用锚点，ADR-005 修订记录第 8 条）；合并后同时更新 ADR、roadmap 和 README。
 
 ## 三、实施顺序（TDD）
 
@@ -241,7 +241,7 @@ function redactSecrets(text: string, secretValues: string[]): string;
 6. 生产 CLI 仍使用 Fake Runner，任何 Delivery 都不会启动真实 subprocess。
 7. 现有 Phase 1 / Batch 1 测试无需改变 Runner 契约且全绿。
 8. `pnpm test`、`pnpm typecheck`、`pnpm build` 全部通过。
-9. ADR、roadmap、README 已更新；详细计划不进入仓库长期文档层。
+9. ADR、roadmap、README 已更新；详细计划经裁决入库 `docs/plan/`（ADR-005 修订记录第 8 条）。
 
 ## 六、明确假设
 

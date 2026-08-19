@@ -70,7 +70,7 @@ export function resolveWorkdir(
 - 拒绝 `..`、符号链接逃逸、前缀碰撞（如 `/foo` vs `/foobar`）
 - Server roots 为空数组时：表示不限制（使用全部 daemon roots）
 - Server roots 非空但与 daemon roots 不相交时：抛出 JailError
-- `loop.workdir` 为 `null` 时：生成 `scratchBase/<loop-id-hash>` 目录
+- `loop.workdir` 为 `null` 时：生成 per-run scratch 目录（现行实现：工厂在 `scratchBase` 内 mkdtemp 不可预测的 per-jail `loopzhb-runs-*` 0700 根目录，再以 loopId+runId 哈希前缀在其内 mkdtemp，0700，永不复用）
 - Jail 失败直接生成失败 report，不 spawn subprocess
 
 **测试矩阵**（12+ 用例）：
@@ -247,7 +247,7 @@ export interface ClaudeRunnerConfig {
   claudeBin: string;
   allowedRoots: string[];
   agentTimeoutMs: number;
-  scratchBaseDir: string;  // daemon 临时目录基准，如 /tmp/loopzhb-runs
+  scratchBaseDir: string;  // daemon 临时目录基准（如 os.tmpdir()；工厂在其内 mkdtemp per-jail 根目录）
 }
 
 export function createClaudeRunner(config: ClaudeRunnerConfig): AgentRunner {
@@ -419,7 +419,7 @@ const runner = createClaudeRunner({
   claudeBin: config.claudeBin,
   allowedRoots: config.allowedRoots,
   agentTimeoutMs: config.agentTimeoutMs,
-  scratchBaseDir: path.join(os.tmpdir(), "loopzhb-runs"),
+  scratchBaseDir: os.tmpdir(), // 工厂在其内 mkdtemp 不可预测 per-jail 根目录（勿传可预测叶子目录）
 });
 
 // 传给 runtime
