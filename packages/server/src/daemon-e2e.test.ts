@@ -66,9 +66,9 @@ describe("daemon E2E: the full HTTP user chain", () => {
     let runnerCalls = 0;
     const fake = createFakeRunner();
     const countingRunner: AgentRunner = {
-      run: (delivery, signal) => {
+      run: (delivery, ctx) => {
         runnerCalls += 1;
-        return fake.run(delivery, signal);
+        return fake.run(delivery, ctx);
       },
     };
     const runtime = createDaemonRuntime({

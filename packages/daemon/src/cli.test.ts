@@ -77,7 +77,10 @@ describe("production Runner seam (I6)", () => {
       systemPrompt: "",
       task: "do nothing",
     } as unknown as Delivery;
-    const report = await productionRunnerFactory().run(delivery, new AbortController().signal);
+    const report = await productionRunnerFactory().run(delivery, {
+      signal: new AbortController().signal,
+      onProgress: () => {},
+    });
     expect(report.message).toBe(FAKE_RUNNER_MESSAGE);
   });
 });

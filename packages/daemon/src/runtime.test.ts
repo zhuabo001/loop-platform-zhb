@@ -24,7 +24,7 @@ import {
   type ReportOutcome,
   type SerializedReportRequest,
 } from "./client.js";
-import type { AgentRunner, RunnerReport } from "./runner.js";
+import type { AgentRunner, RunnerContext, RunnerReport } from "./runner.js";
 import {
   ERROR_CAP,
   FatalDaemonError,
@@ -91,12 +91,12 @@ const flush = (): Promise<void> => new Promise((r) => setImmediate(r));
 
 const OK_RUNNER: RunnerReport = { ok: true, outcome: "exec", message: "fake runner completed", durationMs: 0 };
 
-function captureRunner(impl?: (delivery: Delivery, signal: AbortSignal) => Promise<RunnerReport>) {
-  const calls: { delivery: Delivery; signal: AbortSignal }[] = [];
+function captureRunner(impl?: (delivery: Delivery, ctx: RunnerContext) => Promise<RunnerReport>) {
+  const calls: { delivery: Delivery; ctx: RunnerContext }[] = [];
   const runner: AgentRunner = {
-    run(delivery, signal) {
-      calls.push({ delivery, signal });
-      return impl ? impl(delivery, signal) : Promise.resolve(OK_RUNNER);
+    run(delivery, ctx) {
+      calls.push({ delivery, ctx });
+      return impl ? impl(delivery, ctx) : Promise.resolve(OK_RUNNER);
     },
   };
   return { runner, calls };
@@ -108,7 +108,7 @@ function makeRuntime(overrides: Partial<Parameters<typeof createDaemonRuntime>[0
   const logs: string[] = [];
   const selectedRunner = overrides.runner;
   const { runner, calls: runnerCalls } = captureRunner(
-    selectedRunner ? (delivery, signal) => selectedRunner.run(delivery, signal) : undefined,
+    selectedRunner ? (delivery, ctx) => selectedRunner.run(delivery, ctx) : undefined,
   );
   const rt = createDaemonRuntime({
     client,
@@ -382,7 +382,7 @@ describe("shutdown", () => {
 
     ctl.abort();
     await expect(done).resolves.toBeUndefined();
-    expect(runnerCalls[0]!.signal.aborted).toBe(true); // the Runner seam carries the shutdown
+    expect(runnerCalls[0]!.ctx.signal.aborted).toBe(true); // the Runner seam carries the shutdown
   });
 
   it("fires no report retry after stop (the pending entry survives, un-dropped)", async () => {
@@ -418,11 +418,11 @@ describe("shutdown", () => {
 describe("execution decoupling (Phase 2 batch 1)", () => {
   /** A runner whose every call blocks until the test releases it. */
   function gatedRunner() {
-    const calls: { delivery: Delivery; release: (report: RunnerReport) => void }[] = [];
+    const calls: { delivery: Delivery; ctx: RunnerContext; release: (report: RunnerReport) => void }[] = [];
     const runner: AgentRunner = {
-      run: (d: Delivery) =>
+      run: (d: Delivery, ctx: RunnerContext) =>
         new Promise<RunnerReport>((resolve) => {
-          calls.push({ delivery: d, release: resolve });
+          calls.push({ delivery: d, ctx, release: resolve });
         }),
     };
     return { runner, calls };
@@ -701,5 +701,107 @@ describe("execution decoupling (Phase 2 batch 1)", () => {
     expect(gated.calls.map((c) => c.delivery.runId)).toEqual(["run-1"]); // run-2 never started
 
     await expect(rt.pollOnce()).rejects.toThrow(FatalDaemonError); // and the fatal is visible
+  });
+});
+
+describe("runner progress events (Phase 2 batch 3 — R group)", () => {
+  function ctxGatedRunner() {
+    const calls: { delivery: Delivery; ctx: RunnerContext; release: (report: RunnerReport) => void }[] = [];
+    const runner: AgentRunner = {
+      run: (d: Delivery, ctx: RunnerContext) =>
+        new Promise<RunnerReport>((resolve) => {
+          calls.push({ delivery: d, ctx, release: resolve });
+        }),
+    };
+    return { runner, calls };
+  }
+
+  it("R1: each runner event sanitizes the label (NUL stripped, collapsed to one line, capped at 200 chars) and increments the step", async () => {
+    const gated = ctxGatedRunner();
+    const { rt, client } = makeRuntime({ runner: gated.runner });
+    client.pollQueue.push({ kind: "ok", deliveries: [delivery("run-1")] });
+
+    await rt.pollOnce(); // dispatch (body built pre-dispatch — no progress yet)
+    await rt.pollOnce(); // executing — step 1
+    expect(client.polls.at(-1)!.progress).toEqual([{ runId: "run-1", step: 1, label: "starting claude-code" }]);
+
+    const ctx = gated.calls[0]!.ctx;
+    ctx.onProgress("line one\nline two\0 nul");
+    await rt.pollOnce();
+    expect(client.polls.at(-1)!.progress).toEqual([{ runId: "run-1", step: 2, label: "line one line two nul" }]);
+
+    ctx.onProgress("x".repeat(500));
+    await rt.pollOnce();
+    expect(client.polls.at(-1)!.progress).toEqual([{ runId: "run-1", step: 3, label: "x".repeat(200) }]);
+
+    gated.calls[0]!.release(OK_RUNNER);
+    await rt.executionSettled();
+  });
+
+  it("R2: starting → runner events → reporting is strictly monotonic; reporting lands at last event step + 1", async () => {
+    const gated = ctxGatedRunner();
+    const { rt, client, clock } = makeRuntime({ runner: gated.runner });
+    client.pollQueue.push({ kind: "ok", deliveries: [delivery("run-1")] });
+    client.reportQueue.push({ kind: "retry", reason: "HTTP 503" }, { kind: "confirmed" });
+
+    await rt.pollOnce();
+    const ctx = gated.calls[0]!.ctx;
+    ctx.onProgress("event one");
+    ctx.onProgress("event two");
+    await rt.pollOnce(); // step 3 = 1 (starting) + 2 events
+    expect(client.polls.at(-1)!.progress).toEqual([{ runId: "run-1", step: 3, label: "event two" }]);
+
+    gated.calls[0]!.release(OK_RUNNER); // → reporting at step 4
+    await flush();
+    await flush();
+    await rt.pollOnce();
+    expect(client.polls.at(-1)!.progress).toEqual([{ runId: "run-1", step: 4, label: "reporting result" }]);
+
+    clock.fireNext(); // retry confirms
+    await flush();
+    await flush();
+    await rt.pollOnce();
+    expect(client.polls.at(-1)).not.toHaveProperty("progress");
+  });
+
+  it("R3: a late onProgress after the runner settled is ignored — neither step nor label changes, before AND after the report confirms", async () => {
+    const gated = ctxGatedRunner();
+    const { rt, client, clock } = makeRuntime({ runner: gated.runner });
+    client.pollQueue.push({ kind: "ok", deliveries: [delivery("run-1")] });
+    client.reportQueue.push({ kind: "retry", reason: "HTTP 503" }, { kind: "confirmed" });
+
+    await rt.pollOnce();
+    const ctx = gated.calls[0]!.ctx;
+    gated.calls[0]!.release(OK_RUNNER); // settle → reporting (step 2, no events)
+    await flush();
+    await flush();
+    await rt.pollOnce();
+    expect(client.polls.at(-1)!.progress).toEqual([{ runId: "run-1", step: 2, label: "reporting result" }]);
+
+    ctx.onProgress("late noise"); // the runner already settled — ignored
+    await rt.pollOnce();
+    expect(client.polls.at(-1)!.progress).toEqual([{ runId: "run-1", step: 2, label: "reporting result" }]);
+
+    clock.fireNext(); // confirm → the activity entry is gone entirely
+    await flush();
+    await flush();
+    ctx.onProgress("too late"); // even now: no resurrection
+    await rt.pollOnce();
+    expect(client.polls.at(-1)).not.toHaveProperty("progress");
+  });
+
+  it("R4: labels that sanitize to empty cost no step", async () => {
+    const gated = ctxGatedRunner();
+    const { rt, client } = makeRuntime({ runner: gated.runner });
+    client.pollQueue.push({ kind: "ok", deliveries: [delivery("run-1")] });
+
+    await rt.pollOnce();
+    const ctx = gated.calls[0]!.ctx;
+    ctx.onProgress("   \0 \n\t ");
+    await rt.pollOnce();
+    expect(client.polls.at(-1)!.progress).toEqual([{ runId: "run-1", step: 1, label: "starting claude-code" }]);
+
+    gated.calls[0]!.release(OK_RUNNER);
+    await rt.executionSettled();
   });
 });

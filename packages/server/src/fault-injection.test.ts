@@ -141,9 +141,9 @@ function createDaemon(
 ): DaemonHarness {
   let runnerCalls = 0;
   const countingRunner: AgentRunner = {
-    run: (delivery, signal) => {
+    run: (delivery, ctx) => {
       runnerCalls += 1;
-      return runner.run(delivery, signal);
+      return runner.run(delivery, ctx);
     },
   };
   const baseFetch = fetchOverride ?? appFetch(app);
