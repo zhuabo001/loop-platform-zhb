@@ -1,13 +1,24 @@
 import { EventEmitter } from "node:events";
 import { realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import type { Delivery } from "@loopzhb/protocol";
 import { describe, expect, it } from "vitest";
 
-import { createStartupJail, productionRunnerFactory, registerShutdownSignals, type ShutdownSignalEvents } from "./cli.js";
-import { JailError } from "./jail.js";
-import { createFakeRunner, FAKE_RUNNER_MESSAGE } from "./runner.js";
+import {
+  createStartupJail,
+  prepareDaemon,
+  productionRunnerFactory,
+  registerShutdownSignals,
+  type ShutdownSignalEvents,
+} from "./cli.js";
+import { JailError, type WorkdirJail } from "./jail.js";
+import { ClaudeProbeError } from "./probe-claude.js";
+import { createFakeRunner } from "./runner.js";
+
+const FIXTURE = fileURLToPath(new URL("../test-fixtures/fake-claude.mjs", import.meta.url));
 
 describe("registerShutdownSignals", () => {
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
@@ -56,13 +67,23 @@ describe("createStartupJail — batch-2 startup validation (I5)", () => {
   });
 });
 
-describe("production Runner seam (I6)", () => {
-  it("is STILL the Fake Runner — no Delivery ever spawns a real subprocess in batch 2", async () => {
-    expect(productionRunnerFactory).toBe(createFakeRunner);
+describe("production Runner seam (I6, inverted in batch 3)", () => {
+  it("is NO LONGER the Fake Runner — the factory builds the Claude adapter", async () => {
+    expect(productionRunnerFactory).not.toBe(createFakeRunner);
+
+    // The seam is the Claude adapter: an unsupported agent fails WITHOUT
+    // touching the jail (a stub that throws on any use proves it).
+    const jail: WorkdirJail = {
+      daemonRoots: ["/"],
+      resolve: () => Promise.reject(new Error("jail must not be used for an unsupported agent")),
+      revalidate: () => Promise.reject(new Error("jail must not be used for an unsupported agent")),
+      release: () => Promise.reject(new Error("jail must not be used for an unsupported agent")),
+    };
+    const runner = productionRunnerFactory({ jail, claudeBin: "claude", timeoutMs: 1000, envSource: {} });
     const delivery = {
       runId: "run-1",
       runToken: "rt_x",
-      role: "run",
+      role: "exec",
       loop: {
         id: "loop-1",
         name: "loop",
@@ -71,16 +92,48 @@ describe("production Runner seam (I6)", () => {
         workflow: null,
         model: null,
         allowControl: false,
+        agent: "codex",
       },
       prevState: null,
       roots: [],
       systemPrompt: "",
       task: "do nothing",
     } as unknown as Delivery;
-    const report = await productionRunnerFactory().run(delivery, {
-      signal: new AbortController().signal,
-      onProgress: () => {},
-    });
-    expect(report.message).toBe(FAKE_RUNNER_MESSAGE);
+    const report = await runner.run(delivery, { signal: new AbortController().signal, onProgress: () => {} });
+    expect(report).toEqual({ ok: false, error: "unsupported agent: codex" });
+  });
+});
+
+describe("prepareDaemon — the batch-3 composition root", () => {
+  const baseConfig = {
+    serverUrl: "http://127.0.0.1:3000",
+    machineCredential: "dk_secret_cli_credential",
+    pollMs: 3000,
+    claudeBin: "claude",
+    agentTimeoutMs: 1800000,
+  };
+
+  it("a probe failure rejects BEFORE any client or poll exists", async () => {
+    await expect(
+      prepareDaemon(
+        { ...baseConfig, allowedRoots: [realpathSync(tmpdir())], claudeBin: path.join(tmpdir(), "no-such-claude") },
+        {},
+      ),
+    ).rejects.toThrow(ClaudeProbeError);
+  });
+
+  it("bad isolation roots still reject before the probe (fail-closed ordering)", async () => {
+    await expect(
+      prepareDaemon({ ...baseConfig, allowedRoots: ["/nonexistent/loopzhb-cli-root"], claudeBin: FIXTURE }, {}),
+    ).rejects.toThrow(JailError);
+  });
+
+  it("a healthy probe assembles the runtime (jail → probe → client → Claude runner)", async () => {
+    const runtime = await prepareDaemon(
+      { ...baseConfig, allowedRoots: [realpathSync(tmpdir())], claudeBin: FIXTURE },
+      { PATH: `${path.dirname(process.execPath)}:${process.env.PATH ?? ""}` },
+    );
+    expect(runtime.pollOnce).toBeInstanceOf(Function);
+    expect(runtime.inFlightCount()).toBe(0);
   });
 });
