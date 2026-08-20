@@ -19,9 +19,9 @@
  *  - user/project/local settings sources are disabled (`--setting-sources
  *    ""`, `--safe-mode`), hooks and memory are off, permission mode is
  *    pinned to `dontAsk` (never bypass);
- *  - every child-derived text (progress labels, finalText, error narrative,
- *    the session id) is redacted with the env secret values AND the run token
- *    BEFORE it reaches the runtime/report surface;
+ *  - child-controlled progress text is discarded in favor of fixed semantic
+ *    labels; terminal child text (finalText, error narrative, session id) is
+ *    redacted with env secrets AND the run token before report/runtime;
  *  - jail.revalidate re-checks the resolution immediately before spawn —
  *    a drifted cwd/root/scratch means NO spawn (S1–S10); the irreducible
  *    revalidate→execve residue is bounded by the fail-closed OS sandbox
@@ -52,11 +52,9 @@ export interface ClaudeRunnerDeps {
   timeoutMs: number;
   /** The daemon process env — filtered through the agent-env whitelist. */
   envSource: NodeJS.ProcessEnv;
-  /** The probe-pinned binary (production). When present the runner spawns the
-   *  RESOLVED path — never a PATH lookup — and re-stats it before every
-   *  spawn: a drifted/replaced/vanished binary fails the run WITHOUT spawning
-   *  (round-1 review P1). Absent only in tests, which spawn claudeBin
-   *  directly. */
+  /** The probe-pinned executable identity (production). The runner re-hashes
+   *  this resolved path before every spawn. Absent only in direct adapter
+   *  tests. */
   probedBinary?: ClaudeBinaryIdentity;
   /** Replaces spawnWithTimeout. TEST-ONLY seam (same standing as
    *  SpawnOptions.killImpl): production call sites never set this — the
@@ -161,13 +159,12 @@ export function createClaudeRunner(deps: ClaudeRunnerDeps): AgentRunner {
         // NO spawn — the JailError propagates and fails the run.
         await deps.jail.revalidate(resolved);
 
-        // The probe-pinned binary (round-1 review P1): spawn the RESOLVED
-        // path, and only while it still IS the probed file — a post-probe
-        // replacement must never receive the agent credentials. The residual
-        // stat→execve window is userspace-irreducible (ADR-006 修订记录).
+        // Re-check the exact resolved path that passed the credential-free
+        // startup probes before exposing the full agent environment. The
+        // residual stat/hash→execve window is userspace-irreducible.
         let command = deps.claudeBin;
         if (deps.probedBinary !== undefined) {
-          const now = await statClaudeBinary(deps.probedBinary.resolvedPath).catch(() => null);
+          const now = await statClaudeBinary(deps.probedBinary.resolvedPath, { signal: ctx.signal }).catch(() => null);
           if (now === null || !sameClaudeBinary(deps.probedBinary, now)) {
             return {
               ok: false,
@@ -178,7 +175,15 @@ export function createClaudeRunner(deps: ClaudeRunnerDeps): AgentRunner {
         }
 
         const parser = createClaudeStreamParser({
-          onProgress: (label) => ctx.onProgress(redact(label)),
+          onProgress: (_label, kind) => {
+            // Progress is a continuously observable channel. Per-event
+            // redaction cannot stop a credential split across two events, so
+            // child-controlled assistant/command text never crosses it. Keep
+            // only fixed semantic labels, including provider retry.
+            if (kind === "assistant-text") ctx.onProgress("claude response");
+            else if (kind === "tool-use") ctx.onProgress("running Bash");
+            else ctx.onProgress("provider api retry");
+          },
         });
         const spawned = await spawn({
           command,

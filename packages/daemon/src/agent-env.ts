@@ -49,9 +49,12 @@ function isAllowed(key: string): boolean {
 /** Which FORWARDED values are credentials: non-empty ANTHROPIC_* and the
  *  OAuth token are obvious; proxy URLs can embed userinfo. PATH/HOME/LANG
  *  are never secrets. */
-function isSecret(key: string, value: string): boolean {
-  if (value === "") return false;
+function isSecretKey(key: string): boolean {
   return key.startsWith("ANTHROPIC_") || key === "CLAUDE_CODE_OAUTH_TOKEN" || PROXY_NAMES.has(key);
+}
+
+function isSecret(key: string, value: string): boolean {
+  return value !== "" && isSecretKey(key);
 }
 
 /** Longest-first, deduped, empties dropped — replacing a short secret before
@@ -69,6 +72,19 @@ export function buildAgentEnv(source: NodeJS.ProcessEnv): AgentEnv {
     if (isSecret(key, value)) secrets.push(value);
   }
   return { env, secretValues: normalizeSecrets(secrets) };
+}
+
+/** Startup capability probes need PATH/config/TLS compatibility, but never
+ * authenticate or contact the provider. Removing every credential-bearing
+ * key limits a substituted local executable to an unauthenticated process;
+ * the real Run receives the full agent allow-list only after identity
+ * revalidation. */
+export function buildProbeEnv(source: NodeJS.ProcessEnv): Record<string, string> {
+  const { env } = buildAgentEnv(source);
+  for (const key of Object.keys(env)) {
+    if (isSecretKey(key)) delete env[key];
+  }
+  return env;
 }
 
 /** Chars treated as chunk separators by the tolerant pass: an exfiltrator
@@ -151,8 +167,8 @@ function redactTolerant(text: string, needlesCS: readonly string[], needlesCI: r
   return out + text.slice(cursor);
 }
 
-/** Replace every occurrence of every secret with [REDACTED]. Match forms:
- *  raw and JSON-escaped (length ≥ 2), plus — at realistic secret length
+/** Replace every occurrence of every non-empty secret with [REDACTED]. Match
+ *  forms: raw and JSON-escaped, plus — at realistic secret length
  *  (≥ 8), where a short secret's encodings would vandalize ordinary text —
  *  base64 / base64url / hex / second-order base64 / percent-encoded
  *  (round-2 review P1: a Bash child can pipe a credential through a
@@ -161,9 +177,8 @@ function redactTolerant(text: string, needlesCS: readonly string[], needlesCI: r
  *  chunks) via a strip-and-map pass, hex and percent case-insensitively.
  *
  *  The exact pass is a SINGLE combined-regex replacement: replacements never
- *  feed another pass, and secrets shorter than 2 chars never match — the
- *  round-2 P2 blowup (single-char secrets re-matching inside earlier
- *  "[REDACTED]" output) is structurally impossible.
+ *  feed another pass. A match shorter than "[REDACTED]" is deleted instead
+ *  of expanded, so output never grows — including one-character secrets.
  *
  *  Documented residual (ADR-006 决策 6): transforms WITHOUT a deterministic
  *  plaintext form — compression (gzip headers embed non-determinism),
@@ -174,7 +189,7 @@ function redactTolerant(text: string, needlesCS: readonly string[], needlesCI: r
  *  dropped). Caller contract: redact BEFORE serializing structured fields,
  *  and raw child env/stdout never enters logs unscrubbed. */
 export function redactSecrets(text: string, secretValues: string[]): string {
-  const secrets = normalizeSecrets(secretValues).filter((secret) => secret.length >= 2);
+  const secrets = normalizeSecrets(secretValues);
   if (secrets.length === 0 || text === "") return text;
 
   const exactForms = new Set<string>();
@@ -206,7 +221,11 @@ export function redactSecrets(text: string, secretValues: string[]): string {
   }
 
   const pattern = [...exactForms].sort((a, b) => b.length - a.length).map(escapeRegExp).join("|");
-  let out = pattern === "" ? text : text.replace(new RegExp(pattern, "g"), "[REDACTED]");
+  const marker = "[REDACTED]";
+  let out =
+    pattern === ""
+      ? text
+      : text.replace(new RegExp(pattern, "g"), (match) => (match.length < marker.length ? "" : marker));
   if (tolerantCS.length > 0 || tolerantCI.length > 0) {
     out = redactTolerant(out, [...new Set(tolerantCS)], [...new Set(tolerantCI)]);
   }

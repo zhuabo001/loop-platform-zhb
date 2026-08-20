@@ -7,30 +7,32 @@
  *   2. `claude --help` — output must contain every flag this batch's fixed
  *      argv depends on (REQUIRED_CLAUDE_FLAGS).
  *
- * Both run with `shell: false` under the SAME whitelisted agent env the real
- * runs will use (a binary that cannot start under that env would fail every
- * run anyway). The probe has a fixed 10s timeout per invocation. ANY failure
+ * Both run with `shell: false` under a credential-free subset of the agent
+ * allow-list: system/config/TLS variables remain for compatibility, while
+ * provider, OAuth and proxy credentials are withheld. The probe has a fixed
+ * 10s timeout per invocation. ANY failure
  * — spawn error, non-zero exit, signal, timeout, unparseable version,
  * outdated version, missing flags, unsupported platform — throws a
  * ClaudeProbeError and aborts the daemon startup (fail-closed; plan §2.2).
  *
  * Binary identity (round-1 review P1): the probe first RESOLVES the binary
  * (an explicit path is canonicalized; a bare name is searched on the agent
- * env PATH), runs both probes against the RESOLVED path, and finally pins
- * its inode-level identity (dev/ino/mtimeMs/size). The runner re-stats the
- * resolved path before every spawn and refuses a drifted binary, so a
- * post-probe replacement never receives the agent credentials. The residual
- * stat→execve window is userspace-irreducible and documented in ADR-006.
+ * env PATH), pins its stat+sha256 identity, and verifies that identity before
+ * and after EACH probe invocation. The runner re-checks the resolved path
+ * before every real spawn and refuses drift. The residual stat→execve
+ * window and same-UID trust boundary are documented in ADR-006. Every hash
+ * has its own 10s deadline; real-Run checks also observe shutdown aborts.
  */
 import { createHash } from "node:crypto";
 import { constants as fsConstants, createReadStream } from "node:fs";
 import { access, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 
-import { buildAgentEnv } from "./agent-env.js";
+import { buildProbeEnv } from "./agent-env.js";
 import { spawnWithTimeout } from "./subprocess.js";
 
 export const CLAUDE_PROBE_TIMEOUT_MS = 10_000;
+export const CLAUDE_BINARY_HASH_TIMEOUT_MS = 10_000;
 export const MIN_CLAUDE_VERSION = "2.1.219";
 
 /** Every flag the batch-3 fixed argv depends on (plan §2.3). */
@@ -91,22 +93,57 @@ export function sameClaudeBinary(a: ClaudeBinaryIdentity, b: ClaudeBinaryIdentit
   );
 }
 
-/** Stream a file's sha256 — the CLI binary can be tens of MiB. */
-async function sha256File(filePath: string): Promise<string> {
+/** Stream a file's sha256 — the CLI binary can be hundreds of MiB. */
+async function sha256File(filePath: string, signal: AbortSignal): Promise<string> {
   const hash = createHash("sha256");
-  for await (const chunk of createReadStream(filePath)) {
+  for await (const chunk of createReadStream(filePath, { signal })) {
     hash.update(chunk as Buffer);
   }
   return hash.digest("hex");
 }
 
+export interface ClaudeBinaryCheckOptions {
+  /** Run shutdown cancels an identity check before spawn. */
+  signal?: AbortSignal;
+  /** Independent I/O deadline; defaults to ten seconds. */
+  timeoutMs?: number;
+}
+
+async function withAbort<T>(operation: () => Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted();
+  return await new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    operation().then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (err: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(err);
+      },
+    );
+  });
+}
+
 /** Stat AND hash the pinned binary NOW. Throws raw on any failure — the
  *  caller treats that as drift (probe) or as a run failure (runner). */
-export async function statClaudeBinary(resolvedPath: string): Promise<ClaudeBinaryIdentity> {
-  const st = await stat(resolvedPath);
-  if (!st.isFile()) throw new Error(`not a regular file: ${resolvedPath}`);
-  const sha256 = await sha256File(resolvedPath);
-  return { resolvedPath, dev: st.dev, ino: st.ino, mtimeMs: st.mtimeMs, size: st.size, sha256 };
+export async function statClaudeBinary(
+  resolvedPath: string,
+  options: ClaudeBinaryCheckOptions = {},
+): Promise<ClaudeBinaryIdentity> {
+  const timeout = AbortSignal.timeout(options.timeoutMs ?? CLAUDE_BINARY_HASH_TIMEOUT_MS);
+  const signal = options.signal === undefined ? timeout : AbortSignal.any([options.signal, timeout]);
+  return await withAbort(
+    async () => {
+      const st = await stat(resolvedPath);
+      if (!st.isFile()) throw new Error(`not a regular file: ${resolvedPath}`);
+      const sha256 = await sha256File(resolvedPath, signal);
+      return { resolvedPath, dev: st.dev, ino: st.ino, mtimeMs: st.mtimeMs, size: st.size, sha256 };
+    },
+    signal,
+  );
 }
 
 /** Resolve the configured binary to its realpath: an explicit path is
@@ -166,11 +203,11 @@ export async function probeClaudeBinary(
   envSource: NodeJS.ProcessEnv,
   timeoutMs: number = CLAUDE_PROBE_TIMEOUT_MS,
 ): Promise<ClaudeProbeResult> {
-  const { env } = buildAgentEnv(envSource);
-  // Resolve FIRST, then probe the RESOLVED path, pinning the identity BOTH
-  // before and after the probes (round-2 review P1): a binary swapped while
-  // its own --help output was being produced must NOT get pinned — the
-  // pinned file must be exactly the probed file.
+  const env = buildProbeEnv(envSource);
+  // Resolve first, then bind every individual probe to the same stat+hash
+  // identity before AND after its spawn. Probe children deliberately receive
+  // no credentials; the full agent env is reserved for a real Run after the
+  // runner performs its own immediate identity check.
   let resolvedPath: string;
   try {
     resolvedPath = await resolveClaudeBin(claudeBin, env.PATH);
@@ -180,15 +217,30 @@ export async function probeClaudeBinary(
       `cannot resolve claude binary \`${claudeBin}\`: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
-  let before: ClaudeBinaryIdentity;
+  let binary: ClaudeBinaryIdentity;
   try {
-    before = await statClaudeBinary(resolvedPath);
+    binary = await statClaudeBinary(resolvedPath, { timeoutMs });
   } catch (err) {
     throw new ClaudeProbeError(
       `cannot stat the resolved claude binary \`${resolvedPath}\`: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
+  const assertIdentity = async (stage: string): Promise<void> => {
+    let observed: ClaudeBinaryIdentity;
+    try {
+      observed = await statClaudeBinary(resolvedPath, { timeoutMs });
+    } catch (err) {
+      throw new ClaudeProbeError(
+        `cannot stat the resolved claude binary \`${resolvedPath}\`: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (!sameClaudeBinary(binary, observed)) {
+      throw new ClaudeProbeError(`claude binary \`${resolvedPath}\` changed ${stage} — refusing to pin it`);
+    }
+  };
   const runProbe = async (args: string[]): Promise<string> => {
+    const invocation = `\`${args.join(" ")}\``;
+    await assertIdentity(`before ${invocation}`);
     const result = await spawnWithTimeout({
       command: resolvedPath,
       args,
@@ -197,6 +249,7 @@ export async function probeClaudeBinary(
       timeoutMs,
       signal: new AbortController().signal,
     });
+    await assertIdentity(`during ${invocation}`);
     if (result.completion.kind !== "exited" || result.completion.exitCode !== 0) {
       const detail =
         result.completion.kind === "exited"
@@ -225,19 +278,6 @@ export async function probeClaudeBinary(
   const missing = REQUIRED_CLAUDE_FLAGS.filter((flag) => !helpHasFlag(helpOut, flag));
   if (missing.length > 0) {
     throw new ClaudeProbeError(`probe \`${claudeBin} --help\` is missing required flags: ${missing.join(", ")}`);
-  }
-
-  // Pin LAST, and only if the file is STILL the one the probes ran against.
-  let binary: ClaudeBinaryIdentity;
-  try {
-    binary = await statClaudeBinary(resolvedPath);
-  } catch (err) {
-    throw new ClaudeProbeError(
-      `cannot stat the resolved claude binary \`${resolvedPath}\`: ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-  if (!sameClaudeBinary(before, binary)) {
-    throw new ClaudeProbeError(`claude binary \`${resolvedPath}\` changed during the probe — refusing to pin it`);
   }
 
   return { version: version.join("."), binary };

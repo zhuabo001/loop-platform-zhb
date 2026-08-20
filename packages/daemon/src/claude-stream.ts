@@ -37,9 +37,11 @@
  *    lines are ignored EXCEPT a second result, which is the duplicate-result
  *    failure.
  *
- * This module does NOT redact: progress labels and extracted text are
- * verbatim child output until the ADAPTER scrubs them with redactSecrets
- * before they reach the runtime/report/log surface (plan §2.4).
+ * This module does NOT enforce the external trust boundary: progress labels
+ * and extracted text are verbatim child output. The ADAPTER replaces
+ * assistant/tool progress with fixed semantic labels and applies
+ * redactSecrets to terminal/report fields before anything reaches the
+ * runtime/report/log surface (plan §2.4).
  */
 
 export const MAX_LINE_BYTES = 1024 * 1024;
@@ -83,10 +85,15 @@ export type ClaudeStreamParse =
   | { ok: true; terminal: ClaudeTerminal }
   | { ok: false; reason: ClaudeStreamFailureReason; detail: string };
 
+export type ClaudeProgressKind = "assistant-text" | "tool-use" | "api-retry";
+
 export interface ClaudeStreamEvents {
   /** Fires synchronously per assistant text/tool_use block and per
-   *  api_retry, in stream order, with the child's VERBATIM text. */
-  onProgress?: (label: string) => void;
+   *  api_retry, in stream order. `label` is verbatim child text for assistant
+   *  and tool events; `kind` lets the production adapter replace that
+   *  untrusted content with a fixed semantic label before it crosses the
+   *  progress boundary. */
+  onProgress?: (label: string, kind: ClaudeProgressKind) => void;
 }
 
 export interface ClaudeStreamParser {
@@ -174,12 +181,9 @@ export function createClaudeStreamParser(events: ClaudeStreamEvents = {}): Claud
       return;
     }
     if (event.subtype === "api_retry") {
-      const parts: string[] = [];
-      if (typeof event.attempt === "number" && Number.isFinite(event.attempt)) parts.push(`attempt ${event.attempt}`);
-      if (typeof event.delay_ms === "number" && Number.isFinite(event.delay_ms)) {
-        parts.push(`delay ${event.delay_ms}ms`);
-      }
-      onProgress(parts.length > 0 ? `provider api retry (${parts.join(", ")})` : "provider api retry");
+      // attempt/delay are child-controlled fields. A fixed label preserves the
+      // useful state transition without turning progress into a data channel.
+      onProgress("provider api retry", "api-retry");
     }
     // Unknown system subtypes: ignored.
   }
@@ -192,10 +196,10 @@ export function createClaudeStreamParser(events: ClaudeStreamEvents = {}): Claud
     for (const block of content) {
       if (!isObject(block)) continue;
       if (block.type === "text") {
-        if (typeof block.text === "string" && block.text.trim() !== "") onProgress(block.text);
+        if (typeof block.text === "string" && block.text.trim() !== "") onProgress(block.text, "assistant-text");
       } else if (block.type === "tool_use") {
         if (typeof block.name !== "string" || block.name === "") continue;
-        onProgress(toolLabel(block.name, block.input));
+        onProgress(toolLabel(block.name, block.input), "tool-use");
       }
       // thinking, tool_result and future block kinds: ignored.
     }
