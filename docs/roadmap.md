@@ -101,11 +101,17 @@ claude-code 或 codex 选一：子进程 spawn、进程组 kill、timeout、env 
   - subprocess：一 spawn 一进程组；TERM → 5s → KILL；先到触发器定 kind；返回前 reap 残留孙进程；stdio 1 MiB 头尾各半 + 有序 chunk 回调。
   - env：allow-list 白名单（`LOOPZHB_*` 与云/CI 密钥天然排除）；secretValues 长度降序脱敏。
   - 边界：**不切换生产 Runner**（Fake Runner 保持，I6 守护）；jail 只选 cwd，不是运行时安全边界——Batch 3 的 OS sandbox 才是。
-- **Batch 3 — Claude Code adapter 与生产切换（Day 6–8）：未开始**（真实 Runner、fail-closed OS sandbox、stream-json 解析、runner 事件接入 progress）。
+- **Batch 3 — Claude Code adapter 与生产切换（Day 6–8）：已完成**（2026-08-20，分支 `feat/phase2-batch3`，ADR-006）
+  - Runner seam：`run(delivery, { signal, onProgress })`；runtime 拥有 progress sink（inFlight 门禁、去 NUL/单行/200 字符、每事件 step+1、reporting = lastStep+1 单调不回退）。
+  - adapter：固定 argv + fail-closed 动态 settings；只开放 `Bash`（内建 Read/Edit/Write 不在 OS sandbox 边界内）；sandbox 不可用即失败，禁止降级；`codex`/`grok` 固定 unsupported 不 spawn。
+  - stream-json 增量 parser：跨 chunk UTF-8、1 MiB 行上限、terminal result 恰好一次、数值字段卫生、内容无关的稳定失败。
+  - jail `revalidate` 关闭 resolve→spawn TOCTOU；scratch finally release，清理失败判 Run 失败。
+  - 生产切换：`prepareDaemon` = config → startup jail → Claude 探测（10s、≥2.1.219、flags 检查）→ client → Claude Runner → runtime；Fake Runner 退为测试 fixture。
+  - Issue #12 跨层 round-robin liveness 验收落地（L1–L2：窗口内零误回收 + 对照回收 + 静默后全量回收）；opt-in 真实 sandbox smoke 备妥（默认跳过）。
 
 ### 右移项
 
-- [ ] **跨层 round-robin liveness 验收**：[Issue #12](https://github.com/zhuabo001/loop-platform-zhb/issues/12)（Batch 1 代码评审测试缺口）。
+- [x] **跨层 round-robin liveness 验收**：[Issue #12](https://github.com/zhuabo001/loop-platform-zhb/issues/12)——修复与测试已随 Batch 3 落地（L1–L2），待复审核销后关闭。
 
 顺手收口：[Issue #10](https://github.com/zhuabo001/loop-platform-zhb/issues/10)
 （Day 8–10 二次审查右移项，不影响正确性）。
