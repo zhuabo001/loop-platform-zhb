@@ -233,6 +233,23 @@ describe("redactSecrets — encoded forms (review round-1 P1)", () => {
     expect(Buffer.byteLength(out, "utf8")).toBeLessThanOrEqual(20);
   });
 
+  it("E27: a boundary marker cannot reassemble a derived secret form", () => {
+    // The raw blockers force the first available marker to `%` unless marker
+    // selection also considers derived forms. Replacing X must not complete
+    // the percent encoding of the longer secret.
+    const input = "abcX20defg";
+    const out = redactSecrets(input, ["abc defg", "X", "!", "#", "$"]);
+    expect(out).not.toContain("abc%20defg");
+    expect(Buffer.byteLength(out, "utf8")).toBeLessThanOrEqual(Buffer.byteLength(input, "utf8"));
+  });
+
+  it("E28: exhausting every printable ASCII boundary fails closed", () => {
+    const everyPrintableAscii = Array.from({ length: 0x7e - 0x21 + 1 }, (_, index) =>
+      String.fromCharCode(0x21 + index),
+    ).join("");
+    expect(redactSecrets("otherwise safe output", [everyPrintableAscii])).toBe("");
+  });
+
   it("E19: separator-chunked forms are redacted — chunked base64 AND chunked raw (review round-2 P1)", () => {
     const secret = "sk-ant-api03-ExAmPlE_Secret-1234567890abcdef+/";
     const b64 = Buffer.from(secret, "utf8").toString("base64");
