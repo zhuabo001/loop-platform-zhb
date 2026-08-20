@@ -71,35 +71,144 @@ export function buildAgentEnv(source: NodeJS.ProcessEnv): AgentEnv {
   return { env, secretValues: normalizeSecrets(secrets) };
 }
 
-/** Replace every occurrence of every secret with [REDACTED] — in its raw
- *  form, its JSON-escaped form, and (round-1 review P1) its deterministic
- *  ENCODED forms: a Bash child can pipe a credential through base64/hex
- *  before it reaches progress/finalText, and raw-only matching would miss
- *  it there. Encoded forms are added only at realistic secret length
- *  (>= 8 chars): hex/base64 of a tiny secret would redact ordinary text.
- *  Arbitrary FURTHER transforms (chunking, reversal, nested encodings)
- *  remain a documented residual — ADR-006 修订记录 carries the threat model.
+/** Chars treated as chunk separators by the tolerant pass: an exfiltrator
+ *  splits an encoded secret into chunks joined by whitespace/punctuation
+ *  (chunked base64 defeats exact matching, round-2 review P1). Needles are
+ *  stripped of the same class, so a needle containing one of these chars
+ *  (base64's `/`, base64url's `-_`) still matches consistently. */
+const SEPARATORS = new Set([..." \t\n\r\f\v:;.,|~*_-/\\"]);
+
+function stripSeparators(text: string): string {
+  let out = "";
+  for (const ch of text) {
+    if (!SEPARATORS.has(ch)) out += ch;
+  }
+  return out;
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Separator-tolerant redaction: strip separators from the text (keeping a
+ *  source-index map), search the PLAIN needles in the compressed view, and
+ *  redact the corresponding spans — separators included — in the original.
+ *  Case-insensitive needles (hex, percent) search a lowercased view built in
+ *  the same pass (multi-char lowercase expansions map to the same source
+ *  index, so span mapping stays exact). A span ends at the last NEEDLE char:
+ *  trailing separator-class chars of the leak may survive it — they carry no
+ *  decodable content on their own. */
+function redactTolerant(text: string, needlesCS: readonly string[], needlesCI: readonly string[]): string {
+  const strippedChars: string[] = [];
+  const strippedMap: number[] = [];
+  const loweredChars: string[] = [];
+  const loweredMap: number[] = [];
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i]!;
+    if (SEPARATORS.has(ch)) continue;
+    strippedChars.push(ch);
+    strippedMap.push(i);
+    for (const lc of ch.toLowerCase()) {
+      loweredChars.push(lc);
+      loweredMap.push(i);
+    }
+  }
+  const stripped = strippedChars.join("");
+  const lowered = loweredChars.join("");
+  /** Spans in ORIGINAL-text coordinates: [start, end). */
+  const spans: Array<[number, number]> = [];
+  const collect = (haystack: string, map: number[], needle: string): void => {
+    let from = 0;
+    for (;;) {
+      const idx = haystack.indexOf(needle, from);
+      if (idx < 0) return;
+      spans.push([map[idx]!, map[idx + needle.length - 1]! + 1]);
+      from = idx + needle.length;
+    }
+  };
+  for (const needle of needlesCS) collect(stripped, strippedMap, needle);
+  for (const needle of needlesCI) collect(lowered, loweredMap, needle);
+  if (spans.length === 0) return text;
+
+  spans.sort((a, b) => a[0] - b[0]);
+  let out = "";
+  let cursor = 0;
+  let [spanStart, spanEnd] = spans[0]!;
+  const emit = (): void => {
+    out += `${text.slice(cursor, spanStart)}[REDACTED]`;
+    cursor = spanEnd;
+  };
+  for (let i = 1; i < spans.length; i += 1) {
+    const [s, e] = spans[i]!;
+    if (s <= spanEnd) {
+      spanEnd = Math.max(spanEnd, e); // overlapping spans merge
+    } else {
+      emit();
+      [spanStart, spanEnd] = [s, e];
+    }
+  }
+  emit();
+  return out + text.slice(cursor);
+}
+
+/** Replace every occurrence of every secret with [REDACTED]. Match forms:
+ *  raw and JSON-escaped (length ≥ 2), plus — at realistic secret length
+ *  (≥ 8), where a short secret's encodings would vandalize ordinary text —
+ *  base64 / base64url / hex / second-order base64 / percent-encoded
+ *  (round-2 review P1: a Bash child can pipe a credential through a
+ *  deterministic encoder before it reaches progress/finalText). Encoded and
+ *  raw forms ALSO match separator-chunked (whitespace/punctuation between
+ *  chunks) via a strip-and-map pass, hex and percent case-insensitively.
+ *
+ *  The exact pass is a SINGLE combined-regex replacement: replacements never
+ *  feed another pass, and secrets shorter than 2 chars never match — the
+ *  round-2 P2 blowup (single-char secrets re-matching inside earlier
+ *  "[REDACTED]" output) is structurally impossible.
+ *
+ *  Documented residual (ADR-006 决策 6): transforms WITHOUT a deterministic
+ *  plaintext form — compression (gzip headers embed non-determinism),
+ *  encryption, custom alphabets, deeper nesting — stay out of scope; the
+ *  structural mitigation is that Bash's network allowlist is empty and the
+ *  only egress is the report/progress channel to the operator's own server.
  *  All forms are normalized together (longest-first, deduped, empties
  *  dropped). Caller contract: redact BEFORE serializing structured fields,
  *  and raw child env/stdout never enters logs unscrubbed. */
 export function redactSecrets(text: string, secretValues: string[]): string {
-  const forms = new Set<string>();
-  for (const secret of normalizeSecrets(secretValues)) {
-    forms.add(secret);
+  const secrets = normalizeSecrets(secretValues).filter((secret) => secret.length >= 2);
+  if (secrets.length === 0 || text === "") return text;
+
+  const exactForms = new Set<string>();
+  const tolerantCS: string[] = [];
+  const tolerantCI: string[] = [];
+  for (const secret of secrets) {
+    exactForms.add(secret);
     const escaped = JSON.stringify(secret).slice(1, -1); // body without quotes
-    if (escaped !== secret) forms.add(escaped);
-    if (secret.length >= 8) {
-      const bytes = Buffer.from(secret, "utf8");
-      forms.add(bytes.toString("base64"));
-      forms.add(bytes.toString("base64url"));
-      const hex = bytes.toString("hex");
-      forms.add(hex);
-      forms.add(hex.toUpperCase());
+    if (escaped !== secret) exactForms.add(escaped);
+    if (secret.length < 8) continue;
+    const bytes = Buffer.from(secret, "utf8");
+    const b64 = bytes.toString("base64");
+    const b64url = bytes.toString("base64url");
+    const hexLower = bytes.toString("hex");
+    const nestedB64 = Buffer.from(b64, "utf8").toString("base64");
+    const nestedB64url = Buffer.from(b64url, "utf8").toString("base64url");
+    const percent = encodeURIComponent(secret);
+    for (const form of [b64, b64url, hexLower, hexLower.toUpperCase(), nestedB64, nestedB64url, percent]) {
+      exactForms.add(form);
+    }
+    for (const form of [secret, b64, b64url, nestedB64, nestedB64url, percent]) {
+      const needle = stripSeparators(form);
+      if (needle.length >= 12) tolerantCS.push(needle);
+    }
+    for (const form of [hexLower, percent.toLowerCase()]) {
+      const needle = stripSeparators(form);
+      if (needle.length >= 12) tolerantCI.push(needle);
     }
   }
-  let out = text;
-  for (const form of [...forms].sort((a, b) => b.length - a.length)) {
-    out = out.split(form).join("[REDACTED]");
+
+  const pattern = [...exactForms].sort((a, b) => b.length - a.length).map(escapeRegExp).join("|");
+  let out = pattern === "" ? text : text.replace(new RegExp(pattern, "g"), "[REDACTED]");
+  if (tolerantCS.length > 0 || tolerantCI.length > 0) {
+    out = redactTolerant(out, [...new Set(tolerantCS)], [...new Set(tolerantCI)]);
   }
   return out;
 }

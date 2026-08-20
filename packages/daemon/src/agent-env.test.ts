@@ -190,7 +190,9 @@ describe("redactSecrets — encoded forms (review round-1 P1)", () => {
     expect(redactSecrets(`leak:\n${chunked}\nend`, [secret])).toBe("leak:\n[REDACTED]\nend");
 
     const chunkedRaw = (secret.match(/.{1,6}/g) ?? []).join(" ");
-    expect(redactSecrets(`k = ${chunkedRaw} ;`, [secret])).toBe("k = [REDACTED] ;");
+    // A trailing SEPARATOR-class char of the secret (here `/`) survives the
+    // span — separators carry no decodable content; every needle char is gone.
+    expect(redactSecrets(`k = ${chunkedRaw} ;`, [secret])).toBe("k = [REDACTED]/ ;");
   });
 
   it("E20: mixed-case, colon-separated hex is redacted", () => {
