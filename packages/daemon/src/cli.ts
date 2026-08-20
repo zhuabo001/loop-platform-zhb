@@ -45,7 +45,7 @@ export const productionRunnerFactory: (deps: ClaudeRunnerDeps) => AgentRunner = 
  *  probe provably precedes the first poll (plan §2.2). */
 export async function prepareDaemon(config: DaemonConfig, envSource: NodeJS.ProcessEnv): Promise<DaemonRuntime> {
   const jail = await createStartupJail(config);
-  await probeClaudeBinary(config.claudeBin, envSource);
+  const probe = await probeClaudeBinary(config.claudeBin, envSource);
   const client = createMachineClient({
     baseUrl: config.serverUrl,
     machineCredential: config.machineCredential,
@@ -57,6 +57,9 @@ export async function prepareDaemon(config: DaemonConfig, envSource: NodeJS.Proc
       claudeBin: config.claudeBin,
       timeoutMs: config.agentTimeoutMs,
       envSource,
+      // The probe-pinned binary identity: every run re-verifies it before
+      // spawning (round-1 review P1).
+      probedBinary: probe.binary,
     }),
     identity: machineIdentity(),
     pollMs: config.pollMs,

@@ -161,7 +161,7 @@ describe("probeClaudeBinary", () => {
     const bin = path.join(dir, "path-claude");
     copyFileSync(FIXTURE, bin);
     chmodSync(bin, 0o755);
-    const result = await probeClaudeBinary("path-claude", { PATH: dir });
+    const result = await probeClaudeBinary("path-claude", { PATH: `${dir}:${path.dirname(process.execPath)}` });
     expect(result.version).toBe("2.1.227");
     expect(result.binary.resolvedPath).toBe(realpathSync(bin));
   });

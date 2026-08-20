@@ -35,6 +35,7 @@ import type { CostReport, Delivery } from "@loopzhb/protocol";
 import { buildAgentEnv, redactSecrets } from "./agent-env.js";
 import { createClaudeStreamParser, type ClaudeStreamParser } from "./claude-stream.js";
 import type { ResolvedWorkdir, WorkdirJail } from "./jail.js";
+import { sameClaudeBinary, statClaudeBinary, type ClaudeBinaryIdentity } from "./probe-claude.js";
 import type { AgentRunner, RunnerContext, RunnerReport } from "./runner.js";
 import { ERROR_CAP } from "./runtime.js";
 import type { SpawnResult } from "./subprocess.js";
@@ -46,6 +47,12 @@ export interface ClaudeRunnerDeps {
   timeoutMs: number;
   /** The daemon process env — filtered through the agent-env whitelist. */
   envSource: NodeJS.ProcessEnv;
+  /** The probe-pinned binary (production). When present the runner spawns the
+   *  RESOLVED path — never a PATH lookup — and re-stats it before every
+   *  spawn: a drifted/replaced/vanished binary fails the run WITHOUT spawning
+   *  (round-1 review P1). Absent only in tests, which spawn claudeBin
+   *  directly. */
+  probedBinary?: ClaudeBinaryIdentity;
 }
 
 /** The dynamic per-run settings (plan §2.3). allowRead/allowWrite are the
@@ -142,11 +149,27 @@ export function createClaudeRunner(deps: ClaudeRunnerDeps): AgentRunner {
         // NO spawn — the JailError propagates and fails the run.
         await deps.jail.revalidate(resolved);
 
+        // The probe-pinned binary (round-1 review P1): spawn the RESOLVED
+        // path, and only while it still IS the probed file — a post-probe
+        // replacement must never receive the agent credentials. The residual
+        // stat→execve window is userspace-irreducible (ADR-006 修订记录).
+        let command = deps.claudeBin;
+        if (deps.probedBinary !== undefined) {
+          const now = await statClaudeBinary(deps.probedBinary.resolvedPath).catch(() => null);
+          if (now === null || !sameClaudeBinary(deps.probedBinary, now)) {
+            return {
+              ok: false,
+              error: "claude binary changed since the startup probe — refusing to spawn (restart the daemon to re-probe)",
+            };
+          }
+          command = deps.probedBinary.resolvedPath;
+        }
+
         const parser = createClaudeStreamParser({
           onProgress: (label) => ctx.onProgress(redact(label)),
         });
         const spawned = await spawnWithTimeout({
-          command: deps.claudeBin,
+          command,
           args: buildClaudeArgs(delivery, settingsJson),
           cwd: resolved.cwd,
           env,
