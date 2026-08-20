@@ -52,12 +52,23 @@ export const RETRY_CAP_MS = 30_000;
 export const PROGRESS_SEND_CAP = 20;
 
 /** Runtime-owned activity steps (Phase 2 batch 1; batch 3's runner events
- *  continue the counter past 2). NON-DECREASING per run, incremented only on
- *  a state transition — a repeated heartbeat for the same state repeats the
- *  same step. */
+ *  continue the counter past STEP_STARTING, and `reporting result` lands at
+ *  last-step + 1 instead of a fixed value). NON-DECREASING per run,
+ *  incremented only on a state transition or an accepted runner event — a
+ *  repeated heartbeat for the same state repeats the same step. */
 export const STEP_QUEUED = 0;
 export const STEP_STARTING = 1;
+/** The reporting step when NO runner events fired (the batch-1 shape). With
+ *  runner events it is always lastStep + 1, i.e. ≥ STEP_REPORTING. */
 export const STEP_REPORTING = 2;
+
+/** Runner-event label hygiene (plan §2.1): NULs stripped, whitespace runs
+ *  collapsed to single spaces (one line), capped at 200 chars. */
+export const PROGRESS_LABEL_CAP = 200;
+
+export function sanitizeProgressLabel(label: string): string {
+  return label.replace(/\0/g, "").replace(/\s+/g, " ").trim().slice(0, PROGRESS_LABEL_CAP);
+}
 
 export interface PendingReport {
   runId: string;
@@ -294,15 +305,31 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
 
   async function pipeline(delivery: Delivery): Promise<void> {
     let report: RunnerReport;
+    /** The runtime-owned progress sink (plan §2.1): accepts events ONLY while
+     *  the run is inFlight — a callback that fires after the runner settled
+     *  lands past the finally's inFlight.delete and is ignored. Each accepted
+     *  event increments the run's step with its sanitized label; a label that
+     *  sanitizes to empty carries no information and costs no step. */
+    const onProgress = (label: string): void => {
+      if (!inFlight.has(delivery.runId)) return;
+      const current = activities.get(delivery.runId);
+      if (current === undefined) return;
+      const clean = sanitizeProgressLabel(label);
+      if (clean === "") return;
+      activities.set(delivery.runId, { step: current.step + 1, label: clean });
+    };
     try {
-      report = await deps.runner.run(delivery, signal);
+      report = await deps.runner.run(delivery, { signal, onProgress });
     } catch (err) {
       report = { ok: false, error: sanitizeRunnerError(err, [delivery.runToken, deps.machineCredential]) };
     } finally {
       inFlight.delete(delivery.runId);
     }
-    // The runner settled: the run now waits on report confirmation.
-    activities.set(delivery.runId, { step: STEP_REPORTING, label: "reporting result" });
+    // The runner settled: the run now waits on report confirmation — one more
+    // step past wherever the runner's events left it, so the step NEVER
+    // regresses even when events fired (batch 3: lastStep + 1, not a fixed 2).
+    const settled = activities.get(delivery.runId);
+    activities.set(delivery.runId, { step: (settled?.step ?? STEP_STARTING) + 1, label: "reporting result" });
     // runId is the orchestration layer's, ALWAYS — a Runner-supplied value
     // (only possible via a type lie) is overwritten.
     let body: SerializedReportRequest;
