@@ -25,6 +25,7 @@ import {
   type SerializedReportRequest,
 } from "./client.js";
 import type { AgentRunner, RunnerContext, RunnerReport } from "./runner.js";
+import { ProcessControlError } from "./subprocess.js";
 import {
   ERROR_CAP,
   FatalDaemonError,
@@ -319,6 +320,63 @@ describe("Runner failure synthesis", () => {
     expect(sanitizeRunnerError(new Error("x".repeat(5000)))).toHaveLength(ERROR_CAP);
     expect(sanitizeRunnerError("plain string")).toContain("plain string");
     expect(sanitizeRunnerError(new Error("   \0  "))).toBe("runner failed");
+  });
+});
+
+describe("R5: process-control failures escalate to daemon-fatal (review round-1 P1)", () => {
+  it("a ProcessControlError from the runner reports the owed failure AND goes fatal — the queue never starts", async () => {
+    const client = new StubClient();
+    const clock = manualSleep();
+    const { runner, calls } = captureRunner(() =>
+      Promise.reject(new ProcessControlError("process control failed: kill EPERM")),
+    );
+    const rt = createDaemonRuntime({
+      client,
+      runner,
+      identity: IDENTITY,
+      pollMs: 3000,
+      machineCredential: MACHINE_CRED,
+      sleep: clock.sleep,
+    });
+    client.pollQueue.push({ kind: "ok", deliveries: [delivery("run-1"), delivery("run-2")] });
+    await rt.pollOnce();
+    await rt.executionSettled();
+
+    // The owed terminal failure report WAS attempted before the abort…
+    expect(client.reports).toHaveLength(1);
+    const body = JSON.parse(client.reportJson[0]!) as { ok: boolean; error?: string };
+    expect(body.ok).toBe(false);
+    expect(body.error).toContain("process control failed");
+    // …the queued run NEVER started (a runaway child must never coexist with
+    // the next run)…
+    expect(calls.map((c) => c.delivery.runId)).toEqual(["run-1"]);
+    // …and the runtime is fatal from here on.
+    await expect(rt.pollOnce()).rejects.toThrow(FatalDaemonError);
+    await expect(rt.pollOnce()).rejects.toThrow(/process control failed/);
+  });
+
+  it("a generic runner rejection stays a per-run failure — capacity returns and the queue advances", async () => {
+    const client = new StubClient();
+    const clock = manualSleep();
+    let n = 0;
+    const { runner, calls } = captureRunner(() =>
+      (n += 1) === 1 ? Promise.reject(new Error("boom")) : Promise.resolve(OK_RUNNER),
+    );
+    const rt = createDaemonRuntime({
+      client,
+      runner,
+      identity: IDENTITY,
+      pollMs: 3000,
+      machineCredential: MACHINE_CRED,
+      sleep: clock.sleep,
+    });
+    client.pollQueue.push({ kind: "ok", deliveries: [delivery("run-1"), delivery("run-2")] });
+    await rt.pollOnce();
+    await rt.executionSettled();
+
+    expect(calls.map((c) => c.delivery.runId)).toEqual(["run-1", "run-2"]);
+    expect(client.reports).toHaveLength(2);
+    await rt.pollOnce(); // NO fatal — the daemon lives on
   });
 });
 
