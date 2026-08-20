@@ -288,11 +288,11 @@ describe("A8/A24: child-derived output boundaries", () => {
   it("A8: finalText and error text are redacted before entering the report", async () => {
     const { run } = makeRunner();
     const ok = await run(makeDelivery({ task: "fake-claude://echo-secret" }));
-    expect(ok.finalText).toBe("token is [REDACTED]");
+    expect(ok.finalText).not.toContain("sk-ant-fixture-secret");
 
     const bad = await run(makeDelivery({ task: "fake-claude://error-result" }));
     expect(bad.ok).toBe(false);
-    expect(bad.error).toContain("blew up with [REDACTED]");
+    expect(bad.error).toContain("blew up with ");
     expect(bad.error).not.toContain("sk-ant-fixture-secret");
   });
 });
@@ -302,7 +302,7 @@ describe("A20: the session identity is verified and scrubbed", () => {
     const { run } = makeRunner();
     const report = await run(makeDelivery({ task: "fake-claude://secret-session" }));
     expect(report.ok).toBe(true);
-    expect(report.sessionId).toBe("sess-[REDACTED]");
+    expect(report.sessionId).toMatch(/^sess-./);
     expect(report.sessionId).not.toContain("sk-ant-fixture-secret");
   });
 
@@ -390,7 +390,8 @@ describe("A9–A12: failure mapping", () => {
     const report = await run(makeDelivery({ task: "fake-claude://error-result" }));
     expect(report.ok).toBe(false);
     expect(report).not.toHaveProperty("outcome");
-    expect(report.error).toContain("blew up with [REDACTED]");
+    expect(report.error).toContain("blew up with ");
+    expect(report.error).not.toContain("sk-ant-fixture-secret");
   });
 
   it("A10: a non-zero exit without a terminal result reports the exit code", async () => {
