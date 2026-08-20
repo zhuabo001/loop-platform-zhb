@@ -10,9 +10,10 @@
  * review): resolve() validates the canonical path AT RESOLVE TIME. Between
  * resolve() and spawn() a hostile rename/symlink swap can redirect the cwd
  * outside the roots (TOCTOU) — Node's spawn cwd is a path string, so no
- * handle-based atomicity is available at this layer. Batch 3 MUST therefore
- * (a) re-validate the cwd immediately before spawning, and (b) treat the
- * fail-closed OS sandbox — not this module — as the real boundary.
+ * handle-based atomicity is available at this layer. Batch 3 closes the
+ * window with `revalidate()`: the adapter MUST revalidate the resolution
+ * immediately before spawning (and does — plan §2.2), and the fail-closed OS
+ * sandbox — not this module — remains the real runtime boundary.
  */
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
@@ -47,6 +48,12 @@ export interface WorkdirJail {
   /** Canonicalized (realpath'd, deduped) daemon roots — the intersection input. */
   readonly daemonRoots: readonly string[];
   resolve(input: ResolveWorkdirInput): Promise<ResolvedWorkdir>;
+  /** Pre-spawn re-validation (batch 3, plan §2.2): re-realpath/lstat the cwd
+   *  and every effective root and confirm nothing was renamed, deleted or
+   *  symlink-swapped since resolve(). Fail-closed: ANY drift throws a
+   *  JailError and the caller MUST NOT spawn. This narrows the resolve→spawn
+   *  TOCTOU window; the OS sandbox remains the runtime boundary. */
+  revalidate(resolved: ResolvedWorkdir): Promise<void>;
   release(resolved: ResolvedWorkdir): Promise<void>;
 }
 
@@ -166,26 +173,79 @@ export async function createWorkdirJail(config: {
       }
       return { cwd, effectiveRoots, scratchDir: null };
     },
+    async revalidate(resolved: ResolvedWorkdir): Promise<void> {
+      // Every effective root must still realpath to EXACTLY the canonical
+      // value recorded at resolve time and still be a directory — a root
+      // swapped for a symlink or renamed away would make the sandbox profile
+      // (derived from these paths) alias the wrong tree.
+      for (const root of resolved.effectiveRoots) {
+        let real: string;
+        try {
+          real = await fs.realpath(root);
+        } catch {
+          throw new JailError(`effective root vanished before spawn: ${JSON.stringify(root)}`);
+        }
+        if (real !== root) {
+          throw new JailError(`effective root moved before spawn: ${JSON.stringify(root)} → ${JSON.stringify(real)}`);
+        }
+        if (!(await fs.stat(real)).isDirectory()) {
+          throw new JailError(`effective root is no longer a directory: ${JSON.stringify(root)}`);
+        }
+      }
+      // The cwd must still resolve to itself and still be a directory.
+      let cwd: string;
+      try {
+        cwd = await fs.realpath(resolved.cwd);
+      } catch {
+        throw new JailError(`workdir vanished before spawn: ${JSON.stringify(resolved.cwd)}`);
+      }
+      if (cwd !== resolved.cwd) {
+        throw new JailError(`workdir moved before spawn: ${JSON.stringify(resolved.cwd)} → ${JSON.stringify(cwd)}`);
+      }
+      if (!(await fs.stat(cwd)).isDirectory()) {
+        throw new JailError(`workdir is no longer a directory: ${JSON.stringify(resolved.cwd)}`);
+      }
+      if (resolved.scratchDir !== null) {
+        // A scratch resolution's cwd IS the scratch dir — re-check the same
+        // fail-closed identity release() uses (minted here, direct child of
+        // this jail's scratch root, lstat not a symlink).
+        if (resolved.cwd !== resolved.scratchDir) {
+          throw new JailError("scratch resolution drifted: cwd is no longer the minted scratch dir");
+        }
+        await assertScratchIdentity(resolved.scratchDir, "before spawn");
+      } else if (!resolved.effectiveRoots.some((root) => isWithinOrEqual(root, cwd))) {
+        // A workdir resolution must still sit inside the just-re-verified
+        // effective roots.
+        throw new JailError(`workdir escaped the effective roots before spawn: ${JSON.stringify(resolved.cwd)}`);
+      }
+    },
     async release(resolved: ResolvedWorkdir): Promise<void> {
       const dir = resolved.scratchDir;
       if (dir === null) return; // a non-scratch resolution owns nothing
       // Fail-closed (J23–J25): only delete a directory THIS jail minted, that
       // is STILL a direct child of this jail's scratch root, and that has
       // not been swapped for a symlink. lstat (not stat) sees the swap.
-      if (!mintedScratch.has(dir) || path.dirname(dir) !== scratchRoot) {
-        throw new JailError(`refusing to release a path this jail did not mint here: ${JSON.stringify(dir)}`);
-      }
-      let stat;
-      try {
-        stat = await fs.lstat(dir);
-      } catch {
-        throw new JailError(`scratch dir vanished before release: ${JSON.stringify(dir)}`);
-      }
-      if (stat.isSymbolicLink() || !stat.isDirectory()) {
-        throw new JailError(`scratch dir was replaced (symlink or non-directory) — deleting nothing: ${JSON.stringify(dir)}`);
-      }
+      await assertScratchIdentity(dir, "before release");
       await fs.rm(dir, { recursive: true });
       mintedScratch.delete(dir);
     },
   };
+
+  /** The shared scratch identity check: minted by THIS jail, still a direct
+   *  child of THIS jail's scratch root, and still a real directory (a symlink
+   *  or non-directory swap fails). Used by both revalidate() and release(). */
+  async function assertScratchIdentity(dir: string, when: string): Promise<void> {
+    if (!mintedScratch.has(dir) || path.dirname(dir) !== scratchRoot) {
+      throw new JailError(`refusing a scratch path this jail did not mint here: ${JSON.stringify(dir)}`);
+    }
+    let stat;
+    try {
+      stat = await fs.lstat(dir);
+    } catch {
+      throw new JailError(`scratch dir vanished ${when}: ${JSON.stringify(dir)}`);
+    }
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new JailError(`scratch dir was replaced (symlink or non-directory) ${when}: ${JSON.stringify(dir)}`);
+    }
+  }
 }
