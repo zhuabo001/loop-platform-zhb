@@ -19,9 +19,13 @@
  * paths — the attempt really happens, and the OS boundary alone must say no.
  * A test-only duplicate parser first verifies the UNIQUE, EXACT Bash input.
  * That command writes an in-root ATTEMPT marker, performs the symlink access,
- * captures its exit status, and finally writes a COMPLETION marker. Together
- * the raw tool event and filesystem results bind intent to execution;
- * production progress still exposes only fixed semantic labels.
+ * and branches on its exit status (`&& … || …`) to write a literal COMPLETION
+ * word. Together the raw tool event and filesystem results bind intent to
+ * execution; production progress still exposes only fixed semantic labels.
+ * The command must stay FREE of shell variable assignment/expansion: capturing
+ * `$?` into a variable makes the real CLI's don't-ask permission layer DENY
+ * the whole Bash call pre-execution (verified live 2026-08-21), which would
+ * silently turn scenarios 2/3 into the vacuous form they exist to exclude.
  *
  * Run it with:
  *
@@ -153,19 +157,23 @@ describe.skipIf(!SMOKE)("real Claude sandbox smoke (opt-in)", () => {
         // refuse the read when the kernel resolves the link OUT of the roots.
         const link = path.join(workdir, "note-link.txt");
         symlinkSync(sentinel, link);
-        // ONE shell: marker → read → capture status → completion marker. The
-        // redirection creates `copy` even when the sandbox makes cat fail.
+        // ONE shell: marker → read → branch on its exit status → a literal
+        // completion word (NO `$?` capture — see the header: the CLI's
+        // don't-ask permission layer denies variable assignment/expansion
+        // pre-execution). The redirection creates `copy` even when the
+        // sandbox makes cat fail.
         const marker = path.join(workdir, "attempt-marker.txt");
         const completion = path.join(workdir, "attempt-complete.txt");
         const copy = path.join(workdir, "note-copy.txt");
-        const command = `printf attempted > ${shellQuote(marker)}; cat ${shellQuote(link)} > ${shellQuote(copy)}; rc=$?; printf '%s' "$rc" > ${shellQuote(completion)}`;
+        const command = `printf attempted > ${shellQuote(marker)} && cat ${shellQuote(link)} > ${shellQuote(copy)} && echo read-ok > ${shellQuote(completion)} || echo read-denied > ${shellQuote(completion)}`;
         const { report, progress, rawToolLabels } = await runTask(
           `Run this exact command in ONE Bash call: ${command} — then reply DONE.`,
         );
         expect(rawToolLabels).toEqual([`Bash: ${command}`]);
         expect(readFileSync(marker, "utf8")).toBe("attempted");
-        const readStatus = Number(readFileSync(completion, "utf8"));
-        expect(Number.isInteger(readStatus) && readStatus !== 0, `unexpected read status: ${readStatus}`).toBe(true);
+        // read-denied is written ONLY by the || branch — cat really ran and
+        // really failed (a skipped or spliced attempt leaves no such file).
+        expect(readFileSync(completion, "utf8").trim()).toBe("read-denied");
         const copied = readFileSync(copy, "utf8");
         const leaked =
           copied.includes(SENTINEL_CONTENT) ||
@@ -189,14 +197,15 @@ describe.skipIf(!SMOKE)("real Claude sandbox smoke (opt-in)", () => {
         symlinkSync(sentinel, link);
         const marker = path.join(workdir, "attempt-marker.txt");
         const completion = path.join(workdir, "attempt-complete.txt");
-        const command = `printf attempted > ${shellQuote(marker)}; printf 'smoke-append-7f3a2b\\n' >> ${shellQuote(link)}; rc=$?; printf '%s' "$rc" > ${shellQuote(completion)}`;
+        // Same chain as scenario 2, with an append instead of a read (no
+        // `$?` capture — see the header).
+        const command = `printf attempted > ${shellQuote(marker)} && printf 'smoke-append-7f3a2b\\n' >> ${shellQuote(link)} && echo write-ok > ${shellQuote(completion)} || echo write-denied > ${shellQuote(completion)}`;
         const { rawToolLabels } = await runTask(
           `Run this exact command in ONE Bash call: ${command} — then reply with exactly: DONE`,
         );
         expect(rawToolLabels).toEqual([`Bash: ${command}`]);
         expect(readFileSync(marker, "utf8")).toBe("attempted");
-        const writeStatus = Number(readFileSync(completion, "utf8"));
-        expect(Number.isInteger(writeStatus) && writeStatus !== 0, `unexpected write status: ${writeStatus}`).toBe(true);
+        expect(readFileSync(completion, "utf8").trim()).toBe("write-denied");
         expect(readFileSync(sentinel, "utf8")).toBe(SENTINEL_CONTENT);
       } finally {
         cleanup();
