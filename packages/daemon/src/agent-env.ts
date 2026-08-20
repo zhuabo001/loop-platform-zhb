@@ -106,17 +106,19 @@ function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** Pick a one-byte ASCII boundary which cannot be part of any secret or be
- *  stripped by the tolerant pass. It prevents fragments/adjacent markers from
- *  joining into another secret without growing UTF-8 wire bytes. Exhausting
- *  the safe ASCII set is handled fail-closed by dropping the whole text. */
-function chooseBoundaryMarker(secrets: readonly string[]): string | null {
+/** Pick a one-byte ASCII boundary which cannot be part of any protected raw
+ *  or derived form, even under case-insensitive matching, or be stripped by
+ *  the tolerant pass. It prevents fragments/adjacent markers from joining
+ *  into another form without growing UTF-8 wire bytes. Exhausting the safe
+ *  ASCII set is handled fail-closed by dropping the whole text. */
+function chooseBoundaryMarker(protectedForms: readonly string[]): string | null {
   for (let codePoint = 0x21; codePoint <= 0x7e; codePoint += 1) {
     const candidate = String.fromCharCode(codePoint);
+    const foldedCandidate = candidate.toLowerCase();
     if (
       candidate !== '"' && // JSON would escape it and grow the wire body
       !SEPARATORS.has(candidate) &&
-      secrets.every((secret) => !secret.includes(candidate))
+      protectedForms.every((form) => !form.toLowerCase().includes(foldedCandidate))
     ) {
       return candidate;
     }
@@ -190,7 +192,7 @@ function redactTolerant(
   return out + text.slice(cursor);
 }
 
-/** Replace every occurrence of every non-empty secret with [REDACTED]. Match
+/** Replace every occurrence of every non-empty secret with a boundary marker. Match
  *  forms: raw and JSON-escaped, plus — at realistic secret length
  *  (≥ 8), where a short secret's encodings would vandalize ordinary text —
  *  base64 / base64url / hex / second-order base64 / percent-encoded
@@ -200,9 +202,10 @@ function redactTolerant(
  *  chunks) via a strip-and-map pass, hex and percent case-insensitively.
  *
  *  The exact pass is a SINGLE combined-regex replacement: replacements never
- *  feed another pass. Every match becomes the same secret-absent, non-
- *  separator, one-byte ASCII boundary. Thus UTF-8 output never grows and
- *  fragments (including adjacent replacements) cannot rejoin.
+ *  feed another pass. Every match becomes the same protected-form-absent,
+ *  non-separator, one-byte ASCII boundary. Thus UTF-8 output never grows and
+ *  fragments (including adjacent replacements) cannot rejoin a raw or
+ *  supported derived form.
  *
  *  Documented residual (ADR-006 决策 6): transforms WITHOUT a deterministic
  *  plaintext form — compression (gzip headers embed non-determinism),
@@ -244,7 +247,7 @@ export function redactSecrets(text: string, secretValues: string[]): string {
     }
   }
 
-  const marker = chooseBoundaryMarker(secrets);
+  const marker = chooseBoundaryMarker([...exactForms, ...tolerantCS, ...tolerantCI]);
   if (marker === null) return "";
 
   const pattern = [...exactForms].sort((a, b) => b.length - a.length).map(escapeRegExp).join("|");

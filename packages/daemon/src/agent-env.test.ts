@@ -129,7 +129,7 @@ describe("secretValues and redactSecrets", () => {
   it("E11: an empty-string secret never participates in replacement", () => {
     const { secretValues } = buildAgentEnv({ ANTHROPIC_API_KEY: "" });
     expect(secretValues).toEqual([]);
-    // replacing "" would inject [REDACTED] between every character — pinned shut
+    // replacing "" would inject a redaction marker between every character — pinned shut
     expect(redactSecrets("hello world", ["", ""])).toBe("hello world");
   });
 
