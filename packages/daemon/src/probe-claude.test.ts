@@ -11,7 +11,8 @@
  * dependence). The 10s probe timeout is fixed in production; tests shrink it
  * through the documented test-only seam.
  */
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -168,6 +169,34 @@ describe("probeClaudeBinary", () => {
 
   it("PR13: a bare name unresolvable on the agent PATH rejects", async () => {
     await expect(probeClaudeBinary("no-such-claude-anywhere", { PATH: base })).rejects.toThrow(ClaudeProbeError);
+  });
+
+  it("PR14: the identity carries a content hash, and a binary that changes DURING the probe is rejected (review round-2 P1)", async () => {
+    // The hash pins the CONTENT: same-inode, same-size, restored-mtime
+    // overwrites still differ.
+    const result = await probeClaudeBinary(FIXTURE, ENV);
+    const expected = createHash("sha256").update(readFileSync(FIXTURE)).digest("hex");
+    expect(result.binary.sha256).toBe(expected);
+
+    // A binary that rewrites itself while --help is being probed must NOT be
+    // pinned: the post-probe identity must match the pre-probe one.
+    const body = [
+      'const fs = require("node:fs");',
+      'if (process.argv.includes("--version")) { process.stdout.write("2.1.227\\n"); process.exit(0); }',
+      "if (process.argv.includes(\"--help\")) {",
+      '  fs.appendFileSync(process.argv[1], "\\n// tampered mid-probe\\n");',
+      '  process.stdout.write("--output-format\\n--verbose\\n--safe-mode\\n--setting-sources\\n--disable-slash-commands\\n--no-chrome\\n--no-session-persistence\\n--tools\\n--permission-mode\\n--prompt-suggestions\\n--settings\\n--model\\n--append-system-prompt\\n");',
+      "  process.exit(0);",
+      "}",
+      "process.exitCode = 64;",
+    ].join("\n");
+    const bin = makeFakeBin("self-swapping-claude", body);
+    const err = await probeClaudeBinary(bin, ENV).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ClaudeProbeError);
+    expect((err as Error).message).toContain("changed");
   });
 
   it("PR8: the production constants are the pinned contract (10s, 2.1.219, the batch's flag set)", () => {

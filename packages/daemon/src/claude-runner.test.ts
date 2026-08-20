@@ -27,6 +27,7 @@ import type { Delivery } from "@loopzhb/protocol";
 import { createClaudeRunner, type ClaudeRunnerDeps } from "./claude-runner.js";
 import { JailError, createWorkdirJail, type ResolvedWorkdir, type WorkdirJail } from "./jail.js";
 import type { ClaudeBinaryIdentity } from "./probe-claude.js";
+import { statClaudeBinary } from "./probe-claude.js";
 import type { AgentRunner, RunnerContext, RunnerReport } from "./runner.js";
 import { ProcessControlError } from "./subprocess.js";
 
@@ -307,16 +308,13 @@ describe("A20: the session identity is verified and scrubbed", () => {
 });
 
 describe("A21: the probe-pinned binary identity (review round-1 P1)", () => {
-  const identityOf = (target: string): ClaudeBinaryIdentity => {
-    const st = statSync(target);
-    return { resolvedPath: target, dev: st.dev, ino: st.ino, mtimeMs: st.mtimeMs, size: st.size };
-  };
+  const identityOf = async (target: string): Promise<ClaudeBinaryIdentity> => await statClaudeBinary(target);
 
   it("spawns the probe-RESOLVED path, never a PATH lookup", async () => {
     const { run } = makeRunner({
       // Would ENOENT if spawned — proof the resolved path is what executes.
       claudeBin: "/nonexistent/definitely-not-claude",
-      probedBinary: identityOf(FIXTURE),
+      probedBinary: await identityOf(FIXTURE),
     });
     const report = await run(makeDelivery());
     expect(report.ok).toBe(true);
@@ -324,7 +322,7 @@ describe("A21: the probe-pinned binary identity (review round-1 P1)", () => {
 
   it("a drifted identity fails the run WITHOUT spawning", async () => {
     const { run } = makeRunner({
-      probedBinary: { ...identityOf(FIXTURE), size: statSync(FIXTURE).size + 1 },
+      probedBinary: { ...(await identityOf(FIXTURE)), size: statSync(FIXTURE).size + 1 },
     });
     const report = await run(makeDelivery());
     expect(report.ok).toBe(false);
@@ -336,8 +334,30 @@ describe("A21: the probe-pinned binary identity (review round-1 P1)", () => {
     const local = path.join(base, "claude-copy");
     copyFileSync(FIXTURE, local);
     chmodSync(local, 0o755);
-    const { run } = makeRunner({ claudeBin: local, probedBinary: identityOf(local) });
+    const { run } = makeRunner({ claudeBin: local, probedBinary: await identityOf(local) });
     writeFileSync(local, "#!/usr/bin/env node\n// tampered\n");
+    const report = await run(makeDelivery());
+    expect(report.ok).toBe(false);
+    expect(report.error).toContain("binary");
+    expect(existsSync(path.join(workdir, SIDECAR))).toBe(false);
+  });
+
+  it("A23: a same-size overwrite with ALL stat fields intact is still caught by the content hash (review round-2 P1)", async () => {
+    const local = path.join(base, "claude-copy2");
+    copyFileSync(FIXTURE, local);
+    chmodSync(local, 0o755);
+    const pinned = await identityOf(local);
+    // Same-length in-place overwrite: the dev/ino/mtimeMs/size quadruple is
+    // (re)stat-able to identical values — only the CONTENT differs. The pin
+    // below keeps the post-tamper stat fields with the PRE-tamper hash, so
+    // every stat field matches by construction and only the hash can catch it.
+    const original = readFileSync(local, "utf8");
+    const tampered = original.replace("fake final text", "FAKE FINAL TEXT");
+    expect(tampered).not.toBe(original);
+    expect(tampered.length).toBe(original.length);
+    writeFileSync(local, tampered);
+    const after = await statClaudeBinary(local);
+    const { run } = makeRunner({ claudeBin: local, probedBinary: { ...after, sha256: pinned.sha256 } });
     const report = await run(makeDelivery());
     expect(report.ok).toBe(false);
     expect(report.error).toContain("binary");
@@ -347,7 +367,7 @@ describe("A21: the probe-pinned binary identity (review round-1 P1)", () => {
   it("a vanished binary fails the run", async () => {
     const gone = path.join(base, "gone-claude");
     const { run } = makeRunner({
-      probedBinary: { resolvedPath: gone, dev: 1, ino: 1, mtimeMs: 1, size: 1 },
+      probedBinary: { resolvedPath: gone, dev: 1, ino: 1, mtimeMs: 1, size: 1, sha256: "0".repeat(64) },
     });
     const report = await run(makeDelivery());
     expect(report.ok).toBe(false);
