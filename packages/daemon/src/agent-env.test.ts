@@ -174,4 +174,46 @@ describe("redactSecrets — encoded forms (review round-1 P1)", () => {
     const out = redactSecrets("4162 stays, Ab redacted", ["Ab"]);
     expect(out).toBe("4162 stays, [REDACTED] redacted");
   });
+
+  it("E18: single-char 'secrets' never match, and replacement never feeds another pass (review round-2 P2)", () => {
+    // The round-2 DoS repro: 1000×"R" with R/E/D/A/C/T secrets used to
+    // re-match inside earlier [REDACTED] replacements and balloon ~649×.
+    expect(redactSecrets("R".repeat(1000), ["R", "E", "D", "A", "C", "T"])).toBe("R".repeat(1000));
+    // Bounded one-pass replacement: every occurrence redacts exactly once.
+    expect(redactSecrets("Ab".repeat(1000), ["Ab"])).toBe("[REDACTED]".repeat(1000));
+  });
+
+  it("E19: separator-chunked forms are redacted — chunked base64 AND chunked raw (review round-2 P1)", () => {
+    const secret = "sk-ant-api03-ExAmPlE_Secret-1234567890abcdef+/";
+    const b64 = Buffer.from(secret, "utf8").toString("base64");
+    const chunked = (b64.match(/.{1,4}/g) ?? []).join(" \n");
+    expect(redactSecrets(`leak:\n${chunked}\nend`, [secret])).toBe("leak:\n[REDACTED]\nend");
+
+    const chunkedRaw = (secret.match(/.{1,6}/g) ?? []).join(" ");
+    expect(redactSecrets(`k = ${chunkedRaw} ;`, [secret])).toBe("k = [REDACTED] ;");
+  });
+
+  it("E20: mixed-case, colon-separated hex is redacted", () => {
+    const secret = "sk-ant-api03-ExAmPlE_Secret-1234567890abcdef+/";
+    const hex = Buffer.from(secret, "utf8").toString("hex");
+    const mixed = hex
+      .split("")
+      .map((c, i) => (i % 2 === 0 ? c.toUpperCase() : c))
+      .join("");
+    const separated = (mixed.match(/.{1,2}/g) ?? []).join(":");
+    expect(redactSecrets(`k=${separated};`, [secret])).toBe("k=[REDACTED];");
+  });
+
+  it("E21: second-order base64 (base64 of the base64) is redacted", () => {
+    const secret = "sk-ant-api03-ExAmPlE_Secret-1234567890abcdef+/";
+    const nested = Buffer.from(Buffer.from(secret, "utf8").toString("base64"), "utf8").toString("base64");
+    expect(redactSecrets(`x ${nested} y`, [secret])).toBe("x [REDACTED] y");
+  });
+
+  it("E22: percent-encoded forms are redacted", () => {
+    const secret = 'sk-ant key"with\\special\nchars!';
+    const pct = encodeURIComponent(secret);
+    expect(pct).not.toBe(secret); // the fixture secret must actually exercise encoding
+    expect(redactSecrets(`t=${pct}`, [secret])).toBe("t=[REDACTED]");
+  });
 });
