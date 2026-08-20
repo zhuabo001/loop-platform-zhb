@@ -28,6 +28,7 @@ import { createClaudeRunner, type ClaudeRunnerDeps } from "./claude-runner.js";
 import { JailError, createWorkdirJail, type ResolvedWorkdir, type WorkdirJail } from "./jail.js";
 import type { ClaudeBinaryIdentity } from "./probe-claude.js";
 import type { AgentRunner, RunnerContext, RunnerReport } from "./runner.js";
+import { ProcessControlError } from "./subprocess.js";
 
 const FIXTURE = fileURLToPath(new URL("../test-fixtures/fake-claude.mjs", import.meta.url));
 const SIDECAR = ".fake-claude-session.json";
@@ -440,6 +441,36 @@ describe("A15–A16: the scratch lifecycle", () => {
     const d = makeDelivery({ task: "fake-claude://self-swap-scratch" });
     d.loop = { ...d.loop, workdir: null };
     await expect(run(d)).rejects.toThrow(JailError);
+  });
+});
+
+describe("A22: a scratch-release failure never masks a process-control failure (review round-2 P1)", () => {
+  it("the ProcessControlError survives a throwing release — the fatal signal reaches the runtime", async () => {
+    const resolution: ResolvedWorkdir = { cwd: workdir, effectiveRoots: [realpathSync(root)], scratchDir: null };
+    const stub: WorkdirJail = {
+      daemonRoots: [realpathSync(root)],
+      resolve: () => Promise.resolve(resolution),
+      revalidate: () => Promise.resolve(),
+      release: () => Promise.reject(new JailError("scratch identity broken")),
+    };
+    const runner = createClaudeRunner({
+      jail: stub,
+      claudeBin: FIXTURE,
+      timeoutMs: 10_000,
+      envSource: ENV_SOURCE,
+      // TEST-ONLY seam: a real child cannot fail its own kill on demand, so
+      // the combined-failure path is driven through an injected spawn.
+      spawnImpl: () => Promise.reject(new ProcessControlError("process control failed: kill EPERM")),
+    });
+    const err = await runner
+      .run(makeDelivery(), { signal: new AbortController().signal, onProgress: () => {} })
+      .then(
+        () => null,
+        (e: unknown) => e,
+      );
+    expect(err).toBeInstanceOf(ProcessControlError);
+    expect((err as Error).message).toContain("EPERM");
+    expect((err as Error).message).toContain("release"); // the cleanup failure rides along, not over
   });
 });
 
