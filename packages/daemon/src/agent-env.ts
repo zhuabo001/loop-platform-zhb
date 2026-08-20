@@ -71,10 +71,14 @@ export function buildAgentEnv(source: NodeJS.ProcessEnv): AgentEnv {
   return { env, secretValues: normalizeSecrets(secrets) };
 }
 
-/** Replace every occurrence of every secret with [REDACTED] — in BOTH its
- *  raw and its JSON-escaped form: a secret containing newlines, quotes or
- *  backslashes appears ESCAPED inside serialized JSON (structured logs,
- *  report bodies), and a raw-only replace would miss it there (round-1 P2).
+/** Replace every occurrence of every secret with [REDACTED] — in its raw
+ *  form, its JSON-escaped form, and (round-1 review P1) its deterministic
+ *  ENCODED forms: a Bash child can pipe a credential through base64/hex
+ *  before it reaches progress/finalText, and raw-only matching would miss
+ *  it there. Encoded forms are added only at realistic secret length
+ *  (>= 8 chars): hex/base64 of a tiny secret would redact ordinary text.
+ *  Arbitrary FURTHER transforms (chunking, reversal, nested encodings)
+ *  remain a documented residual — ADR-006 修订记录 carries the threat model.
  *  All forms are normalized together (longest-first, deduped, empties
  *  dropped). Caller contract: redact BEFORE serializing structured fields,
  *  and raw child env/stdout never enters logs unscrubbed. */
@@ -84,6 +88,14 @@ export function redactSecrets(text: string, secretValues: string[]): string {
     forms.add(secret);
     const escaped = JSON.stringify(secret).slice(1, -1); // body without quotes
     if (escaped !== secret) forms.add(escaped);
+    if (secret.length >= 8) {
+      const bytes = Buffer.from(secret, "utf8");
+      forms.add(bytes.toString("base64"));
+      forms.add(bytes.toString("base64url"));
+      const hex = bytes.toString("hex");
+      forms.add(hex);
+      forms.add(hex.toUpperCase());
+    }
   }
   let out = text;
   for (const form of [...forms].sort((a, b) => b.length - a.length)) {
