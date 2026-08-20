@@ -98,6 +98,51 @@ describe("probeClaudeBinary", () => {
     expect(Date.now() - started).toBeLessThan(5000);
   });
 
+  it("PR9: flag detection is token-exact — lookalike names never satisfy the probe (review round-1 P2)", async () => {
+    // Every required flag appears ONLY as a lookalike (--flag-removed).
+    // Substring matching would wave this through; token matching must not.
+    const lookalikes = REQUIRED_CLAUDE_FLAGS.map((flag) => `  ${flag}-removed`).join("\n");
+    const bin = makeFakeBin(
+      "lookalike-claude",
+      `if (process.argv.includes("--version")) { process.stdout.write("2.1.227\\n"); process.exit(0); }
+       process.stdout.write(${JSON.stringify(`usage: fake\n${lookalikes}\n`)});`,
+    );
+    const err = await probeClaudeBinary(bin, {}).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ClaudeProbeError);
+    expect((err as Error).message).toContain("--safe-mode");
+    expect((err as Error).message).toContain("--settings");
+  });
+
+  it("PR10: real help typography still matches — `--flag=value`, comma-separated aliases, backticks", async () => {
+    const help = [
+      "usage: fake [options]",
+      "  --output-format <format>",
+      "  --verbose, -v",
+      "  --safe-mode=true",
+      "  --setting-sources <sources>",
+      "  --disable-slash-commands",
+      "  --no-chrome",
+      "  --no-session-persistence",
+      "  --tools <tools...>",
+      "  --permission-mode <mode>",
+      "  --prompt-suggestions [value]",
+      "  `--settings` <file-or-json>",
+      "  --model <model>",
+      "  --append-system-prompt <prompt>",
+      "",
+    ].join("\n");
+    const bin = makeFakeBin(
+      "typographic-claude",
+      `if (process.argv.includes("--version")) { process.stdout.write("2.1.227\\n"); process.exit(0); }
+       process.stdout.write(${JSON.stringify(help)});`,
+    );
+    const result = await probeClaudeBinary(bin, ENV);
+    expect(result.version).toBe("2.1.227");
+  });
+
   it("PR8: the production constants are the pinned contract (10s, 2.1.219, the batch's flag set)", () => {
     expect(CLAUDE_PROBE_TIMEOUT_MS).toBe(10_000);
     expect(MIN_CLAUDE_VERSION).toBe("2.1.219");
