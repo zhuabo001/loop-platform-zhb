@@ -138,11 +138,30 @@ describe("spawnWithTimeout — termination triggers", () => {
   });
 
   it("S6: a SIGTERM-ignoring child is SIGKILLed after the grace window", async () => {
+    // Readiness handshake (round-2 flake fix): the fixture prints "ready"
+    // only AFTER its SIGTERM handler is installed — a fixed 150ms timeout
+    // could fire first under parallel load and kill the child by SIGTERM.
+    // Aborting on the ready line drives the SAME TERM → grace → KILL
+    // machinery, deterministically; the 30s timeout is a pure backstop.
+    const ctl = new AbortController();
+    let sawReady = false;
     const result = await spawnWithTimeout(
-      opts({ args: [FIXTURE, "ignore-term", "30000"], timeoutMs: 150, graceMs: 100 }),
+      opts({
+        args: [FIXTURE, "ignore-term", "30000"],
+        timeoutMs: 30_000,
+        graceMs: 100,
+        signal: ctl.signal,
+        onStdout: (chunk) => {
+          if (!sawReady && Buffer.from(chunk).toString("utf8").includes("ready")) {
+            sawReady = true;
+            ctl.abort();
+          }
+        },
+      }),
     );
-    expect(result.completion).toEqual({ kind: "timed-out", finalSignal: "SIGKILL" });
-    expect(result.durationMs).toBeLessThan(2500);
+    expect(sawReady).toBe(true);
+    expect(result.completion).toEqual({ kind: "aborted", finalSignal: "SIGKILL" });
+    expect(result.durationMs).toBeLessThan(5000);
   });
 
   it("S7: aborting mid-execution returns aborted and reaps the group", async () => {
