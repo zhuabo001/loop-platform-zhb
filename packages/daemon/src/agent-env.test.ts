@@ -5,7 +5,7 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { buildAgentEnv, redactSecrets } from "./agent-env.js";
+import { buildAgentEnv, buildProbeEnv, redactSecrets } from "./agent-env.js";
 
 describe("buildAgentEnv — whitelist", () => {
   it("E1: forwards system vars PATH/HOME/LANG/TMPDIR", () => {
@@ -80,6 +80,27 @@ describe("buildAgentEnv — whitelist", () => {
     const { env } = buildAgentEnv({ EDITOR: "vim", MY_CUSTOM: "x", npm_config_cache: "/x", RUN_TOKEN: "rt_x" });
     expect(env).toEqual({});
   });
+
+  it("E23: startup probes receive no credential-bearing env values", () => {
+    expect(
+      buildProbeEnv({
+        PATH: "/usr/bin",
+        HOME: "/home/x",
+        LANG: "C",
+        CLAUDE_CONFIG_DIR: "/home/x/.claude",
+        ANTHROPIC_API_KEY: "sk-ant-secret",
+        ANTHROPIC_BASE_URL: "https://api.anthropic.com",
+        CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
+        HTTPS_PROXY: "https://user:pass@proxy.example",
+        NO_PROXY: "localhost",
+      }),
+    ).toEqual({
+      PATH: "/usr/bin",
+      HOME: "/home/x",
+      LANG: "C",
+      CLAUDE_CONFIG_DIR: "/home/x/.claude",
+    });
+  });
 });
 
 describe("secretValues and redactSecrets", () => {
@@ -114,7 +135,7 @@ describe("secretValues and redactSecrets", () => {
 
   it("E12: overlapping secrets redact longest-first (no partial leftovers)", () => {
     const out = redactSecrets("token=sk-abcdef", ["sk-abc", "sk-abcdef"]);
-    expect(out).toBe("token=[REDACTED]");
+    expect(out).toBe("token=");
   });
 
   it("E13: every secret in a multi-secret text is redacted, duplicates included", () => {
@@ -172,15 +193,22 @@ describe("redactSecrets — encoded forms (review round-1 P1)", () => {
     // hex("Ab") === "4162": redacting encoded forms of a 2-char secret would
     // eat ordinary text. The raw form still redacts.
     const out = redactSecrets("4162 stays, Ab redacted", ["Ab"]);
-    expect(out).toBe("4162 stays, [REDACTED] redacted");
+    expect(out).toBe("4162 stays,  redacted");
   });
 
-  it("E18: single-char 'secrets' never match, and replacement never feeds another pass (review round-2 P2)", () => {
-    // The round-2 DoS repro: 1000×"R" with R/E/D/A/C/T secrets used to
-    // re-match inside earlier [REDACTED] replacements and balloon ~649×.
-    expect(redactSecrets("R".repeat(1000), ["R", "E", "D", "A", "C", "T"])).toBe("R".repeat(1000));
-    // Bounded one-pass replacement: every occurrence redacts exactly once.
-    expect(redactSecrets("Ab".repeat(1000), ["Ab"])).toBe("[REDACTED]".repeat(1000));
+  it("E18: single-char secrets redact in one bounded pass without replacement re-entry (review round-3 P2)", () => {
+    // The round-2 DoS repro used R/E/D/A/C/T secrets to re-match inside
+    // earlier [REDACTED] replacements and balloon ~649×. A combined one-pass
+    // replacement must still redact those values without reprocessing its own
+    // output. Short matches are deleted (never expanded), while every
+    // non-empty secret still participates in redaction.
+    expect(redactSecrets("RR", ["R", "E", "D", "A", "C", "T"])).toBe("");
+    // The same no-growth invariant applies to every sub-marker-length secret.
+    expect(redactSecrets("Ab".repeat(1000), ["Ab"])).toBe("");
+  });
+
+  it("E24: one-character secrets can only shrink output, never amplify it past a wire cap", () => {
+    expect(redactSecrets("R".repeat(1024 * 1024), ["R"])).toBe("");
   });
 
   it("E19: separator-chunked forms are redacted — chunked base64 AND chunked raw (review round-2 P1)", () => {

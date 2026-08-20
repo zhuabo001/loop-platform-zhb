@@ -261,19 +261,28 @@ describe("A5–A6: outcome mapping and the success report", () => {
   });
 });
 
-describe("A7–A8: redaction of child-derived text", () => {
-  it("A7: progress labels flow through onProgress, redacted (env secrets AND run token)", async () => {
+describe("A8/A24: child-derived output boundaries", () => {
+  it("A24: production progress exposes semantic events, never child-controlled text", async () => {
     const { run, progress } = makeRunner();
     const d = makeDelivery({ task: "fake-claude://progress-secret" });
     await run(d);
-    expect(progress).toEqual(["using [REDACTED]"]);
+    expect(progress).toEqual(["claude response"]);
     expect(progress.join("\n")).not.toContain("sk-ant-fixture-secret");
 
-    // The run token is redacted too: a label embedding it never leaks it.
-    const { run: run2, progress: progress2 } = makeRunner();
-    const d2 = makeDelivery({ task: "fake-claude://progress-secret", runToken: "rk_adapter_token" });
-    await run2(d2);
-    expect(progress2.join("\n")).not.toContain(d2.runToken);
+    // An encoded credential split across event boundaries is not recoverable:
+    // neither fragment is forwarded at all. Per-event text redaction cannot
+    // provide that guarantee because each half is harmless in isolation.
+    const split = makeRunner();
+    await split.run(makeDelivery({ task: "fake-claude://split-progress-secret" }));
+    expect(split.progress).toEqual(["claude response", "claude response"]);
+
+    const normal = makeRunner();
+    await normal.run(makeDelivery({ task: "fake-claude://ok" }));
+    expect(normal.progress).toEqual(["claude response", "running Bash"]);
+
+    const retry = makeRunner();
+    await retry.run(makeDelivery({ task: "fake-claude://api-retry" }));
+    expect(retry.progress).toEqual(["provider api retry", "claude response", "running Bash"]);
   });
 
   it("A8: finalText and error text are redacted before entering the report", async () => {

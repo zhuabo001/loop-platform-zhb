@@ -142,17 +142,21 @@ describe("spawnWithTimeout — termination triggers", () => {
     // only AFTER its SIGTERM handler is installed — a fixed 150ms timeout
     // could fire first under parallel load and kill the child by SIGTERM.
     // Aborting on the ready line drives the SAME TERM → grace → KILL
-    // machinery, deterministically; the 30s timeout is a pure backstop.
+    // machinery deterministically; the timeout is a pure backstop. The
+    // fixture deliberately splits "ready" across writes, so detection must
+    // accumulate stream chunks instead of trusting pipe read boundaries.
     const ctl = new AbortController();
     let sawReady = false;
+    let readiness = "";
     const result = await spawnWithTimeout(
       opts({
-        args: [FIXTURE, "ignore-term", "30000"],
-        timeoutMs: 30_000,
+        args: [FIXTURE, "ignore-term-split-ready", "30000"],
+        timeoutMs: 10_000,
         graceMs: 100,
         signal: ctl.signal,
         onStdout: (chunk) => {
-          if (!sawReady && Buffer.from(chunk).toString("utf8").includes("ready")) {
+          readiness = `${readiness}${Buffer.from(chunk).toString("utf8")}`.slice(-32);
+          if (!sawReady && readiness.includes("ready")) {
             sawReady = true;
             ctl.abort();
           }

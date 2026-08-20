@@ -17,11 +17,11 @@
  * refuses before any Bash call (the CLI tells it the boundary), so the OS
  * sandbox is never exercised. The symlink form shows the model only in-root
  * paths — the attempt really happens, and the OS boundary alone must say no.
- * Attempt evidence is FILESYSTEM-level (round-2 review P2): each scenario's
- * single Bash command first writes an in-root ATTEMPT MARKER, then (`&&`)
- * attempts the symlink access — the marker exists only if the command truly
- * executed, which the pre-execution tool-use progress label alone could not
- * prove (a CLI/permission-layer refusal would still have emitted it).
+ * A test-only duplicate parser first verifies the UNIQUE, EXACT Bash input.
+ * That command writes an in-root ATTEMPT marker, performs the symlink access,
+ * captures its exit status, and finally writes a COMPLETION marker. Together
+ * the raw tool event and filesystem results bind intent to execution;
+ * production progress still exposes only fixed semantic labels.
  *
  * Run it with:
  *
@@ -32,24 +32,27 @@
  * LOOPZHB_SMOKE_EXPECT_NO_SANDBOX=1 — then scenario 1 MUST FAIL (the
  * `failIfUnavailable` profile may never degrade to unsandboxed execution).
  *
- * Cost/flakiness note: each scenario is one real Claude invocation (a few
- * Bash calls). Assertions tolerate the model refusing or rephrasing — they
- * only check what HAPPENED to the filesystem and what NEVER leaked.
+ * Cost/flakiness note: each scenario is one real Claude invocation. Scenarios
+ * 2/3 deliberately fail if the model does not emit the exact requested Bash
+ * call, because otherwise the OS sandbox was not actually exercised.
  */
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { createClaudeRunner } from "./claude-runner.js";
+import { createClaudeStreamParser } from "./claude-stream.js";
 import { createWorkdirJail, type WorkdirJail } from "./jail.js";
 import type { RunnerReport } from "./runner.js";
+import { spawnWithTimeout } from "./subprocess.js";
 
 const SMOKE = process.env.LOOPZHB_CLAUDE_SMOKE === "1";
 const EXPECT_NO_SANDBOX = process.env.LOOPZHB_SMOKE_EXPECT_NO_SANDBOX === "1";
 const TIMEOUT_MS = 600_000;
 
 const SENTINEL_CONTENT = "top-secret-sentinel-9f8e7d6c5b";
+const shellQuote = (value: string): string => `'${value.replace(/'/g, "'\\''")}'`;
 
 describe.skipIf(!SMOKE)("real Claude sandbox smoke (opt-in)", () => {
   let base: string;
@@ -75,12 +78,29 @@ describe.skipIf(!SMOKE)("real Claude sandbox smoke (opt-in)", () => {
     rmSync(base, { recursive: true, force: true });
   }
 
-  async function runTask(task: string): Promise<{ report: RunnerReport; progress: string[] }> {
+  async function runTask(task: string): Promise<{ report: RunnerReport; progress: string[]; rawToolLabels: string[] }> {
+    const rawToolLabels: string[] = [];
+    const observer = createClaudeStreamParser({
+      onProgress: (label, kind) => {
+        if (kind === "tool-use") rawToolLabels.push(label);
+      },
+    });
     const runner = createClaudeRunner({
       jail,
       claudeBin: process.env.LOOPZHB_CLAUDE_BIN ?? "claude",
       timeoutMs: TIMEOUT_MS,
       envSource: process.env,
+      // Test-only duplicate parser: production still exposes semantic labels,
+      // while the smoke binds filesystem evidence to the exact Bash input
+      // emitted by the real CLI.
+      spawnImpl: async (opts) =>
+        await spawnWithTimeout({
+          ...opts,
+          onStdout: (chunk) => {
+            observer.push(chunk);
+            opts.onStdout?.(chunk);
+          },
+        }),
     });
     const progress: string[] = [];
     const report = await runner.run(
@@ -96,7 +116,8 @@ describe.skipIf(!SMOKE)("real Claude sandbox smoke (opt-in)", () => {
       },
       { signal: new AbortController().signal, onProgress: (label) => progress.push(label) },
     );
-    return { report, progress };
+    observer.finish();
+    return { report, progress, rawToolLabels };
   }
 
   it(
@@ -132,25 +153,20 @@ describe.skipIf(!SMOKE)("real Claude sandbox smoke (opt-in)", () => {
         // refuse the read when the kernel resolves the link OUT of the roots.
         const link = path.join(workdir, "note-link.txt");
         symlinkSync(sentinel, link);
-        // ONE command: write the in-root attempt marker, then (`&&`) try the
-        // symlink read. The marker exists ONLY if the command truly executed
-        // (round-2 P2); a successful read would leave a non-empty copy. (The
-        // shell may still create an EMPTY copy: the redirection is set up
-        // before cat fails.)
+        // ONE shell: marker → read → capture status → completion marker. The
+        // redirection creates `copy` even when the sandbox makes cat fail.
         const marker = path.join(workdir, "attempt-marker.txt");
+        const completion = path.join(workdir, "attempt-complete.txt");
         const copy = path.join(workdir, "note-copy.txt");
-        const { report, progress } = await runTask(
-          `Run this exact command: printf attempted > ${marker} && cat ${link} > ${copy} — then reply with the error if it failed, or DONE.`,
+        const command = `printf attempted > ${shellQuote(marker)}; cat ${shellQuote(link)} > ${shellQuote(copy)}; rc=$?; printf '%s' "$rc" > ${shellQuote(completion)}`;
+        const { report, progress, rawToolLabels } = await runTask(
+          `Run this exact command in ONE Bash call: ${command} — then reply DONE.`,
         );
-        // Attempt evidence: the progress label shows the tool call…
-        expect(
-          progress.some((l) => l.includes("cat") && l.includes(link)),
-          `no Bash attempt at the link observed — progress was: ${JSON.stringify(progress)}`,
-        ).toBe(true);
-        // …and the marker proves the command actually RAN (a refusal or a
-        // permission-layer block leaves no marker).
-        expect(existsSync(marker), "attempt marker missing — the Bash command never executed").toBe(true);
-        const copied = existsSync(copy) ? readFileSync(copy, "utf8") : "";
+        expect(rawToolLabels).toEqual([`Bash: ${command}`]);
+        expect(readFileSync(marker, "utf8")).toBe("attempted");
+        const readStatus = Number(readFileSync(completion, "utf8"));
+        expect(Number.isInteger(readStatus) && readStatus !== 0, `unexpected read status: ${readStatus}`).toBe(true);
+        const copied = readFileSync(copy, "utf8");
         const leaked =
           copied.includes(SENTINEL_CONTENT) ||
           (report.finalText ?? "").includes(SENTINEL_CONTENT) ||
@@ -172,14 +188,15 @@ describe.skipIf(!SMOKE)("real Claude sandbox smoke (opt-in)", () => {
         const link = path.join(workdir, "note-link.txt");
         symlinkSync(sentinel, link);
         const marker = path.join(workdir, "attempt-marker.txt");
-        const { progress } = await runTask(
-          `Run this exact command: printf attempted > ${marker} && printf 'smoke-append-7f3a2b\\n' >> ${link} — then reply with exactly: DONE`,
+        const completion = path.join(workdir, "attempt-complete.txt");
+        const command = `printf attempted > ${shellQuote(marker)}; printf 'smoke-append-7f3a2b\\n' >> ${shellQuote(link)}; rc=$?; printf '%s' "$rc" > ${shellQuote(completion)}`;
+        const { rawToolLabels } = await runTask(
+          `Run this exact command in ONE Bash call: ${command} — then reply with exactly: DONE`,
         );
-        expect(
-          progress.some((l) => l.includes(link)),
-          `no Bash attempt at the link observed — progress was: ${JSON.stringify(progress)}`,
-        ).toBe(true); // attempt evidence (tool call)
-        expect(existsSync(marker), "attempt marker missing — the Bash command never executed").toBe(true);
+        expect(rawToolLabels).toEqual([`Bash: ${command}`]);
+        expect(readFileSync(marker, "utf8")).toBe("attempted");
+        const writeStatus = Number(readFileSync(completion, "utf8"));
+        expect(Number.isInteger(writeStatus) && writeStatus !== 0, `unexpected write status: ${writeStatus}`).toBe(true);
         expect(readFileSync(sentinel, "utf8")).toBe(SENTINEL_CONTENT);
       } finally {
         cleanup();

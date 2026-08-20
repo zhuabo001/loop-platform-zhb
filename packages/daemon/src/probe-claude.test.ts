@@ -12,18 +12,32 @@
  * through the documented test-only seam.
  */
 import { createHash } from "node:crypto";
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  truncateSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
+  CLAUDE_BINARY_HASH_TIMEOUT_MS,
   CLAUDE_PROBE_TIMEOUT_MS,
   ClaudeProbeError,
   MIN_CLAUDE_VERSION,
   REQUIRED_CLAUDE_FLAGS,
   probeClaudeBinary,
+  statClaudeBinary,
 } from "./probe-claude.js";
 
 const FIXTURE = fileURLToPath(new URL("../test-fixtures/fake-claude.mjs", import.meta.url));
@@ -144,16 +158,12 @@ describe("probeClaudeBinary", () => {
     expect(result.version).toBe("2.1.227");
   });
 
-  it("PR11: the probe pins the binary identity — realpath + dev/ino/mtime/size (review round-1 P1)", async () => {
+  it("PR11: the probe pins the resolved executable identity", async () => {
     const result = await probeClaudeBinary(FIXTURE, ENV);
     const st = statSync(FIXTURE);
     expect(result.binary.resolvedPath).toBe(realpathSync(FIXTURE));
-    expect(result.binary).toMatchObject({
-      dev: st.dev,
-      ino: st.ino,
-      size: st.size,
-      mtimeMs: st.mtimeMs,
-    });
+    expect(result.binary.sha256).toBe(createHash("sha256").update(readFileSync(FIXTURE)).digest("hex"));
+    expect(result.binary).toMatchObject({ dev: st.dev, ino: st.ino, size: st.size, mtimeMs: st.mtimeMs });
   });
 
   it("PR12: a bare binary name resolves through the AGENT env PATH (the same env the probes ran under)", async () => {
@@ -199,8 +209,78 @@ describe("probeClaudeBinary", () => {
     expect((err as Error).message).toContain("changed");
   });
 
-  it("PR8: the production constants are the pinned contract (10s, 2.1.219, the batch's flag set)", () => {
+  it("PR15: identity is checked after each probe, so a version→help path swap is rejected", async () => {
+    const target = path.join(base, "switching-claude");
+    const backup = path.join(base, "original-claude");
+    const substitute = path.join(base, "substitute-claude");
+    const stampSeconds = 1_700_000_000;
+    const completeHelp = `${REQUIRED_CLAUDE_FLAGS.join("\n")}\n`;
+
+    // A proves only --version, then puts B at the configured path. B proves
+    // --help and restores A (including mtime) before exiting. A path-based
+    // before/after check sees A both times and incorrectly accepts the pair.
+    writeFileSync(
+      target,
+      `#!${process.execPath}\n` +
+        `const fs=require("node:fs");\n` +
+        `if(process.argv.includes("--version")){fs.copyFileSync(${JSON.stringify(substitute)},${JSON.stringify(target)});fs.chmodSync(${JSON.stringify(target)},0o755);fs.utimesSync(${JSON.stringify(target)},${stampSeconds},${stampSeconds});process.stdout.write("2.1.227\\n");process.exit(0);}\n` +
+        `process.stdout.write("--output-format\\n");\n`,
+      { mode: 0o755 },
+    );
+    copyFileSync(target, backup);
+    writeFileSync(
+      substitute,
+      `#!${process.execPath}\n` +
+        `const fs=require("node:fs");\n` +
+        `if(process.argv.includes("--help")){fs.copyFileSync(${JSON.stringify(backup)},${JSON.stringify(target)});fs.chmodSync(${JSON.stringify(target)},0o755);fs.utimesSync(${JSON.stringify(target)},${stampSeconds},${stampSeconds});process.stdout.write(${JSON.stringify(completeHelp)});process.exit(0);}\n` +
+        `process.exitCode=64;\n`,
+      { mode: 0o755 },
+    );
+    utimesSync(target, stampSeconds, stampSeconds);
+
+    await expect(probeClaudeBinary(target, ENV)).rejects.toThrow(/changed during `--version`/);
+  });
+
+  it("PR16: probe children never receive provider, OAuth, or proxy credentials", async () => {
+    const observed = path.join(base, "probe-env.json");
+    const help = `${REQUIRED_CLAUDE_FLAGS.join("\n")}\n`;
+    const bin = makeFakeBin(
+      "env-claude",
+      `const fs=require("node:fs");
+       fs.writeFileSync(${JSON.stringify(observed)}, JSON.stringify(process.env));
+       process.stdout.write(process.argv.includes("--version") ? "2.1.227\\n" : ${JSON.stringify(help)});`,
+    );
+    await probeClaudeBinary(bin, {
+      PATH: ENV.PATH,
+      HOME: "/home/test",
+      CLAUDE_CONFIG_DIR: "/home/test/.claude",
+      ANTHROPIC_API_KEY: "sk-ant-secret",
+      CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
+      HTTPS_PROXY: "https://user:pass@proxy.example",
+    });
+    const childEnv = JSON.parse(readFileSync(observed, "utf8")) as Record<string, string>;
+    expect(childEnv).toMatchObject({ PATH: ENV.PATH, HOME: "/home/test", CLAUDE_CONFIG_DIR: "/home/test/.claude" });
+    expect(childEnv).not.toHaveProperty("ANTHROPIC_API_KEY");
+    expect(childEnv).not.toHaveProperty("CLAUDE_CODE_OAUTH_TOKEN");
+    expect(childEnv).not.toHaveProperty("HTTPS_PROXY");
+  });
+
+  it("PR17: identity hashing has an independent deadline", async () => {
+    const large = path.join(base, "large-claude");
+    writeFileSync(large, "", { mode: 0o755 });
+    truncateSync(large, 256 * 1024 * 1024);
+    await expect(statClaudeBinary(large, { timeoutMs: 1 })).rejects.toThrow();
+  });
+
+  it("PR18: identity hashing observes an already-aborted Run signal", async () => {
+    const ctl = new AbortController();
+    ctl.abort();
+    await expect(statClaudeBinary(FIXTURE, { signal: ctl.signal })).rejects.toThrow();
+  });
+
+  it("PR8: the production constants are the pinned contract (10s deadlines, 2.1.219, flags)", () => {
     expect(CLAUDE_PROBE_TIMEOUT_MS).toBe(10_000);
+    expect(CLAUDE_BINARY_HASH_TIMEOUT_MS).toBe(10_000);
     expect(MIN_CLAUDE_VERSION).toBe("2.1.219");
     expect(REQUIRED_CLAUDE_FLAGS).toEqual([
       "--output-format",

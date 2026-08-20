@@ -16,6 +16,7 @@
  *   ok               init + text + tool_use + success result with full usage
  *   echo-secret      success result embedding $ANTHROPIC_API_KEY (redaction pin)
  *   progress-secret  an assistant text block embedding $ANTHROPIC_API_KEY
+ *   split-progress-secret  base64 credential split across two progress events
  *   error-result     is_error terminal (text embeds the key), exit 1
  *   big-error        is_error terminal with a 10KB result text (error cap pin)
  *   exit3            no output at all, exit code 3
@@ -106,6 +107,20 @@ switch (scenario) {
     break;
   case "progress-secret":
     line({ type: "assistant", message: { content: [{ type: "text", text: `using ${key}` }] } });
+    line({ type: "result", subtype: "success", is_error: false, result: "done" });
+    break;
+  case "split-progress-secret": {
+    const encoded = Buffer.from(key, "utf8").toString("base64");
+    const cut = Math.floor(encoded.length / 2);
+    line({ type: "assistant", message: { content: [{ type: "text", text: encoded.slice(0, cut) }] } });
+    line({ type: "assistant", message: { content: [{ type: "text", text: encoded.slice(cut) }] } });
+    line({ type: "result", subtype: "success", is_error: false, result: "done" });
+    break;
+  }
+  case "api-retry":
+    line({ type: "system", subtype: "api_retry", attempt: 999999, delay_ms: 123456 });
+    line({ type: "assistant", message: { content: [{ type: "text", text: "working on it" }] } });
+    line({ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command: "echo hi" } }] } });
     line({ type: "result", subtype: "success", is_error: false, result: "done" });
     break;
   case "error-result":

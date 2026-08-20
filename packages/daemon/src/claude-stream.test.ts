@@ -179,11 +179,7 @@ describe("P7: api_retry becomes a provider-retry progress label", () => {
     ];
     parser.push(enc(`${lines.join("\n")}\n`));
     expect(parser.finish().ok).toBe(true);
-    expect(progress).toEqual([
-      "provider api retry (attempt 2, delay 500ms)",
-      "provider api retry",
-      "provider api retry",
-    ]);
+    expect(progress).toEqual(["provider api retry", "provider api retry", "provider api retry"]);
   });
 });
 
