@@ -14,10 +14,11 @@
  *    only when finite, non-negative (and integral where the wire schema
  *    requires integers) — invalid values drop their OWN field only;
  *  - failure modes are stable and content-free: malformed JSON, a line over
- *    1 MiB, a duplicate result and a missing result are distinct reasons, and
- *    the failure detail NEVER quotes the offending line (it may carry
- *    secrets). A parse failure throws from push() (the subprocess layer
- *    terminates the group on a throwing consumer) AND is returned by finish().
+ *    1 MiB, a duplicate result, a missing result and an init/result
+ *    session_id conflict are distinct reasons, and the failure detail NEVER
+ *    quotes the offending line (it may carry secrets). A parse failure throws
+ *    from push() (the subprocess layer terminates the group on a throwing
+ *    consumer) AND is returned by finish().
  */
 import { describe, expect, it } from "vitest";
 

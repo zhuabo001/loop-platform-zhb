@@ -19,9 +19,9 @@
  *  - user/project/local settings sources are disabled (`--setting-sources
  *    ""`, `--safe-mode`), hooks and memory are off, permission mode is
  *    pinned to `dontAsk` (never bypass);
- *  - every child-derived text (progress labels, finalText, error narrative)
- *    is redacted with the env secret values AND the run token BEFORE it
- *    reaches the runtime/report surface;
+ *  - every child-derived text (progress labels, finalText, error narrative,
+ *    the session id) is redacted with the env secret values AND the run token
+ *    BEFORE it reaches the runtime/report surface;
  *  - jail.revalidate re-checks the resolution immediately before spawn —
  *    a drifted cwd/root/scratch means NO spawn (S1–S10).
  *
@@ -201,9 +201,11 @@ function reportFromSpawn(
     if (terminal.finalText !== null && terminal.finalText !== "") {
       report.finalText = redact(terminal.finalText);
     }
-    // The session id falls back to the init capture when the terminal lacks it.
+    // The session id falls back to the init capture when the terminal lacks
+    // it. It is child-controlled text like any other — redact before it
+    // enters the report (round-1 review P1).
     const sessionId = terminal.sessionId ?? parser.initSessionId;
-    if (sessionId !== null) report.sessionId = sessionId;
+    if (sessionId !== null) report.sessionId = redact(sessionId);
     const cost: CostReport = {};
     if (terminal.costUsd !== null) cost.usd = terminal.costUsd;
     if (terminal.inputTokens !== null) cost.inputTokens = terminal.inputTokens;

@@ -26,15 +26,16 @@
  *    fields the wire schema declares int (costReportSchema) — an invalid
  *    value drops its OWN field only, never the parse.
  *  - FAILURES are stable and content-free: malformed JSON (or valid JSON that
- *    is not an event object), an overlong line, a duplicate result and a
- *    missing result are four distinct reasons whose detail carries a line
- *    NUMBER but NEVER line content (a line may embed secrets). A failure
- *    discovered by push() throws ClaudeStreamError — spawnWithTimeout turns a
- *    throwing consumer into consumer-error and terminates the process group
- *    immediately — and is ALSO returned by finish(); the failure state is
- *    sticky (later pushes keep throwing the same reason). After a terminal
- *    result the tail is tolerant: trailing lines are ignored EXCEPT a second
- *    result, which is the duplicate-result failure.
+ *    is not an event object), an overlong line, a duplicate result, a missing
+ *    result and an init/result session_id CONFLICT are five distinct reasons
+ *    whose detail carries a line NUMBER but NEVER line content (a line may
+ *    embed secrets). A failure discovered by push() throws ClaudeStreamError —
+ *    spawnWithTimeout turns a throwing consumer into consumer-error and
+ *    terminates the process group immediately — and is ALSO returned by
+ *    finish(); the failure state is sticky (later pushes keep throwing the
+ *    same reason). After a terminal result the tail is tolerant: trailing
+ *    lines are ignored EXCEPT a second result, which is the duplicate-result
+ *    failure.
  *
  * This module does NOT redact: progress labels and extracted text are
  * verbatim child output until the ADAPTER scrubs them with redactSecrets
@@ -43,7 +44,12 @@
 
 export const MAX_LINE_BYTES = 1024 * 1024;
 
-export type ClaudeStreamFailureReason = "malformed-json" | "line-too-long" | "duplicate-result" | "missing-result";
+export type ClaudeStreamFailureReason =
+  | "malformed-json"
+  | "line-too-long"
+  | "duplicate-result"
+  | "missing-result"
+  | "session-id-conflict";
 
 export class ClaudeStreamError extends Error {
   readonly reason: ClaudeStreamFailureReason;
@@ -210,6 +216,14 @@ export function createClaudeStreamParser(events: ClaudeStreamEvents = {}): Claud
     if (typeof subtype !== "string" || subtype === "" || typeof isError !== "boolean") {
       fail("malformed-json", `line ${linesProcessed}: the result event lacks a valid subtype/is_error`);
     }
+    const sessionId = typeof event.session_id === "string" && event.session_id !== "" ? event.session_id : null;
+    // Session identity (round-1 review): one real CLI invocation has exactly
+    // ONE session, so an init/result disagreement means the stream is
+    // anomalous — fail closed rather than let a Report point at the wrong
+    // transcript. The detail quotes NEITHER id (content-free).
+    if (initSessionId !== null && sessionId !== null && sessionId !== initSessionId) {
+      fail("session-id-conflict", `line ${linesProcessed}: the result session_id conflicts with the init session`);
+    }
     terminalSeen = true;
     const success = subtype === "success" && isError === false;
     const usage = isObject(event.usage) ? event.usage : {};
@@ -217,7 +231,7 @@ export function createClaudeStreamParser(events: ClaudeStreamEvents = {}): Claud
       success,
       subtype,
       finalText: success && typeof event.result === "string" ? event.result : null,
-      sessionId: typeof event.session_id === "string" && event.session_id !== "" ? event.session_id : null,
+      sessionId,
       costUsd: finiteNonNegative(event.total_cost_usd),
       inputTokens: intNonNegative(usage.input_tokens),
       outputTokens: intNonNegative(usage.output_tokens),
