@@ -106,20 +106,20 @@ function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-const DISPLAY_REDACTION_MARKER = "[REDACTED]";
-
-/** Pick a one-code-unit boundary which cannot be part of any secret. It
- *  prevents two fragments from joining into another secret without growing
- *  the output. Exhausting the private-use range is handled fail-closed by the
- *  caller (drop the whole text). */
+/** Pick a one-byte ASCII boundary which cannot be part of any secret or be
+ *  stripped by the tolerant pass. It prevents fragments/adjacent markers from
+ *  joining into another secret without growing UTF-8 wire bytes. Exhausting
+ *  the safe ASCII set is handled fail-closed by dropping the whole text. */
 function chooseBoundaryMarker(secrets: readonly string[]): string | null {
-  for (const codePoint of [0x2588, 0x25a0, 0x25c6, 0x25cf, 0x00a4, 0xfffd]) {
+  for (let codePoint = 0x21; codePoint <= 0x7e; codePoint += 1) {
     const candidate = String.fromCharCode(codePoint);
-    if (secrets.every((secret) => !secret.includes(candidate))) return candidate;
-  }
-  for (let codePoint = 0xe000; codePoint <= 0xf8ff; codePoint += 1) {
-    const candidate = String.fromCharCode(codePoint);
-    if (secrets.every((secret) => !secret.includes(candidate))) return candidate;
+    if (
+      candidate !== '"' && // JSON would escape it and grow the wire body
+      !SEPARATORS.has(candidate) &&
+      secrets.every((secret) => !secret.includes(candidate))
+    ) {
+      return candidate;
+    }
   }
   return null;
 }
@@ -200,9 +200,9 @@ function redactTolerant(
  *  chunks) via a strip-and-map pass, hex and percent case-insensitively.
  *
  *  The exact pass is a SINGLE combined-regex replacement: replacements never
- *  feed another pass. `[REDACTED]` is used only when it cannot contain a
- *  secret and cannot expand a match; otherwise one secret-absent code unit is
- *  used as a boundary. Thus output never grows and fragments cannot rejoin.
+ *  feed another pass. Every match becomes the same secret-absent, non-
+ *  separator, one-byte ASCII boundary. Thus UTF-8 output never grows and
+ *  fragments (including adjacent replacements) cannot rejoin.
  *
  *  Documented residual (ADR-006 决策 6): transforms WITHOUT a deterministic
  *  plaintext form — compression (gzip headers embed non-determinism),
@@ -244,15 +244,13 @@ export function redactSecrets(text: string, secretValues: string[]): string {
     }
   }
 
-  const shortestForm = Math.min(...[...exactForms].map((form) => form.length));
-  const displayMarkerIsSafe =
-    shortestForm >= DISPLAY_REDACTION_MARKER.length &&
-    secrets.every((secret) => !DISPLAY_REDACTION_MARKER.includes(secret));
-  const marker = displayMarkerIsSafe ? DISPLAY_REDACTION_MARKER : chooseBoundaryMarker(secrets);
+  const marker = chooseBoundaryMarker(secrets);
   if (marker === null) return "";
 
   const pattern = [...exactForms].sort((a, b) => b.length - a.length).map(escapeRegExp).join("|");
-  let out = pattern === "" ? text : text.replace(new RegExp(pattern, "g"), marker);
+  // Callback form keeps a `$` marker literal instead of invoking replacement
+  // string substitutions such as `$&` or `$'`.
+  let out = pattern === "" ? text : text.replace(new RegExp(pattern, "g"), () => marker);
   if (tolerantCS.length > 0 || tolerantCI.length > 0) {
     out = redactTolerant(out, [...new Set(tolerantCS)], [...new Set(tolerantCI)], marker);
   }
