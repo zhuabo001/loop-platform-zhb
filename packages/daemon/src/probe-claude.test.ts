@@ -11,7 +11,7 @@
  * dependence). The 10s probe timeout is fixed in production; tests shrink it
  * through the documented test-only seam.
  */
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -141,6 +141,33 @@ describe("probeClaudeBinary", () => {
     );
     const result = await probeClaudeBinary(bin, ENV);
     expect(result.version).toBe("2.1.227");
+  });
+
+  it("PR11: the probe pins the binary identity — realpath + dev/ino/mtime/size (review round-1 P1)", async () => {
+    const result = await probeClaudeBinary(FIXTURE, ENV);
+    const st = statSync(FIXTURE);
+    expect(result.binary.resolvedPath).toBe(realpathSync(FIXTURE));
+    expect(result.binary).toMatchObject({
+      dev: st.dev,
+      ino: st.ino,
+      size: st.size,
+      mtimeMs: st.mtimeMs,
+    });
+  });
+
+  it("PR12: a bare binary name resolves through the AGENT env PATH (the same env the probes ran under)", async () => {
+    const dir = path.join(base, "bin");
+    mkdirSync(dir);
+    const bin = path.join(dir, "path-claude");
+    copyFileSync(FIXTURE, bin);
+    chmodSync(bin, 0o755);
+    const result = await probeClaudeBinary("path-claude", { PATH: dir });
+    expect(result.version).toBe("2.1.227");
+    expect(result.binary.resolvedPath).toBe(realpathSync(bin));
+  });
+
+  it("PR13: a bare name unresolvable on the agent PATH rejects", async () => {
+    await expect(probeClaudeBinary("no-such-claude-anywhere", { PATH: base })).rejects.toThrow(ClaudeProbeError);
   });
 
   it("PR8: the production constants are the pinned contract (10s, 2.1.219, the batch's flag set)", () => {

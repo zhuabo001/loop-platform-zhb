@@ -16,7 +16,7 @@
  *    run (the success report is discarded);
  *  - spawn-time revalidation failure means NO spawn and a failed run.
  */
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -26,6 +26,7 @@ import type { Delivery } from "@loopzhb/protocol";
 
 import { createClaudeRunner, type ClaudeRunnerDeps } from "./claude-runner.js";
 import { JailError, createWorkdirJail, type ResolvedWorkdir, type WorkdirJail } from "./jail.js";
+import type { ClaudeBinaryIdentity } from "./probe-claude.js";
 import type { AgentRunner, RunnerContext, RunnerReport } from "./runner.js";
 
 const FIXTURE = fileURLToPath(new URL("../test-fixtures/fake-claude.mjs", import.meta.url));
@@ -301,6 +302,55 @@ describe("A20: the session identity is verified and scrubbed", () => {
     expect(report.error).toContain("session-id-conflict");
     expect(report.error).not.toContain("fake-sess-init");
     expect(report.error).not.toContain("fake-sess-result");
+  });
+});
+
+describe("A21: the probe-pinned binary identity (review round-1 P1)", () => {
+  const identityOf = (target: string): ClaudeBinaryIdentity => {
+    const st = statSync(target);
+    return { resolvedPath: target, dev: st.dev, ino: st.ino, mtimeMs: st.mtimeMs, size: st.size };
+  };
+
+  it("spawns the probe-RESOLVED path, never a PATH lookup", async () => {
+    const { run } = makeRunner({
+      // Would ENOENT if spawned — proof the resolved path is what executes.
+      claudeBin: "/nonexistent/definitely-not-claude",
+      probedBinary: identityOf(FIXTURE),
+    });
+    const report = await run(makeDelivery());
+    expect(report.ok).toBe(true);
+  });
+
+  it("a drifted identity fails the run WITHOUT spawning", async () => {
+    const { run } = makeRunner({
+      probedBinary: { ...identityOf(FIXTURE), size: statSync(FIXTURE).size + 1 },
+    });
+    const report = await run(makeDelivery());
+    expect(report.ok).toBe(false);
+    expect(report.error).toContain("binary");
+    expect(existsSync(path.join(workdir, SIDECAR))).toBe(false); // never spawned
+  });
+
+  it("an in-place replacement (same path, new content) fails the run", async () => {
+    const local = path.join(base, "claude-copy");
+    copyFileSync(FIXTURE, local);
+    chmodSync(local, 0o755);
+    const { run } = makeRunner({ claudeBin: local, probedBinary: identityOf(local) });
+    writeFileSync(local, "#!/usr/bin/env node\n// tampered\n");
+    const report = await run(makeDelivery());
+    expect(report.ok).toBe(false);
+    expect(report.error).toContain("binary");
+    expect(existsSync(path.join(workdir, SIDECAR))).toBe(false);
+  });
+
+  it("a vanished binary fails the run", async () => {
+    const gone = path.join(base, "gone-claude");
+    const { run } = makeRunner({
+      probedBinary: { resolvedPath: gone, dev: 1, ino: 1, mtimeMs: 1, size: 1 },
+    });
+    const report = await run(makeDelivery());
+    expect(report.ok).toBe(false);
+    expect(report.error).toContain("binary");
   });
 });
 
