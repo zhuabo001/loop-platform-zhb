@@ -44,7 +44,7 @@ import { sameClaudeBinary, statClaudeBinary, type ClaudeBinaryIdentity } from ".
 import type { AgentRunner, RunnerContext, RunnerReport } from "./runner.js";
 import { ERROR_CAP } from "./runtime.js";
 import type { SpawnResult } from "./subprocess.js";
-import { spawnWithTimeout } from "./subprocess.js";
+import { ProcessControlError, spawnWithTimeout } from "./subprocess.js";
 
 export interface ClaudeRunnerDeps {
   jail: WorkdirJail;
@@ -58,6 +58,11 @@ export interface ClaudeRunnerDeps {
    *  (round-1 review P1). Absent only in tests, which spawn claudeBin
    *  directly. */
   probedBinary?: ClaudeBinaryIdentity;
+  /** Replaces spawnWithTimeout. TEST-ONLY seam (same standing as
+   *  SpawnOptions.killImpl): production call sites never set this — the
+   *  combined-failure pin (A22) needs a spawn that rejects with
+   *  ProcessControlError, which a real child cannot do on demand. */
+  spawnImpl?: typeof spawnWithTimeout;
 }
 
 /** The dynamic per-run settings (plan §2.3). allowRead/allowWrite are the
@@ -148,6 +153,8 @@ export function createClaudeRunner(deps: ClaudeRunnerDeps): AgentRunner {
         loopId: delivery.loop.id,
         runId: delivery.runId,
       });
+      const spawn = deps.spawnImpl ?? spawnWithTimeout;
+      let controlErr: ProcessControlError | null = null;
       try {
         const settingsJson = JSON.stringify(buildSandboxSettings(resolved));
         // The spawn-time re-check (plan §2.2): any drift since resolve means
@@ -173,7 +180,7 @@ export function createClaudeRunner(deps: ClaudeRunnerDeps): AgentRunner {
         const parser = createClaudeStreamParser({
           onProgress: (label) => ctx.onProgress(redact(label)),
         });
-        const spawned = await spawnWithTimeout({
+        const spawned = await spawn({
           command,
           args: buildClaudeArgs(delivery, settingsJson),
           cwd: resolved.cwd,
@@ -183,10 +190,27 @@ export function createClaudeRunner(deps: ClaudeRunnerDeps): AgentRunner {
           onStdout: (chunk) => parser.push(chunk),
         });
         return reportFromSpawn(delivery, spawned, parser, redact, deps.timeoutMs);
+      } catch (err) {
+        if (err instanceof ProcessControlError) controlErr = err;
+        throw err;
       } finally {
         // Scratch release is fail-closed and UNCONDITIONAL: if it throws, the
         // run fails (a computed report — success included — is discarded).
-        await deps.jail.release(resolved);
+        // EXCEPTION (round-2 review P1): a ProcessControlError in flight must
+        // NEVER be masked by the release failure — a runaway child outranks
+        // broken cleanup, and the runtime escalates on exactly that type. The
+        // release failure rides in the message so it is not silently lost.
+        try {
+          await deps.jail.release(resolved);
+        } catch (releaseErr) {
+          if (controlErr !== null) {
+            const detail = releaseErr instanceof Error ? releaseErr.message : String(releaseErr);
+            throw new ProcessControlError(`${controlErr.message} (scratch release also failed: ${detail})`, {
+              cause: controlErr,
+            });
+          }
+          throw releaseErr;
+        }
       }
     },
   };
