@@ -64,6 +64,16 @@ function isAtLeast(version: [number, number, number], min: [number, number, numb
   return true;
 }
 
+/** Token-exact flag detection (round-1 review P2): a lookalike like
+ *  `--safe-mode-removed` must NOT satisfy the probe, while real help
+ *  typography — `--flag=value`, `--flag, -f`, backtick-quoted — still does.
+ *  The flag is therefore matched with non-word/non-hyphen boundaries on both
+ *  sides. */
+function helpHasFlag(helpOut: string, flag: string): boolean {
+  const escaped = flag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?<![\\w-])${escaped}(?![\\w-])`).test(helpOut);
+}
+
 /**
  * Probe the binary. `timeoutMs` is a TEST-ONLY seam (same standing as
  * SpawnOptions.graceMs): production call sites never set it — the fixed 10s
@@ -109,7 +119,7 @@ export async function probeClaudeBinary(
   }
 
   const helpOut = await runProbe(["--help"]);
-  const missing = REQUIRED_CLAUDE_FLAGS.filter((flag) => !helpOut.includes(flag));
+  const missing = REQUIRED_CLAUDE_FLAGS.filter((flag) => !helpHasFlag(helpOut, flag));
   if (missing.length > 0) {
     throw new ClaudeProbeError(`probe \`${claudeBin} --help\` is missing required flags: ${missing.join(", ")}`);
   }
