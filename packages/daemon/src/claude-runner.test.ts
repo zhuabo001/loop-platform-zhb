@@ -285,6 +285,25 @@ describe("A7–A8: redaction of child-derived text", () => {
   });
 });
 
+describe("A20: the session identity is verified and scrubbed", () => {
+  it("a session_id embedding a secret is redacted in the success report", async () => {
+    const { run } = makeRunner();
+    const report = await run(makeDelivery({ task: "fake-claude://secret-session" }));
+    expect(report.ok).toBe(true);
+    expect(report.sessionId).toBe("sess-[REDACTED]");
+    expect(report.sessionId).not.toContain("sk-ant-fixture-secret");
+  });
+
+  it("an init/result session conflict fails the run with a stable, content-free stream error", async () => {
+    const { run } = makeRunner();
+    const report = await run(makeDelivery({ task: "fake-claude://session-conflict" }));
+    expect(report.ok).toBe(false);
+    expect(report.error).toContain("session-id-conflict");
+    expect(report.error).not.toContain("fake-sess-init");
+    expect(report.error).not.toContain("fake-sess-result");
+  });
+});
+
 describe("A9–A12: failure mapping", () => {
   it("A9: an is_error terminal fails the run with the redacted CLI narrative and NO outcome", async () => {
     const { run } = makeRunner();

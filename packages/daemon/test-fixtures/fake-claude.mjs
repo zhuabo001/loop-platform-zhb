@@ -24,6 +24,8 @@
  *   hang             write the sidecar, then hang forever (timeout/abort pins)
  *   self-swap-scratch replace our OWN cwd with a symlink mid-run (release
  *                    fail-closed pin — the post-run release must refuse it)
+ *   session-conflict init session_id ≠ result session_id (identity pin)
+ *   secret-session   success result whose session_id embeds $ANTHROPIC_API_KEY
  *   probe            handled by the probe pins: `--version` / `--help` output
  */
 import { rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -127,6 +129,15 @@ switch (scenario) {
     break;
   case "hang":
     setInterval(() => {}, 1000);
+    break;
+  case "session-conflict":
+    // init and result disagree on the session identity — the parser must
+    // refuse the stream (a Report must never point at the wrong transcript).
+    line({ type: "system", subtype: "init", session_id: "fake-sess-init" });
+    line({ type: "result", subtype: "success", is_error: false, result: "done", session_id: "fake-sess-result" });
+    break;
+  case "secret-session":
+    line({ type: "result", subtype: "success", is_error: false, result: "done", session_id: `sess-${key}` });
     break;
   case "self-swap-scratch": {
     // The run SUCCEEDS, but our cwd (the per-run scratch dir) is now a

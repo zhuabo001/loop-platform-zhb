@@ -480,6 +480,69 @@ describe("P19: the result event must carry a valid subtype and is_error", () => 
   });
 });
 
+describe("P21: init/result session identity conflict fails closed", () => {
+  it("a result session_id that differs from the init capture fails session-id-conflict — content-free", () => {
+    const { parser } = harness();
+    const result = JSON.stringify({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "ok",
+      session_id: "sess-OTHER",
+    });
+    expect(() => parser.push(enc(`${INIT}\n${result}\n`))).toThrow(ClaudeStreamError);
+    const outcome = parser.finish();
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.reason).toBe("session-id-conflict");
+      expect(outcome.detail).toContain("line 2");
+      expect(outcome.detail).not.toContain("sess-1");
+      expect(outcome.detail).not.toContain("sess-OTHER");
+    }
+  });
+
+  it("matching ids, a missing terminal id, and no init are all accepted", () => {
+    const matching = harness();
+    matching.parser.push(enc(`${INIT}\n${SUCCESS_RESULT}\n`));
+    const matched = matching.parser.finish();
+    expect(matched.ok).toBe(true);
+    if (matched.ok) expect(matched.terminal.sessionId).toBe("sess-1");
+
+    const noTerminalId = harness();
+    const bare = JSON.stringify({ type: "result", subtype: "success", is_error: false });
+    noTerminalId.parser.push(enc(`${INIT}\n${bare}\n`));
+    expect(noTerminalId.parser.finish().ok).toBe(true);
+
+    const noInit = harness();
+    noInit.parser.push(enc(`${SUCCESS_RESULT}\n`));
+    expect(noInit.parser.finish().ok).toBe(true);
+  });
+
+  it("first-init-wins: a later init does not re-target the identity", () => {
+    const { parser } = harness();
+    const init2 = JSON.stringify({ type: "system", subtype: "init", session_id: "sess-2" });
+    parser.push(enc(`${INIT}\n${init2}\n${SUCCESS_RESULT}\n`));
+    const outcome = parser.finish();
+    expect(outcome.ok).toBe(true);
+    expect(parser.initSessionId).toBe("sess-1");
+  });
+
+  it("an error terminal with a conflicting session_id still fails conflict", () => {
+    const { parser } = harness();
+    const result = JSON.stringify({
+      type: "result",
+      subtype: "error_during_execution",
+      is_error: true,
+      result: "blew up",
+      session_id: "sess-OTHER",
+    });
+    expect(() => parser.push(enc(`${INIT}\n${result}\n`))).toThrow(ClaudeStreamError);
+    const outcome = parser.finish();
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.reason).toBe("session-id-conflict");
+  });
+});
+
 describe("P20: the failure state is sticky", () => {
   it("push() after a failure keeps throwing the same reason; finish() still returns it", () => {
     const { parser } = harness();
