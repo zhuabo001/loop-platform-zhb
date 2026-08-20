@@ -16,7 +16,9 @@
  *    mid-termination failure rejects IMMEDIATELY and detaches (failFatally,
  *    round-2 P1: a child we cannot signal must not hang the caller waiting
  *    for a 'close' we may never bring about); a close-time failure rejects
- *    at settle;
+ *    at settle. BOTH rejection paths surface a typed ProcessControlError so
+ *    the runtime can escalate to daemon-fatal instead of normalizing a lost
+ *    process into an ordinary per-run failure (round-1 review P1);
  *  - the routine is idempotent: SIGTERM to the process GROUP, grace, then
  *    SIGKILL; ESRCH means "already gone" and is never an error;
  *  - after the direct child's 'close' the group is checked once more —
@@ -57,6 +59,23 @@ export type SpawnCompletion =
   | { kind: "aborted"; finalSignal: NodeJS.Signals }
   | { kind: "spawn-error"; code?: string; message: string }
   | { kind: "consumer-error"; message: string };
+
+/** The daemon can no longer control a spawned process group: a kill/probe
+ *  failed, or the group survived SIGKILL. This is NOT an ordinary per-run
+ *  failure — a child we cannot signal may still be alive, so the runtime
+ *  escalates it to daemon-fatal instead of freeing capacity for the next run
+ *  (round-1 review P1). Both reject paths below surface exactly this type. */
+export class ProcessControlError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "ProcessControlError";
+  }
+}
+
+function toProcessControlError(err: Error): ProcessControlError {
+  if (err instanceof ProcessControlError) return err;
+  return new ProcessControlError(`process control failed: ${err.message}`, { cause: err });
+}
 
 export interface SpawnResult {
   completion: SpawnCompletion;
@@ -380,7 +399,7 @@ export async function spawnWithTimeout(opts: SpawnOptions): Promise<SpawnResult>
       child.stdout.destroy();
       child.stderr.destroy();
       child.unref();
-      rejectPromise(err);
+      rejectPromise(toProcessControlError(err));
     };
 
     const onChunk =
@@ -436,7 +455,7 @@ export async function spawnWithTimeout(opts: SpawnOptions): Promise<SpawnResult>
         if (settled) return;
         settled = true;
         if (killError !== null) {
-          rejectPromise(killError);
+          rejectPromise(toProcessControlError(killError));
           return;
         }
         const completion: SpawnCompletion =

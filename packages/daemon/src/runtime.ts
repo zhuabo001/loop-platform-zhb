@@ -36,6 +36,7 @@ import type { Delivery, PollRequest, RunProgress } from "@loopzhb/protocol";
 
 import { serializeReportRequest, type MachineClient, type SerializedReportRequest } from "./client.js";
 import type { AgentRunner, RunnerReport } from "./runner.js";
+import { ProcessControlError } from "./subprocess.js";
 
 export class FatalDaemonError extends Error {
   constructor(message: string) {
@@ -318,9 +319,14 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
       if (clean === "") return;
       activities.set(delivery.runId, { step: current.step + 1, label: clean });
     };
+    let processControlErr: ProcessControlError | null = null;
     try {
       report = await deps.runner.run(delivery, { signal, onProgress });
     } catch (err) {
+      // A process-control failure (the runner could not kill what it spawned)
+      // is escalated AFTER the owed report — never normalized into a plain
+      // per-run failure that frees capacity next to a runaway child.
+      if (err instanceof ProcessControlError) processControlErr = err;
       report = { ok: false, error: sanitizeRunnerError(err, [delivery.runToken, deps.machineCredential]) };
     } finally {
       inFlight.delete(delivery.runId);
@@ -347,6 +353,21 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
     }
     const entry: PendingReport = { runId: delivery.runId, credential: delivery.runToken, body, attempt: 0 };
     pendingReports.set(entry.runId, entry);
+    if (processControlErr !== null) {
+      // Escalation (round-1 review P1): record the fatal and gate ALL new
+      // work NOW — `fatal` alone blocks maybeStartNext (even the confirmed
+      // branch below re-entering) and surfaces on the next pollOnce — but
+      // delay stopCtl.abort() until the owed report has been attempted: the
+      // abort would suppress the send (attemptReport early-returns on an
+      // aborted signal), and this failure deserves a PROMPT terminal report
+      // rather than a 20-minute sweep reclaim.
+      log(`run ${delivery.runId}: process control failed — escalating to daemon fatal`);
+      fatal ??= new FatalDaemonError(`process control failed for run ${delivery.runId}: ${processControlErr.message}`);
+      dropNeverStartedQueue();
+      if (!signal.aborted) await attemptReport(entry);
+      stopCtl.abort();
+      return;
+    }
     // Shutdown keeps the first report pending rather than sending it — the
     // entry is never dropped, and skipping the send lets the pipeline settle.
     if (signal.aborted) return;
