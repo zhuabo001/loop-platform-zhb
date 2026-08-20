@@ -151,3 +151,27 @@ describe("redactSecrets — serialized forms (round-1 hardening)", () => {
     expect(out).toContain("keep-me"); // non-secret content survives
   });
 });
+
+describe("redactSecrets — encoded forms (review round-1 P1)", () => {
+  it("E16: base64, base64url and hex encodings of a secret are redacted too", () => {
+    const secret = "sk-ant-api03-ExAmPlE_Secret-1234567890abcdef+/";
+    const forms = [
+      Buffer.from(secret, "utf8").toString("base64"),
+      Buffer.from(secret, "utf8").toString("base64url"),
+      Buffer.from(secret, "utf8").toString("hex"),
+      Buffer.from(secret, "utf8").toString("hex").toUpperCase(),
+    ];
+    for (const encoded of new Set(forms)) {
+      const out = redactSecrets(`leak: ${encoded} end`, [secret]);
+      expect(out).not.toContain(encoded);
+      expect(out).toBe("leak: [REDACTED] end");
+    }
+  });
+
+  it("E17: encoded forms only apply at realistic secret length — a short secret's hex would false-positive", () => {
+    // hex("Ab") === "4162": redacting encoded forms of a 2-char secret would
+    // eat ordinary text. The raw form still redacts.
+    const out = redactSecrets("4162 stays, Ab redacted", ["Ab"]);
+    expect(out).toBe("4162 stays, [REDACTED] redacted");
+  });
+});
