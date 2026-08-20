@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Loop-platform-zhb machine daemon (Phase 1 Day 5): short-poll claim → Fake Runner → report, with in-process retry of unconfirmed reports. Production dependency surface is @loopzhb/protocol only; HTTP is Node 22 native fetch. See docs/goal/day5-daemon-fake-runner.md and docs/handoff/codex-handoff-day5-plan.md.",
+  "description": "Loop-platform-zhb machine daemon: short-poll claim → sandboxed Claude Code runner → report, with in-process retry of unconfirmed reports. The production runner is the real Claude Code adapter (fail-closed OS sandbox, probe-pinned binary — ADR-006); the Fake Runner survives only as a test fixture. Production dependency surface is @loopzhb/protocol only; HTTP is Node 22 native fetch.",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",

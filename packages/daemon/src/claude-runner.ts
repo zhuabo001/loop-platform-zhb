@@ -23,7 +23,12 @@
  *    the session id) is redacted with the env secret values AND the run token
  *    BEFORE it reaches the runtime/report surface;
  *  - jail.revalidate re-checks the resolution immediately before spawn —
- *    a drifted cwd/root/scratch means NO spawn (S1–S10).
+ *    a drifted cwd/root/scratch means NO spawn (S1–S10); the irreducible
+ *    revalidate→execve residue is bounded by the fail-closed OS sandbox
+ *    (allowlists are computed from realpaths) — ADR-006 决策 7;
+ *  - the production runner spawns the probe-RESOLVED binary path and
+ *    re-verifies its inode identity before every spawn — a post-probe
+ *    replacement never receives the agent credentials (round-1 review P1).
  *
  * Failure mapping is stable and content-free: a fixed message per failure
  * class (spawn/timeout/abort/signal/non-zero exit/stream parse), the CLI's

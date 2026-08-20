@@ -20,7 +20,7 @@ pnpm --filter @loopzhb/daemon start
 | `LOOPZHB_MACHINE_CREDENTIAL` | ✅ | — | `dk_` 前缀设备令牌（仅形状校验） |
 | `LOOPZHB_ALLOWED_ROOTS` | ✅ | — | JSON 字符串数组；绝对路径、无 `..` 段；启动时校验存在且为目录（fail-fast） |
 | `LOOPZHB_POLL_MS` | 否 | `3000` | 严格十进制，250–60000 |
-| `LOOPZHB_CLAUDE_BIN` | 否 | `claude` | Claude Code 二进制名/路径；启动时探测 `--version`（≥2.1.219）与 `--help` flags，失败即拒绝启动 |
+| `LOOPZHB_CLAUDE_BIN` | 否 | `claude` | Claude Code 二进制名/路径；启动时探测 `--version`（≥2.1.219）与 `--help` flags（词边界匹配），并钉住二进制身份（每次 Run 前复核，漂移即拒绝 spawn）；探测失败即拒绝启动 |
 | `LOOPZHB_AGENT_TIMEOUT_MS` | 否 | `1800000` | 严格十进制，1–2147483647 |
 
 **平台**：macOS / Linux / WSL2。原生 Windows 不支持（subprocess 进程组语义是 POSIX 的）。
