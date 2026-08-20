@@ -105,13 +105,14 @@ claude-code 或 codex 选一：子进程 spawn、进程组 kill、timeout、env 
   - Runner seam：`run(delivery, { signal, onProgress })`；runtime 拥有 progress sink（inFlight 门禁、去 NUL/单行/200 字符、每事件 step+1、reporting = lastStep+1 单调不回退）。
   - adapter：固定 argv + fail-closed 动态 settings；只开放 `Bash`（内建 Read/Edit/Write 不在 OS sandbox 边界内）；sandbox 不可用即失败，禁止降级；`codex`/`grok` 固定 unsupported 不 spawn。
   - stream-json 增量 parser：跨 chunk UTF-8、1 MiB 行上限、terminal result 恰好一次、数值字段卫生、内容无关的稳定失败。
-  - jail `revalidate` 关闭 resolve→spawn TOCTOU；scratch finally release，清理失败判 Run 失败。
+  - jail `revalidate` 把 resolve→spawn TOCTOU 收窄到最小窗口（残余由 fail-closed OS sandbox 兜底）；scratch finally release，清理失败判 Run 失败。
   - 生产切换：`prepareDaemon` = config → startup jail → Claude 探测（10s、≥2.1.219、flags 检查）→ client → Claude Runner → runtime；Fake Runner 退为测试 fixture。
   - Issue #12 跨层 round-robin liveness 验收落地（L1–L2：窗口内零误回收 + 对照回收 + 静默后全量回收）；opt-in 真实 sandbox smoke 备妥（默认跳过）。
 
 ### 右移项
 
 - [ ] **跨层 round-robin liveness 验收**：[Issue #12](https://github.com/zhuabo001/loop-platform-zhb/issues/12)——修复与测试已随 Batch 3 落地（L1–L2），待复审核销后关闭。
+- [ ] **Batch 3 复审核销**：[Issue #15](https://github.com/zhuabo001/loop-platform-zhb/issues/15)——两轮复审的 P1/P2 修复已全部落地（red→green 成对提交），待第三轮复审逐项核销后关闭。
 
 顺手收口：[Issue #10](https://github.com/zhuabo001/loop-platform-zhb/issues/10)
 （Day 8–10 二次审查右移项，不影响正确性）。

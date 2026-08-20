@@ -25,7 +25,7 @@ pnpm --filter @loopzhb/daemon start
 
 **平台**：macOS / Linux / WSL2。原生 Windows 不支持（subprocess 进程组语义是 POSIX 的）。
 
-**Batch 3 状态（当前）**：生产 daemon 已切换到**真实 Claude Code Runner**（ADR-006）。每次 Run 经固定 argv 的 `claude -p --output-format stream-json` 执行，只开放 `Bash` 工具，文件系统与网络由 fail-closed OS sandbox 兜底（sandbox 不可用即失败，绝不降级为 unsandboxed）；jail 在 spawn 前重校验（TOCTOU 收口），per-run scratch 用后即焚且清理失败判 Run 失败。启动顺序：`config → startup jail → Claude 探测 → HTTP client → Claude Runner → runtime`，探测失败时 daemon 不启动。
+**Batch 3 状态（当前）**：生产 daemon 已切换到**真实 Claude Code Runner**（ADR-006）。每次 Run 经固定 argv 的 `claude -p --output-format stream-json` 执行，只开放 `Bash` 工具，文件系统与网络由 fail-closed OS sandbox 兜底（sandbox 不可用即失败，绝不降级为 unsandboxed）；jail 在 spawn 前重校验（resolve→spawn 窗口收窄，残余由 sandbox 兜底），per-run scratch 用后即焚且清理失败判 Run 失败。启动顺序：`config → startup jail → Claude 探测 → HTTP client → Claude Runner → runtime`，探测失败时 daemon 不启动。
 
 人工验收（不进默认离线测试套件，使用开发者本机 Claude 认证）：
 
