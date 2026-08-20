@@ -27,8 +27,8 @@
  *    revalidate→execve residue is bounded by the fail-closed OS sandbox
  *    (allowlists are computed from realpaths) — ADR-006 决策 7;
  *  - the production runner spawns the probe-RESOLVED binary path and
- *    re-verifies its inode identity before every spawn — a post-probe
- *    replacement never receives the agent credentials (round-1 review P1).
+ *    re-verifies its identity before every spawn; observed drift is refused.
+ *    The same-UID stat/hash→execve residual is explicit in ADR-006.
  *
  * Failure mapping is stable and content-free: a fixed message per failure
  * class (spawn/timeout/abort/signal/non-zero exit/stream parse), the CLI's

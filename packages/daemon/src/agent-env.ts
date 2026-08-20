@@ -106,6 +106,24 @@ function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+const DISPLAY_REDACTION_MARKER = "[REDACTED]";
+
+/** Pick a one-code-unit boundary which cannot be part of any secret. It
+ *  prevents two fragments from joining into another secret without growing
+ *  the output. Exhausting the private-use range is handled fail-closed by the
+ *  caller (drop the whole text). */
+function chooseBoundaryMarker(secrets: readonly string[]): string | null {
+  for (const codePoint of [0x2588, 0x25a0, 0x25c6, 0x25cf, 0x00a4, 0xfffd]) {
+    const candidate = String.fromCharCode(codePoint);
+    if (secrets.every((secret) => !secret.includes(candidate))) return candidate;
+  }
+  for (let codePoint = 0xe000; codePoint <= 0xf8ff; codePoint += 1) {
+    const candidate = String.fromCharCode(codePoint);
+    if (secrets.every((secret) => !secret.includes(candidate))) return candidate;
+  }
+  return null;
+}
+
 /** Separator-tolerant redaction: strip separators from the text (keeping a
  *  source-index map), search the PLAIN needles in the compressed view, and
  *  redact the corresponding spans — separators included — in the original.
@@ -114,7 +132,12 @@ function escapeRegExp(text: string): string {
  *  index, so span mapping stays exact). A span ends at the last NEEDLE char:
  *  trailing separator-class chars of the leak may survive it — they carry no
  *  decodable content on their own. */
-function redactTolerant(text: string, needlesCS: readonly string[], needlesCI: readonly string[]): string {
+function redactTolerant(
+  text: string,
+  needlesCS: readonly string[],
+  needlesCI: readonly string[],
+  marker: string,
+): string {
   const strippedChars: string[] = [];
   const strippedMap: number[] = [];
   const loweredChars: string[] = [];
@@ -151,7 +174,7 @@ function redactTolerant(text: string, needlesCS: readonly string[], needlesCI: r
   let cursor = 0;
   let [spanStart, spanEnd] = spans[0]!;
   const emit = (): void => {
-    out += `${text.slice(cursor, spanStart)}[REDACTED]`;
+    out += `${text.slice(cursor, spanStart)}${marker}`;
     cursor = spanEnd;
   };
   for (let i = 1; i < spans.length; i += 1) {
@@ -177,8 +200,9 @@ function redactTolerant(text: string, needlesCS: readonly string[], needlesCI: r
  *  chunks) via a strip-and-map pass, hex and percent case-insensitively.
  *
  *  The exact pass is a SINGLE combined-regex replacement: replacements never
- *  feed another pass. A match shorter than "[REDACTED]" is deleted instead
- *  of expanded, so output never grows — including one-character secrets.
+ *  feed another pass. `[REDACTED]` is used only when it cannot contain a
+ *  secret and cannot expand a match; otherwise one secret-absent code unit is
+ *  used as a boundary. Thus output never grows and fragments cannot rejoin.
  *
  *  Documented residual (ADR-006 决策 6): transforms WITHOUT a deterministic
  *  plaintext form — compression (gzip headers embed non-determinism),
@@ -220,14 +244,17 @@ export function redactSecrets(text: string, secretValues: string[]): string {
     }
   }
 
+  const shortestForm = Math.min(...[...exactForms].map((form) => form.length));
+  const displayMarkerIsSafe =
+    shortestForm >= DISPLAY_REDACTION_MARKER.length &&
+    secrets.every((secret) => !DISPLAY_REDACTION_MARKER.includes(secret));
+  const marker = displayMarkerIsSafe ? DISPLAY_REDACTION_MARKER : chooseBoundaryMarker(secrets);
+  if (marker === null) return "";
+
   const pattern = [...exactForms].sort((a, b) => b.length - a.length).map(escapeRegExp).join("|");
-  const marker = "[REDACTED]";
-  let out =
-    pattern === ""
-      ? text
-      : text.replace(new RegExp(pattern, "g"), (match) => (match.length < marker.length ? "" : marker));
+  let out = pattern === "" ? text : text.replace(new RegExp(pattern, "g"), marker);
   if (tolerantCS.length > 0 || tolerantCI.length > 0) {
-    out = redactTolerant(out, [...new Set(tolerantCS)], [...new Set(tolerantCI)]);
+    out = redactTolerant(out, [...new Set(tolerantCS)], [...new Set(tolerantCI)], marker);
   }
   return out;
 }

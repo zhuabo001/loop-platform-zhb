@@ -70,8 +70,8 @@ export interface ClaudeProbeResult {
  *  the realpath-resolved absolute path, its inode-level fingerprint, and a
  *  sha256 of the CONTENT — a same-inode, same-size, restored-mtime in-place
  *  overwrite still differs by hash. The runner re-stats (and re-hashes) the
- *  resolved path before EVERY spawn and refuses a drifted binary — a
- *  post-probe replacement never receives the agent credentials. */
+ *  resolved path before EVERY spawn and refuses any observed drift. The
+ *  same-UID stat/hash→execve residual is accepted in ADR-006. */
 export interface ClaudeBinaryIdentity {
   /** The realpath-resolved absolute path pinned at probe time. */
   resolvedPath: string;
