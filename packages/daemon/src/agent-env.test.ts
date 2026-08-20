@@ -135,7 +135,8 @@ describe("secretValues and redactSecrets", () => {
 
   it("E12: overlapping secrets redact longest-first (no partial leftovers)", () => {
     const out = redactSecrets("token=sk-abcdef", ["sk-abc", "sk-abcdef"]);
-    expect(out).toBe("token=");
+    expect(out).toHaveLength("token=sk-abcdef".length - "sk-abcdef".length + 1);
+    expect(out).not.toContain("sk-abc");
   });
 
   it("E13: every secret in a multi-secret text is redacted, duplicates included", () => {
@@ -193,22 +194,34 @@ describe("redactSecrets — encoded forms (review round-1 P1)", () => {
     // hex("Ab") === "4162": redacting encoded forms of a 2-char secret would
     // eat ordinary text. The raw form still redacts.
     const out = redactSecrets("4162 stays, Ab redacted", ["Ab"]);
-    expect(out).toBe("4162 stays,  redacted");
+    expect(out).toHaveLength("4162 stays, Ab redacted".length - 1);
+    expect(out).not.toContain("Ab");
   });
 
   it("E18: single-char secrets redact in one bounded pass without replacement re-entry (review round-3 P2)", () => {
     // The round-2 DoS repro used R/E/D/A/C/T secrets to re-match inside
     // earlier [REDACTED] replacements and balloon ~649×. A combined one-pass
     // replacement must still redact those values without reprocessing its own
-    // output. Short matches are deleted (never expanded), while every
-    // non-empty secret still participates in redaction.
-    expect(redactSecrets("RR", ["R", "E", "D", "A", "C", "T"])).toBe("");
+    // output. Short matches use a one-code-unit boundary absent from every
+    // secret, while every non-empty secret still participates in redaction.
+    const singleCharOut = redactSecrets("RR", ["R", "E", "D", "A", "C", "T"]);
+    expect(singleCharOut).toHaveLength(2);
+    for (const secret of ["R", "E", "D", "A", "C", "T"]) expect(singleCharOut).not.toContain(secret);
     // The same no-growth invariant applies to every sub-marker-length secret.
-    expect(redactSecrets("Ab".repeat(1000), ["Ab"])).toBe("");
+    expect(redactSecrets("Ab".repeat(1000), ["Ab"])).toHaveLength(1000);
   });
 
-  it("E24: one-character secrets can only shrink output, never amplify it past a wire cap", () => {
-    expect(redactSecrets("R".repeat(1024 * 1024), ["R"])).toBe("");
+  it("E24: one-character secrets cannot amplify output past a wire cap", () => {
+    const input = "R".repeat(1024 * 1024);
+    const out = redactSecrets(input, ["R"]);
+    expect(out).toHaveLength(input.length);
+    expect(out).not.toContain("R");
+  });
+
+  it("E25: redacting a short separator cannot reassemble another secret", () => {
+    const out = redactSecrets("abcdXefgh", ["abcdefgh", "X"]);
+    expect(out).not.toContain("abcdefgh");
+    expect(out.length).toBeLessThanOrEqual("abcdXefgh".length);
   });
 
   it("E19: separator-chunked forms are redacted — chunked base64 AND chunked raw (review round-2 P1)", () => {
