@@ -22,7 +22,8 @@
  * post-probe replacement never receives the agent credentials. The residual
  * stat→execve window is userspace-irreducible and documented in ADR-006.
  */
-import { constants as fsConstants } from "node:fs";
+import { createHash } from "node:crypto";
+import { constants as fsConstants, createReadStream } from "node:fs";
 import { access, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 
@@ -63,10 +64,12 @@ export interface ClaudeProbeResult {
   binary: ClaudeBinaryIdentity;
 }
 
-/** The probe-pinned binary identity (round-1 review P1): the realpath-
- *  resolved absolute path plus its inode-level fingerprint. The runner
- *  re-stats the resolved path before EVERY spawn and refuses a drifted
- *  binary — a post-probe replacement never receives the agent credentials. */
+/** The probe-pinned binary identity (round-1 review P1, round-2 hardened):
+ *  the realpath-resolved absolute path, its inode-level fingerprint, and a
+ *  sha256 of the CONTENT — a same-inode, same-size, restored-mtime in-place
+ *  overwrite still differs by hash. The runner re-stats (and re-hashes) the
+ *  resolved path before EVERY spawn and refuses a drifted binary — a
+ *  post-probe replacement never receives the agent credentials. */
 export interface ClaudeBinaryIdentity {
   /** The realpath-resolved absolute path pinned at probe time. */
   resolvedPath: string;
@@ -74,6 +77,7 @@ export interface ClaudeBinaryIdentity {
   ino: number;
   mtimeMs: number;
   size: number;
+  sha256: string;
 }
 
 export function sameClaudeBinary(a: ClaudeBinaryIdentity, b: ClaudeBinaryIdentity): boolean {
@@ -82,16 +86,27 @@ export function sameClaudeBinary(a: ClaudeBinaryIdentity, b: ClaudeBinaryIdentit
     a.dev === b.dev &&
     a.ino === b.ino &&
     a.mtimeMs === b.mtimeMs &&
-    a.size === b.size
+    a.size === b.size &&
+    a.sha256 === b.sha256
   );
 }
 
-/** Stat the pinned binary NOW. Throws raw on any stat failure — the caller
- *  treats that as drift (probe) or as a run failure (runner). */
+/** Stream a file's sha256 — the CLI binary can be tens of MiB. */
+async function sha256File(filePath: string): Promise<string> {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(filePath)) {
+    hash.update(chunk as Buffer);
+  }
+  return hash.digest("hex");
+}
+
+/** Stat AND hash the pinned binary NOW. Throws raw on any failure — the
+ *  caller treats that as drift (probe) or as a run failure (runner). */
 export async function statClaudeBinary(resolvedPath: string): Promise<ClaudeBinaryIdentity> {
   const st = await stat(resolvedPath);
   if (!st.isFile()) throw new Error(`not a regular file: ${resolvedPath}`);
-  return { resolvedPath, dev: st.dev, ino: st.ino, mtimeMs: st.mtimeMs, size: st.size };
+  const sha256 = await sha256File(resolvedPath);
+  return { resolvedPath, dev: st.dev, ino: st.ino, mtimeMs: st.mtimeMs, size: st.size, sha256 };
 }
 
 /** Resolve the configured binary to its realpath: an explicit path is
@@ -152,8 +167,10 @@ export async function probeClaudeBinary(
   timeoutMs: number = CLAUDE_PROBE_TIMEOUT_MS,
 ): Promise<ClaudeProbeResult> {
   const { env } = buildAgentEnv(envSource);
-  // Resolve FIRST, then probe the RESOLVED path: the identity pinned at the
-  // end is exactly the file that just proved itself usable (round-1 P1).
+  // Resolve FIRST, then probe the RESOLVED path, pinning the identity BOTH
+  // before and after the probes (round-2 review P1): a binary swapped while
+  // its own --help output was being produced must NOT get pinned — the
+  // pinned file must be exactly the probed file.
   let resolvedPath: string;
   try {
     resolvedPath = await resolveClaudeBin(claudeBin, env.PATH);
@@ -161,6 +178,14 @@ export async function probeClaudeBinary(
     if (err instanceof ClaudeProbeError) throw err;
     throw new ClaudeProbeError(
       `cannot resolve claude binary \`${claudeBin}\`: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  let before: ClaudeBinaryIdentity;
+  try {
+    before = await statClaudeBinary(resolvedPath);
+  } catch (err) {
+    throw new ClaudeProbeError(
+      `cannot stat the resolved claude binary \`${resolvedPath}\`: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
   const runProbe = async (args: string[]): Promise<string> => {
@@ -202,8 +227,7 @@ export async function probeClaudeBinary(
     throw new ClaudeProbeError(`probe \`${claudeBin} --help\` is missing required flags: ${missing.join(", ")}`);
   }
 
-  // Pin LAST: the identity is taken from the file that just passed both
-  // probes; the runner re-verifies it before every spawn.
+  // Pin LAST, and only if the file is STILL the one the probes ran against.
   let binary: ClaudeBinaryIdentity;
   try {
     binary = await statClaudeBinary(resolvedPath);
@@ -211,6 +235,9 @@ export async function probeClaudeBinary(
     throw new ClaudeProbeError(
       `cannot stat the resolved claude binary \`${resolvedPath}\`: ${err instanceof Error ? err.message : String(err)}`,
     );
+  }
+  if (!sameClaudeBinary(before, binary)) {
+    throw new ClaudeProbeError(`claude binary \`${resolvedPath}\` changed during the probe — refusing to pin it`);
   }
 
   return { version: version.join("."), binary };
