@@ -43,3 +43,4 @@
 ## 修订记录
 
 - 2026-08-20：初始 Accepted。
+- 2026-08-20：opt-in 真实 sandbox smoke 在 macOS + Claude Code 2.1.227 上执行通过（3/3，约 63s）：根内读写成功、根外 sentinel 读取不泄漏（report 与 progress 均无内容）、根外覆盖写不发生。生产切换的人工验收项达成。
