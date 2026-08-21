@@ -111,8 +111,7 @@ claude-code 或 codex 选一：子进程 spawn、进程组 kill、timeout、env 
 
 ### 右移项
 
-- [ ] **跨层 round-robin liveness 验收**：[Issue #12](https://github.com/zhuabo001/loop-platform-zhb/issues/12)——修复与测试已随 Batch 3 落地（L1–L2），待复审核销后关闭。
-- [ ] **Batch 3 复审核销**：[Issue #15](https://github.com/zhuabo001/loop-platform-zhb/issues/15)——第三轮遗留的 P1/P2/P3 修复已按 red→green 落地，待第四轮复审逐项核销后关闭。
+- [ ] **Batch 3 复审核销**：[Issue #15](https://github.com/zhuabo001/loop-platform-zhb/issues/15)——复审 P1/P2/P3 已全部落地（red→green 成对提交），第四轮三轨核销通过；仅剩签字后的 smoke 命令形态修复（纯测试提交）待一轮聚焦复验后关闭。
 
 顺手收口：[Issue #10](https://github.com/zhuabo001/loop-platform-zhb/issues/10)
 （Day 8–10 二次审查右移项，不影响正确性）。
