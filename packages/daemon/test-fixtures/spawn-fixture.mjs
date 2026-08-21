@@ -6,7 +6,10 @@
  *   big <stdout|stderr> <bytes> exactly <bytes> of a repeating digit pattern
  *   drip <count> <intervalMs>   numbered stdout lines with delays
  *   sleep <ms>                  stay alive (default SIGTERM kills us)
- *   ignore-term <ms>            ignore SIGTERM, stay alive (SIGKILL test)
+ *   ignore-term <ms>            ignore SIGTERM, stay alive (SIGKILL test);
+ *                               prints "ready" only AFTER the handler is
+ *                               installed (the S6 readiness handshake)
+ *   ignore-term-split-ready <ms> same, but splits "ready" across writes
  *   grandchild                  unref a same-group sleeping child, exit 0
  *   self-signal <signal>        signal ourselves after 20ms
  *   printenv                    JSON.stringify(process.env) to stdout
@@ -78,6 +81,19 @@ async function main() {
     }
     case "ignore-term": {
       process.on("SIGTERM", () => {}); // deliberately ignored — forces SIGKILL escalation
+      // Readiness handshake (S6, round-2 flake fix): a fixed test timeout
+      // could fire BEFORE the handler above is installed under parallel
+      // load; consumers trigger termination only after this line.
+      await writeAll(process.stdout, "ready\n");
+      await new Promise((resolve) => setTimeout(resolve, Number(rest[0] ?? 60000)));
+      process.exitCode = 0;
+      return;
+    }
+    case "ignore-term-split-ready": {
+      process.on("SIGTERM", () => {});
+      await writeAll(process.stdout, "rea");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      await writeAll(process.stdout, "dy\n");
       await new Promise((resolve) => setTimeout(resolve, Number(rest[0] ?? 60000)));
       process.exitCode = 0;
       return;

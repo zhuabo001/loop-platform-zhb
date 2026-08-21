@@ -1,25 +1,32 @@
 /**
- * THE daemon composition root (plan §1/§4): validated config → Machine client
- * → Fake Runner → runtime foreground loop, with ONE AbortController fanning
- * SIGINT/SIGTERM out to the poll sleep, in-flight HTTP and report retries.
- * The core never calls process.exit: a clean signal shutdown returns from
- * run() (exit 0); config failure or a protocol-fatal poll/report rejects
- * main() and the direct-run wrapper exits non-zero.
+ * THE daemon composition root (plan §1/§4): validated config → startup jail →
+ * Claude CLI probe → Machine client → Claude Runner → runtime foreground
+ * loop, with ONE AbortController fanning SIGINT/SIGTERM out to the poll
+ * sleep, in-flight HTTP and report retries. The core never calls
+ * process.exit: a clean signal shutdown returns from run() (exit 0); config
+ * failure, a failed startup jail/probe, or a protocol-fatal poll/report
+ * rejects main() and the direct-run wrapper exits non-zero.
+ *
+ * Batch 3 ordering contract (plan §2.2): the jail and the Claude probe run
+ * BEFORE the HTTP client exists — a daemon that cannot isolate or cannot run
+ * Claude never talks to the server (fail-closed). The probe therefore
+ * provably happens before the first poll.
  */
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { createMachineClient } from "./client.js";
+import { createClaudeRunner, type ClaudeRunnerDeps } from "./claude-runner.js";
 import { loadDaemonConfig, type DaemonConfig } from "./config.js";
 import { machineIdentity } from "./identity.js";
 import { createWorkdirJail, type WorkdirJail } from "./jail.js";
-import { createFakeRunner, type AgentRunner } from "./runner.js";
-import { createDaemonRuntime } from "./runtime.js";
+import { probeClaudeBinary } from "./probe-claude.js";
+import type { AgentRunner } from "./runner.js";
+import { createDaemonRuntime, type DaemonRuntime } from "./runtime.js";
 
 /** Batch-2 startup seam: canonicalize + verify the isolation roots BEFORE
- *  any resource opens (fail-fast, fail-closed). The returned jail is NOT
- *  wired to a Runner yet — batch 3's sandboxed adapter receives it. */
+ *  any resource opens (fail-fast, fail-closed). */
 export async function createStartupJail(config: DaemonConfig): Promise<WorkdirJail> {
   return await createWorkdirJail({
     allowedRoots: config.allowedRoots,
@@ -29,10 +36,37 @@ export async function createStartupJail(config: DaemonConfig): Promise<WorkdirJa
   });
 }
 
-/** The production Runner seam stays the Fake Runner for ALL of batch 2: no
- *  Delivery ever spawns a real subprocess until batch 3's sandboxed adapter
- *  lands (plan §2.5, pin I6). */
-export const productionRunnerFactory: () => AgentRunner = createFakeRunner;
+/** The production Runner (batch 3 switch, plan §2.2): the sandboxed Claude
+ *  adapter. The Fake Runner survives only as a test/loopback fixture. */
+export const productionRunnerFactory: (deps: ClaudeRunnerDeps) => AgentRunner = (deps) => createClaudeRunner(deps);
+
+/** The testable composition: config → startup jail → Claude probe → client →
+ *  Claude Runner → runtime. Polls begin only after this resolves, so the
+ *  probe provably precedes the first poll (plan §2.2). */
+export async function prepareDaemon(config: DaemonConfig, envSource: NodeJS.ProcessEnv): Promise<DaemonRuntime> {
+  const jail = await createStartupJail(config);
+  const probe = await probeClaudeBinary(config.claudeBin, envSource);
+  const client = createMachineClient({
+    baseUrl: config.serverUrl,
+    machineCredential: config.machineCredential,
+  });
+  return createDaemonRuntime({
+    client,
+    runner: productionRunnerFactory({
+      jail,
+      claudeBin: config.claudeBin,
+      timeoutMs: config.agentTimeoutMs,
+      envSource,
+      // The probe-pinned binary identity: every run re-verifies it before
+      // spawning (round-1 review P1).
+      probedBinary: probe.binary,
+    }),
+    identity: machineIdentity(),
+    pollMs: config.pollMs,
+    machineCredential: config.machineCredential,
+    log: (line) => console.log(line),
+  });
+}
 
 export type ShutdownSignal = "SIGINT" | "SIGTERM";
 
@@ -65,21 +99,7 @@ export function registerShutdownSignals(
 
 export async function main(): Promise<void> {
   const config = loadDaemonConfig(process.env);
-  // Fail fast on bad isolation roots BEFORE the first poll: a misconfigured
-  // daemon never talks to the server (fail-closed, plan §2.1).
-  await createStartupJail(config);
-  const client = createMachineClient({
-    baseUrl: config.serverUrl,
-    machineCredential: config.machineCredential,
-  });
-  const runtime = createDaemonRuntime({
-    client,
-    runner: productionRunnerFactory(),
-    identity: machineIdentity(),
-    pollMs: config.pollMs,
-    machineCredential: config.machineCredential,
-    log: (line) => console.log(line),
-  });
+  const runtime = await prepareDaemon(config, process.env);
 
   const ctl = new AbortController();
   const unregisterShutdownSignals = registerShutdownSignals(ctl);

@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-import { CappedStream, MAX_STREAM_BYTES, spawnWithTimeout, type SpawnOptions } from "./subprocess.js";
+import { CappedStream, MAX_STREAM_BYTES, ProcessControlError, spawnWithTimeout, type SpawnOptions } from "./subprocess.js";
 
 const FIXTURE = fileURLToPath(new URL("../test-fixtures/spawn-fixture.mjs", import.meta.url));
 const NODE = process.execPath;
@@ -138,11 +138,34 @@ describe("spawnWithTimeout — termination triggers", () => {
   });
 
   it("S6: a SIGTERM-ignoring child is SIGKILLed after the grace window", async () => {
+    // Readiness handshake (round-2 flake fix): the fixture prints "ready"
+    // only AFTER its SIGTERM handler is installed — a fixed 150ms timeout
+    // could fire first under parallel load and kill the child by SIGTERM.
+    // Aborting on the ready line drives the SAME TERM → grace → KILL
+    // machinery deterministically; the timeout is a pure backstop. The
+    // fixture deliberately splits "ready" across writes, so detection must
+    // accumulate stream chunks instead of trusting pipe read boundaries.
+    const ctl = new AbortController();
+    let sawReady = false;
+    let readiness = "";
     const result = await spawnWithTimeout(
-      opts({ args: [FIXTURE, "ignore-term", "30000"], timeoutMs: 150, graceMs: 100 }),
+      opts({
+        args: [FIXTURE, "ignore-term-split-ready", "30000"],
+        timeoutMs: 10_000,
+        graceMs: 100,
+        signal: ctl.signal,
+        onStdout: (chunk) => {
+          readiness = `${readiness}${Buffer.from(chunk).toString("utf8")}`.slice(-32);
+          if (!sawReady && readiness.includes("ready")) {
+            sawReady = true;
+            ctl.abort();
+          }
+        },
+      }),
     );
-    expect(result.completion).toEqual({ kind: "timed-out", finalSignal: "SIGKILL" });
-    expect(result.durationMs).toBeLessThan(2500);
+    expect(sawReady).toBe(true);
+    expect(result.completion).toEqual({ kind: "aborted", finalSignal: "SIGKILL" });
+    expect(result.durationMs).toBeLessThan(5000);
   });
 
   it("S7: aborting mid-execution returns aborted and reaps the group", async () => {
@@ -403,6 +426,52 @@ describe("spawnWithTimeout — kill failure propagation (round-2 P1)", () => {
         }
       }
     }
+  });
+
+  it("S22: both kill-failure reject paths surface ProcessControlError (review round-1 P1)", async () => {
+    // Path 1 — mid-termination (failFatally): EPERM on every group signal.
+    let attacked = 0;
+    const epermKill: typeof process.kill = (pid, signal) => {
+      if (pid < 0) {
+        attacked = -pid;
+        throw Object.assign(new Error("kill EPERM"), { code: "EPERM" });
+      }
+      return process.kill(pid, signal);
+    };
+    try {
+      const err = await spawnWithTimeout(
+        opts({ args: [FIXTURE, "sleep", "30000"], timeoutMs: 150, killImpl: epermKill }),
+      ).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(ProcessControlError);
+      expect((err as Error).name).toBe("ProcessControlError");
+      expect((err as Error).message).toContain("EPERM");
+    } finally {
+      if (attacked > 0) {
+        try {
+          process.kill(-attacked, "SIGKILL");
+        } catch {
+          /* already gone */
+        }
+      }
+    }
+
+    // Path 2 — close-time reap: the child exits cleanly on its own, but the
+    // post-close group probe throws a non-ESRCH/EPERM error.
+    const weirdKill: typeof process.kill = (pid, signal) => {
+      if (pid < 0 && signal === 0) throw Object.assign(new Error("probe EBADF"), { code: "EBADF" });
+      return process.kill(pid, signal);
+    };
+    const err2 = await spawnWithTimeout(
+      opts({ args: [FIXTURE, "exit", "0"], timeoutMs: 5000, killImpl: weirdKill }),
+    ).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err2).toBeInstanceOf(ProcessControlError);
+    expect((err2 as Error).message).toContain("EBADF");
   });
 
   it("S21: a transient EPERM from signal-0 probing does not override successful group signals", async () => {

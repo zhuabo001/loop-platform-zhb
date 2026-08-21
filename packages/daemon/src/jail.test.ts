@@ -283,3 +283,109 @@ describe("resolve/release — per-run scratch lifecycle", () => {
     await expect(j.release(plain)).resolves.toBeUndefined();
   });
 });
+
+describe("revalidate — the pre-spawn re-check (Phase 2 batch 3, plan §2.2)", () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = path.join(base, "root");
+    mkdirSync(root);
+  });
+
+  const jail = () => createWorkdirJail({ allowedRoots: [root], scratchBase: scratchBase() });
+
+  it("S1: an unchanged workdir resolution revalidates cleanly", async () => {
+    const j = await jail();
+    const sub = path.join(root, "sub");
+    mkdirSync(sub);
+    const resolved = await j.resolve({ workdir: sub, serverRoots: [], loopId: "loop-1", runId: "run-1" });
+    await expect(j.revalidate(resolved)).resolves.toBeUndefined();
+  });
+
+  it("S2: an unchanged scratch resolution revalidates cleanly", async () => {
+    const j = await jail();
+    const resolved = await j.resolve({ workdir: null, serverRoots: [], loopId: "loop-1", runId: "run-1" });
+    await expect(j.revalidate(resolved)).resolves.toBeUndefined();
+    await j.release(resolved); // revalidate does NOT consume the release obligation
+  });
+
+  it("S3: the cwd swapped for a symlink (even pointing INSIDE the roots) is rejected — the recorded canonical path must still resolve to itself", async () => {
+    const j = await jail();
+    const sub = path.join(root, "sub");
+    const other = path.join(root, "other");
+    mkdirSync(sub);
+    mkdirSync(other);
+    const resolved = await j.resolve({ workdir: sub, serverRoots: [], loopId: "loop-1", runId: "run-1" });
+    rmSync(sub, { recursive: true });
+    symlinkSync(other, sub, "dir");
+    await expect(j.revalidate(resolved)).rejects.toThrow(JailError);
+  });
+
+  it("S4: a deleted cwd is rejected", async () => {
+    const j = await jail();
+    const sub = path.join(root, "sub");
+    mkdirSync(sub);
+    const resolved = await j.resolve({ workdir: sub, serverRoots: [], loopId: "loop-1", runId: "run-1" });
+    rmSync(sub, { recursive: true });
+    await expect(j.revalidate(resolved)).rejects.toThrow(JailError);
+  });
+
+  it("S5: the cwd swapped for a symlink pointing OUTSIDE the roots is rejected", async () => {
+    const j = await jail();
+    const sub = path.join(root, "sub");
+    const outside = path.join(base, "outside");
+    mkdirSync(sub);
+    mkdirSync(outside);
+    const resolved = await j.resolve({ workdir: sub, serverRoots: [], loopId: "loop-1", runId: "run-1" });
+    rmSync(sub, { recursive: true });
+    symlinkSync(outside, sub, "dir");
+    await expect(j.revalidate(resolved)).rejects.toThrow(JailError);
+  });
+
+  it("S6: an effective root swapped for a symlink is rejected — the sandbox profile would otherwise alias the wrong tree", async () => {
+    const j = await jail();
+    const resolved = await j.resolve({ workdir: root, serverRoots: [], loopId: "loop-1", runId: "run-1" });
+    const elsewhere = path.join(base, "elsewhere");
+    mkdirSync(elsewhere);
+    rmSync(root, { recursive: true });
+    symlinkSync(elsewhere, root, "dir");
+    await expect(j.revalidate(resolved)).rejects.toThrow(JailError);
+  });
+
+  it("S7: a deleted effective root is rejected", async () => {
+    const j = await jail();
+    const resolved = await j.resolve({ workdir: root, serverRoots: [], loopId: "loop-1", runId: "run-1" });
+    rmSync(root, { recursive: true });
+    await expect(j.revalidate(resolved)).rejects.toThrow(JailError);
+  });
+
+  it("S8: a scratch dir swapped for a symlink is rejected (lstat sees the swap)", async () => {
+    const j = await jail();
+    const resolved = await j.resolve({ workdir: null, serverRoots: [], loopId: "loop-1", runId: "run-1" });
+    const dir = resolved.scratchDir!;
+    rmSync(dir, { recursive: true });
+    symlinkSync(root, dir, "dir");
+    await expect(j.revalidate(resolved)).rejects.toThrow(JailError);
+  });
+
+  it("S9: a deleted scratch dir is rejected — and a release()d resolution no longer revalidates", async () => {
+    const j = await jail();
+    const resolved = await j.resolve({ workdir: null, serverRoots: [], loopId: "loop-1", runId: "run-1" });
+    rmSync(resolved.scratchDir!, { recursive: true });
+    await expect(j.revalidate(resolved)).rejects.toThrow(JailError);
+
+    const second = await j.resolve({ workdir: null, serverRoots: [], loopId: "loop-1", runId: "run-2" });
+    await j.release(second);
+    await expect(j.revalidate(second)).rejects.toThrow(JailError);
+  });
+
+  it("S10: a cwd that became a FILE is rejected", async () => {
+    const j = await jail();
+    const sub = path.join(root, "sub");
+    mkdirSync(sub);
+    const resolved = await j.resolve({ workdir: sub, serverRoots: [], loopId: "loop-1", runId: "run-1" });
+    rmSync(sub, { recursive: true });
+    writeFileSync(sub, "x");
+    await expect(j.revalidate(resolved)).rejects.toThrow(JailError);
+  });
+});
