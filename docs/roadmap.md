@@ -108,10 +108,9 @@ claude-code 或 codex 选一：子进程 spawn、进程组 kill、timeout、env 
   - jail `revalidate` 把 resolve→spawn TOCTOU 收窄到最小窗口（残余由 fail-closed OS sandbox 兜底）；scratch finally release，清理失败判 Run 失败。
   - 生产切换：`prepareDaemon` = config → startup jail → 无凭据 Claude 探测（10s、≥2.1.219、flags 检查，每次前后 stat+sha256）→ client → Claude Runner → runtime；真实 Run 在携带凭据前再复核身份，Fake Runner 退为测试 fixture。
   - Issue #12 跨层 round-robin liveness 验收落地（L1–L2：窗口内零误回收 + 对照回收 + 静默后全量回收）；opt-in 真实 sandbox smoke 备妥（默认跳过）。
+  - Batch 3 复审核销：四轮三轨复审全部通过、无 P1/P2/P3 finding（对比 `5f0263c...1ec7506`）；签字后 smoke 命令形态修复（`6de4a6f`）经聚焦复审核销，Issue #15 已关闭（2026-08-21）。
 
 ### 右移项
-
-- [ ] **Batch 3 复审核销**：[Issue #15](https://github.com/zhuabo001/loop-platform-zhb/issues/15)——复审 P1/P2/P3 已全部落地（red→green 成对提交），第四轮三轨核销通过；仅剩签字后的 smoke 命令形态修复（纯测试提交）待一轮聚焦复验后关闭。
 
 顺手收口：[Issue #10](https://github.com/zhuabo001/loop-platform-zhb/issues/10)
 （Day 8–10 二次审查右移项，不影响正确性）。
