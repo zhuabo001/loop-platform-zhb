@@ -23,7 +23,7 @@
  * dependency on auth, cost, and model stability.
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtemp, rm, writeFile, readFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -31,6 +31,7 @@ import { serve, type ServerType } from "@hono/node-server";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createLoopResponseSchema, runListResponseSchema, triggerRunResponseSchema } from "@loopzhb/protocol";
+import { machineIdFromToken } from "@loopzhb/protocol/node";
 
 import { closeDb, type DbHandle } from "./db/index.js";
 import { runLeases } from "./db/schema.js";
@@ -101,6 +102,7 @@ describe.skipIf(!ENABLED)("real Claude E2E (opt-in)", () => {
       const allowedRoot = await mkdtemp(path.join(tmpdir(), `loopzhb-e2e-root-${process.pid}-`));
       tempDirs.push(allowedRoot);
       const workdir = path.join(allowedRoot, "workdir");
+      await mkdir(workdir, { recursive: true });
       const taskFile = path.join(workdir, "TASK.md");
       const proofFile = path.join(workdir, "proof.txt");
 
@@ -125,9 +127,9 @@ describe.skipIf(!ENABLED)("real Claude E2E (opt-in)", () => {
       const daemonCliPath = path.join(__dirname, "../../daemon/dist/cli.js");
       const daemonEnv = {
         ...process.env,
-        LOOPZHB_SERVER: baseUrl,
+        LOOPZHB_SERVER_URL: baseUrl,
         LOOPZHB_MACHINE_CREDENTIAL: TOKEN,
-        LOOPZHB_ALLOWED_ROOTS: allowedRoot,
+        LOOPZHB_ALLOWED_ROOTS: JSON.stringify([allowedRoot]),
         LOOPZHB_CLAUDE_BIN: process.env.LOOPZHB_CLAUDE_BIN || "claude",
         NODE_ENV: "production",
       };
@@ -151,7 +153,7 @@ describe.skipIf(!ENABLED)("real Claude E2E (opt-in)", () => {
       });
 
       // 4. Wait for machine registration (daemon polls and self-registers)
-      const machineId = `machine-${TOKEN.slice(3, 11)}`; // deterministic from token
+      const machineId = machineIdFromToken(TOKEN);
       await waitFor(
         async () => {
           const res = await fetch(`${baseUrl}/api/machines`);
@@ -225,9 +227,9 @@ describe.skipIf(!ENABLED)("real Claude E2E (opt-in)", () => {
       const updatedLoop = loopBody.loops.find((l) => l.id === loop.id);
       expect(updatedLoop?.lastRun).toMatchObject({ id: runId, phase: "done", outcome: "exec" });
 
-      // 9. Assertions: proof file content
+      // 9. Assertions: proof file content (trim trailing whitespace/newline)
       const proofContent = await readFile(proofFile, "utf-8");
-      expect(proofContent).toBe(SUCCESS_MARKER);
+      expect(proofContent.trim()).toBe(SUCCESS_MARKER);
 
       // 10. Assertions: daemon logs do NOT contain machine credential
       const allLogs = daemonLogs.join("\n");
