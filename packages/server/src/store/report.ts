@@ -251,11 +251,7 @@ async function runReportTx(
     if (updated.length !== 1) throw new ReportCasLostError(run.id);
     // Fault-injection seam (between the two writes — see the jsdoc above).
     await input.insideTxHook?.(run.id);
-    const deleted = await tx
-      .delete(runLeases)
-      .where(and(eq(runLeases.tokenHash, input.tokenHash), eq(runLeases.state, lease.state)))
-      .returning({ tokenHash: runLeases.tokenHash });
-    if (deleted.length !== 1) throw new ReportCasLostError(run.id);
+    await deleteObservedLease();
     return { kind: "ok", result: reconcile ? { ok: true as const, reconciled: true as const } : { ok: true as const } };
   });
   if (outcome.kind === "denied") throw new RunCapabilityInvalidError(outcome.reason);
