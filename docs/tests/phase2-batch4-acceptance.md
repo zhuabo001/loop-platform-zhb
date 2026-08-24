@@ -8,7 +8,7 @@
 - **平台**: macOS (Darwin 25.5.0)
 - **Node.js**: >=22
 - **Claude Code**: 2.1.231
-- **Claude SHA-256**: `ba790279cab6ef77b713864d4bf5f764fcea87d3a3eb7591a41f741e45212b5c`
+- **Claude SHA-256**: `ba79****...****12b5c`（已脱敏）
 - **分支**: `feat/phase2-batch4`
 - **提交**: `4a818d3` (fix(e2e): track claude process groups from spawn)
 
@@ -28,7 +28,7 @@ Hello! Yes, I'm here and ready to work. 👋
 ### 测试命令
 
 ```bash
-LOOPZHB_EXPECTED_CLAUDE_SHA256=ba790279cab6ef77b713864d4bf5f764fcea87d3a3eb7591a41f741e45212b5c pnpm test:phase2:e2e
+LOOPZHB_EXPECTED_CLAUDE_SHA256=<approved-sha256-hash> pnpm test:phase2:e2e
 ```
 
 ### 测试目的
