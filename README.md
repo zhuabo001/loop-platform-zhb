@@ -31,7 +31,7 @@ pnpm --filter @loopzhb/daemon start
 
 ```bash
 # Sandbox smoke（Batch 3 验收：根内读写成功、根外拒绝）
-LOOPZHB_CLAUDE_SMOKE=1 pnpm --filter @loopzhb/daemon vitest run src/claude-smoke.test.ts
+LOOPZHB_CLAUDE_SMOKE=1 pnpm --filter @loopzhb/daemon test src/claude-smoke.test.ts
 
 # 全链路 E2E（Batch 4 验收：HTTP → daemon → Claude → DB 完整闭环）
 # 先独立核对本机 Claude realpath/version，并计算、审核其 SHA-256；
