@@ -48,6 +48,23 @@ describe("spawnWithTimeout — lifecycle basics", () => {
     expect(result.completion.kind).toBe("spawn-error");
     expect((result.completion as { code?: string }).code).toBe("ENOENT");
   });
+
+  it("S18: reports the exact detached process-group lifecycle", async () => {
+    const events: Array<{ kind: "started" | "closed"; pgid: number }> = [];
+
+    const result = await spawnWithTimeout(
+      opts({
+        args: [FIXTURE, "exit", "0"],
+        onProcessGroup: (event) => events.push(event),
+      }),
+    );
+
+    expect(result.completion).toEqual({ kind: "exited", exitCode: 0 });
+    expect(events).toHaveLength(2);
+    expect(events[0]).toMatchObject({ kind: "started" });
+    expect(events[0]!.pgid).toBeGreaterThan(1);
+    expect(events[1]).toEqual({ kind: "closed", pgid: events[0]!.pgid });
+  });
 });
 
 describe("spawnWithTimeout — stdio capture, caps and chunk callbacks", () => {

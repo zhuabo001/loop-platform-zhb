@@ -25,13 +25,7 @@ pnpm --filter @loopzhb/daemon start
 
 **平台**：macOS / Linux / WSL2。原生 Windows 不支持（subprocess 进程组语义是 POSIX 的）。
 
-**Batch 3 状态（当前）**：生产 daemon 已切换到**真实 Claude Code Runner**（ADR-006）。每次 Run 经固定 argv 的 `claude -p --output-format stream-json` 执行，只开放 `Bash` 工具，文件系统与网络由 fail-closed OS sandbox 兜底（sandbox 不可用即失败，绝不降级为 unsandboxed）；child-controlled progress 只暴露固定语义标签，不转发模型文本或命令；jail 在 spawn 前重校验（resolve→spawn 窗口收窄，残余由 sandbox 兜底），per-run scratch 用后即焚且清理失败判 Run 失败。启动顺序：`config → startup jail → 无凭据 Claude 探测 → HTTP client → Claude Runner → runtime`，探测失败时 daemon 不启动。
-
-人工验收（不进默认离线测试套件，使用开发者本机 Claude 认证）：
-
-```bash
-LOOPZHB_CLAUDE_SMOKE=1 pnpm --filter @loopzhb/daemon vitest run src/claude-smoke.test.ts
-```
+**生产 Runner**：生产 daemon 使用真实 Claude Code Runner（ADR-006）。每次 Run 经固定 argv 的 `claude -p --output-format stream-json` 执行，只开放 `Bash` 工具，文件系统与网络由 fail-closed OS sandbox 兜底（sandbox 不可用即失败，绝不降级为 unsandboxed）；child-controlled progress 只暴露固定语义标签，不转发模型文本或命令；jail 在 spawn 前重校验（resolve→spawn 窗口收窄，残余由 sandbox 兜底），per-run scratch 用后即焚且清理失败判 Run 失败。
 
 ## 开发
 
@@ -42,4 +36,18 @@ pnpm typecheck
 pnpm build
 ```
 
+## 验收测试
+
+人工验收测试（不进默认离线测试套件，使用开发者本机 Claude 认证与真实 LLM 调用，会产生费用）：
+
+```bash
+# Sandbox smoke：验证 OS sandbox 边界保护
+LOOPZHB_CLAUDE_SMOKE=1 pnpm --filter @loopzhb/daemon test src/claude-smoke.test.ts
+
+# 全链路 E2E：验证完整生产链路（HTTP → daemon → Claude → DB）
+# 先独立核对本机 Claude realpath/version，并计算、审核其 SHA-256
+LOOPZHB_EXPECTED_CLAUDE_SHA256=<approved-64-hex-sha256> pnpm test:phase2:e2e
+```
+
 仓库工作规约（文档四层分流、批次收口仪式）见 `AGENTS.md`。
+

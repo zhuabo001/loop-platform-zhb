@@ -43,7 +43,7 @@ import type { ResolvedWorkdir, WorkdirJail } from "./jail.js";
 import { sameClaudeBinary, statClaudeBinary, type ClaudeBinaryIdentity } from "./probe-claude.js";
 import type { AgentRunner, RunnerContext, RunnerReport } from "./runner.js";
 import { ERROR_CAP } from "./runtime.js";
-import type { SpawnResult } from "./subprocess.js";
+import type { ProcessGroupLifecycleEvent, SpawnResult } from "./subprocess.js";
 import { ProcessControlError, spawnWithTimeout } from "./subprocess.js";
 
 export interface ClaudeRunnerDeps {
@@ -56,6 +56,9 @@ export interface ClaudeRunnerDeps {
    *  this resolved path before every spawn. Absent only in direct adapter
    *  tests. */
   probedBinary?: ClaudeBinaryIdentity;
+  /** Opt-in Batch-4 acceptance observer for the exact Claude process group
+   *  created by spawnWithTimeout. */
+  onProcessGroup?: (event: ProcessGroupLifecycleEvent) => void;
   /** Replaces spawnWithTimeout. TEST-ONLY seam (same standing as
    *  SpawnOptions.killImpl): production call sites never set this — the
    *  combined-failure pin (A22) needs a spawn that rejects with
@@ -193,6 +196,7 @@ export function createClaudeRunner(deps: ClaudeRunnerDeps): AgentRunner {
           timeoutMs: deps.timeoutMs,
           signal: ctx.signal,
           onStdout: (chunk) => parser.push(chunk),
+          ...(deps.onProcessGroup !== undefined ? { onProcessGroup: deps.onProcessGroup } : {}),
         });
         return reportFromSpawn(delivery, spawned, parser, redact, deps.timeoutMs);
       } catch (err) {

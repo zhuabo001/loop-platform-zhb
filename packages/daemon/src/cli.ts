@@ -21,9 +21,10 @@ import { createClaudeRunner, type ClaudeRunnerDeps } from "./claude-runner.js";
 import { loadDaemonConfig, type DaemonConfig } from "./config.js";
 import { machineIdentity } from "./identity.js";
 import { createWorkdirJail, type WorkdirJail } from "./jail.js";
-import { probeClaudeBinary } from "./probe-claude.js";
+import { probeClaudeBinary, type ClaudeProbeResult } from "./probe-claude.js";
 import type { AgentRunner } from "./runner.js";
 import { createDaemonRuntime, type DaemonRuntime } from "./runtime.js";
+import type { ProcessGroupLifecycleEvent } from "./subprocess.js";
 
 /** Batch-2 startup seam: canonicalize + verify the isolation roots BEFORE
  *  any resource opens (fail-fast, fail-closed). */
@@ -43,9 +44,22 @@ export const productionRunnerFactory: (deps: ClaudeRunnerDeps) => AgentRunner = 
 /** The testable composition: config → startup jail → Claude probe → client →
  *  Claude Runner → runtime. Polls begin only after this resolves, so the
  *  probe provably precedes the first poll (plan §2.2). */
-export async function prepareDaemon(config: DaemonConfig, envSource: NodeJS.ProcessEnv): Promise<DaemonRuntime> {
+export interface PrepareDaemonOptions {
+  /** Opt-in acceptance observer. It receives the exact identity pinned by
+   *  the production probe, not a second test-side resolution. */
+  onClaudeProbe?: (probe: ClaudeProbeResult) => void;
+  /** Opt-in acceptance observer for each real Claude process group. */
+  onClaudeProcessGroup?: (event: ProcessGroupLifecycleEvent) => void;
+}
+
+export async function prepareDaemon(
+  config: DaemonConfig,
+  envSource: NodeJS.ProcessEnv,
+  options: PrepareDaemonOptions = {},
+): Promise<DaemonRuntime> {
   const jail = await createStartupJail(config);
   const probe = await probeClaudeBinary(config.claudeBin, envSource);
+  options.onClaudeProbe?.(probe);
   const client = createMachineClient({
     baseUrl: config.serverUrl,
     machineCredential: config.machineCredential,
@@ -60,6 +74,7 @@ export async function prepareDaemon(config: DaemonConfig, envSource: NodeJS.Proc
       // The probe-pinned binary identity: every run re-verifies it before
       // spawning (round-1 review P1).
       probedBinary: probe.binary,
+      ...(options.onClaudeProcessGroup !== undefined ? { onProcessGroup: options.onClaudeProcessGroup } : {}),
     }),
     identity: machineIdentity(),
     pollMs: config.pollMs,
@@ -99,7 +114,24 @@ export function registerShutdownSignals(
 
 export async function main(): Promise<void> {
   const config = loadDaemonConfig(process.env);
-  const runtime = await prepareDaemon(config, process.env);
+  const runtime = await prepareDaemon(config, process.env, {
+    ...(process.env.LOOPZHB_REAL_CLAUDE_E2E === "1"
+      ? {
+          onClaudeProbe: (probe: ClaudeProbeResult): void => {
+            console.log(
+              `loopzhb claude provenance ${JSON.stringify({
+                resolvedPath: probe.binary.resolvedPath,
+                version: probe.version,
+                sha256: probe.binary.sha256,
+              })}`,
+            );
+          },
+          onClaudeProcessGroup: (event: ProcessGroupLifecycleEvent): void => {
+            console.log(`loopzhb claude process-group ${JSON.stringify(event)}`);
+          },
+        }
+      : {}),
+  });
 
   const ctl = new AbortController();
   const unregisterShutdownSignals = registerShutdownSignals(ctl);

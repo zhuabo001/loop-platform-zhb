@@ -42,7 +42,7 @@ import type { Db } from "../db/index.js";
 import { runLeases, runs, type RunProgressRow } from "../db/schema.js";
 import { isLeaseDead } from "../store/leases.js";
 import { classifyHeartbeatWatermark, getMachine, heartbeatAgeMs } from "../store/machines.js";
-import { lastRunActivityMs, reclaimStaleRunTx } from "../store/runs.js";
+import { lastRunActivityMs, reclaimStaleRunTx, ReclaimGuardLostError } from "../store/runs.js";
 import type { Clock } from "../time.js";
 
 /** Production thresholds (plan §1): a run silent for 20 minutes is stale;
@@ -96,6 +96,18 @@ const terminalGraceColumns = {
   expiresAt: runLeases.expiresAt,
 } as const;
 
+/**
+ * Classify a reclaim failure for logging (Issue #10, Batch 4). Returns ONLY a
+ * fixed classification string — never the error message, stack, or any
+ * database text that might contain credentials.
+ */
+function classifyReclaimError(err: unknown): string {
+  if (err instanceof ReclaimGuardLostError) {
+    return "reclaim_guard_lost";
+  }
+  return "reclaim_failed";
+}
+
 export function createInactivitySweep(deps: InactivitySweepDeps): InactivitySweep {
   const runInactivityMs = deps.runInactivityMs ?? DEFAULT_RUN_INACTIVITY_MS;
   const pageSize = deps.pageSize ?? DEFAULT_SWEEP_PAGE_SIZE;
@@ -142,11 +154,13 @@ export function createInactivitySweep(deps: InactivitySweepDeps): InactivitySwee
         `[sweep] reclaim run=${run.id} loop=${run.loopId} machine=${run.machineId}` +
           ` inactiveMs=${activityMs === null ? "unknown" : nowMs - activityMs} ${diagnostic}`,
       );
-    } catch {
+    } catch (err) {
       // A conjunctive-guard violation (running WITHOUT an active lease) rolls
-      // its own transaction back — count it, log it, keep sweeping.
+      // its own transaction back — count it, log it (with fixed classification
+      // ONLY — never the error message or database text), keep sweeping.
       stats.failed += 1;
-      log(`[sweep] reclaim FAILED run=${run.id} classification=reclaim_failed`);
+      const classification = classifyReclaimError(err);
+      log(`[sweep] reclaim FAILED run=${run.id} classification=${classification}`);
     }
   }
 
