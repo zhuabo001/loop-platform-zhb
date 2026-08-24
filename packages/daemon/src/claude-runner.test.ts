@@ -141,6 +141,18 @@ describe("A1–A3: the fixed argv and the dynamic sandbox settings", () => {
     ]);
   });
 
+  it("A1b: forwards the exact Claude process-group lifecycle to the acceptance observer", async () => {
+    const events: Array<{ kind: "started" | "closed"; pgid: number }> = [];
+    const { run } = makeRunner({ onProcessGroup: (event) => events.push(event) });
+
+    const report = await run(makeDelivery());
+
+    expect(report.ok).toBe(true);
+    expect(events).toHaveLength(2);
+    expect(events[0]).toMatchObject({ kind: "started" });
+    expect(events[1]).toEqual({ kind: "closed", pgid: events[0]!.pgid });
+  });
+
   it("A2: --model and --append-system-prompt append only when configured", async () => {
     const { run } = makeRunner();
     const d = makeDelivery();

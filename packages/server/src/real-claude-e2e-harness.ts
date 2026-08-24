@@ -1,26 +1,7 @@
-import { execFile, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 
 export type DaemonLogStream = "stdout" | "stderr";
-
-export const CLAUDE_PROVENANCE_PREFIX = "loopzhb claude provenance ";
-
-export interface ClaudeProvenance {
-  resolvedPath: string;
-  version: string;
-  sha256: string;
-}
-
-export type ProcessCloseResult = {
-  kind: "closed";
-  code: number | null;
-  signal: NodeJS.Signals | null;
-};
-
-export interface TerminationOptions {
-  graceMs: number;
-  killWaitMs: number;
-}
 
 export class DaemonLogObserver {
   private readonly secrets: Buffer[];
@@ -31,10 +12,6 @@ export class DaemonLogObserver {
   };
   private tail = Buffer.alloc(0);
   private foundSecret = false;
-  private readonly stdoutDecoder = new StringDecoder("utf8");
-  private stdoutLineCarry = "";
-  private provenance: ClaudeProvenance | null = null;
-  private provenanceError: Error | null = null;
 
   constructor(
     secrets: readonly string[],
@@ -53,7 +30,6 @@ export class DaemonLogObserver {
     if (this.secrets.some((secret) => searchable.indexOf(secret) !== -1)) this.foundSecret = true;
     this.overlap[stream] = this.overlapBytes === 0 ? Buffer.alloc(0) : searchable.subarray(-this.overlapBytes);
     this.tail = Buffer.concat([this.tail, bytes]).subarray(-this.maxDiagnosticBytes);
-    if (stream === "stdout") this.observeStdoutLines(this.stdoutDecoder.write(bytes));
   }
 
   get secretSeen(): boolean {
@@ -71,6 +47,32 @@ export class DaemonLogObserver {
     }
     return text;
   }
+}
+
+export const CLAUDE_PROVENANCE_PREFIX = "loopzhb claude provenance ";
+export const CLAUDE_PROCESS_GROUP_PREFIX = "loopzhb claude process-group ";
+
+export interface ClaudeProvenance {
+  resolvedPath: string;
+  version: string;
+  sha256: string;
+}
+
+export type ProcessGroupEvent =
+  | { kind: "started"; pgid: number }
+  | { kind: "closed"; pgid: number };
+
+export class DaemonControlObserver {
+  private readonly decoder = new StringDecoder("utf8");
+  private lineCarry = "";
+  private provenance: ClaudeProvenance | null = null;
+  private controlError: Error | null = null;
+
+  constructor(private readonly onProcessGroup: (event: ProcessGroupEvent) => void) {}
+
+  append(chunk: Uint8Array): void {
+    this.observeLines(this.decoder.write(Buffer.from(chunk)));
+  }
 
   requireApprovedProvenance(expectedSha256: string): ClaudeProvenance {
     const provenance = this.approvedProvenance(expectedSha256);
@@ -79,38 +81,51 @@ export class DaemonLogObserver {
   }
 
   approvedProvenance(expectedSha256: string): ClaudeProvenance | null {
+    this.assertHealthy();
     if (!/^[0-9a-f]{64}$/i.test(expectedSha256)) {
       throw new Error("LOOPZHB_EXPECTED_CLAUDE_SHA256 must be exactly 64 hexadecimal characters");
     }
-    if (this.provenanceError !== null) throw this.provenanceError;
     if (this.provenance === null) return null;
-    if (this.provenance.sha256.toLowerCase() !== expectedSha256.toLowerCase()) {
+    if (this.provenance.sha256 !== expectedSha256.toLowerCase()) {
       throw new Error("production daemon Claude provenance does not match the approved sha256");
     }
     return this.provenance;
   }
 
-  private observeStdoutLines(text: string): void {
-    this.stdoutLineCarry += text;
-    let newline = this.stdoutLineCarry.indexOf("\n");
+  assertHealthy(): void {
+    if (this.controlError !== null) throw this.controlError;
+  }
+
+  private observeLines(text: string): void {
+    this.lineCarry += text;
+    let newline = this.lineCarry.indexOf("\n");
     while (newline !== -1) {
-      const line = this.stdoutLineCarry.slice(0, newline).replace(/\r$/, "");
-      this.stdoutLineCarry = this.stdoutLineCarry.slice(newline + 1);
-      this.observeStdoutLine(line);
-      newline = this.stdoutLineCarry.indexOf("\n");
+      const line = this.lineCarry.slice(0, newline).replace(/\r$/, "");
+      this.lineCarry = this.lineCarry.slice(newline + 1);
+      this.observeLine(line);
+      newline = this.lineCarry.indexOf("\n");
     }
-    if (this.stdoutLineCarry.length > 8192) {
-      if (this.stdoutLineCarry.includes(CLAUDE_PROVENANCE_PREFIX)) {
-        this.provenanceError = new Error("production daemon emitted an oversized Claude provenance record");
+    if (this.lineCarry.length > 8192) {
+      if (this.lineCarry.includes(CLAUDE_PROVENANCE_PREFIX) || this.lineCarry.includes(CLAUDE_PROCESS_GROUP_PREFIX)) {
+        this.controlError = new Error("production daemon emitted an oversized control record");
       }
-      this.stdoutLineCarry = this.stdoutLineCarry.slice(-8192);
+      this.lineCarry = this.lineCarry.slice(-8192);
     }
   }
 
-  private observeStdoutLine(line: string): void {
-    if (!line.startsWith(CLAUDE_PROVENANCE_PREFIX)) return;
+  private observeLine(line: string): void {
+    if (line.startsWith(CLAUDE_PROVENANCE_PREFIX)) {
+      this.observeProvenance(line.slice(CLAUDE_PROVENANCE_PREFIX.length));
+      return;
+    }
+    if (line.startsWith(CLAUDE_PROCESS_GROUP_PREFIX)) {
+      this.observeProcessGroup(line.slice(CLAUDE_PROCESS_GROUP_PREFIX.length));
+    }
+  }
+
+  private observeProvenance(json: string): void {
     try {
-      const value = JSON.parse(line.slice(CLAUDE_PROVENANCE_PREFIX.length)) as Record<string, unknown>;
+      const value = JSON.parse(json) as Record<string, unknown>;
       if (
         typeof value.resolvedPath !== "string" ||
         !value.resolvedPath.startsWith("/") ||
@@ -131,11 +146,41 @@ export class DaemonLogObserver {
       }
       this.provenance = observed;
     } catch (err) {
-      this.provenanceError = new Error(
+      this.controlError = new Error(
         `invalid production daemon Claude provenance: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }
+
+  private observeProcessGroup(json: string): void {
+    try {
+      const value = JSON.parse(json) as Record<string, unknown>;
+      if (
+        (value.kind !== "started" && value.kind !== "closed") ||
+        typeof value.pgid !== "number" ||
+        !Number.isSafeInteger(value.pgid) ||
+        value.pgid <= 1
+      ) {
+        throw new Error("invalid fields");
+      }
+      this.onProcessGroup({ kind: value.kind, pgid: value.pgid });
+    } catch (err) {
+      this.controlError = new Error(
+        `invalid production daemon Claude process-group record: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+}
+
+export type ProcessCloseResult = {
+  kind: "closed";
+  code: number | null;
+  signal: NodeJS.Signals | null;
+};
+
+export interface TerminationOptions {
+  graceMs: number;
+  killWaitMs: number;
 }
 
 export class DetachedProcessSupervisor {
@@ -143,6 +188,8 @@ export class DetachedProcessSupervisor {
   private readonly closePromise: Promise<ProcessCloseResult>;
   private closeResult: ProcessCloseResult | null = null;
   private readonly knownGroups = new Set<number>();
+  private terminationPromise: Promise<ProcessCloseResult> | null = null;
+  private currentSignal: NodeJS.Signals | null = null;
 
   constructor(private readonly child: ChildProcess) {
     if (process.platform === "win32") throw new Error("detached process-group supervision requires POSIX");
@@ -157,13 +204,29 @@ export class DetachedProcessSupervisor {
     });
   }
 
+  trackProcessGroup(pgid: number): void {
+    this.validateExternalGroup(pgid);
+    this.knownGroups.add(pgid);
+    if (this.currentSignal !== null) this.signalGroup(pgid, this.currentSignal);
+  }
+
+  releaseProcessGroup(pgid: number): void {
+    this.validateExternalGroup(pgid);
+    this.knownGroups.delete(pgid);
+  }
+
   async terminate(options: TerminationOptions): Promise<ProcessCloseResult> {
-    await this.refreshDescendantGroups();
+    this.terminationPromise ??= this.terminateOnce(options);
+    return await this.terminationPromise;
+  }
+
+  private async terminateOnce(options: TerminationOptions): Promise<ProcessCloseResult> {
+    this.currentSignal = "SIGTERM";
     this.signalKnownGroups("SIGTERM");
     const graceful = await this.waitForClosedGroups(options.graceMs);
     if (graceful !== null) return graceful;
 
-    await this.refreshDescendantGroups();
+    this.currentSignal = "SIGKILL";
     this.signalKnownGroups("SIGKILL");
     const forced = await this.waitForClosedGroups(options.killWaitMs);
     if (forced === null) {
@@ -188,35 +251,15 @@ export class DetachedProcessSupervisor {
     return this.closeResult !== null && this.allKnownGroupsGone() ? this.closeResult : null;
   }
 
-  private async refreshDescendantGroups(): Promise<void> {
-    const rows = parseProcessTable(await readProcessTable());
-    const children = new Map<number, Array<{ pid: number; pgid: number }>>();
-    for (const row of rows) {
-      const entries = children.get(row.ppid) ?? [];
-      entries.push({ pid: row.pid, pgid: row.pgid });
-      children.set(row.ppid, entries);
-    }
-
-    const pending = [this.pid];
-    const visited = new Set<number>();
-    while (pending.length > 0) {
-      const parent = pending.pop()!;
-      if (visited.has(parent)) continue;
-      visited.add(parent);
-      for (const descendant of children.get(parent) ?? []) {
-        if (descendant.pgid > 1) this.knownGroups.add(descendant.pgid);
-        pending.push(descendant.pid);
-      }
-    }
+  private signalKnownGroups(signal: NodeJS.Signals): void {
+    for (const pgid of [...this.knownGroups].sort((a, b) => b - a)) this.signalGroup(pgid, signal);
   }
 
-  private signalKnownGroups(signal: NodeJS.Signals): void {
-    for (const pgid of [...this.knownGroups].sort((a, b) => b - a)) {
-      try {
-        process.kill(-pgid, signal);
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "ESRCH") throw err;
-      }
+  private signalGroup(pgid: number, signal: NodeJS.Signals): void {
+    try {
+      process.kill(-pgid, signal);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ESRCH") throw err;
     }
   }
 
@@ -231,37 +274,10 @@ export class DetachedProcessSupervisor {
     }
     return true;
   }
-}
 
-interface ProcessTableRow {
-  pid: number;
-  ppid: number;
-  pgid: number;
-}
-
-function readProcessTable(): Promise<string> {
-  return new Promise((resolve, reject) => {
-    execFile(
-      "ps",
-      ["-axo", "pid=,ppid=,pgid="],
-      { encoding: "utf8", timeout: 2000, maxBuffer: 1024 * 1024 },
-      (err, stdout) => {
-        if (err !== null) {
-          reject(new Error(`cannot inspect daemon descendants: ${err.message}`, { cause: err }));
-          return;
-        }
-        resolve(stdout);
-      },
-    );
-  });
-}
-
-function parseProcessTable(output: string): ProcessTableRow[] {
-  const rows: ProcessTableRow[] = [];
-  for (const line of output.split("\n")) {
-    const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s*$/.exec(line);
-    if (match === null) continue;
-    rows.push({ pid: Number(match[1]), ppid: Number(match[2]), pgid: Number(match[3]) });
+  private validateExternalGroup(pgid: number): void {
+    if (!Number.isSafeInteger(pgid) || pgid <= 1 || pgid === this.pid) {
+      throw new Error(`invalid external process group ${pgid}`);
+    }
   }
-  return rows;
 }

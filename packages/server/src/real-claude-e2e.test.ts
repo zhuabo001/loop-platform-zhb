@@ -39,7 +39,7 @@ import { machineIdFromToken } from "@loopzhb/protocol/node";
 
 import { closeDb, type DbHandle } from "./db/index.js";
 import { runLeases } from "./db/schema.js";
-import { DaemonLogObserver, DetachedProcessSupervisor } from "./real-claude-e2e-harness.js";
+import { DaemonControlObserver, DaemonLogObserver, DetachedProcessSupervisor } from "./real-claude-e2e-harness.js";
 import { bootstrapServer, waitForListening } from "./start.js";
 
 const ENABLED = process.env.LOOPZHB_REAL_CLAUDE_E2E === "1";
@@ -139,7 +139,6 @@ describe.skipIf(!ENABLED)("real Claude E2E (opt-in)", () => {
         NODE_ENV: "production",
       };
 
-      const logs = new DaemonLogObserver([TOKEN], MAX_LOG_BYTES);
       const daemon = spawn(process.execPath, [daemonCliPath], {
         env: daemonEnv,
         shell: false,
@@ -147,10 +146,16 @@ describe.skipIf(!ENABLED)("real Claude E2E (opt-in)", () => {
         stdio: ["ignore", "pipe", "pipe"],
       });
       const supervisor = new DetachedProcessSupervisor(daemon);
+      const logs = new DaemonLogObserver([TOKEN], MAX_LOG_BYTES);
+      const control = new DaemonControlObserver((event) => {
+        if (event.kind === "started") supervisor.trackProcessGroup(event.pgid);
+        else supervisor.releaseProcessGroup(event.pgid);
+      });
       daemons.push(supervisor);
 
       daemon.stdout?.on("data", (chunk: Buffer) => {
         logs.append("stdout", chunk);
+        control.append(chunk);
       });
       daemon.stderr?.on("data", (chunk: Buffer) => {
         logs.append("stderr", chunk);
@@ -159,10 +164,10 @@ describe.skipIf(!ENABLED)("real Claude E2E (opt-in)", () => {
       try {
         // 4. Require provenance from the daemon's actual production probe and
         // compare it with an explicit operator-approved hash.
-        let provenance = logs.approvedProvenance(expectedClaudeSha256);
+        let provenance = control.approvedProvenance(expectedClaudeSha256);
         await waitFor(
           async () => {
-            provenance = logs.approvedProvenance(expectedClaudeSha256);
+            provenance = control.approvedProvenance(expectedClaudeSha256);
             return provenance !== null;
           },
           REGISTER_TIMEOUT_MS,
@@ -254,6 +259,9 @@ describe.skipIf(!ENABLED)("real Claude E2E (opt-in)", () => {
         // ChildProcess close also proves stdout/stderr have drained.
         const closed = await supervisor.terminate({ graceMs: 5000, killWaitMs: 2000 });
         expect(closed).toEqual({ kind: "closed", code: 0, signal: null });
+        control.assertHealthy();
+        const daemonIndex = daemons.indexOf(supervisor);
+        if (daemonIndex !== -1) daemons.splice(daemonIndex, 1);
 
         // 12. Sticky streaming scan covers the complete lifecycle, including
         // shutdown output received before close.

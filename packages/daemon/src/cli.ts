@@ -24,6 +24,7 @@ import { createWorkdirJail, type WorkdirJail } from "./jail.js";
 import { probeClaudeBinary, type ClaudeProbeResult } from "./probe-claude.js";
 import type { AgentRunner } from "./runner.js";
 import { createDaemonRuntime, type DaemonRuntime } from "./runtime.js";
+import type { ProcessGroupLifecycleEvent } from "./subprocess.js";
 
 /** Batch-2 startup seam: canonicalize + verify the isolation roots BEFORE
  *  any resource opens (fail-fast, fail-closed). */
@@ -47,6 +48,8 @@ export interface PrepareDaemonOptions {
   /** Opt-in acceptance observer. It receives the exact identity pinned by
    *  the production probe, not a second test-side resolution. */
   onClaudeProbe?: (probe: ClaudeProbeResult) => void;
+  /** Opt-in acceptance observer for each real Claude process group. */
+  onClaudeProcessGroup?: (event: ProcessGroupLifecycleEvent) => void;
 }
 
 export async function prepareDaemon(
@@ -71,6 +74,7 @@ export async function prepareDaemon(
       // The probe-pinned binary identity: every run re-verifies it before
       // spawning (round-1 review P1).
       probedBinary: probe.binary,
+      ...(options.onClaudeProcessGroup !== undefined ? { onProcessGroup: options.onClaudeProcessGroup } : {}),
     }),
     identity: machineIdentity(),
     pollMs: config.pollMs,
@@ -121,6 +125,9 @@ export async function main(): Promise<void> {
                 sha256: probe.binary.sha256,
               })}`,
             );
+          },
+          onClaudeProcessGroup: (event: ProcessGroupLifecycleEvent): void => {
+            console.log(`loopzhb claude process-group ${JSON.stringify(event)}`);
           },
         }
       : {}),

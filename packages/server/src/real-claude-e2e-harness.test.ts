@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 
 import { describe, expect, it } from "vitest";
 
-import { DaemonLogObserver, DetachedProcessSupervisor } from "./real-claude-e2e-harness.js";
+import { DaemonControlObserver, DaemonLogObserver, DetachedProcessSupervisor } from "./real-claude-e2e-harness.js";
 
 describe("DaemonLogObserver", () => {
   it("keeps a sticky credential finding even when one oversized chunk is evicted from diagnostics", () => {
@@ -28,17 +28,26 @@ describe("DaemonLogObserver", () => {
     expect(observer.diagnosticBytes).toBe(32);
   });
 
-  it("parses the production daemon provenance across chunks and requires an approved hash", () => {
-    const observer = new DaemonLogObserver([], 1024);
-    const sha256 = "a".repeat(64);
-    const line = `loopzhb claude provenance ${JSON.stringify({
-      resolvedPath: "/tmp/Claude Code/claude",
-      version: "2.1.227",
-      sha256,
-    })}\n`;
+});
 
-    observer.append("stdout", Buffer.from(line.slice(0, 23)));
-    observer.append("stdout", Buffer.from(line.slice(23)));
+describe("DaemonControlObserver", () => {
+  it("parses production provenance and process-group lifecycle records across chunks", () => {
+    const events: Array<{ kind: "started" | "closed"; pgid: number }> = [];
+    const observer = new DaemonControlObserver((event) => events.push(event));
+    const sha256 = "a".repeat(64);
+    const output = [
+      `loopzhb claude provenance ${JSON.stringify({
+        resolvedPath: "/tmp/Claude Code/claude",
+        version: "2.1.227",
+        sha256,
+      })}`,
+      `loopzhb claude process-group ${JSON.stringify({ kind: "started", pgid: 43210 })}`,
+      `loopzhb claude process-group ${JSON.stringify({ kind: "closed", pgid: 43210 })}`,
+      "",
+    ].join("\n");
+
+    observer.append(Buffer.from(output.slice(0, 23)));
+    observer.append(Buffer.from(output.slice(23)));
 
     expect(observer.requireApprovedProvenance(sha256)).toEqual({
       resolvedPath: "/tmp/Claude Code/claude",
@@ -46,6 +55,10 @@ describe("DaemonLogObserver", () => {
       sha256,
     });
     expect(() => observer.requireApprovedProvenance("b".repeat(64))).toThrow(/does not match the approved sha256/);
+    expect(events).toEqual([
+      { kind: "started", pgid: 43210 },
+      { kind: "closed", pgid: 43210 },
+    ]);
   });
 });
 
@@ -62,11 +75,13 @@ describe("DetachedProcessSupervisor", () => {
     });
 
     try {
-      await new Promise<void>((resolve) => child.stdout!.once("data", () => resolve()));
+      await withTimeout(new Promise<void>((resolve) => child.stdout!.once("data", () => resolve())), 2000);
       const startedAt = Date.now();
       const closed = await supervisor.terminate({ graceMs: 1000, killWaitMs: 1000 });
+      const closedAgain = await supervisor.terminate({ graceMs: 1000, killWaitMs: 1000 });
 
       expect(closed).toEqual({ kind: "closed", code: null, signal: "SIGTERM" });
+      expect(closedAgain).toEqual(closed);
       expect(externalExitCalls).toBe(1);
       expect(Date.now() - startedAt).toBeLessThan(1000);
     } finally {
@@ -80,32 +95,30 @@ describe("DetachedProcessSupervisor", () => {
     }
   });
 
-  it("waits for inherited stdio and force-closes a detached descendant group", async () => {
-    const token = "dk_e2e_late_descendant_secret";
+  it("force-closes a registered detached descendant after its parent has already closed", async () => {
     const descendantScript = [
       'process.on("SIGTERM", () => {});',
-      'process.stdout.write(`DESCENDANT_READY ${process.pid}\\n`);',
-      `setTimeout(() => process.stdout.write(${JSON.stringify(`${token}\n`)}), 120);`,
+      'if (process.send) process.send("ready");',
       "setInterval(() => {}, 1000);",
     ].join(" ");
     const parentScript = [
       'const { spawn } = require("node:child_process");',
-      `spawn(process.execPath, ["-e", ${JSON.stringify(descendantScript)}], { detached: true, stdio: ["ignore", process.stdout, process.stderr] });`,
-      'process.on("SIGTERM", () => process.exit(0));',
-      "setInterval(() => {}, 1000);",
+      `const descendant = spawn(process.execPath, ["-e", ${JSON.stringify(descendantScript)}], { detached: true, stdio: ["ignore", "ignore", "ignore", "ipc"] });`,
+      'descendant.once("message", () => { process.stdout.write(`DESCENDANT_READY ${descendant.pid}\\n`); process.exit(0); });',
     ].join(" ");
     const child = spawn(process.execPath, ["-e", parentScript], {
       detached: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
     const supervisor = new DetachedProcessSupervisor(child);
-    const observer = new DaemonLogObserver([token], 1024);
+    const parentClosed = new Promise<void>((resolve) => child.once("close", () => resolve()));
     let descendantPid: number | null = null;
+    let stdout = "";
 
     const ready = new Promise<void>((resolve) => {
       child.stdout!.on("data", (chunk: Buffer) => {
-        observer.append("stdout", chunk);
-        const match = /DESCENDANT_READY (\d+)/.exec(chunk.toString("utf8"));
+        stdout += chunk.toString("utf8");
+        const match = /DESCENDANT_READY (\d+)/.exec(stdout);
         if (match !== null) {
           descendantPid = Number(match[1]);
           resolve();
@@ -114,11 +127,14 @@ describe("DetachedProcessSupervisor", () => {
     });
 
     try {
-      await ready;
-      const closed = await supervisor.terminate({ graceMs: 250, killWaitMs: 1000 });
+      await withTimeout(ready, 2000);
+      supervisor.trackProcessGroup(descendantPid!);
+      await withTimeout(parentClosed, 2000);
+      expect(isGroupAlive(descendantPid!)).toBe(true);
+
+      const closed = await supervisor.terminate({ graceMs: 100, killWaitMs: 1000 });
 
       expect(closed).toEqual({ kind: "closed", code: 0, signal: null });
-      expect(observer.secretSeen).toBe(true);
       expect(descendantPid).not.toBeNull();
       expect(isGroupAlive(descendantPid!)).toBe(false);
     } finally {
@@ -141,5 +157,19 @@ function isGroupAlive(pgid: number): boolean {
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ESRCH") return false;
     throw err;
+  }
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`test readiness timed out after ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }

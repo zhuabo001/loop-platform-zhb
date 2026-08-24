@@ -41,6 +41,10 @@ export interface SpawnOptions {
   signal: AbortSignal;
   onStdout?: (chunk: Uint8Array) => void;
   onStderr?: (chunk: Uint8Array) => void;
+  /** Exact lifecycle of the detached process group. The Batch-4 opt-in E2E
+   *  supervisor uses this to retain a Claude PGID even if the daemon exits
+   *  before teardown can inspect its descendants. */
+  onProcessGroup?: (event: ProcessGroupLifecycleEvent) => void;
   /** Grace between SIGTERM and SIGKILL to the process group. TEST-ONLY seam
    *  (ADR-005 决策 6/修订): production call sites never set this — the fixed
    *  5000ms policy applies; tests shrink it to keep the suite fast. */
@@ -51,6 +55,10 @@ export interface SpawnOptions {
    *  tests inject it here. Production call sites never set this. */
   killImpl?: typeof process.kill;
 }
+
+export type ProcessGroupLifecycleEvent =
+  | { kind: "started"; pgid: number }
+  | { kind: "closed"; pgid: number };
 
 export type SpawnCompletion =
   | { kind: "exited"; exitCode: number }
@@ -453,11 +461,22 @@ export async function spawnWithTimeout(opts: SpawnOptions): Promise<SpawnResult>
         // A mid-termination kill failure already rejected and detached via
         // failFatally — possibly while we were awaiting terminationDone.
         if (settled) return;
-        settled = true;
         if (killError !== null) {
+          settled = true;
           rejectPromise(toProcessControlError(killError));
           return;
         }
+        if (child.pid !== undefined && opts.onProcessGroup !== undefined) {
+          try {
+            opts.onProcessGroup({ kind: "closed", pgid: child.pid });
+          } catch (err) {
+            if (winner === null) {
+              winner = "consumer-error";
+              consumerErrorMessage = `process-group observer failed: ${err instanceof Error ? err.message : String(err)}`;
+            }
+          }
+        }
+        settled = true;
         const completion: SpawnCompletion =
           spawnError !== null
             ? { kind: "spawn-error", ...spawnError }
@@ -481,5 +500,15 @@ export async function spawnWithTimeout(opts: SpawnOptions): Promise<SpawnResult>
       };
       void settle();
     });
+
+    if (child.pid !== undefined && opts.onProcessGroup !== undefined) {
+      try {
+        opts.onProcessGroup({ kind: "started", pgid: child.pid });
+      } catch (err) {
+        winner = "consumer-error";
+        consumerErrorMessage = `process-group observer failed: ${err instanceof Error ? err.message : String(err)}`;
+        terminate();
+      }
+    }
   });
 }

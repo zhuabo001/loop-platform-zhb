@@ -109,11 +109,11 @@ claude-code 或 codex 选一：子进程 spawn、进程组 kill、timeout、env 
   - 生产切换：`prepareDaemon` = config → startup jail → 无凭据 Claude 探测（10s、≥2.1.219、flags 检查，每次前后 stat+sha256）→ client → Claude Runner → runtime；真实 Run 在携带凭据前再复核身份，Fake Runner 退为测试 fixture。
   - Issue #12 跨层 round-robin liveness 验收落地（L1–L2：窗口内零误回收 + 对照回收 + 静默后全量回收）；opt-in 真实 sandbox smoke 备妥（默认跳过）。
   - Batch 3 复审核销：四轮三轨复审全部通过、无 P1/P2/P3 finding（对比 `5f0263c...1ec7506`）；签字后 smoke 命令形态修复（`6de4a6f`）经聚焦复审核销，Issue #15 已关闭（2026-08-21）。
-- **Batch 4 — 真实 Claude 全链路验收与阶段收口：复审整改中**（2026-08-24，分支 `feat/phase2-batch4`，Issue #10 OPEN）
+- **Batch 4 — 真实 Claude 全链路验收与阶段收口：复审整改中**（2026-08-24，分支 `feat/phase2-batch4`）
   - Issue #10 修复：sweep 错误分类固定化（`ReclaimGuardLostError` → `reclaim_guard_lost`，其他 → `reclaim_failed`，日志不泄漏敏感信息）；report transaction 最终成功路径复用 `deleteObservedLease()` helper。
   - 真实 Claude 全链路 E2E 验收落地（`real-claude-e2e.test.ts`，`LOOPZHB_REAL_CLAUDE_E2E=1` opt-in）：生产 bootstrapServer + 文件型 PGlite + 真实 HTTP listener → daemon CLI 子进程（生产 prepareDaemon、Claude probe、原生 fetch、真实 runner）→ 真实 Claude Code → Report → DB 持久化完整闭环验证。
   - 历史人工执行：sandbox smoke 3/3 通过（约 108s），真实 E2E 曾通过（约 65s）；第三轮复审发现旧 harness 的 cleanup、secret 扫描和 provenance 证据可 false-pass，因此该次 E2E 结果不作为最终核销证据，需在加固后的 harness 上重新执行。
-  - **Phase 2 尚未最终收口**：等待 Batch 4 后续三轨复审通过、Issue #10 关闭及加固版人工验收复跑。
+  - **Phase 2 尚未最终收口**：等待 Batch 4 后续三轨复审通过及加固版人工验收复跑。
 
 ### 右移项
 

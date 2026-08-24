@@ -25,7 +25,7 @@ pnpm --filter @loopzhb/daemon start
 
 **平台**：macOS / Linux / WSL2。原生 Windows 不支持（subprocess 进程组语义是 POSIX 的）。
 
-**Phase 2 状态：Batch 4 收口复审中**（2026-08-24，Issue #10 仍开放）。生产 daemon 已切换到**真实 Claude Code Runner**（ADR-006）。每次 Run 经固定 argv 的 `claude -p --output-format stream-json` 执行，只开放 `Bash` 工具，文件系统与网络由 fail-closed OS sandbox 兜底（sandbox 不可用即失败，绝不降级为 unsandboxed）；child-controlled progress 只暴露固定语义标签，不转发模型文本或命令；jail 在 spawn 前重校验（resolve→spawn 窗口收窄，残余由 sandbox 兜底），per-run scratch 用后即焚且清理失败判 Run 失败。启动顺序：`config → startup jail → 无凭据 Claude 探测 → HTTP client → Claude Runner → runtime`，探测失败时 daemon 不启动。Phase 2 需待 Batch 4 后续三轨复审通过、Issue #10 关闭后才能最终标记完成。
+**Phase 2 状态：Batch 4 收口复审中**（2026-08-24；未完成项见 roadmap 的 Issue 指针）。生产 daemon 已切换到**真实 Claude Code Runner**（ADR-006）。每次 Run 经固定 argv 的 `claude -p --output-format stream-json` 执行，只开放 `Bash` 工具，文件系统与网络由 fail-closed OS sandbox 兜底（sandbox 不可用即失败，绝不降级为 unsandboxed）；child-controlled progress 只暴露固定语义标签，不转发模型文本或命令；jail 在 spawn 前重校验（resolve→spawn 窗口收窄，残余由 sandbox 兜底），per-run scratch 用后即焚且清理失败判 Run 失败。启动顺序：`config → startup jail → 无凭据 Claude 探测 → HTTP client → Claude Runner → runtime`，探测失败时 daemon 不启动。Phase 2 需待 Batch 4 的复审与人工验收条件全部满足后才能最终标记完成。
 
 人工验收（不进默认离线测试套件，使用开发者本机 Claude 认证与真实 LLM 调用，会产生费用）：
 
