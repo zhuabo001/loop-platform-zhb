@@ -118,7 +118,7 @@ claude-code 或 codex 选一：子进程 spawn、进程组 kill、timeout、env 
 ### 右移项
 
 ~~顺手收口：[Issue #10](https://github.com/zhuabo001/loop-platform-zhb/issues/10)
-（Day 8–10 二次审查右移项，不影响正确性）。~~ **已在 Batch 4 中收口**（2026-08-24）。
+（Day 8–10 二次审查右移项，不影响正确性）。~~ **已在 Batch 4 中收口并关闭**（2026-08-24）。
 
 ## Phase 3 — cron 与离线恢复（第 5–6 周）
 
