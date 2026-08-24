@@ -177,6 +177,19 @@ describe("probeClaudeBinary", () => {
     expect(result.binary.resolvedPath).toBe(realpathSync(bin));
   });
 
+  it("PR12b: an explicit path containing spaces and shell metacharacters is executed literally", async () => {
+    const completeHelp = `${REQUIRED_CLAUDE_FLAGS.join("\n")}\n`;
+    const bin = makeFakeBin(
+      "claude path; printf INJECTION_MUST_NOT_RUN",
+      `process.stdout.write(process.argv.includes("--version") ? "2.1.227\\n" : ${JSON.stringify(completeHelp)});`,
+    );
+
+    const result = await probeClaudeBinary(bin, ENV);
+
+    expect(result.version).toBe("2.1.227");
+    expect(result.binary.resolvedPath).toBe(realpathSync(bin));
+  });
+
   it("PR13: a bare name unresolvable on the agent PATH rejects", async () => {
     await expect(probeClaudeBinary("no-such-claude-anywhere", { PATH: base })).rejects.toThrow(ClaudeProbeError);
   });

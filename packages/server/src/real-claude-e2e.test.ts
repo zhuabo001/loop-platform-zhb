@@ -14,17 +14,20 @@
  *    durationMs is valid;
  *  - RunLease is consumed, Loop's lastRun points to the Run;
  *  - daemon exits gracefully on SIGTERM (with SIGKILL fallback and full cleanup);
- *  - captured logs (byte-bounded, no prefix) do NOT contain machine credential.
+ *  - a sticky streaming observer scans the complete stdout/stderr lifecycle
+ *    for the machine credential; failure diagnostics retain at most 64 KiB;
+ *  - the daemon's production probe provenance matches an operator-approved
+ *    SHA-256 before the test can trigger a real Run.
  *
  * Bounded waits: registration ≤30s, agent ≤10min, whole test ≤12min.
  * Cleanup order (finally): daemon → HTTP listener → DB → temp dirs.
  *
- * Enable with LOOPZHB_REAL_CLAUDE_E2E=1. Skipped by default to avoid CI
- * dependency on auth, cost, and model stability.
+ * Enable with LOOPZHB_REAL_CLAUDE_E2E=1 and
+ * LOOPZHB_EXPECTED_CLAUDE_SHA256=<approved hash>. Skipped by default to avoid
+ * CI dependency on auth, cost, and model stability.
  */
-import { spawn, execSync, type ChildProcess } from "node:child_process";
-import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, rm, writeFile, readFile, stat } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { mkdtemp, mkdir, rm, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -36,6 +39,7 @@ import { machineIdFromToken } from "@loopzhb/protocol/node";
 
 import { closeDb, type DbHandle } from "./db/index.js";
 import { runLeases } from "./db/schema.js";
+import { DaemonLogObserver, DetachedProcessSupervisor } from "./real-claude-e2e-harness.js";
 import { bootstrapServer, waitForListening } from "./start.js";
 
 const ENABLED = process.env.LOOPZHB_REAL_CLAUDE_E2E === "1";
@@ -49,92 +53,16 @@ const TEST_TIMEOUT_MS = 12 * 60_000;
 
 const handles: DbHandle[] = [];
 const servers: ServerType[] = [];
-const daemons: ChildProcess[] = [];
+const daemons: DetachedProcessSupervisor[] = [];
 const tempDirs: string[] = [];
 
 const MAX_LOG_BYTES = 64 * 1024; // 64 KiB byte-bounded log buffer
 
-/** Byte-bounded log accumulator (no chunk prefix, preserves cross-chunk sequences). */
-class LogBuffer {
-  private chunks: Buffer[] = [];
-  private totalBytes = 0;
-
-  append(chunk: Buffer): void {
-    this.chunks.push(chunk);
-    this.totalBytes += chunk.length;
-
-    // Trim oldest chunks until under limit
-    while (this.totalBytes > MAX_LOG_BYTES && this.chunks.length > 0) {
-      const removed = this.chunks.shift()!;
-      this.totalBytes -= removed.length;
-    }
-  }
-
-  toString(): string {
-    return Buffer.concat(this.chunks).toString("utf-8");
-  }
-
-  contains(needle: string): boolean {
-    return this.toString().includes(needle);
-  }
-}
-
-/** Wait for process exit with proper cleanup. */
-async function waitForProcessExit(proc: ChildProcess, timeoutMs: number): Promise<number | null> {
-  return new Promise((resolve) => {
-    let resolved = false;
-    let timer: NodeJS.Timeout | null = null;
-
-    const cleanup = () => {
-      if (timer) clearTimeout(timer);
-      proc.removeAllListeners("exit");
-    };
-
-    const onExit = (code: number | null) => {
-      if (resolved) return;
-      resolved = true;
-      cleanup();
-      resolve(code);
-    };
-
-    // Register listener BEFORE checking if already exited
-    proc.once("exit", onExit);
-
-    // Check if already exited (race condition guard)
-    if (proc.exitCode !== null) {
-      onExit(proc.exitCode);
-      return;
-    }
-
-    // Timeout fallback
-    timer = setTimeout(() => {
-      if (resolved) return;
-      resolved = true;
-      cleanup();
-      resolve(null);
-    }, timeoutMs);
-  });
-}
-
-/** Kill process and wait for actual exit. */
-async function killAndWait(proc: ChildProcess): Promise<void> {
-  // Try SIGTERM first
-  if (proc.exitCode === null && !proc.killed) {
-    proc.kill("SIGTERM");
-    const exitCode = await waitForProcessExit(proc, 5000);
-    if (exitCode !== null) return; // Graceful exit
-  }
-
-  // Fallback to SIGKILL
-  if (proc.exitCode === null) {
-    proc.kill("SIGKILL");
-    await waitForProcessExit(proc, 2000);
-  }
-}
-
 afterEach(async () => {
   // Cleanup order: daemon → HTTP listener → DB → temp dirs
-  await Promise.all(daemons.splice(0).map((proc) => killAndWait(proc)));
+  for (const daemon of daemons.splice(0)) {
+    await daemon.terminate({ graceMs: 5000, killWaitMs: 2000 });
+  }
   await Promise.all(
     servers.splice(0).map(
       (server) =>
@@ -143,9 +71,9 @@ afterEach(async () => {
         }),
     ),
   );
-  await Promise.all(handles.splice(0).map((h) => closeDb(h).catch(() => {})));
-  await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true }).catch(() => {})));
-});
+  await Promise.all(handles.splice(0).map((h) => closeDb(h)));
+  await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+}, 15_000);
 
 /** Wait for a condition with timeout. */
 async function waitFor(
@@ -161,38 +89,17 @@ async function waitFor(
   throw new Error(`waitFor timeout after ${timeoutMs}ms`);
 }
 
-/** Resolve Claude binary and record provenance. */
-async function resolveClaudeProvenance(claudeBin: string): Promise<{
-  resolvedPath: string;
-  version: string;
-  sha256: string;
-}> {
-  // Resolve PATH if not absolute
-  let resolvedPath = claudeBin;
-  if (!path.isAbsolute(claudeBin)) {
-    try {
-      resolvedPath = execSync(`which ${claudeBin}`, { encoding: "utf-8" }).trim();
-    } catch {
-      throw new Error(`Claude binary not found in PATH: ${claudeBin}`);
-    }
-  }
-
-  // Get version
-  const version = execSync(`${resolvedPath} --version`, { encoding: "utf-8" }).trim();
-
-  // Compute SHA256
-  const stats = await stat(resolvedPath);
-  if (!stats.isFile()) throw new Error(`Claude binary is not a file: ${resolvedPath}`);
-  const content = await readFile(resolvedPath);
-  const sha256 = createHash("sha256").update(content).digest("hex");
-
-  return { resolvedPath, version, sha256 };
-}
-
 describe.skipIf(!ENABLED)("real Claude E2E (opt-in)", () => {
   it(
     "full chain: machine register → create loop → trigger → real Claude → report → DB",
     async () => {
+      const expectedClaudeSha256 = process.env.LOOPZHB_EXPECTED_CLAUDE_SHA256;
+      if (expectedClaudeSha256 === undefined || !/^[0-9a-f]{64}$/i.test(expectedClaudeSha256)) {
+        throw new Error(
+          "real Claude E2E requires LOOPZHB_EXPECTED_CLAUDE_SHA256 as an explicit 64-hex binary approval",
+        );
+      }
+
       // 1. Setup temp allowed root with task file and proof file paths
       const allowedRoot = await mkdtemp(path.join(tmpdir(), `loopzhb-e2e-root-${process.pid}-`));
       tempDirs.push(allowedRoot);
@@ -217,127 +124,145 @@ describe.skipIf(!ENABLED)("real Claude E2E (opt-in)", () => {
       if (!address || typeof address === "string") throw new Error("failed to get server address");
       const baseUrl = `http://127.0.0.1:${address.port}`;
 
-      // 3. Resolve and record Claude binary provenance
-      const claudeBin = process.env.LOOPZHB_CLAUDE_BIN || "claude";
-      const provenance = await resolveClaudeProvenance(claudeBin);
-      console.log(`[e2e] Claude provenance:`);
-      console.log(`  resolvedPath: ${provenance.resolvedPath}`);
-      console.log(`  version: ${provenance.version}`);
-      console.log(`  sha256: ${provenance.sha256}`);
-
-      // 4. Start daemon CLI as child process
+      // 3. Start the production daemon CLI. Its own production probe reports
+      // the exact realpath/version/hash it pinned; no test-side shell or
+      // second resolution is allowed to stand in for that identity.
+      const claudeBin = process.env.LOOPZHB_CLAUDE_BIN?.trim() || "claude";
       const daemonCliPath = path.join(__dirname, "../../daemon/dist/cli.js");
       const daemonEnv = {
         ...process.env,
         LOOPZHB_SERVER_URL: baseUrl,
         LOOPZHB_MACHINE_CREDENTIAL: TOKEN,
         LOOPZHB_ALLOWED_ROOTS: JSON.stringify([allowedRoot]),
-        LOOPZHB_CLAUDE_BIN: provenance.resolvedPath, // Use resolved path
+        LOOPZHB_CLAUDE_BIN: claudeBin,
+        LOOPZHB_REAL_CLAUDE_E2E: "1",
         NODE_ENV: "production",
       };
 
-      const logBuffer = new LogBuffer();
-      const daemon = spawn("node", [daemonCliPath], {
+      const logs = new DaemonLogObserver([TOKEN], MAX_LOG_BYTES);
+      const daemon = spawn(process.execPath, [daemonCliPath], {
         env: daemonEnv,
+        shell: false,
+        detached: true,
         stdio: ["ignore", "pipe", "pipe"],
       });
-      daemons.push(daemon);
+      const supervisor = new DetachedProcessSupervisor(daemon);
+      daemons.push(supervisor);
 
       daemon.stdout?.on("data", (chunk: Buffer) => {
-        logBuffer.append(chunk);
-        console.log(`[daemon stdout] ${chunk.toString().trim()}`);
+        logs.append("stdout", chunk);
       });
       daemon.stderr?.on("data", (chunk: Buffer) => {
-        logBuffer.append(chunk);
-        console.error(`[daemon stderr] ${chunk.toString().trim()}`);
+        logs.append("stderr", chunk);
       });
 
-      // 5. Wait for machine registration (daemon polls and self-registers)
-      const machineId = machineIdFromToken(TOKEN);
-      await waitFor(
-        async () => {
-          const res = await fetch(`${baseUrl}/api/machines`);
-          if (!res.ok) return false;
-          const body = (await res.json()) as { machines?: Array<{ id: string }> };
-          return body.machines?.some((m) => m.id === machineId) ?? false;
-        },
-        REGISTER_TIMEOUT_MS,
-      );
+      try {
+        // 4. Require provenance from the daemon's actual production probe and
+        // compare it with an explicit operator-approved hash.
+        let provenance = logs.approvedProvenance(expectedClaudeSha256);
+        await waitFor(
+          async () => {
+            provenance = logs.approvedProvenance(expectedClaudeSha256);
+            return provenance !== null;
+          },
+          REGISTER_TIMEOUT_MS,
+          50,
+        );
+        if (provenance === null) throw new Error("production daemon did not report Claude provenance");
+        console.log(`[e2e] Claude resolved path: ${provenance.resolvedPath}`);
+        console.log(`[e2e] Claude version: ${provenance.version}`);
+        console.log(`[e2e] Claude sha256: ${provenance.sha256}`);
 
-      // 6. Create loop via HTTP
-      const createRes = await fetch(`${baseUrl}/api/loops`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
+        // 5. Wait for machine registration (daemon polls and self-registers)
+        const machineId = machineIdFromToken(TOKEN);
+        await waitFor(
+          async () => {
+            const res = await fetch(`${baseUrl}/api/machines`);
+            if (!res.ok) return false;
+            const body = (await res.json()) as { machines?: Array<{ id: string }> };
+            return body.machines?.some((m) => m.id === machineId) ?? false;
+          },
+          REGISTER_TIMEOUT_MS,
+        );
+
+        // 6. Create loop via HTTP
+        const createRes = await fetch(`${baseUrl}/api/loops`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            machineId,
+            name: "e2e-real-claude",
+            workdir,
+            taskFile,
+          }),
+        });
+        expect(createRes.status).toBe(201);
+        const { loop } = createLoopResponseSchema.parse(await createRes.json());
+
+        // 7. Trigger run via HTTP
+        const triggerRes = await fetch(`${baseUrl}/api/loops/${loop.id}/run`, { method: "POST" });
+        expect(triggerRes.status).toBe(202);
+        const trigger = triggerRunResponseSchema.parse(await triggerRes.json());
+        if (!trigger.enqueued) throw new Error("expected the trigger to enqueue");
+        const runId = trigger.runId;
+
+        // 8. Wait for Run to reach terminal state (agent execution)
+        await waitFor(
+          async () => {
+            const res = await fetch(`${baseUrl}/api/loops/${loop.id}/runs`);
+            if (!res.ok) return false;
+            const body = runListResponseSchema.parse(await res.json());
+            const run = body.runs.find((r) => r.id === runId);
+            return run !== undefined && (run.phase === "done" || run.phase === "error");
+          },
+          AGENT_TIMEOUT_MS,
+        );
+
+        // 9. Assertions: DB state
+        const runsRes = await fetch(`${baseUrl}/api/loops/${loop.id}/runs`);
+        expect(runsRes.status).toBe(200);
+        const runList = runListResponseSchema.parse(await runsRes.json()).runs;
+        expect(runList).toHaveLength(1);
+        const run = runList[0]!;
+
+        expect(run).toMatchObject({
+          id: runId,
+          loopId: loop.id,
           machineId,
-          name: "e2e-real-claude",
-          workdir,
-          taskFile,
-        }),
-      });
-      expect(createRes.status).toBe(201);
-      const { loop } = createLoopResponseSchema.parse(await createRes.json());
+          phase: "done",
+          outcome: "exec",
+          error: null,
+          progress: null,
+        });
+        expect(run.message).toContain(SUCCESS_MARKER);
+        expect(Number.isInteger(run.durationMs)).toBe(true);
+        expect(run.durationMs!).toBeGreaterThan(0);
 
-      // 7. Trigger run via HTTP
-      const triggerRes = await fetch(`${baseUrl}/api/loops/${loop.id}/run`, { method: "POST" });
-      expect(triggerRes.status).toBe(202);
-      const trigger = triggerRunResponseSchema.parse(await triggerRes.json());
-      if (!trigger.enqueued) throw new Error("expected the trigger to enqueue");
-      const runId = trigger.runId;
+        const leases = await booted.handle.db.select().from(runLeases);
+        expect(leases).toHaveLength(0);
 
-      // 8. Wait for Run to reach terminal state (agent execution)
-      await waitFor(
-        async () => {
-          const res = await fetch(`${baseUrl}/api/loops/${loop.id}/runs`);
-          if (!res.ok) return false;
-          const body = runListResponseSchema.parse(await res.json());
-          const run = body.runs.find((r) => r.id === runId);
-          return run !== undefined && (run.phase === "done" || run.phase === "error");
-        },
-        AGENT_TIMEOUT_MS,
-      );
+        const loopsRes = await fetch(`${baseUrl}/api/loops`);
+        const loopBody = (await loopsRes.json()) as { loops: Array<{ id: string; lastRun: any }> };
+        const updatedLoop = loopBody.loops.find((l) => l.id === loop.id);
+        expect(updatedLoop?.lastRun).toMatchObject({ id: runId, phase: "done", outcome: "exec" });
 
-      // 9. Assertions: DB state
-      const runsRes = await fetch(`${baseUrl}/api/loops/${loop.id}/runs`);
-      expect(runsRes.status).toBe(200);
-      const runList = runListResponseSchema.parse(await runsRes.json()).runs;
-      expect(runList).toHaveLength(1);
-      const run = runList[0]!;
+        // 10. Assertions: proof file content (trim trailing whitespace/newline)
+        const proofContent = await readFile(proofFile, "utf-8");
+        expect(proofContent.trim()).toBe(SUCCESS_MARKER);
 
-      expect(run).toMatchObject({
-        id: runId,
-        loopId: loop.id,
-        machineId,
-        phase: "done",
-        outcome: "exec",
-        error: null,
-        progress: null,
-      });
-      expect(run.message).toContain(SUCCESS_MARKER);
-      expect(Number.isInteger(run.durationMs)).toBe(true);
-      expect(run.durationMs!).toBeGreaterThan(0);
+        // 11. Daemon and every observed descendant process group close;
+        // ChildProcess close also proves stdout/stderr have drained.
+        const closed = await supervisor.terminate({ graceMs: 5000, killWaitMs: 2000 });
+        expect(closed).toEqual({ kind: "closed", code: 0, signal: null });
 
-      // RunLease consumed
-      const leases = await booted.handle.db.select().from(runLeases);
-      expect(leases).toHaveLength(0);
-
-      // Loop's lastRun points to this run
-      const loopsRes = await fetch(`${baseUrl}/api/loops`);
-      const loopBody = (await loopsRes.json()) as { loops: Array<{ id: string; lastRun: any }> };
-      const updatedLoop = loopBody.loops.find((l) => l.id === loop.id);
-      expect(updatedLoop?.lastRun).toMatchObject({ id: runId, phase: "done", outcome: "exec" });
-
-      // 10. Assertions: proof file content (trim trailing whitespace/newline)
-      const proofContent = await readFile(proofFile, "utf-8");
-      expect(proofContent.trim()).toBe(SUCCESS_MARKER);
-
-      // 11. Daemon exits gracefully on SIGTERM (with SIGKILL fallback)
-      await killAndWait(daemon);
-      expect(daemon.exitCode).toBe(0);
-
-      // 12. Assertions: daemon logs (byte-bounded, no prefix) do NOT contain machine credential
-      expect(logBuffer.contains(TOKEN)).toBe(false);
-      expect(logBuffer.contains("dk_e2e_real_claude")).toBe(false);
+        // 12. Sticky streaming scan covers the complete lifecycle, including
+        // shutdown output received before close.
+        expect(logs.secretSeen).toBe(false);
+      } catch (err) {
+        const tail = logs.secretSeen ? "[suppressed because a credential was detected]" : logs.diagnosticTail();
+        console.error(`[e2e] bounded redacted daemon log tail (max ${MAX_LOG_BYTES} bytes):\n${tail}`);
+        throw err;
+      }
     },
     TEST_TIMEOUT_MS,
   );

@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
-import { realpathSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -135,5 +136,23 @@ describe("prepareDaemon — the batch-3 composition root", () => {
     );
     expect(runtime.pollOnce).toBeInstanceOf(Function);
     expect(runtime.inFlightCount()).toBe(0);
+  });
+
+  it("exposes the exact production probe result to the opt-in provenance observer", async () => {
+    let observed: { version: string; binary: { resolvedPath: string; sha256: string } } | null = null;
+    await prepareDaemon(
+      { ...baseConfig, allowedRoots: [realpathSync(tmpdir())], claudeBin: FIXTURE },
+      { PATH: `${path.dirname(process.execPath)}:${process.env.PATH ?? ""}` },
+      {
+        onClaudeProbe: (probe) => {
+          observed = probe;
+        },
+      },
+    );
+
+    expect(observed).not.toBeNull();
+    expect(observed!.version).toBe("2.1.227");
+    expect(observed!.binary.resolvedPath).toBe(realpathSync(FIXTURE));
+    expect(observed!.binary.sha256).toBe(createHash("sha256").update(readFileSync(FIXTURE)).digest("hex"));
   });
 });
