@@ -395,3 +395,73 @@ describe("armInactivitySweep timer wiring", () => {
     }
   });
 });
+
+describe("Issue #10: reclaim error classification (Batch 4)", () => {
+  it("classifies ReclaimGuardLostError as reclaim_guard_lost", async () => {
+    await fresh();
+    await seedRunningCandidate("run-1", iso(nowMs() - TWENTY_MIN));
+
+    // Inject a throwing reclaim that simulates the guard loss
+    const { ReclaimGuardLostError } = await import("../store/runs.js");
+    const brokenSweep = createInactivitySweep({
+      db,
+      clock,
+      log: (line) => logs.push(line),
+    });
+
+    // Patch reclaimStaleRunTx to throw ReclaimGuardLostError
+    const originalReclaim = (await import("../store/runs.js")).reclaimStaleRunTx;
+    const { reclaimStaleRunTx } = await import("../store/runs.js");
+    vi.spyOn(await import("../store/runs.js"), "reclaimStaleRunTx").mockRejectedValueOnce(
+      new ReclaimGuardLostError("run-1")
+    );
+
+    const stats = await brokenSweep.runOnce();
+    expect(stats).toMatchObject({ scanned: 1, reclaimed: 0, failed: 1 });
+    expect(logs.some((l) => l.includes("run-1") && l.includes("classification=reclaim_guard_lost"))).toBe(true);
+  });
+
+  it("classifies other errors as reclaim_failed and never logs error message", async () => {
+    await fresh();
+    await seedRunningCandidate("run-1", iso(nowMs() - TWENTY_MIN));
+
+    const brokenSweep = createInactivitySweep({
+      db,
+      clock,
+      log: (line) => logs.push(line),
+    });
+
+    // Inject an error with credential-like content
+    vi.spyOn(await import("../store/runs.js"), "reclaimStaleRunTx").mockRejectedValueOnce(
+      new Error("password=rk_secret123\nconnection failed")
+    );
+
+    const stats = await brokenSweep.runOnce();
+    expect(stats).toMatchObject({ scanned: 1, reclaimed: 0, failed: 1 });
+    expect(logs.some((l) => l.includes("run-1") && l.includes("classification=reclaim_failed"))).toBe(true);
+    // Must not log the error message content
+    expect(logs.join("\n")).not.toContain("rk_secret123");
+    expect(logs.join("\n")).not.toContain("connection failed");
+  });
+
+  it("classifies non-Error throws as reclaim_failed", async () => {
+    await fresh();
+    await seedRunningCandidate("run-1", iso(nowMs() - TWENTY_MIN));
+
+    const brokenSweep = createInactivitySweep({
+      db,
+      clock,
+      log: (line) => logs.push(line),
+    });
+
+    // Inject a non-Error throw (string, object, etc.)
+    vi.spyOn(await import("../store/runs.js"), "reclaimStaleRunTx").mockRejectedValueOnce(
+      "some string error with credential=rk_token"
+    );
+
+    const stats = await brokenSweep.runOnce();
+    expect(stats).toMatchObject({ scanned: 1, reclaimed: 0, failed: 1 });
+    expect(logs.some((l) => l.includes("run-1") && l.includes("classification=reclaim_failed"))).toBe(true);
+    expect(logs.join("\n")).not.toContain("rk_token");
+  });
+});
