@@ -13,8 +13,8 @@
  *  - message contains the fixed success marker, error=null, progress=null,
  *    durationMs is valid;
  *  - RunLease is consumed, Loop's lastRun points to the Run;
- *  - daemon exits gracefully on SIGTERM;
- *  - captured logs do NOT contain machine credential.
+ *  - daemon exits gracefully on SIGTERM (with SIGKILL fallback);
+ *  - captured logs (bounded tail) do NOT contain machine credential.
  *
  * Bounded waits: registration ≤30s, agent ≤10min, whole test ≤12min.
  * Cleanup order (finally): daemon → HTTP listener → DB → temp dirs.
@@ -35,7 +35,7 @@ import { machineIdFromToken } from "@loopzhb/protocol/node";
 
 import { closeDb, type DbHandle } from "./db/index.js";
 import { runLeases } from "./db/schema.js";
-import { bootstrapServer, waitForListening, type BootedServer } from "./start.js";
+import { bootstrapServer, waitForListening } from "./start.js";
 
 const ENABLED = process.env.LOOPZHB_REAL_CLAUDE_E2E === "1";
 const SUCCESS_MARKER = "PHASE2_BATCH4_E2E_OK";
@@ -48,25 +48,38 @@ const TEST_TIMEOUT_MS = 12 * 60_000;
 
 const handles: DbHandle[] = [];
 const servers: ServerType[] = [];
-const bootedServers: BootedServer[] = [];
-const daemons: ChildProcess[] = [];
+const daemons: Array<{ proc: ChildProcess; logs: string[] }> = [];
 const tempDirs: string[] = [];
+
+const MAX_LOG_TAIL = 100; // Keep last 100 log lines
 
 afterEach(async () => {
   // Cleanup order: daemon → HTTP listener → DB → temp dirs
   await Promise.all(
-    daemons.splice(0).map(
-      (proc) =>
-        new Promise<void>((resolve) => {
-          if (proc.killed) return resolve();
-          proc.once("exit", () => resolve());
-          proc.kill("SIGTERM");
-          setTimeout(() => {
-            if (!proc.killed) proc.kill("SIGKILL");
-            resolve();
-          }, 5000);
-        }),
-    ),
+    daemons.splice(0).map(async ({ proc, logs }) => {
+      return new Promise<void>((resolve) => {
+        let exited = false;
+        let killed = false;
+
+        proc.once("exit", () => {
+          exited = true;
+          resolve();
+        });
+
+        // Try SIGTERM first
+        proc.kill("SIGTERM");
+
+        // Fallback to SIGKILL after 5s if not exited
+        setTimeout(() => {
+          if (!exited && !killed) {
+            killed = true;
+            proc.kill("SIGKILL");
+            // Give SIGKILL another 2s to take effect
+            setTimeout(() => resolve(), 2000);
+          }
+        }, 5000);
+      });
+    }),
   );
   await Promise.all(
     servers.splice(0).map(
@@ -94,6 +107,14 @@ async function waitFor(
   throw new Error(`waitFor timeout after ${timeoutMs}ms`);
 }
 
+/** Append log line to bounded tail buffer. */
+function appendLog(logs: string[], line: string): void {
+  logs.push(line);
+  if (logs.length > MAX_LOG_TAIL) {
+    logs.shift(); // Remove oldest
+  }
+}
+
 describe.skipIf(!ENABLED)("real Claude E2E (opt-in)", () => {
   it(
     "full chain: machine register → create loop → trigger → real Claude → report → DB",
@@ -112,7 +133,6 @@ describe.skipIf(!ENABLED)("real Claude E2E (opt-in)", () => {
       const dataDir = await mkdtemp(path.join(tmpdir(), `loopzhb-e2e-data-${process.pid}-`));
       tempDirs.push(dataDir);
       const booted = await bootstrapServer({ host: "127.0.0.1", port: 0, dataDir });
-      bootedServers.push(booted);
       handles.push(booted.handle);
 
       const server = serve({ fetch: booted.app.fetch, port: 0, hostname: "127.0.0.1" });
@@ -125,12 +145,18 @@ describe.skipIf(!ENABLED)("real Claude E2E (opt-in)", () => {
 
       // 3. Start daemon CLI as child process
       const daemonCliPath = path.join(__dirname, "../../daemon/dist/cli.js");
+      const claudeBin = process.env.LOOPZHB_CLAUDE_BIN || "claude";
+
+      // Log Claude binary provenance for manual verification
+      console.log(`[e2e] Claude binary: ${claudeBin}`);
+      console.log(`[e2e] PATH: ${process.env.PATH}`);
+
       const daemonEnv = {
         ...process.env,
         LOOPZHB_SERVER_URL: baseUrl,
         LOOPZHB_MACHINE_CREDENTIAL: TOKEN,
         LOOPZHB_ALLOWED_ROOTS: JSON.stringify([allowedRoot]),
-        LOOPZHB_CLAUDE_BIN: process.env.LOOPZHB_CLAUDE_BIN || "claude",
+        LOOPZHB_CLAUDE_BIN: claudeBin,
         NODE_ENV: "production",
       };
 
@@ -139,16 +165,16 @@ describe.skipIf(!ENABLED)("real Claude E2E (opt-in)", () => {
         env: daemonEnv,
         stdio: ["ignore", "pipe", "pipe"],
       });
-      daemons.push(daemon);
+      daemons.push({ proc: daemon, logs: daemonLogs });
 
       daemon.stdout?.on("data", (chunk) => {
         const line = chunk.toString();
-        daemonLogs.push(line);
+        appendLog(daemonLogs, `[stdout] ${line.trim()}`);
         console.log(`[daemon stdout] ${line.trim()}`);
       });
       daemon.stderr?.on("data", (chunk) => {
         const line = chunk.toString();
-        daemonLogs.push(line);
+        appendLog(daemonLogs, `[stderr] ${line.trim()}`);
         console.error(`[daemon stderr] ${line.trim()}`);
       });
 
@@ -231,21 +257,53 @@ describe.skipIf(!ENABLED)("real Claude E2E (opt-in)", () => {
       const proofContent = await readFile(proofFile, "utf-8");
       expect(proofContent.trim()).toBe(SUCCESS_MARKER);
 
-      // 10. Assertions: daemon logs do NOT contain machine credential
-      const allLogs = daemonLogs.join("\n");
-      expect(allLogs).not.toContain(TOKEN);
-      expect(allLogs).not.toContain("dk_e2e_real_claude");
-
-      // 11. Daemon exits gracefully on SIGTERM
+      // 10. Daemon exits gracefully on SIGTERM (with SIGKILL fallback)
       const exitPromise = new Promise<number | null>((resolve) => {
         daemon.once("exit", (code) => resolve(code));
       });
       daemon.kill("SIGTERM");
+
       const exitCode = await Promise.race([
         exitPromise,
-        new Promise<null>((resolve) => setTimeout(() => resolve(null), 5000)),
+        new Promise<null>((resolve) =>
+          setTimeout(() => {
+            // If not exited after 5s, send SIGKILL
+            daemon.kill("SIGKILL");
+            resolve(null);
+          }, 5000),
+        ),
       ]);
+
+      // Wait for stdout/stderr to close (ensures all shutdown logs are captured)
+      await new Promise<void>((resolve) => {
+        let stdoutClosed = false;
+        let stderrClosed = false;
+        const checkDone = () => {
+          if (stdoutClosed && stderrClosed) resolve();
+        };
+        daemon.stdout?.once("close", () => {
+          stdoutClosed = true;
+          checkDone();
+        });
+        daemon.stderr?.once("close", () => {
+          stderrClosed = true;
+          checkDone();
+        });
+        // Timeout after 2s
+        setTimeout(() => resolve(), 2000);
+      });
+
       expect(exitCode).toBe(0);
+
+      // 11. Assertions: daemon logs (bounded tail) do NOT contain machine credential
+      // Check both individual chunks and joined logs to catch cross-chunk credentials
+      for (const logLine of daemonLogs) {
+        expect(logLine).not.toContain(TOKEN);
+        expect(logLine).not.toContain("dk_e2e_real_claude");
+      }
+      const allLogs = daemonLogs.join("");
+      expect(allLogs).not.toContain(TOKEN);
+      expect(allLogs).not.toContain("dk_e2e_real_claude");
     },
     TEST_TIMEOUT_MS,
   );

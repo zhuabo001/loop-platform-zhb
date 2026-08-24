@@ -201,7 +201,7 @@ describe("reclaim semantics through the sweep", () => {
     // Zero writes on the invariant-violating row (the guard rolled back).
     expect(rows.find((r) => r.id === "run-a-bad")).toMatchObject({ phase: "running", outcome: null });
     expect(rows.find((r) => r.id === "run-b-good")).toMatchObject({ phase: "error", outcome: "error" });
-    expect(logs.some((l) => l.includes("run-a-bad") && l.includes("FAILED"))).toBe(true);
+    expect(logs.some((l) => l.includes("run-a-bad") && l.includes("classification=reclaim_guard_lost"))).toBe(true);
   });
 
   it("a THROWING diagnostic read never aborts the pass — the reclaim proceeds with the hole marked unavailable (review: candidate-level isolation)", async () => {
@@ -410,8 +410,6 @@ describe("Issue #10: reclaim error classification (Batch 4)", () => {
     });
 
     // Patch reclaimStaleRunTx to throw ReclaimGuardLostError
-    const originalReclaim = (await import("../store/runs.js")).reclaimStaleRunTx;
-    const { reclaimStaleRunTx } = await import("../store/runs.js");
     vi.spyOn(await import("../store/runs.js"), "reclaimStaleRunTx").mockRejectedValueOnce(
       new ReclaimGuardLostError("run-1")
     );
