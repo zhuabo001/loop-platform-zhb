@@ -36,7 +36,7 @@
 | 里程碑 | 到达标志 |
 |---|---|
 | 学习骨架 | ✅ Phase 1 完成（2026-08-11）：T1–T6 绿，手动触发端到端跑通 |
-| 可演示 MVP | Phase 2 完成：一条真实 Agent E2E |
+| 可演示 MVP | ✅ Phase 2 完成（2026-08-24）：真实 Claude E2E 验收通过，生产 daemon 已切换 |
 | 可靠单用户 | Phase 5 完成：artifact 同步 + 单用户使用闭环 |
 | 可公开部署多用户 | Phase 6 生产硬化完成 + auth 上线 |
 
@@ -109,11 +109,16 @@ claude-code 或 codex 选一：子进程 spawn、进程组 kill、timeout、env 
   - 生产切换：`prepareDaemon` = config → startup jail → 无凭据 Claude 探测（10s、≥2.1.219、flags 检查，每次前后 stat+sha256）→ client → Claude Runner → runtime；真实 Run 在携带凭据前再复核身份，Fake Runner 退为测试 fixture。
   - Issue #12 跨层 round-robin liveness 验收落地（L1–L2：窗口内零误回收 + 对照回收 + 静默后全量回收）；opt-in 真实 sandbox smoke 备妥（默认跳过）。
   - Batch 3 复审核销：四轮三轨复审全部通过、无 P1/P2/P3 finding（对比 `5f0263c...1ec7506`）；签字后 smoke 命令形态修复（`6de4a6f`）经聚焦复审核销，Issue #15 已关闭（2026-08-21）。
+- **Batch 4 — 真实 Claude 全链路验收与阶段收口：已完成**（2026-08-24，分支 `feat/phase2-batch4`）
+  - Issue #10 修复：sweep 错误分类固定化（`ReclaimGuardLostError` → `reclaim_guard_lost`，其他 → `reclaim_failed`，日志不泄漏敏感信息）；report transaction 最终成功路径复用 `deleteObservedLease()` helper。
+  - 真实 Claude 全链路 E2E 验收落地（`real-claude-e2e.test.ts`，`LOOPZHB_REAL_CLAUDE_E2E=1` opt-in）：生产 bootstrapServer + 文件型 PGlite + 真实 HTTP listener → daemon CLI 子进程（生产 prepareDaemon、Claude probe、原生 fetch、真实 runner）→ 真实 Claude Code → Report → DB 持久化完整闭环验证。
+  - 验收证据：`pnpm test`（237 通过）、`pnpm typecheck`、`pnpm build`、`git diff --check` 全绿；sandbox smoke 复验 3/3 通过（约 108s）；真实 E2E 通过（约 65s，验证 proof file、DB 状态、RunLease 消费、daemon 优雅退出、日志无 credential）。
+  - **Phase 2 完成**：可演示 MVP 里程碑达成。
 
 ### 右移项
 
-顺手收口：[Issue #10](https://github.com/zhuabo001/loop-platform-zhb/issues/10)
-（Day 8–10 二次审查右移项，不影响正确性）。
+~~顺手收口：[Issue #10](https://github.com/zhuabo001/loop-platform-zhb/issues/10)
+（Day 8–10 二次审查右移项，不影响正确性）。~~ **已在 Batch 4 中收口**（2026-08-24）。
 
 ## Phase 3 — cron 与离线恢复（第 5–6 周）
 
