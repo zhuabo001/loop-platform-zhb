@@ -619,6 +619,47 @@ describe("C: Configuration state machine", () => {
       expect(loopAfterError2.scheduleRevision).toBe(1); // Still unchanged
       expect(loopAfterError2.timezone).toBe("UTC"); // Original value
 
+      // Inputs that normalize to the persisted values still must not bypass
+      // the raw field length limit as semantic no-ops.
+      await expect(
+        updateSchedule(
+          { db: handle.db, clock: systemClock },
+          "loop-c8",
+          { cron: `0 9 * * *${" ".repeat(300)}` },
+        ),
+      ).rejects.toThrow();
+      await expect(
+        updateSchedule(
+          { db: handle.db, clock: systemClock },
+          "loop-c8",
+          { timezone: `UTC${" ".repeat(300)}` },
+        ),
+      ).rejects.toThrow();
+
+      // Inject a real database failure after PostgreSQL has executed the row
+      // update. The statement and surrounding transaction must roll back.
+      const [beforeDbFailure] = await handle.db.select().from(loops).where(eq(loops.id, "loop-c8"));
+      await handle.client.exec(`
+        CREATE FUNCTION fail_loop_c8_schedule_update() RETURNS trigger AS $$
+        BEGIN
+          IF NEW.id = 'loop-c8' THEN
+            RAISE EXCEPTION 'injected schedule update failure';
+          END IF;
+          RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        CREATE TRIGGER fail_loop_c8_schedule_update
+          AFTER UPDATE ON loops
+          FOR EACH ROW EXECUTE FUNCTION fail_loop_c8_schedule_update();
+      `);
+
+      await expect(
+        updateSchedule({ db: handle.db, clock: systemClock }, "loop-c8", { cron: "30 10 * * *" }),
+      ).rejects.toThrow();
+
+      const [afterDbFailure] = await handle.db.select().from(loops).where(eq(loops.id, "loop-c8"));
+      expect(afterDbFailure).toEqual(beforeDbFailure);
+
       // Manual-only loop cannot persist invalid timezone
       await handle.db.insert(loops).values({
         id: "loop-c8-manual",

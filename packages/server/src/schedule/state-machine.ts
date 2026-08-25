@@ -33,7 +33,7 @@ import type { Db } from "../db/index.js";
 import type { Loop } from "../db/schema.js";
 import { loops } from "../db/schema.js";
 import type { Clock } from "../time.js";
-import { ScheduleValidationError, validateSchedule } from "./time-semantics.js";
+import { validateSchedule } from "./time-semantics.js";
 
 /**
  * Partial schedule configuration update.
@@ -88,27 +88,10 @@ export async function updateSchedule(
       return { found: false };
     }
 
-    // 2. Validate patch values BEFORE normalization (length checks, basic format)
-    if (patch.cron !== undefined && patch.cron !== null) {
-      if (patch.cron.length > 255) {
-        throw new ScheduleValidationError("cron", "cron must not exceed 255 characters");
-      }
-      if (patch.cron.includes("\0")) {
-        throw new ScheduleValidationError("cron", "cron must not contain NUL character");
-      }
-    }
-
-    if (patch.timezone !== undefined) {
-      if (patch.timezone.length > 255) {
-        throw new ScheduleValidationError("timezone", "timezone must not exceed 255 characters");
-      }
-      if (patch.timezone.includes("\0")) {
-        throw new ScheduleValidationError("timezone", "timezone must not contain NUL character");
-      }
-    }
-
-    // 3. Normalize the patch
-    const normalizedPatch = normalizePatch(currentLoop, patch);
+    // 2. Validate raw values before semantic no-op comparison, then normalize
+    // through the shared time-semantics entry point so field limits and syntax
+    // have one owner.
+    const normalizedPatch = normalizeAndValidatePatch(currentLoop, patch);
 
     // 4. Check if this is semantically a no-op
     if (isNoOp(currentLoop, normalizedPatch)) {
@@ -177,21 +160,33 @@ export async function updateSchedule(
  * Normalizes a patch by applying validation and whitespace normalization
  * to cron and timezone fields.
  */
-function normalizePatch(currentLoop: Loop, patch: SchedulePatch): SchedulePatch {
+function normalizeAndValidatePatch(currentLoop: Loop, patch: SchedulePatch): SchedulePatch {
   const normalized: SchedulePatch = {};
+  const changesCron = patch.cron !== undefined;
+  const changesTimezone = patch.timezone !== undefined;
+
+  let normalizedSchedule: ReturnType<typeof validateSchedule> | null = null;
+  if (changesCron || changesTimezone) {
+    const candidateCron = changesCron ? patch.cron : currentLoop.cron;
+    const candidateTimezone = changesTimezone ? patch.timezone! : currentLoop.timezone;
+
+    // Manual-only schedules still carry a real timezone. A fixed dummy cron
+    // lets the shared validator normalize and validate that timezone without
+    // inventing a second timezone-only ruleset.
+    normalizedSchedule = validateSchedule(candidateCron ?? "0 0 * * *", candidateTimezone);
+  }
 
   if (patch.cron !== undefined) {
     if (patch.cron === null) {
       // Explicit null = clear to manual-only
       normalized.cron = null;
     } else {
-      // Normalize whitespace
-      normalized.cron = patch.cron.trim().replace(/\s+/g, " ");
+      normalized.cron = normalizedSchedule!.cron;
     }
   }
 
   if (patch.timezone !== undefined) {
-    normalized.timezone = patch.timezone.trim();
+    normalized.timezone = normalizedSchedule!.timezone;
   }
 
   if (patch.enabled !== undefined) {

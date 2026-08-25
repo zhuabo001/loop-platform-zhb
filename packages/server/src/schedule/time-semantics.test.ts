@@ -82,7 +82,11 @@ describe("D: Cron, timezone, and DST", () => {
     expect(() => validateSchedule("0 24 * * *", "UTC")).toThrow(ScheduleValidationError); // hour 24
     expect(() => validateSchedule("0 9 32 * *", "UTC")).toThrow(ScheduleValidationError); // day 32
     expect(() => validateSchedule("0 9 * 13 *", "UTC")).toThrow(ScheduleValidationError); // month 13
-    expect(() => validateSchedule("0 9 * * 7", "UTC")).toThrow(ScheduleValidationError); // weekday 7 (Croner uses 0-6)
+    // Standard cron treats both 0 and 7 as Sunday.
+    expect(validateSchedule("0 9 * * 7", "UTC")).toEqual({
+      cron: "0 9 * * 7",
+      timezone: "UTC",
+    });
   });
 
   test("D3: accept valid IANA timezones, reject invalid", () => {
@@ -161,6 +165,17 @@ describe("D: Cron, timezone, and DST", () => {
     // Verify it's March 9
     expect(next?.getUTCDate()).toBe(9);
     expect(next?.getUTCMonth()).toBe(2); // March (0-indexed)
+  });
+
+  test("D5: DST gap skips invalid candidates from list and range hour fields", () => {
+    const beforeGap = new Date("2026-03-08T03:00:00.000Z");
+
+    const listSchedule = validateSchedule("30 2,4 * * *", "America/New_York");
+    expect(nextOccurrence(listSchedule, beforeGap)).toEqual(new Date("2026-03-08T08:30:00.000Z"));
+
+    const afterFirstRangeOccurrence = new Date("2026-03-08T06:31:00.000Z");
+    const rangeSchedule = validateSchedule("30 1-2 * * *", "America/New_York");
+    expect(nextOccurrence(rangeSchedule, afterFirstRangeOccurrence)).toEqual(new Date("2026-03-09T05:30:00.000Z"));
   });
 
   test("D6: DST overlap (fall back) — only first occurrence, no duplicate", () => {

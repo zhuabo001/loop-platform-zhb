@@ -97,7 +97,7 @@ export function validateSchedule(cron: string, timezone: string): NormalizedSche
   }
 
   // Additional validation for specific values
-  const [minute, hour, day, month, weekday] = segments;
+  const [minute, hour, day, month] = segments;
 
   // Basic range checks for literal values (not ranges or wildcards)
   const checkRange = (value: string, min: number, max: number, fieldName: string) => {
@@ -116,20 +116,11 @@ export function validateSchedule(cron: string, timezone: string): NormalizedSche
   checkRange(day, 1, 31, "day");
   checkRange(month, 1, 12, "month");
 
-  // Weekday validation: Croner accepts 0-6 (Sunday-Saturday) and 7 (Sunday alias)
-  // We reject 7 to be strict
-  if (weekday !== "*" && !weekday.includes("-") && !weekday.includes(",") && !weekday.includes("/")) {
-    const num = Number.parseInt(weekday, 10);
-    if (!Number.isNaN(num) && num > 6) {
-      throw new ScheduleValidationError("cron", `weekday value ${num} is out of range [0-6]`);
-    }
-  }
-
   // Validate cron expression by attempting to parse it
   try {
     // Use Croner to validate the expression (will throw if invalid)
     // We use UTC here just for validation; actual timezone is applied in nextOccurrence
-    new Cron(normalizedCron, { timezone: "UTC" });
+    new Cron(normalizedCron, { timezone: "UTC", mode: "5-part" });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     throw new ScheduleValidationError("cron", `invalid cron expression: ${message}`);
@@ -157,7 +148,7 @@ export function validateSchedule(cron: string, timezone: string): NormalizedSche
   // Validate timezone by attempting to create a Cron instance with it
   try {
     // Croner will throw if the timezone is not recognized by the runtime
-    new Cron("0 0 * * *", { timezone: normalizedTimezone });
+    new Cron("0 0 * * *", { timezone: normalizedTimezone, mode: "5-part" });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     throw new ScheduleValidationError("timezone", `invalid or unrecognized timezone: ${message}`);
@@ -191,36 +182,22 @@ export function nextOccurrence(schedule: NormalizedSchedule, afterExclusive: Dat
   // Create Cron instance with the schedule's timezone
   const cron = new Cron(schedule.cron, {
     timezone: schedule.timezone,
+    mode: "5-part",
   });
 
   // Get next occurrence after the reference time
   let next = cron.nextRun(afterExclusive);
 
-  if (!next) {
-    return null;
-  }
+  // Croner can surface a normalized instant for a non-existent wall-clock time
+  // during a DST gap. `match` evaluates the returned instant back in the target
+  // timezone, so rejecting non-matching candidates works for literals, lists,
+  // ranges and steps without reimplementing cron parsing here.
+  while (next !== null && !cron.match(next)) {
+    const invalidCandidate = next;
+    next = cron.nextRun(invalidCandidate);
 
-  // DST gap handling: verify the returned time is valid in the target timezone
-  // by checking if the local hour matches what we expect from the cron expression
-  const cronParts = schedule.cron.split(/\s+/);
-  const expectedHour = cronParts[1]; // hour field (0-23)
-
-  // Only check if hour is a specific value (not *, range, list, or step)
-  if (expectedHour !== "*" && !expectedHour.includes("-") && !expectedHour.includes(",") && !expectedHour.includes("/")) {
-    const expectedHourNum = Number.parseInt(expectedHour, 10);
-
-    // Get the actual hour in the target timezone
-    const actualHourStr = next.toLocaleString("en-US", {
-      timeZone: schedule.timezone,
-      hour: "numeric",
-      hour12: false,
-    });
-    const actualHour = Number.parseInt(actualHourStr, 10);
-
-    // If the hour doesn't match, we're in a DST gap - skip to next occurrence
-    if (actualHour !== expectedHourNum) {
-      // This occurrence fell in a DST gap; get the next one
-      next = cron.nextRun(next);
+    if (next !== null && next.getTime() <= invalidCandidate.getTime()) {
+      throw new Error("Croner returned a non-increasing next occurrence");
     }
   }
 

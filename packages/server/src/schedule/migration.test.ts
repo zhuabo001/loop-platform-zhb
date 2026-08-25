@@ -12,7 +12,12 @@
  * All tests assert runs table remains empty (no accidental automatic execution).
  */
 
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
 import { eq } from "drizzle-orm";
+import { migrate } from "drizzle-orm/pglite/migrator";
 import { describe, expect, test } from "vitest";
 
 import { closeDb, createDb, openMigratedDb, runMigrations } from "../db/index.js";
@@ -21,33 +26,12 @@ import { loops, runs } from "../db/schema.js";
 
 describe("M: Migration and schema", () => {
   test("M1: old database upgrade preserves existing fields and adds safe defaults", async () => {
-    // This test simulates a real old database upgrade:
-    // 1. Create a fresh database
-    // 2. Apply old migrations (0000-0001) to create old schema
-    // 3. Insert a Loop with old schema (no schedule fields)
-    // 4. Apply new migration (0002) manually
-    // 5. Verify old fields preserved and new fields have safe defaults
-
-    const handle = await createDb();
+    const dataDir = await mkdtemp(path.join(tmpdir(), `loopzhb-phase3-m1-${process.pid}-`));
+    let handle = await createDb({ dataDir });
 
     try {
-      const fs = await import("node:fs/promises");
-      const path = await import("node:path");
-
       const fixtureDir = path.resolve("test-fixtures/old-migrations");
-      const migration0000 = await fs.readFile(path.join(fixtureDir, "0000_safe_the_fallen.sql"), "utf-8");
-      const migration0001 = await fs.readFile(path.join(fixtureDir, "0001_wooden_domino.sql"), "utf-8");
-
-      // Split and execute SQL statements for old migrations
-      const statements0000 = migration0000.split("--> statement-breakpoint").map((s) => s.trim()).filter(Boolean);
-      const statements0001 = migration0001.split("--> statement-breakpoint").map((s) => s.trim()).filter(Boolean);
-
-      for (const stmt of statements0000) {
-        if (stmt) await handle.client.exec(stmt);
-      }
-      for (const stmt of statements0001) {
-        if (stmt) await handle.client.exec(stmt);
-      }
+      await migrate(handle.db, { migrationsFolder: fixtureDir });
 
       // Insert a Loop with old schema (no schedule fields)
       await handle.client.exec(`
@@ -87,16 +71,11 @@ describe("M: Migration and schema", () => {
       expect(beforeResult.rows[0].workdir).toBe("/home/user/project");
       expect(beforeResult.rows[0].enabled).toBe(true);
 
-      // Apply new migration (0002) manually
-      const migration0002 = await fs.readFile(
-        path.resolve("drizzle/0002_wild_millenium_guard.sql"),
-        "utf-8"
-      );
-      const statements0002 = migration0002.split("--> statement-breakpoint").map((s) => s.trim()).filter(Boolean);
-
-      for (const stmt of statements0002) {
-        if (stmt) await handle.client.exec(stmt);
-      }
+      // Simulate an application upgrade: close the old process, reopen the same
+      // file-backed database, then let the production migration runner apply 0002.
+      await closeDb(handle);
+      handle = await createDb({ dataDir });
+      await runMigrations(handle);
 
       // Re-read using Drizzle ORM
       const [result] = await handle.db.select().from(loops).where(eq(loops.id, "loop-old"));
@@ -122,6 +101,7 @@ describe("M: Migration and schema", () => {
       expect(allRuns).toHaveLength(0);
     } finally {
       await closeDb(handle);
+      await rm(dataDir, { recursive: true, force: true });
     }
   });
 
@@ -246,7 +226,8 @@ describe("M: Migration and schema", () => {
   });
 
   test("M5: idempotent migration (no errors, no duplicates, data unchanged)", async () => {
-    const handle = await openMigratedDb();
+    const dataDir = await mkdtemp(path.join(tmpdir(), `loopzhb-phase3-m5-${process.pid}-`));
+    let handle = await openMigratedDb({ dataDir });
 
     try {
       const now = new Date().toISOString();
@@ -278,7 +259,10 @@ describe("M: Migration and schema", () => {
 
       const [before] = await handle.db.select().from(loops).where(eq(loops.id, "loop-idempotent"));
 
-      // Re-run migrations (should be a no-op)
+      // Close and reopen the same file-backed database, as production does on
+      // restart, then repeat the migration runner once more on the live handle.
+      await closeDb(handle);
+      handle = await openMigratedDb({ dataDir });
       await runMigrations(handle);
 
       const [after] = await handle.db.select().from(loops).where(eq(loops.id, "loop-idempotent"));
@@ -297,6 +281,7 @@ describe("M: Migration and schema", () => {
       expect(allRuns).toHaveLength(0);
     } finally {
       await closeDb(handle);
+      await rm(dataDir, { recursive: true, force: true });
     }
   });
 
