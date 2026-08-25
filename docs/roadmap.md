@@ -128,6 +128,18 @@ supersede 未领取的 pending——T7 语义在 cron 表面继承）+ 重启 ca
 |---|
 | server 重启 / 机器离线恢复后最多补跑一次，绝不双跑 |
 
+### 状态
+
+- **Batch 1 — 时间语义与持久化基础（Day 1–3）：已完成**（2026-08-25，ADR-007）
+  - schema：`loops` 表新增 6 个调度字段（`cron`、`timezone`、`next_run_at`、`schedule_revision`、`schedule_activated_at`、`last_scheduled_at`）；migration 0002 安全升级旧库（默认值：`cron=null`、`timezone='UTC'`、`schedule_revision=0`）。
+  - index：`loops_active_schedule_idx` 部分索引（`WHERE enabled=true AND cron IS NOT NULL`），Scheduler 扫描活跃调度配置专用。
+  - 时间语义：`validateSchedule()` 五段 cron 校验（拒绝 macro/秒/年字段）+ IANA 时区验证；`nextOccurrence()` 计算下次执行时间，DST gap 跳过到下一有效时间，DST overlap 仅首次。
+  - 状态机：`updateSchedule()` 集中式配置管理，原子事务（revision 递增、activation 边界维护、watermark 生命周期、no-op 检测、先校验后归一化）；manual-only Loop（`cron=null`）的 timezone 变更也触发校验，防止持久化非法时区。
+  - 测试覆盖：M 组（迁移与 schema，6 tests）、D 组（cron/timezone/DST，8 tests）、C 组（配置状态机，8 tests）——22 tests；M1/M5 使用文件型 PGlite、Drizzle journal/runner 和关闭重开路径。
+  - 边界：`next_run_at` 完成 schema 声明但 Phase 3 全程保持 write-closed（未来 Phase 需要时重新评估）；无 protocol 变更、无 HTTP 路由、无 Scheduler 或 timer——批次 1 只建立持久化与语义基础，不开放自动调度。
+  - 复审：Round 1–3 发现的问题由 `67cb80a`、`f69216c` 修复；Round 4 Standards、Specs、Adversarial 均 0 finding，完整质量门通过。
+  - **Batch 1 已最终收口**（2026-08-25）；Phase 3 整体仍进行中，下一目标为 Batch 2 在线 Scheduler。
+
 ## Phase 4 — Loop 产品语义（第 7–8 周）
 
 Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Dashboard
