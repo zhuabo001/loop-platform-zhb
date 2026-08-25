@@ -1,9 +1,9 @@
 # ADR-007：Phase 3 批次一——时间语义与持久化基础
 
-- 状态：Proposed（Round 3 复审中）
+- 状态：Accepted
 - 日期：2026-08-25
 - 关联：docs/roadmap.md Phase 3 批次一；docs/plan/codex-phase3-batch1-plan.md；ADR-003（schema 演进纪律）
-- 实现：migration `0002_wild_millenium_guard.sql`；初始实现 `51f3ceb`；Round 2 修复 `67cb80a`；测试分组 M/D/C
+- 实现：migration `0002_wild_millenium_guard.sql`；初始实现 `51f3ceb`；Round 2 修复 `67cb80a`；Round 3 修复 `f69216c`；测试分组 M/D/C
 
 ## 背景
 
@@ -280,3 +280,4 @@ Batch 1 只有在上述目标全部通过时才能标记完成；任何自动 Ru
 
 - 2026-08-25：初始 Proposed。
 - 2026-08-25：Round 2 修复统一 DST gap、真实文件库迁移与数据库故障回滚证据；等待 Round 3 复审后决定是否 Accepted。
+- 2026-08-25：Round 3 修复 overlap `afterExclusive` 单调性和 M1 全字段快照；Round 4 Standards/Specs/Adversarial 均 0 finding，状态改为 Accepted。

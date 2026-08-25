@@ -1,9 +1,10 @@
 # Phase 3 Batch 1 开发计划：时间语义与持久化基础
 
-- 状态：实现完成，等待 Round 3 三轨复审核销
+- 状态：已完成（Round 4 三轨复审通过，0 finding）
 - 基线：`f9f3025d0ac80b1f9f947a9392e82549207bdb2b`
 - 初始实现：`51f3cebcf8e8f4e8346b26d0cfbe81eb31303276`
 - Round 2 修复：`67cb80a`
+- Round 3 修复：`f69216c`
 - 长期决策：ADR-007
 - 范围状态：`docs/roadmap.md` Phase 3
 
