@@ -46,6 +46,14 @@ export class ScheduleValidationError extends Error {
 const MAX_FIELD_LENGTH = 255;
 
 /**
+ * Croner recovery is only needed while traversing a timezone discontinuity.
+ * Advancing at minute precision is sufficient for a five-part cron; this guard
+ * prevents an upstream regression from turning the pure calculation into an
+ * infinite loop.
+ */
+const MAX_DISCONTINUITY_RECOVERY_STEPS = 6_000;
+
+/**
  * Validates and normalizes a cron expression and timezone.
  *
  * Validation rules:
@@ -185,21 +193,36 @@ export function nextOccurrence(schedule: NormalizedSchedule, afterExclusive: Dat
     mode: "5-part",
   });
 
-  // Get next occurrence after the reference time
-  let next = cron.nextRun(afterExclusive);
+  let cursor = afterExclusive;
 
-  // Croner can surface a normalized instant for a non-existent wall-clock time
-  // during a DST gap. `match` evaluates the returned instant back in the target
-  // timezone, so rejecting non-matching candidates works for literals, lists,
-  // ranges and steps without reimplementing cron parsing here.
-  while (next !== null && !cron.match(next)) {
-    const invalidCandidate = next;
-    next = cron.nextRun(invalidCandidate);
+  for (let step = 0; step < MAX_DISCONTINUITY_RECOVERY_STEPS; step += 1) {
+    const candidate = cron.nextRun(cursor);
+    if (candidate === null) return null;
 
-    if (next !== null && next.getTime() <= invalidCandidate.getTime()) {
-      throw new Error("Croner returned a non-increasing next occurrence");
+    if (candidate.getTime() <= cursor.getTime()) {
+      // During a DST overlap Croner may resolve a wall-clock match to its first
+      // occurrence even when the cursor is already inside the second occurrence.
+      // Move toward the end of the ambiguous minute without stepping over a
+      // valid occurrence at the first minute after the overlap.
+      cursor = advanceWithinFivePartMinute(cursor);
+      continue;
     }
+
+    // During a DST gap Croner can normalize a non-existent wall-clock time to
+    // a later instant. Matching the candidate back in the target timezone
+    // rejects it for literals, lists, ranges and steps alike.
+    if (!cron.match(candidate)) {
+      cursor = candidate;
+      continue;
+    }
+
+    return candidate;
   }
 
-  return next;
+  throw new Error("Croner could not advance beyond a timezone discontinuity");
+}
+
+function advanceWithinFivePartMinute(cursor: Date): Date {
+  const minuteEnd = Math.floor(cursor.getTime() / 60_000) * 60_000 + 59_999;
+  return new Date(minuteEnd > cursor.getTime() ? minuteEnd : cursor.getTime() + 1);
 }

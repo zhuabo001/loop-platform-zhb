@@ -204,4 +204,19 @@ describe("D: Cron, timezone, and DST", () => {
     expect(second?.getUTCDate()).toBe(2);
     expect(second?.getUTCMonth()).toBe(10); // November (0-indexed)
   });
+
+  test("D6: reference inside the repeated hour never returns a past or duplicate occurrence", () => {
+    const insideSecondRepeatedHour = new Date("2026-11-01T06:15:00.000Z");
+
+    const literal = validateSchedule("30 1 * * *", "America/New_York");
+    expect(nextOccurrence(literal, insideSecondRepeatedHour)).toEqual(new Date("2026-11-02T06:30:00.000Z"));
+
+    const wildcard = validateSchedule("* 1 * * *", "America/New_York");
+    expect(nextOccurrence(wildcard, insideSecondRepeatedHour)).toEqual(new Date("2026-11-02T06:00:00.000Z"));
+
+    // 02:00 EST is the first valid matching wall-clock time after the repeated
+    // hour for this range and must not be skipped while recovering.
+    const range = validateSchedule("0 1-2 * * *", "America/New_York");
+    expect(nextOccurrence(range, insideSecondRepeatedHour)).toEqual(new Date("2026-11-01T07:00:00.000Z"));
+  });
 });

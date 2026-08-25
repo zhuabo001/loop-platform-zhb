@@ -47,12 +47,12 @@ describe("M: Migration and schema", () => {
           '/home/user/project/loop.md',
           'Old content',
           '2026-01-01T00:00:00.000Z',
-          NULL,
-          NULL,
+          'return true;',
+          'sonnet',
           true,
           'claude-code',
           true,
-          NULL,
+          '{"cursor":3}'::jsonb,
           '2026-01-01T00:00:00.000Z',
           '2026-01-01T00:00:00.000Z'
         )
@@ -61,15 +61,41 @@ describe("M: Migration and schema", () => {
       // Verify old state before applying new migration
       const beforeResult = await handle.client.query<{
         id: string;
-        name: string;
-        workdir: string;
+        machine_id: string;
+        name: string | null;
+        workdir: string | null;
+        task_file: string | null;
+        task_file_content: string | null;
+        task_file_synced_at: string | null;
+        workflow: string | null;
+        model: string | null;
+        allow_control: boolean;
+        agent: string;
         enabled: boolean;
-      }>("SELECT id, name, workdir, enabled FROM loops WHERE id = 'loop-old'");
+        state: unknown;
+        created_at: string;
+        updated_at: string;
+      }>("SELECT * FROM loops WHERE id = 'loop-old'");
 
       expect(beforeResult.rows).toHaveLength(1);
-      expect(beforeResult.rows[0].name).toBe("Old Loop");
-      expect(beforeResult.rows[0].workdir).toBe("/home/user/project");
-      expect(beforeResult.rows[0].enabled).toBe(true);
+      const before = beforeResult.rows[0];
+      expect(before).toEqual({
+        id: "loop-old",
+        machine_id: "m-test",
+        name: "Old Loop",
+        workdir: "/home/user/project",
+        task_file: "/home/user/project/loop.md",
+        task_file_content: "Old content",
+        task_file_synced_at: "2026-01-01T00:00:00.000Z",
+        workflow: "return true;",
+        model: "sonnet",
+        allow_control: true,
+        agent: "claude-code",
+        enabled: true,
+        state: { cursor: 3 },
+        created_at: "2026-01-01T00:00:00.000Z",
+        updated_at: "2026-01-01T00:00:00.000Z",
+      });
 
       // Simulate an application upgrade: close the old process, reopen the same
       // file-backed database, then let the production migration runner apply 0002.
@@ -81,12 +107,23 @@ describe("M: Migration and schema", () => {
       const [result] = await handle.db.select().from(loops).where(eq(loops.id, "loop-old"));
 
       expect(result).toBeDefined();
-      expect(result.id).toBe("loop-old");
-      expect(result.name).toBe("Old Loop");
-      expect(result.workdir).toBe("/home/user/project");
-      expect(result.taskFile).toBe("/home/user/project/loop.md");
-      expect(result.taskFileContent).toBe("Old content");
-      expect(result.enabled).toBe(true);
+      expect({
+        id: result.id,
+        machine_id: result.machineId,
+        name: result.name,
+        workdir: result.workdir,
+        task_file: result.taskFile,
+        task_file_content: result.taskFileContent,
+        task_file_synced_at: result.taskFileSyncedAt,
+        workflow: result.workflow,
+        model: result.model,
+        allow_control: result.allowControl,
+        agent: result.agent,
+        enabled: result.enabled,
+        state: result.state,
+        created_at: result.createdAt,
+        updated_at: result.updatedAt,
+      }).toEqual(before);
 
       // New fields have safe defaults
       expect(result.cron).toBeNull();
