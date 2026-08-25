@@ -26,6 +26,12 @@ const loopBase: Loop = {
   agent: "claude-code",
   enabled: true,
   state: null,
+  cron: null,
+  timezone: "UTC",
+  nextRunAt: null,
+  scheduleRevision: 0,
+  scheduleActivatedAt: null,
+  lastScheduledAt: null,
   createdAt: "2026-07-01T00:00:00.000Z",
   updatedAt: "2026-07-01T00:00:00.000Z",
 };

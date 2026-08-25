@@ -130,10 +130,37 @@ export const loops = pgTable(
     enabled: boolean("enabled").notNull().default(true),
     /** Workflow cursor: last returned state, passed back to the next run as `prev`. */
     state: jsonb("state").$type<unknown>(),
+    /** Standard five-segment cron expression (minute hour day month weekday).
+     *  Null = manual-only loop (no automatic scheduling). */
+    cron: text("cron"),
+    /** IANA timezone for cron interpretation (e.g., 'UTC', 'Asia/Shanghai',
+     *  'America/New_York'). Must be recognizable by the runtime. */
+    timezone: text("timezone").notNull().default("UTC"),
+    /** Next planned automatic execution time (ISO). Phase 3 keeps this
+     *  write-closed (always null) — schema declaration only. */
+    nextRunAt: text("next_run_at"),
+    /** Schedule configuration revision number — increments on every effective
+     *  configuration change (cron/timezone/enabled). Used to detect stale
+     *  schedule updates and track configuration history. */
+    scheduleRevision: integer("schedule_revision").notNull().default(0),
+    /** Activation timestamp (ISO) for the current schedule configuration. Set
+     *  when enabled=true && cron!=null; cleared when paused or manual-only.
+     *  Establishes the boundary for occurrence calculation — runs are never
+     *  backfilled before this timestamp. */
+    scheduleActivatedAt: text("schedule_activated_at"),
+    /** Last automatic scheduling trigger timestamp (ISO). Watermark for
+     *  occurrence calculation — cleared on configuration change, advanced on
+     *  each automatic trigger. Phase 3 Batch 1 keeps this write-closed. */
+    lastScheduledAt: text("last_scheduled_at"),
     createdAt: text("created_at").notNull(),
     updatedAt: text("updated_at").notNull(),
   },
-  (t) => [index("loops_machine_idx").on(t.machineId)],
+  (t) => [
+    index("loops_machine_idx").on(t.machineId),
+    /** Covers the Scheduler's active-schedule scan (enabled loops with cron).
+     *  Partial index keeps it small — only rows where enabled=true AND cron IS NOT NULL. */
+    index("loops_active_schedule_idx").on(t.id).where(sql`${t.enabled} = true AND ${t.cron} IS NOT NULL`),
+  ],
 );
 
 // ---- runs: one execution record ----

@@ -41,6 +41,7 @@ describe("runMigrations", () => {
     // index definition must not slip through (db:check only guards
     // schema.ts↔snapshot, not snapshot↔committed-SQL).
     const expected: Record<string, string> = {
+      loops_active_schedule_idx: "USING btree (id)",
       loops_machine_idx: "USING btree (machine_id)",
       run_leases_loop_idx: "USING btree (loop_id)",
       run_leases_run_idx: "USING btree (run_id)",
@@ -57,6 +58,9 @@ describe("runMigrations", () => {
     // leads (`WHERE machineId=? AND phase='pending'`) and pending-only rows keep
     // the index tiny.
     expect(byName.get("runs_pending_idx")).toContain("WHERE (phase = 'pending'::text)");
+    // The Scheduler's active-schedule scan carries its partial predicate:
+    // enabled=true AND cron IS NOT NULL (Phase 3 Batch 1).
+    expect(byName.get("loops_active_schedule_idx")).toContain("WHERE ((enabled = true) AND (cron IS NOT NULL))");
   });
 
   it("persists across close/reopen in the file-backed tier", async () => {

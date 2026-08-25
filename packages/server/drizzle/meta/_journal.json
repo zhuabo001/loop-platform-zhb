@@ -15,6 +15,13 @@
       "when": 1785251135682,
       "tag": "0001_wooden_domino",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1787645548955,
+      "tag": "0002_wild_millenium_guard",
+      "breakpoints": true
     }
   ]
 }
