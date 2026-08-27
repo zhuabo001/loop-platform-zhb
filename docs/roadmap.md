@@ -139,7 +139,7 @@ supersede 未领取的 pending——T7 语义在 cron 表面继承）+ 重启 ca
   - 边界：`next_run_at` 完成 schema 声明但 Phase 3 全程保持 write-closed（未来 Phase 需要时重新评估）；无 protocol 变更、无 HTTP 路由、无 Scheduler 或 timer——批次 1 只建立持久化与语义基础，不开放自动调度。
   - 复审：Round 1–3 发现的问题由 `67cb80a`、`f69216c` 修复；Round 4 Standards、Specs、Adversarial 均 0 finding，完整质量门通过。
   - **Batch 1 已最终收口**（2026-08-25）；Phase 3 整体仍进行中，下一目标为 Batch 2 在线 Scheduler。
-- **Batch 2 — 在线 Scheduler 与 Protocol 扩展（Day 4–6）：已完成**（2026-08-27，ADR-007）
+- **Batch 2 — 在线 Scheduler 与 Protocol 扩展（Day 4–6）：已完成**（2026-08-27，ADR-008）
   - Protocol：`CreateLoopRequest` 扩展 `cron?/timezone?`；新增 `UpdateScheduleRequest/Response`；`LoopSummary` 扩展 `cron/timezone/nextFireAt`（additive，向后兼容）。
   - Admin API：`createLoop()` 支持创建 scheduled loop（validation + scheduleRevision=0 + scheduleActivatedAt）；`updateSchedule()` 已在 Batch 1 完成，Batch 2 通过 HTTP 路由暴露。
   - ExecTrigger：定义 `manual | { scheduled; scheduledFor; scheduleRevision }`；`RunCoordinator.enqueueExecRun()` 接受可选 trigger 参数；scheduled trigger 验证 revision/cron/enabled/activation/watermark，原子推进 `lastScheduledAt`；running run 时跳过 pending 创建但 watermark 仍推进。

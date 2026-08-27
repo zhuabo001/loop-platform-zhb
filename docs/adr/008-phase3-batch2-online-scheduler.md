@@ -1,4 +1,4 @@
-# ADR-007: Online Scheduler Architecture
+# ADR-008: Online Scheduler Architecture
 
 **Status**: Accepted  
 **Date**: 2026-08-27  

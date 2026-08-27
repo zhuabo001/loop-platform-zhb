@@ -63,7 +63,7 @@ PATCH /api/loops/:id/schedule
 - 配置更新立即生效（零停机 reconcile）
 - 手动触发和定时调度可共存（手动触发不受 cron 配置影响）
 
-详见 `docs/adr/ADR-007-online-scheduler.md`。
+详见 `docs/adr/008-phase3-batch2-online-scheduler.md`。
 
 ## Daemon 运行
 
