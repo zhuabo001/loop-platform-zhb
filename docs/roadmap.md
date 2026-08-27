@@ -139,7 +139,7 @@ supersede 未领取的 pending——T7 语义在 cron 表面继承）+ 重启 ca
   - 边界：`next_run_at` 完成 schema 声明但 Phase 3 全程保持 write-closed（未来 Phase 需要时重新评估）；无 protocol 变更、无 HTTP 路由、无 Scheduler 或 timer——批次 1 只建立持久化与语义基础，不开放自动调度。
   - 复审：Round 1–3 发现的问题由 `67cb80a`、`f69216c` 修复；Round 4 Standards、Specs、Adversarial 均 0 finding，完整质量门通过。
   - **Batch 1 已最终收口**（2026-08-25）；Phase 3 整体仍进行中，下一目标为 Batch 2 在线 Scheduler。
-- **Batch 2 — 在线 Scheduler 与 Protocol 扩展（Day 4–6）：实现完成，复审核销中**（2026-08-27，ADR-008；开放 Issue：#23）
+- **Batch 2 — 在线 Scheduler 与 Protocol 扩展（Day 4–6）：已完成**（2026-08-28，ADR-008；Issue #23 已关闭）
   - Protocol：`CreateLoopRequest` 扩展 `cron?/timezone?`；新增 `UpdateScheduleRequest/Response`；`LoopSummary` 扩展 `cron/timezone/nextFireAt`（additive，向后兼容）。
   - Admin API：`createLoop()` 支持创建 scheduled loop（validation + scheduleRevision=0 + scheduleActivatedAt；timezone-only 创建也经过共享校验）；`updateSchedule()` 已在 Batch 1 完成，Batch 2 通过 HTTP 路由暴露。
   - ExecTrigger：定义 `manual | { scheduled; scheduledFor; scheduleRevision }`；`RunCoordinator.enqueueExecRun()` 接受可选 trigger 参数；scheduled trigger 验证 revision/cron/enabled/occurrence 真实性（`isOccurrence`，拒绝非当前 cron occurrence 与未来时间）/activation/watermark；`scheduledFor` 解析后立即规范为 canonical UTC ISO，比较与持久化只用规范形式（等价 offset 表示不可绕过水位去重）；running run 时跳过 pending 创建但 watermark 仍推进。
@@ -150,7 +150,7 @@ supersede 未领取的 pending——T7 语义在 cron 表面继承）+ 重启 ca
   - 日志纪律：scheduler 与 schedule 校验路径只输出固定分类（不含异常消息、cron、timezone 等用户输入）。
   - 测试覆盖：A 组（API 表面与 schedule 校验）、O 组（occurrence 原子性：真实回滚/未来时间/非 occurrence/等价 ISO 规范化/并发 callback/manual-scheduled 竞争）、S 组（Scheduler 生命周期：固定参数/旧回调/occurrence 重建/长延迟重建/overrun/启动失败传播/stopped guard/update-callback 竞态）、F 组（集成：multi-tick 合并/恢复只领最新/tick-claim 竞态/暂停后 Run Now/热注册/seam 故障）；全量回归通过。
   - 边界：单进程 scheduler（Phase 6 多实例调度留后）；时钟偏移接受（系统时钟变化影响调度，Phase 3 可接受）；per-loop 错误隔离（一个 loop 的 bad config 不阻塞其他）。
-  - 复审状态：Round 1 不通过（Standards P1×1/P2×3/P3×1、Specs P1×8/P2×1、Adversarial P1×5/P2×6，跨轨未去重），修复后 Round 2 仍余 3 个 P1（occurrence 规范化、启动清理竞态、长延迟丢 tick）并继续修复；所有发现追踪于 #23，三轨复审无未核销 P1/P2 后方可关闭 #23 并标记 Batch 2 完成。
+  - 复审状态：Round 1–3 的 Standards/Specs/Adversarial 发现均已修复；Round 4 三轨 0 finding，完整质量门通过，Issue #23 已关闭。Phase 3 整体仍进行中，下一目标为 Batch 3 重启 catch-up。
 
 ### 右移项
 
