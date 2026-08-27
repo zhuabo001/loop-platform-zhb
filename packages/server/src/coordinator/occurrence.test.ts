@@ -395,5 +395,53 @@ describe("O-group: scheduled trigger and atomic occurrence", () => {
       expect(loop.lastScheduledAt).toBeNull();
       expect(await snapshotRuns(db)).toHaveLength(0);
     });
+
+    test("O16: concurrent callbacks for the same occurrence enqueue exactly once", async () => {
+      // Two callbacks racing the SAME occurrence (per-loop serialization +
+      // watermark make exactly one win).
+      const [a, b] = await Promise.all([
+        coordinator.enqueueExecRun(loopId, {
+          kind: "scheduled",
+          scheduledFor: "2026-08-27T10:00:00.000Z",
+          scheduleRevision: 0,
+        }),
+        coordinator.enqueueExecRun(loopId, {
+          kind: "scheduled",
+          scheduledFor: "2026-08-27T10:00:00.000Z",
+          scheduleRevision: 0,
+        }),
+      ]);
+
+      const outcomes = [a, b].map((r) => (r.enqueued ? "enqueued" : r.reason)).sort();
+      expect(outcomes).toEqual(["already_scheduled", "enqueued"]);
+
+      const runs = await snapshotRuns(db);
+      expect(runs).toHaveLength(1);
+
+      const [loop] = await db.select().from(loops).where(eq(loops.id, loopId));
+      expect(loop.lastScheduledAt).toBe("2026-08-27T10:00:00.000Z");
+    });
+
+    test("O17: manual/scheduled race converges to exactly one executable pending run", async () => {
+      // A manual Run Now racing a scheduled tick: the later writer supersedes
+      // the earlier pending — never two executable runs, watermark still advances.
+      const [manual, scheduled] = await Promise.all([
+        coordinator.enqueueExecRun(loopId),
+        coordinator.enqueueExecRun(loopId, {
+          kind: "scheduled",
+          scheduledFor: "2026-08-27T10:00:00.000Z",
+          scheduleRevision: 0,
+        }),
+      ]);
+
+      expect(manual.enqueued || scheduled.enqueued).toBe(true);
+
+      const runs = await snapshotRuns(db);
+      expect(runs.filter((r) => r.phase === "pending")).toHaveLength(1);
+      expect(runs).toHaveLength(2); // winner pending + loser superseded
+
+      const [loop] = await db.select().from(loops).where(eq(loops.id, loopId));
+      expect(loop.lastScheduledAt).toBe("2026-08-27T10:00:00.000Z");
+    });
   });
 });
