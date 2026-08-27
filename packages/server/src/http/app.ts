@@ -36,6 +36,7 @@ import {
   reportRequestSchema,
   RUN_CAPABILITY_INVALID_CODE,
   triggerRunRequestSchema,
+  updateScheduleRequestSchema,
 } from "@loopzhb/protocol";
 
 import { LoopValidationError } from "../admin/errors.js";
@@ -43,6 +44,10 @@ import type { LoopAdmin } from "../admin/index.js";
 import { InvalidMachineCredentialError, RunCapabilityInvalidError } from "../coordinator/errors.js";
 import type { RunCoordinator } from "../coordinator/index.js";
 import type { OwnerControl } from "../owner/index.js";
+import { ScheduleValidationError, updateSchedule } from "../schedule/index.js";
+import type { Scheduler } from "../scheduler/index.js";
+import type { Db } from "../db/index.js";
+import type { Clock } from "../time.js";
 
 /** Both machine endpoints share one wire body cap (plan §HTTP). */
 const BODY_CAP_BYTES = 2 * 1024 * 1024;
@@ -80,7 +85,14 @@ async function parseJsonBodyOrEmpty(c: Context): Promise<unknown> {
   }
 }
 
-export function createServerApp(coordinator: RunCoordinator, admin: LoopAdmin, ownerControl: OwnerControl): Hono {
+export function createServerApp(
+  coordinator: RunCoordinator,
+  admin: LoopAdmin,
+  ownerControl: OwnerControl,
+  db: Db,
+  clock: Clock,
+  scheduler?: Scheduler,
+): Hono {
   const app = new Hono();
 
   app.onError((err, c) => {
@@ -200,6 +212,34 @@ export function createServerApp(coordinator: RunCoordinator, admin: LoopAdmin, o
     if (result.canceled) return c.json({ canceled: true }, 200);
     if (result.reason === "not_found") return jsonError(c, 404, "not found");
     return c.json({ canceled: false, reason: "not_cancelable" }, 200);
+  });
+
+  app.patch("/api/loops/:id/schedule", cap, async (c) => {
+    const raw = await parseJsonBody(c);
+    if (raw === undefined) return jsonError(c, 400, "invalid request");
+    const parsed = updateScheduleRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      console.warn("[http] update-schedule DTO rejected", parsed.error.issues);
+      return jsonError(c, 400, "invalid request");
+    }
+    try {
+      const result = await updateSchedule({ db, clock }, c.req.param("id"), parsed.data);
+
+      if (!result.found) return jsonError(c, 404, "not found");
+
+      // Reconcile scheduler if present and schedule changed
+      if (scheduler && result.changed) {
+        scheduler.reconcile(result.loop);
+      }
+
+      return c.json({ loop: result.loop }, 200);
+    } catch (err) {
+      if (err instanceof ScheduleValidationError) {
+        console.warn("[http] update-schedule validation failed", err.message);
+        return jsonError(c, 400, "invalid request");
+      }
+      throw err;
+    }
   });
 
   return app;

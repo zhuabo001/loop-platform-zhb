@@ -57,7 +57,7 @@ async function bootLiveness() {
   });
   const admin = createLoopAdmin({ db: handle.db, clock, newLoopId: newUuidLoopId });
   const ownerControl = createOwnerControl({ db: handle.db, clock });
-  const app = createServerApp(coordinator, admin, ownerControl);
+  const app = createServerApp(coordinator, admin, ownerControl, handle.db, clock);
   const sweep = createInactivitySweep({ db: handle.db, clock, log: () => {} });
   return { app, sweep, handle, clock };
 }

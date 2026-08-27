@@ -68,7 +68,7 @@ async function fresh(): Promise<void> {
   let loopN = 0;
   admin = createLoopAdmin({ db, clock, newLoopId: () => `loop-${++loopN}` });
   ownerControl = createOwnerControl({ db, clock });
-  app = createServerApp(coordinator, admin, ownerControl);
+  app = createServerApp(coordinator, admin, ownerControl, db, clock);
 }
 
 async function pollReq(body: unknown = {}, token: string | null = TOKEN): Promise<Response> {
@@ -130,7 +130,7 @@ async function expectJsonError(res: Response, status: number, body: { error: str
 describe("createServerApp: seam properties", () => {
   it("returns an independent app per call and constructs with no DB/env/listener side effects", async () => {
     await fresh();
-    const other = createServerApp(coordinator, admin, ownerControl);
+    const other = createServerApp(coordinator, admin, ownerControl, db, clock);
     expect(other).not.toBe(app);
     // Both serve independently.
     expect((await app.request("/api/machine/poll", { method: "GET" })).status).toBe(404);
@@ -667,6 +667,8 @@ describe("unified error surface", () => {
       },
       admin,
       ownerControl,
+      db,
+      clock,
     );
     const res = await sabotaged.request("/api/machine/poll", {
       method: "POST",

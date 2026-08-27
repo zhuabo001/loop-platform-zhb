@@ -23,6 +23,8 @@ import { loadServerConfig, unauthenticatedExposureWarning, type ServerConfig } f
 import { closeDb, openMigratedDb, type DbHandle } from "./db/index.js";
 import { createServerApp } from "./http/app.js";
 import { createOwnerControl } from "./owner/index.js";
+import { createScheduler, type Scheduler } from "./scheduler/index.js";
+import { productionCronFactory } from "./scheduler/croner-factory.js";
 import { armInactivitySweep, createInactivitySweep, type InactivitySweep } from "./sweep/index.js";
 import { systemClock } from "./time.js";
 
@@ -33,6 +35,8 @@ export interface BootedServer {
    *  listener binds, in main). Tests drive `sweep.runOnce()` directly, which
    *  is exactly the pass the armed timer fires. */
   sweep: InactivitySweep;
+  /** Phase 3 Batch 2: Scheduler instance (not yet started). */
+  scheduler: Scheduler;
   handle: DbHandle;
 }
 
@@ -42,6 +46,8 @@ export interface BootedServer {
  * wires the production coordinator (systemClock, UUID run ids, `rk_` mint)
  * and the production sweep (default 20min timeout). Throws if the data dir
  * cannot be created — boot fails fast, before listen.
+ *
+ * Phase 3 Batch 2: Creates Scheduler with production Croner factory.
  */
 export async function bootstrapServer(config: ServerConfig): Promise<BootedServer> {
   await fs.promises.mkdir(config.dataDir, { recursive: true });
@@ -55,7 +61,19 @@ export async function bootstrapServer(config: ServerConfig): Promise<BootedServe
   const admin = createLoopAdmin({ db: handle.db, clock: systemClock, newLoopId: newUuidLoopId });
   const ownerControl = createOwnerControl({ db: handle.db, clock: systemClock });
   const sweep = createInactivitySweep({ db: handle.db, clock: systemClock });
-  return { app: createServerApp(coordinator, admin, ownerControl), coordinator, sweep, handle };
+  const scheduler = createScheduler({
+    db: handle.db,
+    coordinator,
+    clock: systemClock,
+    cronFactory: productionCronFactory,
+  });
+  return {
+    app: createServerApp(coordinator, admin, ownerControl, handle.db, systemClock, scheduler),
+    coordinator,
+    sweep,
+    scheduler,
+    handle,
+  };
 }
 
 export async function main(): Promise<void> {
@@ -63,7 +81,7 @@ export async function main(): Promise<void> {
   const warning = unauthenticatedExposureWarning(config.host);
   if (warning) console.warn(warning);
 
-  const { app, sweep, handle } = await bootstrapServer(config);
+  const { app, sweep, scheduler, handle } = await bootstrapServer(config);
   const server: ServerType = serve({ fetch: app.fetch, port: config.port, hostname: config.host });
   try {
     // serve() returns BEFORE listen completes — EADDRINUSE & friends arrive
@@ -76,6 +94,13 @@ export async function main(): Promise<void> {
     await closeDb(handle).catch(() => {});
     throw err;
   }
+
+  // Phase 3 Batch 2: Start scheduler AFTER listener is bound
+  await scheduler.start().catch((err) => {
+    console.error("[scheduler] startup failed", err);
+    // Scheduler failure is non-fatal; server continues without scheduling
+  });
+
   // The sweep arms ONLY after the listener is actually bound (plan §1): one
   // immediate async pass, then the unref'd interval.
   const sweepTimer = armInactivitySweep(sweep);
@@ -87,17 +112,15 @@ export async function main(): Promise<void> {
   const shutdown = (signal: string): void => {
     if (closing) return; // idempotent across SIGINT+SIGTERM races
     closing = true;
-    console.log(`received ${signal} — draining the sweep, closing HTTP server, then DB`);
-    // Ordered (plan §1 + review): block new sweep ticks and DRAIN the
-    // in-flight pass → HTTP → DB. A pass mid-transaction settles before
-    // closeDb runs — it never outlives the database it transacts on.
-    // Drain failures must not strand the HTTP listener/DB. armInactivitySweep
-    // contains ordinary pass and logger failures, but this final boundary is
-    // deliberately defensive for any future timer implementation.
-    void sweepTimer.stopAndDrain().catch(() => {}).then(() => {
-      server.close(async () => {
-        await closeDb(handle).catch(() => {});
-        process.exit(0);
+    console.log(`received ${signal} — draining scheduler, sweep, closing HTTP server, then DB`);
+    // Ordered (plan §1 + Phase 3 Batch 2): stop scheduler (drain callbacks) →
+    // block new sweep ticks and DRAIN the in-flight pass → HTTP → DB.
+    void scheduler.stopAndDrain().catch(() => {}).then(() => {
+      void sweepTimer.stopAndDrain().catch(() => {}).then(() => {
+        server.close(async () => {
+          await closeDb(handle).catch(() => {});
+          process.exit(0);
+        });
       });
     });
   };
