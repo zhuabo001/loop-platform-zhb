@@ -41,10 +41,11 @@ import {
 
 import { LoopValidationError } from "../admin/errors.js";
 import type { LoopAdmin } from "../admin/index.js";
+import { toLoopSummary } from "../admin/views.js";
 import { InvalidMachineCredentialError, RunCapabilityInvalidError } from "../coordinator/errors.js";
 import type { RunCoordinator } from "../coordinator/index.js";
 import type { OwnerControl } from "../owner/index.js";
-import { ScheduleValidationError, updateSchedule } from "../schedule/index.js";
+import { ScheduleValidationError, updateSchedule, nextOccurrence } from "../schedule/index.js";
 import type { Scheduler } from "../scheduler/index.js";
 import type { Db } from "../db/index.js";
 import type { Clock } from "../time.js";
@@ -172,6 +173,17 @@ export function createServerApp(
     try {
       const result = await admin.createLoop(parsed.data);
       if (!result.created) return jsonError(c, 404, "not found");
+
+      // Reconcile scheduler if loop has active schedule
+      if (scheduler && result.loop.cron !== null && result.loop.enabled) {
+        // Re-read loop from DB to get full row for reconcile
+        const { getLoop } = await import("../store/runs.js");
+        const loopRow = await getLoop(db, result.loop.id);
+        if (loopRow) {
+          scheduler.reconcile(loopRow);
+        }
+      }
+
       return c.json({ loop: result.loop }, 201);
     } catch (err) {
       if (err instanceof LoopValidationError) {
@@ -232,7 +244,23 @@ export function createServerApp(
         scheduler.reconcile(result.loop);
       }
 
-      return c.json({ loop: result.loop }, 200);
+      // Map to LoopSummary with nextFireAt calculation
+      let nextFireAt: string | null = null;
+      if (result.loop.enabled && result.loop.cron !== null) {
+        try {
+          const next = nextOccurrence(
+            { cron: result.loop.cron, timezone: result.loop.timezone },
+            clock.now()
+          );
+          nextFireAt = next ? next.toISOString() : null;
+        } catch {
+          // Invalid schedule state; nextFireAt stays null
+        }
+      }
+
+      const loopSummary = toLoopSummary(result.loop, null, nextFireAt);
+
+      return c.json({ loop: loopSummary }, 200);
     } catch (err) {
       if (err instanceof ScheduleValidationError) {
         console.warn("[http] update-schedule validation failed", err.message);

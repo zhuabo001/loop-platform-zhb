@@ -81,51 +81,63 @@ export async function main(): Promise<void> {
   const warning = unauthenticatedExposureWarning(config.host);
   if (warning) console.warn(warning);
 
-  const { app, sweep, scheduler, handle } = await bootstrapServer(config);
-  const server: ServerType = serve({ fetch: app.fetch, port: config.port, hostname: config.host });
+  let handle: DbHandle | undefined;
   try {
-    // serve() returns BEFORE listen completes — EADDRINUSE & friends arrive
-    // via the async error event. Await the outcome; on failure run the SAME
-    // ordered cleanup as shutdown (HTTP first, then DB) and rethrow so boot
-    // exits non-zero instead of falsely reporting ready (review #8).
-    await waitForListening(server);
-  } catch (err) {
-    server.close();
-    await closeDb(handle).catch(() => {});
-    throw err;
-  }
+    const result = await bootstrapServer(config);
+    handle = result.handle;
+    const { app, sweep, scheduler } = result;
 
-  // Phase 3 Batch 2: Start scheduler AFTER listener is bound
-  await scheduler.start().catch((err) => {
-    console.error("[scheduler] startup failed", err);
-    // Scheduler failure is non-fatal; server continues without scheduling
-  });
+    const server: ServerType = serve({ fetch: app.fetch, port: config.port, hostname: config.host });
+    try {
+      // serve() returns BEFORE listen completes — EADDRINUSE & friends arrive
+      // via the async error event. Await the outcome; on failure run the SAME
+      // ordered cleanup as shutdown (HTTP first, then DB) and rethrow so boot
+      // exits non-zero instead of falsely reporting ready (review #8).
+      await waitForListening(server);
+    } catch (err) {
+      server.close();
+      await closeDb(handle).catch(() => {});
+      throw err;
+    }
 
-  // The sweep arms ONLY after the listener is actually bound (plan §1): one
-  // immediate async pass, then the unref'd interval.
-  const sweepTimer = armInactivitySweep(sweep);
-  // Startup log: host/port/dataDir only — NEVER a secret. Logged only once
-  // the listener is actually bound.
-  console.log(`loopzhb server listening on http://${config.host}:${config.port} (dataDir: ${config.dataDir})`);
+    // Phase 3 Batch 2: Start scheduler AFTER listener is bound
+    await scheduler.start().catch((err) => {
+      console.error("[scheduler] startup failed", err);
+      // Scheduler failure is non-fatal; server continues without scheduling
+    });
 
-  let closing = false;
-  const shutdown = (signal: string): void => {
-    if (closing) return; // idempotent across SIGINT+SIGTERM races
-    closing = true;
-    console.log(`received ${signal} — draining scheduler, sweep, closing HTTP server, then DB`);
-    // Ordered (plan §1 + Phase 3 Batch 2): stop scheduler (drain callbacks) →
-    // block new sweep ticks and DRAIN the in-flight pass → HTTP → DB.
-    void scheduler.stopAndDrain().catch(() => {}).then(() => {
-      void sweepTimer.stopAndDrain().catch(() => {}).then(() => {
-        server.close(async () => {
-          await closeDb(handle).catch(() => {});
-          process.exit(0);
+    // The sweep arms ONLY after the listener is actually bound (plan §1): one
+    // immediate async pass, then the unref'd interval.
+    const sweepTimer = armInactivitySweep(sweep);
+    // Startup log: host/port/dataDir only — NEVER a secret. Logged only once
+    // the listener is actually bound.
+    console.log(`loopzhb server listening on http://${config.host}:${config.port} (dataDir: ${config.dataDir})`);
+
+    let closing = false;
+    const shutdown = (signal: string): void => {
+      if (closing) return; // idempotent across SIGINT+SIGTERM races
+      closing = true;
+      console.log(`received ${signal} — draining scheduler, sweep, closing HTTP server, then DB`);
+      // Ordered (plan §1 + Phase 3 Batch 2): stop scheduler (drain callbacks) →
+      // block new sweep ticks and DRAIN the in-flight pass → HTTP → DB.
+      void scheduler.stopAndDrain().catch(() => {}).then(() => {
+        void sweepTimer.stopAndDrain().catch(() => {}).then(() => {
+          server.close(async () => {
+            await closeDb(handle!).catch(() => {});
+            process.exit(0);
+          });
         });
       });
-    });
-  };
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+    };
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
+  } catch (err) {
+    // Clean up DB handle if bootstrapServer failed
+    if (handle) {
+      await closeDb(handle).catch(() => {});
+    }
+    throw err;
+  }
 }
 
 /** Resolve once the server is bound; reject on the first listen error. The

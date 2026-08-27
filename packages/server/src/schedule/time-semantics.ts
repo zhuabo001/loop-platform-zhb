@@ -235,19 +235,22 @@ function advanceWithinFivePartMinute(cursor: Date): Date {
  * be slightly after the scheduled minute due to system load or execution delay.
  *
  * Algorithm:
- *  1. Use Croner's nextRun to find the occurrence that would fire after (atInclusive - 1 minute)
+ *  1. Use Croner's nextRun to find the occurrence that would fire after (atInclusive - 2 minutes)
  *  2. If that occurrence is at or before atInclusive, it's the latest occurrence
  *  3. Otherwise, no valid occurrence exists at or before atInclusive
  *
  * DST handling mirrors nextOccurrence: gaps are skipped, overlaps use first occurrence.
+ *
+ * The 2-minute lookback accommodates callback delays under system load while remaining
+ * safe for minutely schedules (won't skip back past the previous occurrence).
  *
  * @param schedule - Validated and normalized schedule configuration
  * @param atInclusive - Reference time (find the latest occurrence at or before this)
  * @returns Latest occurrence as an absolute Date, or null if no past occurrence exists
  */
 export function latestOccurrence(schedule: NormalizedSchedule, atInclusive: Date): Date | null {
-  // Look back one minute to find the occurrence that would fire at or before atInclusive
-  const lookbackStart = new Date(atInclusive.getTime() - 60_000);
+  // Look back 2 minutes to accommodate callback delays
+  const lookbackStart = new Date(atInclusive.getTime() - 120_000);
 
   const candidate = nextOccurrence(schedule, lookbackStart);
 
@@ -261,4 +264,3 @@ export function latestOccurrence(schedule: NormalizedSchedule, atInclusive: Date
   // Candidate is after atInclusive, no valid occurrence exists
   return null;
 }
-

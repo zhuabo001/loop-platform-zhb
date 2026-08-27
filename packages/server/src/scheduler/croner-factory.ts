@@ -13,6 +13,7 @@ export const productionCronFactory: CronFactory = {
         timezone: options.timezone,
         protect: options.protect,
         catch: options.catch,
+        mode: "5-part",
       },
       callback,
     );
