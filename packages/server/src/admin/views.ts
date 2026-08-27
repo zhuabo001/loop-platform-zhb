@@ -24,7 +24,18 @@ export type MachineSummaryRow = Pick<
 
 export type LoopSummaryRow = Pick<
   Loop,
-  "id" | "machineId" | "name" | "workdir" | "taskFile" | "agent" | "allowControl" | "enabled" | "createdAt" | "updatedAt"
+  | "id"
+  | "machineId"
+  | "name"
+  | "workdir"
+  | "taskFile"
+  | "agent"
+  | "allowControl"
+  | "enabled"
+  | "createdAt"
+  | "updatedAt"
+  | "cron"
+  | "timezone"
 >;
 
 export type RunSummaryRow = Pick<
@@ -75,7 +86,11 @@ export function toRunSummary(row: RunSummaryRow): RunSummary {
   };
 }
 
-export function toLoopSummary(row: LoopSummaryRow, lastRun: RunSummary | null): LoopSummary {
+export function toLoopSummary(
+  row: LoopSummaryRow,
+  lastRun: RunSummary | null,
+  nextFireAt: string | null = null
+): LoopSummary {
   return {
     id: row.id,
     machineId: row.machineId,
@@ -88,5 +103,8 @@ export function toLoopSummary(row: LoopSummaryRow, lastRun: RunSummary | null): 
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
     lastRun,
+    cron: row.cron ?? null,
+    timezone: row.timezone,
+    nextFireAt,
   };
 }

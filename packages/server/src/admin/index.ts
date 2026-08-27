@@ -25,12 +25,14 @@ import { loops, machines, runs } from "../db/schema.js";
 import { getMachine } from "../store/machines.js";
 import { getLoop } from "../store/runs.js";
 import type { Clock } from "../time.js";
+import { nextOccurrence, validateSchedule } from "../schedule/index.js";
 import { LoopValidationError } from "./errors.js";
 import { toLoopSummary, toMachineSummary, toRunSummary, type LoopSummaryRow, type RunSummaryRow } from "./views.js";
 
 /** Server-side length ceilings (goal §2). Exceeding ⇒ LoopValidationError. */
 export const LOOP_NAME_CAP = 255;
 export const LOOP_PATH_CAP = 4096;
+export const SCHEDULE_FIELD_CAP = 255;
 
 /** Observation-surface page caps (goal §4): fixed, no pagination params in
  *  Phase 1. The SQL ORDER BY lands BEFORE the LIMIT — sort-then-truncate is
@@ -67,6 +69,8 @@ export const loopSummaryColumns = {
   enabled: loops.enabled,
   createdAt: loops.createdAt,
   updatedAt: loops.updatedAt,
+  cron: loops.cron,
+  timezone: loops.timezone,
 } as const;
 
 export const runSummaryColumns = {
@@ -110,6 +114,10 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
      * relying on DDL defaults: the values are this batch's fixed policy, and
      * not-yet-open caller fields never reach the row (tolerant-reader strip
      * happened at the route; only declared fields arrive here).
+     *
+     * Phase 3 Batch 2: Supports cron/timezone for scheduled loops. Validates
+     * schedule semantics before insertion. Sets scheduleRevision=0 and
+     * scheduleActivatedAt for active scheduled loops.
      */
     async createLoop(input: CreateLoopRequest): Promise<CreateLoopResult> {
       if (input.name !== undefined && input.name.length > LOOP_NAME_CAP) {
@@ -121,11 +129,30 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
       if (input.taskFile !== undefined && input.taskFile.length > LOOP_PATH_CAP) {
         throw new LoopValidationError("taskFile");
       }
+      if (input.cron !== undefined && input.cron.length > SCHEDULE_FIELD_CAP) {
+        throw new LoopValidationError("cron");
+      }
+      if (input.timezone !== undefined && input.timezone.length > SCHEDULE_FIELD_CAP) {
+        throw new LoopValidationError("timezone");
+      }
 
       const machine = await getMachine(deps.db, input.machineId);
       if (!machine) return { created: false as const, reason: "machine_not_found" as const };
 
+      // Validate and normalize schedule if provided
+      const timezone = input.timezone ?? "UTC";
+      let normalizedCron: string | null = null;
+      let normalizedTimezone = timezone;
+
+      if (input.cron !== undefined) {
+        const normalized = validateSchedule(input.cron, timezone);
+        normalizedCron = normalized.cron;
+        normalizedTimezone = normalized.timezone;
+      }
+
       const nowIso = deps.clock.now().toISOString();
+      const isActive = normalizedCron !== null; // enabled=true by default
+
       const inserted: LoopSummaryRow[] = await deps.db
         .insert(loops)
         .values({
@@ -137,11 +164,28 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
           agent: "claude-code",
           allowControl: true,
           enabled: true,
+          cron: normalizedCron,
+          timezone: normalizedTimezone,
+          scheduleRevision: 0,
+          scheduleActivatedAt: isActive ? nowIso : null,
+          lastScheduledAt: null,
           createdAt: nowIso,
           updatedAt: nowIso,
         })
         .returning(loopSummaryColumns);
-      return { created: true as const, loop: toLoopSummary(inserted[0]!, null) };
+
+      const row = inserted[0]!;
+
+      // Calculate nextFireAt for active scheduled loops
+      let nextFireAt: string | null = null;
+      if (row.enabled && row.cron !== null) {
+        const next = nextOccurrence({ cron: row.cron, timezone: row.timezone }, deps.clock.now());
+        if (next !== null) {
+          nextFireAt = next.toISOString();
+        }
+      }
+
+      return { created: true as const, loop: toLoopSummary(row, null, nextFireAt) };
     },
 
     /** `name ASC, id ASC`, capped — the machine picker for loop creation. */
@@ -161,6 +205,8 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
      * LOOP_LIST_CAP rows regardless of Run history size. Non-exec roles never
      * appear — they are Phase 3's surface, and `ts` is the last TRANSITION time
      * (ADR-003 决策 6), so a run re-enters the top after a lifecycle write.
+     *
+     * Phase 3 Batch 2: Computes nextFireAt for active scheduled loops.
      */
     async listLoops(): Promise<LoopSummary[]> {
       const loopRows = await deps.db
@@ -184,9 +230,21 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
         )
         .orderBy(asc(runs.loopId), desc(runs.ts), desc(runs.id));
       const latestByLoop = new Map<string, RunSummaryRow>(runRows.map((row) => [row.loopId, row]));
+
+      const now = deps.clock.now();
       return loopRows.map((row) => {
         const lastRun = latestByLoop.get(row.id);
-        return toLoopSummary(row, lastRun ? toRunSummary(lastRun) : null);
+
+        // Calculate nextFireAt for active scheduled loops
+        let nextFireAt: string | null = null;
+        if (row.enabled && row.cron !== null) {
+          const next = nextOccurrence({ cron: row.cron, timezone: row.timezone }, now);
+          if (next !== null) {
+            nextFireAt = next.toISOString();
+          }
+        }
+
+        return toLoopSummary(row, lastRun ? toRunSummary(lastRun) : null, nextFireAt);
       });
     },
 

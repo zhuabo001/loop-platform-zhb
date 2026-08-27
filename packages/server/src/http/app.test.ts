@@ -278,6 +278,9 @@ describe("POST /api/loops", () => {
         createdAt: clock.iso(),
         updatedAt: clock.iso(),
         lastRun: null,
+        cron: null,
+        timezone: "UTC",
+        nextFireAt: null,
       },
     });
     expect(await snapshotLoops(db)).toHaveLength(1);
@@ -549,6 +552,9 @@ describe("GET observation surface", () => {
         enabled: true,
         createdAt: "2026-07-01T00:00:00.000Z",
         updatedAt: "2026-07-01T00:00:00.000Z",
+        cron: null,
+        timezone: "UTC",
+        nextFireAt: null,
         lastRun: {
           id: "run-1",
           loopId: "loop-1",
