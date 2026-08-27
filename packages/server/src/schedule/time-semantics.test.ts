@@ -283,6 +283,40 @@ describe("latestOccurrence / isOccurrence (Batch 2 occurrence reconstruction)", 
     );
   });
 
+  test("reconstructs leap-day schedules across a non-leap century gap (Round 3 regression)", () => {
+    const leapDay = validateSchedule("0 10 29 2 *", "UTC");
+
+    expect(latestOccurrence(leapDay, new Date("2103-03-01T00:00:00.000Z"))).toEqual(
+      new Date("2096-02-29T10:00:00.000Z"),
+    );
+  });
+
+  test("sparse seasonal schedules do not walk every occurrence on the event loop (Round 3 regression)", () => {
+    const januaryMinutely = validateSchedule("* * * 1 *", "UTC");
+    const startedAt = performance.now();
+
+    expect(latestOccurrence(januaryMinutely, new Date("2026-12-31T23:59:59.999Z"))).toEqual(
+      new Date("2026-01-31T23:59:00.000Z"),
+    );
+    expect(performance.now() - startedAt).toBeLessThan(1_000);
+  }, 15_000);
+
+  test("reconstructs the canonical latest occurrence across DST gap and overlap (Round 3)", () => {
+    const gap = validateSchedule("30 2 * * *", "America/New_York");
+    // March 8 02:30 does not exist; after the gap, the latest canonical tick
+    // is still March 7 02:30 EST (07:30Z).
+    expect(latestOccurrence(gap, new Date("2026-03-08T08:00:00.000Z"))).toEqual(
+      new Date("2026-03-07T07:30:00.000Z"),
+    );
+
+    const overlap = validateSchedule("30 1 * * *", "America/New_York");
+    // The repeated 01:30 uses only its first occurrence (EDT, 05:30Z); the
+    // second wall-clock spelling in EST is not a second canonical tick.
+    expect(latestOccurrence(overlap, new Date("2026-11-01T06:45:00.000Z"))).toEqual(
+      new Date("2026-11-01T05:30:00.000Z"),
+    );
+  });
+
   test("isOccurrence: exact occurrence true, off-by-one-second and wrong minute false", () => {
     expect(isOccurrence(daily10, new Date("2026-08-27T10:00:00.000Z"))).toBe(true);
     expect(isOccurrence(daily10, new Date("2026-08-27T10:00:01.000Z"))).toBe(false);

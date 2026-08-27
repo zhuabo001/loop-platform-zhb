@@ -55,12 +55,12 @@ Croner callbacks fire at approximately the scheduled minute, but may be delayed 
 function latestOccurrence(schedule: NormalizedSchedule, atInclusive: Date): Date | null
 ```
 
-**Algorithm (adaptive lookback — no arbitrary fixed drop window)**:
-1. Start with a 2-minute lookback window (the common case)
-2. Find the first occurrence after (firing time - window), then walk forward occurrence-by-occurrence, keeping the last one ≤ firing time (dense schedules have several occurrences inside the window; the first is NOT the latest)
-3. If the window holds no occurrence ≤ firing time, double the window and retry, up to a 5-year cap (covers Feb-29-only crons)
+**Algorithm (unbounded history, logarithmic occurrence lookup)**:
+1. Exponentially probe backward until `nextOccurrence(probe) <= firingTime`; the only lower boundary is cron's four-digit calendar domain (year 0001), not an arbitrary elapsed-time cap.
+2. Binary-search the millisecond cursor boundary where `nextOccurrence(cursor)` changes from `<= firingTime` to `> firingTime`.
+3. Return the occurrence at that boundary through the same DST-aware `nextOccurrence` implementation.
 
-A fired callback is a live occurrence: it must NEVER be silently dropped because of its delay (Round 2 review). Cost stays bounded — dense crons succeed on the first small window; only sparse crons expand (few occurrences per window). Multiple late callbacks firing after a suspension collapse onto the SAME latest occurrence, and the watermark dedups them to at most one run (no catch-up backlog — full restart catch-up remains Batch 3 scope).
+A fired callback is a live occurrence: it must NEVER be silently dropped because of its delay (Round 2 review). Runtime is logarithmic in elapsed time and independent of intervening occurrence count, so a dense January-only cron cannot block the event loop while reconstructing a December callback. Century leap-year gaps (for example 2096 → 2104) have no special cap. Multiple late callbacks firing after a suspension collapse onto the SAME latest occurrence, and the watermark dedups them to at most one run (no catch-up backlog — full restart catch-up remains Batch 3 scope).
 
 ### 3. Scheduled Enqueue Transaction
 
@@ -87,6 +87,8 @@ type ExecTrigger =
 
 Steps 4–6 close the watermark-pollution paths: an arbitrary, future, or non-canonically-encoded timestamp can never advance `lastScheduledAt` and thereby swallow later real ticks.
 
+The parser accepts the producer-compatible RFC 3339 subset (`Z` or numeric offset, optional 1–3 fractional digits) and validates calendar components before timezone conversion. Native `Date.parse` normalization is not used, so spellings such as `2026-02-30T10:00:00Z` are rejected rather than silently becoming March 2.
+
 **Manual triggers** bypass all schedule validation (Phase 1-2 semantics preserved).
 
 ### 4. Dynamic Reconcile
@@ -102,6 +104,8 @@ The management surface syncs the scheduler through ONE injected seam: `onSchedul
 - Loop unchanged: `revision`, `cron`, `timezone` all match
 - Scheduler already stopped
 
+`reconcile` also remembers the highest observed revision per loop independently of the active-job registry. Any lower revision is ignored, including after a newer pause/manual-only revision removed the job; delayed objects can neither downgrade nor resurrect scheduling.
+
 **Job replacement**:
 - Stop old Croner job (if exists)
 - Create new job with updated config
@@ -112,6 +116,8 @@ The management surface syncs the scheduler through ONE injected seam: `onSchedul
 
 **Reconcile is synchronous**: the HTTP response is shaped after the job registration attempt, ensuring immediate effect.
 
+**PATCH read-failure recovery contract**: the schedule state-machine transaction and synchronous reconcile happen before the response's `LoopSummary` read. Therefore a generic 500 may mean the write committed but the representation read failed. Clients MUST retry the exact PATCH body. Normalized-equal PATCH values are a state-machine no-op, so this recovery cannot increment `scheduleRevision` or replace the Croner job twice; the retry returns the authoritative current representation once the read path recovers (pinned by F14).
+
 ### 5. Error Isolation
 
 **Per-loop isolation**:
@@ -120,7 +126,7 @@ The management surface syncs the scheduler through ONE injected seam: `onSchedul
 - Callback errors caught and logged, don't crash scheduler
 
 **Startup failure handling**:
-- A scan-level DB error from `scheduler.start()` is a BOOT failure. Cleanup follows the fixed shutdown order: drain the scheduler, then DRAIN THE LISTENER (await in-flight requests), and only then may the outer catch close the DB — an in-flight request must never meet a closed database
+- A scan-level DB error from `scheduler.start()` is a BOOT failure. Cleanup follows the fixed shutdown order: drain the scheduler, then DRAIN THE LISTENER (await in-flight requests), and only then close the DB — an in-flight request must never meet a closed database. Listener drain is bounded; on timeout production force-closes HTTP connections before DB close so failed boot cannot hang forever.
 - The boot error rethrown to the entry layer carries a FIXED message (`scheduler startup scan failed`, original as `cause`) — the scan's original exception (DB internals) never reaches entry-layer logs
 - Per-loop registration errors are isolated: logged with a fixed classification, loop skipped, startup continues
 

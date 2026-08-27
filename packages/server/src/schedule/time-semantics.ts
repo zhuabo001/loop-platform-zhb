@@ -236,50 +236,61 @@ function advanceWithinFivePartMinute(cursor: Date): Date {
  * reconstruction must succeed for ANY such delay (a fired callback is a live
  * occurrence that must never be silently dropped).
  *
- * Algorithm (adaptive lookback — no arbitrary fixed window):
- *  1. Start with a small lookback window (2 minutes — the common case)
- *  2. Find the first occurrence after (atInclusive - window), then walk forward
- *     occurrence-by-occurrence, keeping the last one ≤ atInclusive
- *  3. If the window holds no occurrence ≤ atInclusive, double the window and
- *     retry, up to a 5-year cap (covers Feb-29-only crons)
- *
- * The walk-forward (step 2) matters for schedules denser than the window (e.g.
- * minutely crons): the first occurrence in the window is NOT the latest one.
- * Cost stays bounded: dense crons always succeed on the first small window, and
- * only sparse crons expand (few occurrences per window, Croner jumps directly).
+ * Uses an exponential backward probe followed by a millisecond binary search
+ * for the boundary where `nextOccurrence(cursor)` stops being ≤ atInclusive.
+ * This has no arbitrary year cap and its cost is logarithmic in elapsed time,
+ * independent of the number of intervening occurrences (important for dense
+ * schedules separated by long gaps).
  *
  * DST handling mirrors nextOccurrence: gaps are skipped, overlaps use first occurrence.
- * Returns null only when no occurrence exists within the 5-year cap (defensive —
- * unreachable for valid recurring crons in practice).
+ * Returns null only when Croner cannot find any earlier occurrence.
  *
  * @param schedule - Validated and normalized schedule configuration
  * @param atInclusive - Reference time (find the latest occurrence at or before this)
  * @returns Latest occurrence as an absolute Date, or null if no past occurrence exists
  */
 export function latestOccurrence(schedule: NormalizedSchedule, atInclusive: Date): Date | null {
-  const MAX_LOOKBACK_MS = 5 * 366 * 24 * 60 * 60 * 1000; // covers Feb-29-only gaps
+  const atMs = atInclusive.getTime();
+  if (!Number.isFinite(atMs)) return null;
+
+  // Cron expressions operate on four-digit calendar years. This is a domain
+  // boundary, not a lookback duration: every representable schedule history
+  // from year 0001 remains searchable.
+  const earliest = new Date(0);
+  earliest.setUTCFullYear(1, 0, 1);
+  earliest.setUTCHours(0, 0, 0, 0);
+  const earliestMs = earliest.getTime();
+
+  let low = atMs;
   let windowMs = 120_000;
-
   while (true) {
-    const windowStart = new Date(atInclusive.getTime() - windowMs);
-    let candidate = nextOccurrence(schedule, windowStart);
-
-    if (candidate !== null && candidate.getTime() <= atInclusive.getTime()) {
-      // Walk forward to the LATEST occurrence ≤ atInclusive (dense schedules
-      // have multiple occurrences inside the window).
-      let latest = candidate;
-      while (true) {
-        candidate = nextOccurrence(schedule, latest);
-        if (candidate === null || candidate.getTime() > atInclusive.getTime()) {
-          return latest;
-        }
-        latest = candidate;
-      }
+    const startMs = Math.max(earliestMs, atMs - windowMs);
+    const probeMs = Math.max(earliestMs, startMs - 1);
+    const candidate = nextOccurrence(schedule, new Date(probeMs));
+    if (candidate !== null && candidate.getTime() <= atMs) {
+      low = probeMs;
+      break;
     }
-
-    if (windowMs >= MAX_LOOKBACK_MS) return null;
-    windowMs = Math.min(windowMs * 2, MAX_LOOKBACK_MS);
+    if (startMs === earliestMs) return null;
+    windowMs = Math.min(windowMs * 2, atMs - earliestMs);
   }
+
+  // P(cursor) := nextOccurrence(cursor) <= atInclusive. P is true before the
+  // latest occurrence and false at/after it, so its boundary identifies the
+  // answer without enumerating dense intervening ticks.
+  let high = atMs;
+  while (high - low > 1) {
+    const middle = low + Math.floor((high - low) / 2);
+    const candidate = nextOccurrence(schedule, new Date(middle));
+    if (candidate !== null && candidate.getTime() <= atMs) {
+      low = middle;
+    } else {
+      high = middle;
+    }
+  }
+
+  const latest = nextOccurrence(schedule, new Date(low));
+  return latest !== null && latest.getTime() <= atMs ? latest : null;
 }
 
 /**

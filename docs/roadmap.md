@@ -144,7 +144,7 @@ supersede 未领取的 pending——T7 语义在 cron 表面继承）+ 重启 ca
   - Admin API：`createLoop()` 支持创建 scheduled loop（validation + scheduleRevision=0 + scheduleActivatedAt；timezone-only 创建也经过共享校验）；`updateSchedule()` 已在 Batch 1 完成，Batch 2 通过 HTTP 路由暴露。
   - ExecTrigger：定义 `manual | { scheduled; scheduledFor; scheduleRevision }`；`RunCoordinator.enqueueExecRun()` 接受可选 trigger 参数；scheduled trigger 验证 revision/cron/enabled/occurrence 真实性（`isOccurrence`，拒绝非当前 cron occurrence 与未来时间）/activation/watermark；`scheduledFor` 解析后立即规范为 canonical UTC ISO，比较与持久化只用规范形式（等价 offset 表示不可绕过水位去重）；running run 时跳过 pending 创建但 watermark 仍推进。
   - Scheduler 深模块：in-memory job 注册表（`Map<loopId, JobEntry>`）；`start()` 扫描 active loops 并注册 Croner jobs；`reconcile(loop)` 动态更新/移除 job（no-op 检测、job 替换、removal on pause/clear）；`stopAndDrain()` 停止所有 job 并等待回调完成；callback await enqueue（Croner protect 真实生效）+ stopped guard。
-  - latestOccurrence：Croner callback 用此函数将实际触发时间还原为规范 occurrence（自适应 lookback：2 分钟起步、翻倍扩展至 5 年上限，窗口内取最新 occurrence；任意延迟的在线 callback 均可重建，不静默丢 tick）。
+  - latestOccurrence：Croner callback 用此函数将实际触发时间还原为规范 occurrence（指数向后探测 + 毫秒级二分边界；无任意年份上限，复杂度与中间 occurrence 数量无关；任意延迟的在线 callback 均可重建，不静默丢 tick）。
   - FakeCronFactory：测试用 factory，job 按需触发（`triggerAll()`）；production 使用 `productionCronFactory`（封装真实 Croner，固定 `mode: "5-part"` + `unref: true`）。
   - 集成：HTTP 路由 `PATCH /api/loops/:id/schedule`（validation + updateSchedule，响应为 LoopSummary 视图）；创建/有效 PATCH 提交后经统一 `onScheduleCommitted(loop)` seam 同步 Scheduler（seam 失败只记固定分类，不回滚已提交配置）；`main()` 在 listener bind 后启动 scheduler（扫描级失败 = 启动失败：scheduler drain → HTTP drain → DB close → 非零退出，入口日志不输出 scan 原异常消息）；shutdown 顺序：scheduler drain → sweep drain → HTTP close → DB close。
   - 日志纪律：scheduler 与 schedule 校验路径只输出固定分类（不含异常消息、cron、timezone 等用户输入）。

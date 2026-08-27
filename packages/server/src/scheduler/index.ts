@@ -84,6 +84,10 @@ export function createScheduler(deps: SchedulerDeps) {
   // Registry: loopId → JobEntry
   const registry = new Map<string, JobEntry>();
 
+  // Highest authoritative revision observed for each loop. This survives job
+  // removal so a delayed pre-pause object cannot resurrect an obsolete job.
+  const highestRevisions = new Map<string, number>();
+
   // Track in-flight callbacks for drain
   const inFlightCallbacks = new Set<Promise<unknown>>();
 
@@ -97,6 +101,10 @@ export function createScheduler(deps: SchedulerDeps) {
    */
   function reconcile(loop: Loop): void {
     if (stopped) return;
+
+    const highestRevision = highestRevisions.get(loop.id);
+    if (highestRevision !== undefined && loop.scheduleRevision < highestRevision) return;
+    highestRevisions.set(loop.id, loop.scheduleRevision);
 
     const existing = registry.get(loop.id);
 

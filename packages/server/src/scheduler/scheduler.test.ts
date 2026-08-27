@@ -280,6 +280,33 @@ describe("S-group: Scheduler registration and lifecycle", () => {
 
       expect(cronFactory.activeCount()).toBe(0);
     });
+
+    test("S21: reconcile never downgrades or resurrects a loop from a stale revision (Round 3)", async () => {
+      await seedLoop(db, {
+        id: "loop-1",
+        machineId,
+        cron: "0 10 * * *",
+        timezone: "UTC",
+        enabled: true,
+        scheduleRevision: 2,
+        scheduleActivatedAt: ACTIVATION_9AM,
+      });
+
+      await scheduler.start();
+      const [revision2] = await db.select().from(loops).where(eq(loops.id, "loop-1"));
+
+      scheduler.reconcile({ ...revision2!, cron: "0 14 * * *", scheduleRevision: 1 });
+      expect(cronFactory.jobs.size).toBe(1);
+      expect(cronFactory.activeCount()).toBe(1);
+      expect(cronFactory.entries().filter((entry) => !entry.stopped)[0]!.pattern).toBe("0 10 * * *");
+
+      scheduler.reconcile({ ...revision2!, enabled: false, scheduleRevision: 3 });
+      expect(cronFactory.activeCount()).toBe(0);
+
+      scheduler.reconcile(revision2!);
+      expect(cronFactory.activeCount()).toBe(0);
+      expect(cronFactory.jobs.size).toBe(1);
+    });
   });
 
   describe("Callback execution and isolation", () => {

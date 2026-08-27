@@ -514,5 +514,25 @@ describe("O-group: scheduled trigger and atomic occurrence", () => {
       loop = (await db.select().from(loops).where(eq(loops.id, loopId)))[0]!;
       expect(loop.lastScheduledAt).toBe("2026-08-27T12:00:00.000Z");
     });
+
+    test("O20: rejects an impossible RFC 3339 calendar date without advancing state (Round 3)", async () => {
+      // Date.parse normalizes this spelling to March 2. Put activation before
+      // that instant so a permissive parser would otherwise accept and write it.
+      await db
+        .update(loops)
+        .set({ scheduleActivatedAt: "2026-01-01T00:00:00.000Z" })
+        .where(eq(loops.id, loopId));
+
+      const result = await coordinator.enqueueExecRun(loopId, {
+        kind: "scheduled",
+        scheduledFor: "2026-02-30T10:00:00Z",
+        scheduleRevision: 0,
+      });
+
+      expect(result).toEqual({ enqueued: false, reason: "not_an_occurrence" });
+      expect(await snapshotRuns(db)).toHaveLength(0);
+      const [loop] = await db.select().from(loops).where(eq(loops.id, loopId));
+      expect(loop!.lastScheduledAt).toBeNull();
+    });
   });
 });

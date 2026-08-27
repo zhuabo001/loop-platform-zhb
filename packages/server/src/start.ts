@@ -110,9 +110,11 @@ export async function main(): Promise<void> {
 
     // Phase 3 Batch 2: Start scheduler AFTER listener is bound (plan §2 fixed
     // startup order: DB → listener bind → scheduler start → sweep arm → ready).
-    // On scan failure this drains the scheduler AND the listener before the
-    // outer catch closes the DB (Scheduler → HTTP → DB order).
-    await startSchedulerOrFailBoot(scheduler, server);
+    // On scan failure the helper drains the scheduler AND the listener before
+    // closing the DB through the composition-owned callback.
+    await startSchedulerOrFailBootWithDatabase(scheduler, server, handle!, () => {
+      handle = undefined;
+    });
 
     // The sweep arms ONLY after the listener is actually bound (plan §1): one
     // immediate async pass, then the unref'd interval.
@@ -157,22 +159,100 @@ export async function main(): Promise<void> {
  * exception (DB internals must not reach logs). Extracted from main() so tests
  * can drive the failure path without binding a port.
  */
-export async function startSchedulerOrFailBoot(scheduler: Scheduler, server: ServerType): Promise<void> {
+export interface FailedBootCleanupOptions {
+  /** Production uses a bounded drain so a stuck connection cannot hang boot. */
+  closeTimeoutMs?: number;
+  /** Composition-owned DB close, invoked only after the listener is drained
+   *  or force-closed. Tests inject this boundary to pin the ordering. */
+  closeDatabase?: () => Promise<void>;
+}
+
+/** Production composition for the scheduler boot gate. Keeping the real
+ * closeDb wiring in this exported seam lets lifecycle tests observe the actual
+ * database handle rather than a callback-shaped stand-in. */
+export async function startSchedulerOrFailBootWithDatabase(
+  scheduler: Scheduler,
+  server: ServerType,
+  handle: DbHandle,
+  onDatabaseClosed?: () => void,
+): Promise<void> {
+  await startSchedulerOrFailBoot(scheduler, server, {
+    closeDatabase: async () => {
+      await closeDb(handle);
+      onDatabaseClosed?.();
+    },
+  });
+}
+
+export async function startSchedulerOrFailBoot(
+  scheduler: Scheduler,
+  server: ServerType,
+  cleanup: FailedBootCleanupOptions = {},
+): Promise<void> {
   try {
     await scheduler.start();
   } catch (err) {
     console.error("[scheduler] startup scan failed — draining scheduler and listener before DB close");
     await scheduler.stopAndDrain().catch(() => {});
-    await closeServer(server).catch(() => {});
+    await closeServer(server, cleanup.closeTimeoutMs).catch(() => {});
+    await cleanup.closeDatabase?.().catch(() => {});
     throw new Error("scheduler startup scan failed", { cause: err });
   }
 }
 
 /** Awaitable http.Server close: resolves once the listener has drained its
- *  in-flight connections (the close callback fires only after they finish). */
-function closeServer(server: ServerType): Promise<void> {
+ *  in-flight connections. A bounded fallback force-closes connections so a
+ *  callback that never fires cannot keep failed boot alive forever. */
+function closeServer(server: ServerType, timeoutMs = 5_000): Promise<void> {
   return new Promise((resolve, reject) => {
-    server.close((err) => (err ? reject(err) : resolve()));
+    let settled = false;
+    const forceClose = (): void => {
+      const forceClosable = server as ServerType & {
+        closeIdleConnections?: () => void;
+        closeAllConnections?: () => void;
+      };
+      forceClosable.closeIdleConnections?.();
+      forceClosable.closeAllConnections?.();
+    };
+    const settle = (err?: Error): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      err ? reject(err) : resolve();
+    };
+    const timer = setTimeout(() => {
+      try {
+        forceClose();
+      } catch {
+        // Best-effort cleanup; failed boot must still progress to DB close.
+      } finally {
+        settle();
+      }
+    }, timeoutMs);
+
+    try {
+      server.close((err) => {
+        if (!err) {
+          settle();
+          return;
+        }
+        try {
+          forceClose();
+        } catch {
+          // Preserve the listener close error as the primary failure.
+        } finally {
+          settle(err);
+        }
+      });
+    } catch (err) {
+      try {
+        forceClose();
+      } catch {
+        // Preserve the listener close error as the primary failure.
+      } finally {
+        settle(err instanceof Error ? err : new Error("server close failed"));
+      }
+    }
   });
 }
 

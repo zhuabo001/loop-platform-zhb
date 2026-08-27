@@ -71,6 +71,61 @@ export class EnqueueGuardLostError extends Error {
   }
 }
 
+/** Parse the exact RFC 3339 subset accepted at the scheduled-trigger edge.
+ * Native Date.parse normalizes impossible dates (for example February 30),
+ * which would let a non-existent spelling advance the occurrence watermark. */
+function parseScheduledFor(value: string): number | undefined {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|([+-])(\d{2}):(\d{2}))$/.exec(
+    value,
+  );
+  if (!match) return undefined;
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const millisecond = Number((match[7] ?? "").padEnd(3, "0"));
+  const offsetHour = Number(match[10] ?? 0);
+  const offsetMinute = Number(match[11] ?? 0);
+
+  if (
+    year < 1 ||
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > 31 ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59 ||
+    offsetHour > 23 ||
+    offsetMinute > 59
+  ) {
+    return undefined;
+  }
+
+  const wallClock = new Date(0);
+  wallClock.setUTCFullYear(year, month - 1, day);
+  wallClock.setUTCHours(hour, minute, second, millisecond);
+  if (
+    wallClock.getUTCFullYear() !== year ||
+    wallClock.getUTCMonth() !== month - 1 ||
+    wallClock.getUTCDate() !== day ||
+    wallClock.getUTCHours() !== hour ||
+    wallClock.getUTCMinutes() !== minute ||
+    wallClock.getUTCSeconds() !== second ||
+    wallClock.getUTCMilliseconds() !== millisecond
+  ) {
+    return undefined;
+  }
+
+  const offsetSign = match[9] === "-" ? -1 : 1;
+  const offsetMs = offsetSign * (offsetHour * 60 + offsetMinute) * 60_000;
+  const timestamp = wallClock.getTime() - offsetMs;
+  return Number.isFinite(timestamp) ? timestamp : undefined;
+}
+
 export async function getLoop(db: Db, loopId: string): Promise<Loop | undefined> {
   return (await db.select().from(loops).where(eq(loops.id, loopId)))[0];
 }
@@ -133,9 +188,9 @@ export async function enqueueExecRunTx(
       // loop's CURRENT cron/timezone and not in the future. Without these
       // guards an arbitrary (or future) timestamp would advance the watermark
       // and silently swallow every later real tick.
-      const scheduledMs = Date.parse(trigger.scheduledFor);
+      const scheduledMs = parseScheduledFor(trigger.scheduledFor);
       if (
-        Number.isNaN(scheduledMs) ||
+        scheduledMs === undefined ||
         !isOccurrence({ cron: currentLoop.cron, timezone: currentLoop.timezone }, new Date(scheduledMs))
       ) {
         return { enqueued: false as const, reason: "not_an_occurrence" as const };

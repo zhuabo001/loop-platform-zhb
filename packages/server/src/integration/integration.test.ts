@@ -161,6 +161,66 @@ describe("F-group: Integration and production wiring", () => {
       const json = await res.json() as any;
       expect(json.error).toBe("not found");
     });
+
+    test("F14: retrying the same PATCH recovers a committed/read-failed response idempotently (Round 3)", async () => {
+      await seedLoop(db, {
+        id: "loop-1",
+        machineId,
+        cron: null,
+        enabled: true,
+      });
+
+      const stableAdmin = createLoopAdmin({ db, clock, newLoopId: newUuidLoopId });
+      let failSummaryReadOnce = true;
+      const failingReadAdmin = {
+        ...stableAdmin,
+        async getLoopSummary(loopId: string) {
+          if (failSummaryReadOnce) {
+            failSummaryReadOnce = false;
+            throw new Error("injected post-commit summary read failure");
+          }
+          return stableAdmin.getLoopSummary(loopId);
+        },
+      };
+      const retryableApp = createServerApp(
+        coordinator,
+        failingReadAdmin,
+        createOwnerControl({ db, clock }),
+        db,
+        clock,
+        (loop) => scheduler.reconcile(loop),
+      );
+      const request = {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ cron: "0 10 * * *", timezone: "UTC" }),
+      };
+      const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        // The write and reconcile commit before the injected projection read
+        // fails. A generic 500 therefore has an explicitly retryable contract.
+        const first = await retryableApp.request("/api/loops/loop-1/schedule", request);
+        expect(first.status).toBe(500);
+        let [row] = await db.select().from(loops).where(eq(loops.id, "loop-1"));
+        expect(row).toMatchObject({ cron: "0 10 * * *", scheduleRevision: 1 });
+        expect(cronFactory.activeCount()).toBe(1);
+        expect(cronFactory.jobs.size).toBe(1);
+
+        // Exact retry is a semantic no-op: it recovers the representation but
+        // neither increments revision nor replaces the already-current job.
+        const retry = await retryableApp.request("/api/loops/loop-1/schedule", request);
+        expect(retry.status).toBe(200);
+        expect((await retry.json()) as any).toMatchObject({
+          loop: { id: "loop-1", cron: "0 10 * * *", timezone: "UTC" },
+        });
+        [row] = await db.select().from(loops).where(eq(loops.id, "loop-1"));
+        expect(row!.scheduleRevision).toBe(1);
+        expect(cronFactory.activeCount()).toBe(1);
+        expect(cronFactory.jobs.size).toBe(1);
+      } finally {
+        errorLog.mockRestore();
+      }
+    });
   });
 
   describe("Bootstrap and lifecycle", () => {

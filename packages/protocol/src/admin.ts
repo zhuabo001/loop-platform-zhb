@@ -205,7 +205,11 @@ export const updateScheduleRequestSchema = z.object({
 export type UpdateScheduleRequest = z.infer<typeof updateScheduleRequestSchema>;
 
 /** PATCH /api/loops/:id/schedule response: returns updated loop on success
- *  (200). Loop not found → 404; invalid cron/timezone → 400. */
+ *  (200). Loop not found → 404; invalid cron/timezone → 400. A 500 may occur
+ *  after the atomic update committed but before this representation was read;
+ *  clients recover by retrying the exact request. Equal normalized values are
+ *  a state-machine no-op, so retry never increments revision or reconciles the
+ *  scheduler a second time. */
 export const updateScheduleResponseSchema = z.object({
   loop: loopSummarySchema,
 });
