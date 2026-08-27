@@ -48,6 +48,20 @@ import {
 } from "../store/runs.js";
 import { InvalidMachineCredentialError, RunCapabilityInvalidError } from "./errors.js";
 
+/**
+ * Exec run trigger metadata — distinguishes manual from scheduled enqueues.
+ *
+ * Phase 3 Batch 2: scheduled triggers carry occurrence timestamp and revision
+ * for atomic watermark progression and stale-config rejection.
+ */
+export type ExecTrigger =
+  | { kind: "manual" }
+  | {
+      kind: "scheduled";
+      scheduledFor: string; // ISO timestamp of the cron occurrence
+      scheduleRevision: number;
+    };
+
 export interface CoordinatorHooks {
   /** Runs after the loop lookup, BEFORE the enqueue write transaction opens —
    *  lets a test commit a competing claim on the (then-idle) single pglite
@@ -106,14 +120,20 @@ export function createRunCoordinator(deps: RunCoordinatorDependencies) {
   }
 
   return {
-    /** T7: atomically supersede stale pendings and enqueue the loop's next
-     *  exec run (zero-write skip while a run is running). */
-    enqueueExecRun(loopId: string): Promise<EnqueueExecRunResult> {
+    /**
+     * T7: atomically supersede stale pendings and enqueue the loop's next
+     * exec run (zero-write skip while a run is running).
+     *
+     * Phase 3 Batch 2: accepts optional trigger metadata. Manual triggers
+     * (default) bypass schedule validation; scheduled triggers validate
+     * revision, cron, enabled state, and atomically advance lastScheduledAt.
+     */
+    enqueueExecRun(loopId: string, trigger?: ExecTrigger): Promise<EnqueueExecRunResult> {
       return serialize(`enqueue:${loopId}`, async () => {
         const loop = await getLoop(deps.db, loopId);
         if (!loop) return { enqueued: false as const, reason: "loop_not_found" as const };
         await deps.hooks?.beforeEnqueueTx?.(loopId);
-        return enqueueExecRunTx(deps, loop);
+        return enqueueExecRunTx(deps, loop, trigger);
       });
     },
 

@@ -8,6 +8,10 @@
  *  - claim (Step 2): conditional `pending → running` UPDATE + lease INSERT in
  *    ONE transaction;
  *  - report finalize (Step 3): run UPDATE + lease DELETE in ONE transaction.
+ *
+ * Phase 3 Batch 2: enqueue accepts optional trigger metadata for scheduled
+ * runs. Scheduled triggers validate revision/cron/enabled and atomically
+ * advance lastScheduledAt watermark.
  */
 import { and, asc, eq, inArray, isNull } from "drizzle-orm";
 
@@ -18,6 +22,7 @@ import type { Db } from "../db/index.js";
 import { loops, runLeases, runs, type Loop, type Run, type RunProgressRow } from "../db/schema.js";
 import { isHeartbeatWatermarkAnomalous } from "./machines.js";
 import type { Clock } from "../time.js";
+import type { ExecTrigger } from "../coordinator/index.js";
 
 /** The slice of coordinator dependencies the run store needs. */
 export interface RunStoreDeps {
@@ -37,7 +42,17 @@ export const RECLAIM_RUN_ERROR = "machine timed out / disconnected";
 
 export type EnqueueExecRunResult =
   | { enqueued: true; runId: string; supersededRunIds: string[] }
-  | { enqueued: false; reason: "loop_not_found" | "running_exists" };
+  | {
+      enqueued: false;
+      reason:
+        | "loop_not_found"
+        | "running_exists"
+        | "stale_revision"
+        | "not_active"
+        | "before_activation"
+        | "occurrence_too_old"
+        | "already_scheduled";
+    };
 
 /**
  * A phase guard inside the enqueue transaction lost a race (the row was no
@@ -70,17 +85,77 @@ export async function getRun(db: Db, runId: string): Promise<Run | undefined> {
  * out of scope — Phase 3 roles), then insert exactly one new pending run.
  * Any failure — a lost phase guard, a factory throw, an insert error —
  * propagates and rolls the whole transaction back.
+ *
+ * Phase 3 Batch 2: scheduled triggers validate revision/cron/enabled state
+ * and atomically advance lastScheduledAt watermark. Running runs still skip
+ * but watermark advances. Manual triggers (default) bypass all schedule checks.
  */
-export async function enqueueExecRunTx(deps: RunStoreDeps, loop: Loop): Promise<EnqueueExecRunResult> {
+export async function enqueueExecRunTx(
+  deps: RunStoreDeps,
+  loop: Loop,
+  trigger?: ExecTrigger,
+): Promise<EnqueueExecRunResult> {
   const { db, clock, newRunId } = deps;
   return db.transaction(async (tx) => {
-    const running = await tx
-      .select({ id: runs.id })
-      .from(runs)
-      .where(and(eq(runs.loopId, loop.id), eq(runs.phase, "running")))
-      .limit(1);
-    if (running.length > 0) return { enqueued: false as const, reason: "running_exists" as const };
+    // For scheduled triggers, validate and advance watermark
+    if (trigger?.kind === "scheduled") {
+      // Re-read loop within transaction for latest schedule state
+      const [currentLoop] = await tx.select().from(loops).where(eq(loops.id, loop.id)).limit(1);
+      if (!currentLoop) {
+        return { enqueued: false as const, reason: "loop_not_found" as const };
+      }
 
+      // Validate revision
+      if (currentLoop.scheduleRevision !== trigger.scheduleRevision) {
+        return { enqueued: false as const, reason: "stale_revision" as const };
+      }
+
+      // Validate active (enabled && cron not null)
+      if (!currentLoop.enabled || currentLoop.cron === null) {
+        return { enqueued: false as const, reason: "not_active" as const };
+      }
+
+      // Validate occurrence is after activation
+      if (
+        currentLoop.scheduleActivatedAt !== null &&
+        trigger.scheduledFor <= currentLoop.scheduleActivatedAt
+      ) {
+        return { enqueued: false as const, reason: "before_activation" as const };
+      }
+
+      // Validate occurrence is after watermark
+      if (currentLoop.lastScheduledAt !== null && trigger.scheduledFor <= currentLoop.lastScheduledAt) {
+        return { enqueued: false as const, reason: "already_scheduled" as const };
+      }
+
+      // Check if running exists BEFORE updating watermark
+      const running = await tx
+        .select({ id: runs.id })
+        .from(runs)
+        .where(and(eq(runs.loopId, loop.id), eq(runs.phase, "running")))
+        .limit(1);
+
+      // Atomically advance watermark (even if running exists)
+      await tx
+        .update(loops)
+        .set({ lastScheduledAt: trigger.scheduledFor })
+        .where(eq(loops.id, loop.id));
+
+      // If running exists, skip creating new run but watermark is advanced
+      if (running.length > 0) {
+        return { enqueued: false as const, reason: "running_exists" as const };
+      }
+    } else {
+      // Manual trigger: original behavior
+      const running = await tx
+        .select({ id: runs.id })
+        .from(runs)
+        .where(and(eq(runs.loopId, loop.id), eq(runs.phase, "running")))
+        .limit(1);
+      if (running.length > 0) return { enqueued: false as const, reason: "running_exists" as const };
+    }
+
+    // Supersede all pending exec runs
     const pendings = await tx
       .select({ id: runs.id })
       .from(runs)
