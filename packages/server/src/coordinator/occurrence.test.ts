@@ -443,5 +443,76 @@ describe("O-group: scheduled trigger and atomic occurrence", () => {
       const [loop] = await db.select().from(loops).where(eq(loops.id, loopId));
       expect(loop.lastScheduledAt).toBe("2026-08-27T10:00:00.000Z");
     });
+
+    test("O18: equivalent ISO representations canonicalize to one watermark (Round 2)", async () => {
+      // The SAME instant in +08:00 offset form: parses to the genuine 10:00Z
+      // occurrence and must be ACCEPTED — but persisted canonically.
+      const offset = await coordinator.enqueueExecRun(loopId, {
+        kind: "scheduled",
+        scheduledFor: "2026-08-27T18:00:00+08:00", // === 2026-08-27T10:00:00.000Z
+        scheduleRevision: 0,
+      });
+      expect(offset.enqueued).toBe(true);
+
+      const [loop] = await db.select().from(loops).where(eq(loops.id, loopId));
+      // Canonical UTC, never the raw input string
+      expect(loop.lastScheduledAt).toBe("2026-08-27T10:00:00.000Z");
+
+      // The same instant in Z form dedups against the canonical watermark
+      const dupe = await coordinator.enqueueExecRun(loopId, {
+        kind: "scheduled",
+        scheduledFor: "2026-08-27T10:00:00.000Z",
+        scheduleRevision: 0,
+      });
+      expect(dupe.enqueued).toBe(false);
+      if (dupe.enqueued) return;
+      expect(dupe.reason).toBe("already_scheduled");
+
+      // And the +00:00 spelling too
+      const dupe2 = await coordinator.enqueueExecRun(loopId, {
+        kind: "scheduled",
+        scheduledFor: "2026-08-27T10:00:00+00:00",
+        scheduleRevision: 0,
+      });
+      expect(dupe2.enqueued).toBe(false);
+
+      expect(await snapshotRuns(db)).toHaveLength(1);
+    });
+
+    test("O19: offset-form watermark cannot poison later legitimate occurrences (Round 2 attack)", async () => {
+      // Switch the loop to an hourly cron so the day has many occurrences.
+      // (updateSchedule re-activates at clock.now() = 10:00Z, so the first
+      // valid hourly occurrence is 11:00Z.)
+      await updateSchedule({ db, clock }, loopId, { cron: "0 * * * *" });
+      const revision = 1;
+
+      // Attacker submits the 11:00Z occurrence in +08:00 offset form (clock
+      // advanced past 11:00Z so the occurrence is legitimately in the past).
+      clock.advance(70 * 60 * 1000); // now 11:10Z
+      const first = await coordinator.enqueueExecRun(loopId, {
+        kind: "scheduled",
+        scheduledFor: "2026-08-27T19:00:00+08:00", // === 2026-08-27T11:00:00.000Z
+        scheduleRevision: revision,
+      });
+      expect(first.enqueued).toBe(true);
+
+      // The watermark must hold the CANONICAL form.
+      let loop = (await db.select().from(loops).where(eq(loops.id, loopId)))[0]!;
+      expect(loop.lastScheduledAt).toBe("2026-08-27T11:00:00.000Z");
+
+      // The NEXT legitimate hourly occurrence must still enqueue. With raw
+      // string comparison, "12:00:00.000Z" <= "19:00:00+08:00" lexicographically
+      // and this tick would be swallowed as already_scheduled.
+      clock.advance(60 * 60 * 1000); // now 12:10Z
+      const second = await coordinator.enqueueExecRun(loopId, {
+        kind: "scheduled",
+        scheduledFor: "2026-08-27T12:00:00.000Z",
+        scheduleRevision: revision,
+      });
+      expect(second.enqueued).toBe(true);
+
+      loop = (await db.select().from(loops).where(eq(loops.id, loopId)))[0]!;
+      expect(loop.lastScheduledAt).toBe("2026-08-27T12:00:00.000Z");
+    });
   });
 });

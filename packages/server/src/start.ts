@@ -47,33 +47,45 @@ export interface BootedServer {
  * and the production sweep (default 20min timeout). Throws if the data dir
  * cannot be created — boot fails fast, before listen.
  *
+ * DB-handle ownership: a failure INSIDE bootstrap closes the handle here; once
+ * the BootedServer is returned, the caller owns the handle exactly once.
+ *
  * Phase 3 Batch 2: Creates Scheduler with production Croner factory.
  */
 export async function bootstrapServer(config: ServerConfig): Promise<BootedServer> {
   await fs.promises.mkdir(config.dataDir, { recursive: true });
   const handle = await openMigratedDb({ dataDir: config.dataDir });
-  const coordinator = createRunCoordinator({
-    db: handle.db,
-    clock: systemClock,
-    newRunId: newUuidRunId,
-    mintRunCredential,
-  });
-  const admin = createLoopAdmin({ db: handle.db, clock: systemClock, newLoopId: newUuidLoopId });
-  const ownerControl = createOwnerControl({ db: handle.db, clock: systemClock });
-  const sweep = createInactivitySweep({ db: handle.db, clock: systemClock });
-  const scheduler = createScheduler({
-    db: handle.db,
-    coordinator,
-    clock: systemClock,
-    cronFactory: productionCronFactory,
-  });
-  return {
-    app: createServerApp(coordinator, admin, ownerControl, handle.db, systemClock, scheduler),
-    coordinator,
-    sweep,
-    scheduler,
-    handle,
-  };
+  try {
+    const coordinator = createRunCoordinator({
+      db: handle.db,
+      clock: systemClock,
+      newRunId: newUuidRunId,
+      mintRunCredential,
+    });
+    const admin = createLoopAdmin({ db: handle.db, clock: systemClock, newLoopId: newUuidLoopId });
+    const ownerControl = createOwnerControl({ db: handle.db, clock: systemClock });
+    const sweep = createInactivitySweep({ db: handle.db, clock: systemClock });
+    const scheduler = createScheduler({
+      db: handle.db,
+      coordinator,
+      clock: systemClock,
+      cronFactory: productionCronFactory,
+    });
+    return {
+      app: createServerApp(coordinator, admin, ownerControl, handle.db, systemClock, (loop) =>
+        scheduler.reconcile(loop),
+      ),
+      coordinator,
+      sweep,
+      scheduler,
+      handle,
+    };
+  } catch (err) {
+    // Internal wiring failure after the DB opened: close the handle HERE —
+    // the caller never received it and must not double-close.
+    await closeDb(handle).catch(() => {});
+    throw err;
+  }
 }
 
 export async function main(): Promise<void> {
@@ -81,6 +93,8 @@ export async function main(): Promise<void> {
   const warning = unauthenticatedExposureWarning(config.host);
   if (warning) console.warn(warning);
 
+  // The outer catch is the SINGLE owner of post-bootstrap DB cleanup
+  // (bootstrapServer owns its own internal failures).
   let handle: DbHandle | undefined;
   try {
     const result = await bootstrapServer(config);
@@ -88,20 +102,16 @@ export async function main(): Promise<void> {
     const { app, sweep, scheduler } = result;
 
     const server: ServerType = serve({ fetch: app.fetch, port: config.port, hostname: config.host });
-    try {
-      // serve() returns BEFORE listen completes — EADDRINUSE & friends arrive
-      // via the async error event. Await the outcome; on failure run the SAME
-      // ordered cleanup as shutdown (HTTP first, then DB) and rethrow so boot
-      // exits non-zero instead of falsely reporting ready (review #8).
-      await waitForListening(server);
-    } catch (err) {
-      server.close();
-      await closeDb(handle).catch(() => {});
-      throw err;
-    }
+    // serve() returns BEFORE listen completes — EADDRINUSE & friends arrive
+    // via the async error event. Await the outcome; on failure the outer catch
+    // runs the DB cleanup so boot exits non-zero instead of falsely reporting
+    // ready (review #8). Nothing is bound on a listen failure, so no drain.
+    await waitForListening(server);
 
     // Phase 3 Batch 2: Start scheduler AFTER listener is bound (plan §2 fixed
     // startup order: DB → listener bind → scheduler start → sweep arm → ready).
+    // On scan failure this drains the scheduler AND the listener before the
+    // outer catch closes the DB (Scheduler → HTTP → DB order).
     await startSchedulerOrFailBoot(scheduler, server);
 
     // The sweep arms ONLY after the listener is actually bound (plan §1): one
@@ -140,20 +150,30 @@ export async function main(): Promise<void> {
 
 /**
  * Scheduler start is a BOOT gate (Batch 2 plan §2): a scan-level failure means
- * the server must NOT report ready without scheduling. Drain the scheduler,
- * close the listener, and rethrow — the caller's catch closes the DB and boot
- * exits non-zero. Extracted from main() so tests can drive the failure path
- * without binding a port.
+ * the server must NOT report ready without scheduling. Cleanup follows the
+ * fixed shutdown order — drain the scheduler, then drain the LISTENER (await
+ * in-flight requests; only then may the caller close the DB), and rethrow a
+ * fixed-message error so the entry layer never prints the scan's original
+ * exception (DB internals must not reach logs). Extracted from main() so tests
+ * can drive the failure path without binding a port.
  */
 export async function startSchedulerOrFailBoot(scheduler: Scheduler, server: ServerType): Promise<void> {
   try {
     await scheduler.start();
   } catch (err) {
-    console.error("[scheduler] startup scan failed — closing listener and DB");
+    console.error("[scheduler] startup scan failed — draining scheduler and listener before DB close");
     await scheduler.stopAndDrain().catch(() => {});
-    server.close();
-    throw err;
+    await closeServer(server).catch(() => {});
+    throw new Error("scheduler startup scan failed", { cause: err });
   }
+}
+
+/** Awaitable http.Server close: resolves once the listener has drained its
+ *  in-flight connections (the close callback fires only after they finish). */
+function closeServer(server: ServerType): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.close((err) => (err ? reject(err) : resolve()));
+  });
 }
 
 /** Resolve once the server is bound; reject on the first listen error. The

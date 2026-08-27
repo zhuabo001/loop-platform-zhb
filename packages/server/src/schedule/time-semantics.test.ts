@@ -238,11 +238,35 @@ describe("latestOccurrence / isOccurrence (Batch 2 occurrence reconstruction)", 
     );
   });
 
-  test("returns null when no occurrence lies inside the 2-minute lookback", () => {
-    // 10:02:30 with a daily cron: the 10:00 occurrence fell out of the window
-    expect(latestOccurrence(daily10, new Date("2026-08-27T10:02:30.000Z"))).toBeNull();
-    // Before the first occurrence of the day entirely
-    expect(latestOccurrence(daily10, new Date("2026-08-27T09:58:00.000Z"))).toBeNull();
+  test("reconstructs across arbitrary callback delays — no drop window (Round 2 regression)", () => {
+    // A daily 10:00 callback arriving 2.5 minutes, 3 hours, or 26 hours late
+    // still reconstructs its occurrence (a fired callback is a live occurrence).
+    expect(latestOccurrence(daily10, new Date("2026-08-27T10:02:30.000Z"))).toEqual(
+      new Date("2026-08-27T10:00:00.000Z"),
+    );
+    expect(latestOccurrence(daily10, new Date("2026-08-27T13:00:00.000Z"))).toEqual(
+      new Date("2026-08-27T10:00:00.000Z"),
+    );
+    expect(latestOccurrence(daily10, new Date("2026-08-28T09:59:59.000Z"))).toEqual(
+      new Date("2026-08-27T10:00:00.000Z"),
+    );
+
+    // Hourly cron delayed 90 minutes: latest occurrence ≤ now
+    const hourly = validateSchedule("0 * * * *", "UTC");
+    expect(latestOccurrence(hourly, new Date("2026-08-27T11:35:00.000Z"))).toEqual(
+      new Date("2026-08-27T11:00:00.000Z"),
+    );
+
+    // Before today's occurrence, the answer is YESTERDAY's (walk-back across days)
+    expect(latestOccurrence(daily10, new Date("2026-08-27T09:58:00.000Z"))).toEqual(
+      new Date("2026-08-26T10:00:00.000Z"),
+    );
+
+    // Feb-29-only cron: the adaptive window spans the multi-year gap
+    const leapDay = validateSchedule("0 10 29 2 *", "UTC");
+    expect(latestOccurrence(leapDay, new Date("2027-03-01T00:00:00.000Z"))).toEqual(
+      new Date("2024-02-29T10:00:00.000Z"),
+    );
   });
 
   test("dense schedules: returns the LATEST occurrence in the window, not the first", () => {

@@ -144,23 +144,30 @@ export async function enqueueExecRunTx(
         return { enqueued: false as const, reason: "future_occurrence" as const };
       }
 
+      // Canonicalize to UTC ISO before ANY comparison or persistence: every
+      // equivalent representation of the same instant (`+08:00` offsets,
+      // `+00:00`, …) must behave identically. Stored activation/watermark are
+      // canonical by construction (toISOString writes only), so string
+      // comparison on canonical forms is exact.
+      const canonicalFor = new Date(scheduledMs).toISOString();
+
       // Validate occurrence is after activation
       if (
         currentLoop.scheduleActivatedAt !== null &&
-        trigger.scheduledFor <= currentLoop.scheduleActivatedAt
+        canonicalFor <= currentLoop.scheduleActivatedAt
       ) {
         return { enqueued: false as const, reason: "before_activation" as const };
       }
 
       // Validate occurrence is after watermark
-      if (currentLoop.lastScheduledAt !== null && trigger.scheduledFor <= currentLoop.lastScheduledAt) {
+      if (currentLoop.lastScheduledAt !== null && canonicalFor <= currentLoop.lastScheduledAt) {
         return { enqueued: false as const, reason: "already_scheduled" as const };
       }
 
-      // Atomically advance watermark (even if running exists)
+      // Atomically advance watermark — the CANONICAL form only (even if running exists)
       await tx
         .update(loops)
-        .set({ lastScheduledAt: trigger.scheduledFor })
+        .set({ lastScheduledAt: canonicalFor })
         .where(eq(loops.id, loop.id));
 
       // If running exists, skip creating new run but watermark is advanced

@@ -9,7 +9,7 @@
  *    watermark without queueing
  */
 
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { eq } from "drizzle-orm";
 
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
@@ -92,7 +92,7 @@ describe("F-group: Integration and production wiring", () => {
       cronFactory: cronFactory as any,
     });
 
-    app = createServerApp(coordinator, admin, ownerControl, db, clock, scheduler);
+    app = createServerApp(coordinator, admin, ownerControl, db, clock, (loop) => scheduler.reconcile(loop));
   });
 
   describe("HTTP PATCH /schedule", () => {
@@ -374,6 +374,135 @@ describe("F-group: Integration and production wiring", () => {
       const allRuns = await snapshotRuns(db);
       expect(allRuns).toHaveLength(1);
       expect(allRuns[0]).toMatchObject({ loopId: "loop-1", phase: "pending" });
+    });
+
+    test("F11: a tick racing a poll claim converges to one running run (real interleaving)", async () => {
+      const tokenMachineId = await seedMachineForToken(db, TOKEN);
+      await seedLoop(db, {
+        id: "loop-1",
+        machineId: tokenMachineId,
+        cron: "* * * * *",
+        timezone: "UTC",
+        enabled: true,
+        scheduleRevision: 0,
+        scheduleActivatedAt: "2026-08-27T09:00:00.000Z",
+      });
+
+      // Gate the SECOND tick's enqueue inside the coordinator so the claim
+      // lands while the tick is mid-flight.
+      let release: (() => void) | undefined;
+      let gateEnabled = false;
+      const gate = new Promise<void>((r) => {
+        release = r;
+      });
+      const gatedCoordinator = createRunCoordinator(
+        testDeps(db, clock, {
+          hooks: { beforeEnqueueTx: () => (gateEnabled ? gate : undefined) },
+        }),
+      );
+      const gatedScheduler = createScheduler({
+        db,
+        coordinator: gatedCoordinator,
+        clock,
+        cronFactory: cronFactory as any,
+      });
+      await gatedScheduler.start();
+
+      // Tick 1 → run-1 pending (gate not yet armed)
+      clock.advance(30_000);
+      await cronFactory.triggerAll();
+      expect(await snapshotRuns(db)).toHaveLength(1);
+
+      // Arm the gate, advance to the next minute, fire tick 2 (parks in beforeEnqueueTx)
+      gateEnabled = true;
+      clock.advance(60_000);
+      const tick2 = cronFactory.triggerAll();
+
+      // The machine polls and claims run-1 WHILE tick 2 is parked
+      const pollResult = await gatedCoordinator.poll(TOKEN, { host: "test-host" });
+      expect(pollResult.deliveries).toHaveLength(1);
+      expect(pollResult.deliveries[0]!.runId).toBe("run-1");
+
+      // Release tick 2: the in-transaction re-check sees the running run →
+      // watermark advances but NO new pending is queued
+      release!();
+      await tick2;
+
+      const allRuns = await snapshotRuns(db);
+      expect(allRuns).toHaveLength(1);
+      expect(allRuns[0]).toMatchObject({ id: "run-1", phase: "running" });
+
+      const [loop] = await db.select().from(loops);
+      expect(loop.lastScheduledAt).toBe("2026-08-27T10:01:00.000Z");
+    });
+  });
+
+  describe("Schedule-commit seam (onScheduleCommitted)", () => {
+    /** The wire schema pins machineId to m-<16 lowercase hex> — the seeded
+     *  default id is deliberately NOT wire-valid, so seam tests use this one. */
+    const WIRE_MACHINE_ID = "m-0123456789abcdef";
+
+    test("F12: POST /loops with a schedule hot-registers the job through the seam", async () => {
+      await seedMachine(db, WIRE_MACHINE_ID);
+
+      // The app is wired with the seam in beforeEach — creating a scheduled
+      // loop must register the Croner job WITHOUT a restart (Round 1 P1).
+      const res = await app.request("/api/loops", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ machineId: WIRE_MACHINE_ID, cron: "* * * * *", timezone: "UTC" }),
+      });
+
+      expect(res.status).toBe(201);
+      const json = (await res.json()) as any;
+      expect(json.loop.cron).toBe("* * * * *");
+
+      expect(cronFactory.activeCount()).toBe(1);
+
+      // And the registered job actually fires an enqueue on the next tick
+      // (advance past the creation minute: occurrences must postdate activation)
+      clock.advance(61_000);
+      await cronFactory.triggerAll();
+      const allRuns = await snapshotRuns(db);
+      expect(allRuns).toHaveLength(1);
+      expect(allRuns[0]).toMatchObject({ phase: "pending", role: "exec" });
+    });
+
+    test("F13: a failing seam never fails the committed create (no 500-but-committed)", async () => {
+      await seedMachine(db, WIRE_MACHINE_ID);
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const failingApp = createServerApp(
+          coordinator,
+          createLoopAdmin({ db, clock, newLoopId: newUuidLoopId }),
+          createOwnerControl({ db, clock }),
+          db,
+          clock,
+          () => {
+            throw new Error("injected reconcile failure");
+          },
+        );
+
+        const res = await failingApp.request("/api/loops", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ machineId: WIRE_MACHINE_ID, cron: "0 10 * * *", timezone: "UTC" }),
+        });
+
+        // The committed create still succeeds — the seam error is classified,
+        // never propagated (the loop row IS persisted).
+        expect(res.status).toBe(201);
+        const allLoops = await db.select().from(loops);
+        expect(allLoops).toHaveLength(1);
+        expect(allLoops[0]).toMatchObject({ cron: "0 10 * * *" });
+
+        // Fixed classification only — the exception message never reaches logs
+        const warnLines = warn.mock.calls.map((c) => String(c[0]));
+        expect(warnLines).toContain("[http] schedule_commit_sync_failed");
+        expect(warnLines.join("\n")).not.toContain("injected reconcile failure");
+      } finally {
+        warn.mockRestore();
+      }
     });
   });
 });

@@ -49,18 +49,18 @@ interface Scheduler {
 
 ### 2. Occurrence Reconstruction (`latestOccurrence`)
 
-Croner callbacks fire at approximately the scheduled minute, but may be delayed by system load. The Scheduler uses `latestOccurrence()` to reconstruct the canonical UTC timestamp:
+Croner callbacks fire at approximately the scheduled minute, but may be delayed by system load, event-loop stalls, or process suspension. The Scheduler uses `latestOccurrence()` to reconstruct the canonical UTC timestamp:
 
 ```typescript
 function latestOccurrence(schedule: NormalizedSchedule, atInclusive: Date): Date | null
 ```
 
-**Algorithm**:
-1. Find the first occurrence after (firing time - 2 minutes)
-2. Walk forward occurrence-by-occurrence, keeping the last one ≤ firing time (dense schedules have several occurrences inside the window; the first is NOT the latest)
-3. If even the first occurrence is after the firing time, no occurrence exists and the tick is skipped
+**Algorithm (adaptive lookback — no arbitrary fixed drop window)**:
+1. Start with a 2-minute lookback window (the common case)
+2. Find the first occurrence after (firing time - window), then walk forward occurrence-by-occurrence, keeping the last one ≤ firing time (dense schedules have several occurrences inside the window; the first is NOT the latest)
+3. If the window holds no occurrence ≤ firing time, double the window and retry, up to a 5-year cap (covers Feb-29-only crons)
 
-This ensures deterministic `scheduledFor` values across callback delays. The 2-minute lookback accommodates delays under system load; a callback delayed beyond the window finds no occurrence and the tick is skipped (no catch-up — consistent with the batch's at-most-once, no-backfill stance). The walk is bounded: 5-part cron resolution is one minute, so at most ~120 steps.
+A fired callback is a live occurrence: it must NEVER be silently dropped because of its delay (Round 2 review). Cost stays bounded — dense crons succeed on the first small window; only sparse crons expand (few occurrences per window). Multiple late callbacks firing after a suspension collapse onto the SAME latest occurrence, and the watermark dedups them to at most one run (no catch-up backlog — full restart catch-up remains Batch 3 scope).
 
 ### 3. Scheduled Enqueue Transaction
 
@@ -78,19 +78,25 @@ type ExecTrigger =
 3. Validate `enabled=true` AND `cron IS NOT NULL` (reject inactive)
 4. Validate `scheduledFor` parses and IS a genuine occurrence of the loop's current cron/timezone (`isOccurrence` — reject `not_an_occurrence`)
 5. Validate `scheduledFor` is not in the future (reject `future_occurrence`)
-6. Validate `scheduledFor > scheduleActivatedAt` (reject before activation)
-7. Validate `scheduledFor > lastScheduledAt` (reject duplicate/old)
-8. **Atomically advance `lastScheduledAt = scheduledFor`** (watermark)
-9. If running run exists, skip new pending but **watermark still advances**
-10. Supersede old pending runs and insert new pending
+6. **Canonicalize to UTC ISO** (`new Date(ms).toISOString()`) — every equivalent representation of the same instant (offset forms like `+08:00`) behaves identically; ALL subsequent comparisons and the persisted watermark use ONLY the canonical form
+7. Validate `scheduledFor > scheduleActivatedAt` (reject before activation)
+8. Validate `scheduledFor > lastScheduledAt` (reject duplicate/old)
+9. **Atomically advance `lastScheduledAt = canonicalFor`** (watermark)
+10. If running run exists, skip new pending but **watermark still advances**
+11. Supersede old pending runs and insert new pending
 
-Steps 4–5 close the watermark-pollution path: an arbitrary or future timestamp can never advance `lastScheduledAt` and thereby swallow later real ticks.
+Steps 4–6 close the watermark-pollution paths: an arbitrary, future, or non-canonically-encoded timestamp can never advance `lastScheduledAt` and thereby swallow later real ticks.
 
 **Manual triggers** bypass all schedule validation (Phase 1-2 semantics preserved).
 
 ### 4. Dynamic Reconcile
 
-`scheduler.reconcile(loop)` is called by management API after schedule commits:
+The management surface syncs the scheduler through ONE injected seam: `onScheduleCommitted(loop)`, wired at composition (`start.ts`) to `scheduler.reconcile`:
+
+**Call sites**:
+- `POST /api/loops` after a committed create of an active scheduled loop — the seam receives the authoritative row returned by the INSERT (no post-commit re-read: a failed re-read would turn a committed create into a 500)
+- `PATCH /api/loops/:id/schedule` after an EFFECTIVE change (`result.changed`) — a no-op patch must not replace the job
+- Seam errors are caught at the call site and logged with a fixed classification; they never roll back the committed configuration nor fail the response
 
 **No-op conditions**:
 - Loop unchanged: `revision`, `cron`, `timezone` all match
@@ -104,7 +110,7 @@ Steps 4–5 close the watermark-pollution path: an arbitrary or future timestamp
 **Job removal**:
 - `enabled=false` OR `cron=null` → stop and remove job
 
-**Reconcile is synchronous**: HTTP response waits for job registration, ensuring immediate effect.
+**Reconcile is synchronous**: the HTTP response is shaped after the job registration attempt, ensuring immediate effect.
 
 ### 5. Error Isolation
 
@@ -114,7 +120,8 @@ Steps 4–5 close the watermark-pollution path: an arbitrary or future timestamp
 - Callback errors caught and logged, don't crash scheduler
 
 **Startup failure handling**:
-- A scan-level DB error from `scheduler.start()` is a BOOT failure: `main()` drains the scheduler, closes the listener, closes the DB, and exits non-zero — the server never reports ready without scheduling
+- A scan-level DB error from `scheduler.start()` is a BOOT failure. Cleanup follows the fixed shutdown order: drain the scheduler, then DRAIN THE LISTENER (await in-flight requests), and only then may the outer catch close the DB — an in-flight request must never meet a closed database
+- The boot error rethrown to the entry layer carries a FIXED message (`scheduler startup scan failed`, original as `cause`) — the scan's original exception (DB internals) never reaches entry-layer logs
 - Per-loop registration errors are isolated: logged with a fixed classification, loop skipped, startup continues
 
 **Callback error handling**:

@@ -232,46 +232,53 @@ function advanceWithinFivePartMinute(cursor: Date): Date {
  *
  * This function is used by the Scheduler to reconstruct the canonical occurrence
  * timestamp when a Croner callback fires. The callback's actual firing time may
- * be slightly after the scheduled minute due to system load or execution delay.
+ * be delayed by system load, event-loop stalls, or process suspension — the
+ * reconstruction must succeed for ANY such delay (a fired callback is a live
+ * occurrence that must never be silently dropped).
  *
- * Algorithm:
- *  1. Use Croner's nextRun to find the first occurrence after (atInclusive - 2 minutes)
- *  2. Walk forward occurrence-by-occurrence, keeping the last one ≤ atInclusive
- *  3. If even the first occurrence is after atInclusive, no valid occurrence exists
+ * Algorithm (adaptive lookback — no arbitrary fixed window):
+ *  1. Start with a small lookback window (2 minutes — the common case)
+ *  2. Find the first occurrence after (atInclusive - window), then walk forward
+ *     occurrence-by-occurrence, keeping the last one ≤ atInclusive
+ *  3. If the window holds no occurrence ≤ atInclusive, double the window and
+ *     retry, up to a 5-year cap (covers Feb-29-only crons)
  *
- * The walk-forward (step 2) matters for schedules denser than the lookback
- * window (e.g. minutely crons): the first occurrence in the window is NOT the
- * latest one. At most ~120 iterations are possible (5-part cron resolution is
- * one minute), so the walk is bounded.
+ * The walk-forward (step 2) matters for schedules denser than the window (e.g.
+ * minutely crons): the first occurrence in the window is NOT the latest one.
+ * Cost stays bounded: dense crons always succeed on the first small window, and
+ * only sparse crons expand (few occurrences per window, Croner jumps directly).
  *
  * DST handling mirrors nextOccurrence: gaps are skipped, overlaps use first occurrence.
- *
- * The 2-minute lookback accommodates callback delays under system load while remaining
- * bounded; a firing delayed beyond the window finds no occurrence and the tick is
- * skipped (no catch-up — the batch's at-most-once stance).
+ * Returns null only when no occurrence exists within the 5-year cap (defensive —
+ * unreachable for valid recurring crons in practice).
  *
  * @param schedule - Validated and normalized schedule configuration
  * @param atInclusive - Reference time (find the latest occurrence at or before this)
  * @returns Latest occurrence as an absolute Date, or null if no past occurrence exists
  */
 export function latestOccurrence(schedule: NormalizedSchedule, atInclusive: Date): Date | null {
-  // Look back 2 minutes to accommodate callback delays
-  const lookbackStart = new Date(atInclusive.getTime() - 120_000);
+  const MAX_LOOKBACK_MS = 5 * 366 * 24 * 60 * 60 * 1000; // covers Feb-29-only gaps
+  let windowMs = 120_000;
 
-  let candidate = nextOccurrence(schedule, lookbackStart);
-  if (candidate === null || candidate.getTime() > atInclusive.getTime()) {
-    return null;
-  }
-
-  // Walk forward to the LATEST occurrence ≤ atInclusive (dense schedules have
-  // multiple occurrences inside the lookback window).
-  let latest = candidate;
   while (true) {
-    candidate = nextOccurrence(schedule, latest);
-    if (candidate === null || candidate.getTime() > atInclusive.getTime()) {
-      return latest;
+    const windowStart = new Date(atInclusive.getTime() - windowMs);
+    let candidate = nextOccurrence(schedule, windowStart);
+
+    if (candidate !== null && candidate.getTime() <= atInclusive.getTime()) {
+      // Walk forward to the LATEST occurrence ≤ atInclusive (dense schedules
+      // have multiple occurrences inside the window).
+      let latest = candidate;
+      while (true) {
+        candidate = nextOccurrence(schedule, latest);
+        if (candidate === null || candidate.getTime() > atInclusive.getTime()) {
+          return latest;
+        }
+        latest = candidate;
+      }
     }
-    latest = candidate;
+
+    if (windowMs >= MAX_LOOKBACK_MS) return null;
+    windowMs = Math.min(windowMs * 2, MAX_LOOKBACK_MS);
   }
 }
 

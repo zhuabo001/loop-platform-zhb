@@ -43,10 +43,9 @@ import { LoopValidationError } from "../admin/errors.js";
 import type { LoopAdmin } from "../admin/index.js";
 import { InvalidMachineCredentialError, RunCapabilityInvalidError } from "../coordinator/errors.js";
 import type { RunCoordinator } from "../coordinator/index.js";
+import type { Loop } from "../db/schema.js";
 import type { OwnerControl } from "../owner/index.js";
 import { ScheduleValidationError, updateSchedule } from "../schedule/index.js";
-import type { Scheduler } from "../scheduler/index.js";
-import { getLoop } from "../store/runs.js";
 import type { Db } from "../db/index.js";
 import type { Clock } from "../time.js";
 
@@ -92,9 +91,25 @@ export function createServerApp(
   ownerControl: OwnerControl,
   db: Db,
   clock: Clock,
-  scheduler?: Scheduler,
+  onScheduleCommitted?: (loop: Loop) => void,
 ): Hono {
   const app = new Hono();
+
+  /**
+   * The ONE schedule-commit seam (Batch 2 plan §2): invoked synchronously after
+   * a committed create/PATCH with the authoritative loop row. A seam failure
+   * is logged with a fixed classification and NEVER fails the request — the
+   * configuration is already committed, and rolling the response back would
+   * leave client and server disagreeing about state.
+   */
+  const commitSchedule = (loop: Loop): void => {
+    if (!onScheduleCommitted) return;
+    try {
+      onScheduleCommitted(loop);
+    } catch {
+      console.warn("[http] schedule_commit_sync_failed");
+    }
+  };
 
   app.onError((err, c) => {
     console.error("[http] unhandled error", err);
@@ -174,13 +189,11 @@ export function createServerApp(
       const result = await admin.createLoop(parsed.data);
       if (!result.created) return jsonError(c, 404, "not found");
 
-      // Reconcile scheduler if loop has active schedule
-      if (scheduler && result.loop.cron !== null && result.loop.enabled) {
-        // Re-read loop from DB to get full row for reconcile
-        const loopRow = await getLoop(db, result.loop.id);
-        if (loopRow) {
-          scheduler.reconcile(loopRow);
-        }
+      // Hot-register the schedule through the seam with the authoritative row
+      // from the INSERT (no post-commit re-read). The seam never blocks or
+      // fails the response — the committed loop stands either way.
+      if (result.row.enabled && result.row.cron !== null) {
+        commitSchedule(result.row);
       }
 
       return c.json({ loop: result.loop }, 201);
@@ -243,9 +256,10 @@ export function createServerApp(
 
       if (!result.found) return jsonError(c, 404, "not found");
 
-      // Reconcile scheduler if present and schedule changed
-      if (scheduler && result.changed) {
-        scheduler.reconcile(result.loop);
+      // Sync the in-memory scheduler through the seam on an EFFECTIVE change
+      // (a no-op patch must not replace the job).
+      if (result.changed) {
+        commitSchedule(result.loop);
       }
 
       // The wire response is the admin view (LoopSummary with lastRun and

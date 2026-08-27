@@ -476,11 +476,11 @@ describe("S-group: Scheduler registration and lifecycle", () => {
       expect(await snapshotRuns(db)).toHaveLength(1);
     });
 
-    test("S16: a firing delayed beyond the 2-minute lookback skips the tick", async () => {
+    test("S16: a long-delayed callback still reconstructs its canonical occurrence", async () => {
       await seedLoop(db, {
         id: "loop-1",
         machineId,
-        cron: "0 10 * * *", // daily — no other occurrence within the lookback
+        cron: "0 10 * * *", // daily
         timezone: "UTC",
         enabled: true,
         scheduleRevision: 0,
@@ -489,15 +489,15 @@ describe("S-group: Scheduler registration and lifecycle", () => {
 
       await scheduler.start();
 
-      // 150s late: the lookback window no longer contains the 10:00 occurrence
-      clock.advance(150_000);
+      // The 10:00 tick fires 2.5 hours late (process suspended / event loop
+      // stalled) — a fired callback is a live occurrence and must NOT be
+      // silently dropped by an arbitrary lookback window (Round 2).
+      clock.advance(2.5 * 60 * 60 * 1000);
       await cronFactory.triggerAll();
 
-      // Tick skipped — no run, no watermark advance, classified log
-      expect(await snapshotRuns(db)).toHaveLength(0);
       const [loop] = await db.select().from(loops).where(eq(loops.id, "loop-1"));
-      expect(loop!.lastScheduledAt).toBeNull();
-      expect(logs).toEqual(["scheduler: occurrence_rebuild_failed loop=loop-1"]);
+      expect(loop!.lastScheduledAt).toBe(OCCURRENCE_10AM);
+      expect(await snapshotRuns(db)).toHaveLength(1);
     });
 
     test("S17: the callback promise stays pending until the enqueue settles (overrun protection)", async () => {
@@ -587,6 +587,56 @@ describe("S-group: Scheduler registration and lifecycle", () => {
       await entry.callback();
 
       expect(logs).toEqual([]);
+    });
+
+    test("S20: a callback racing a schedule update loses to the revision guard (Round 2)", async () => {
+      await seedLoop(db, {
+        id: "loop-1",
+        machineId,
+        cron: "0 10 * * *",
+        timezone: "UTC",
+        enabled: true,
+        scheduleRevision: 0,
+        scheduleActivatedAt: ACTIVATION_9AM,
+      });
+
+      // Gate the enqueue INSIDE the coordinator so the callback is parked
+      // mid-flight while the schedule update commits.
+      let release: (() => void) | undefined;
+      const gate = new Promise<void>((r) => {
+        release = r;
+      });
+      const gatedCoordinator = createRunCoordinator(
+        testDeps(db, clock, { hooks: { beforeEnqueueTx: () => gate } }),
+      );
+      const gatedScheduler = createScheduler({
+        db,
+        coordinator: gatedCoordinator,
+        clock,
+        cronFactory,
+        log: (line) => logs.push(line),
+      });
+      await gatedScheduler.start();
+
+      // Tick fires, callback parks inside the gated enqueue
+      const [cbPromise] = cronFactory.fireAll();
+
+      // The schedule update COMMITS while the callback is in flight (rev 0→1)
+      await updateSchedule({ db, clock }, "loop-1", { cron: "0 14 * * *" });
+      const [updatedLoop] = await db.select().from(loops);
+      gatedScheduler.reconcile(updatedLoop!);
+
+      // Release the in-flight callback: its captured revision 0 is now stale
+      release!();
+      await cbPromise;
+
+      // Rejected by the revision guard — zero runs, and the NEW config's
+      // watermark was not polluted by the stale callback
+      expect(await snapshotRuns(db)).toHaveLength(0);
+      const [loop] = await db.select().from(loops).where(eq(loops.id, "loop-1"));
+      expect(loop!.scheduleRevision).toBe(1);
+      expect(loop!.lastScheduledAt).toBeNull();
+      expect(logs).toEqual(["scheduler: enqueue_skipped loop=loop-1 reason=stale_revision"]);
     });
   });
 });

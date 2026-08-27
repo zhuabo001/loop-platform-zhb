@@ -21,7 +21,7 @@ import { and, asc, desc, eq, inArray } from "drizzle-orm";
 import type { CreateLoopRequest, LoopSummary, MachineSummary, RunSummary } from "@loopzhb/protocol";
 
 import type { Db } from "../db/index.js";
-import { loops, machines, runs } from "../db/schema.js";
+import { loops, machines, runs, type Loop } from "../db/schema.js";
 import { getMachine } from "../store/machines.js";
 import { getLoop } from "../store/runs.js";
 import type { Clock } from "../time.js";
@@ -32,7 +32,6 @@ import {
   toLoopSummary,
   toMachineSummary,
   toRunSummary,
-  type LoopSummaryRow,
   type RunSummaryRow,
 } from "./views.js";
 
@@ -107,7 +106,15 @@ export function newUuidLoopId(): string {
 }
 
 export type CreateLoopResult =
-  | { created: true; loop: LoopSummary }
+  | {
+      created: true;
+      /** The wire-safe view — the HTTP response body. */
+      loop: LoopSummary;
+      /** The inserted full row — for the schedule-commit seam ONLY (the
+       *  scheduler's reconcile needs scheduleRevision/activation, which the
+       *  wire view deliberately lacks). Never serialized to a response. */
+      row: Loop;
+    }
   | { created: false; reason: "machine_not_found" };
 
 export function createLoopAdmin(deps: LoopAdminDeps) {
@@ -165,7 +172,10 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
       const nowIso = deps.clock.now().toISOString();
       const isActive = normalizedCron !== null; // enabled=true by default
 
-      const inserted: LoopSummaryRow[] = await deps.db
+      // Insert with a FULL-row returning: the wire view is mapped from the row,
+      // and the row itself feeds the schedule-commit seam (no post-commit
+      // re-read — a failed re-read would turn a committed create into a 500).
+      const inserted: Loop[] = await deps.db
         .insert(loops)
         .values({
           id: deps.newLoopId(),
@@ -184,11 +194,11 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
           createdAt: nowIso,
           updatedAt: nowIso,
         })
-        .returning(loopSummaryColumns);
+        .returning();
 
       const row = inserted[0]!;
 
-      return { created: true as const, loop: toLoopSummary(row, null, nextFireAtIso(row, deps.clock.now())) };
+      return { created: true as const, loop: toLoopSummary(row, null, nextFireAtIso(row, deps.clock.now())), row };
     },
 
     /** `name ASC, id ASC`, capped — the machine picker for loop creation. */

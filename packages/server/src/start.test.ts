@@ -101,13 +101,18 @@ describe("bootstrapServer", () => {
 
     let listenerClosed = false;
     const fakeServer = {
-      close: () => {
+      close: (cb?: (err?: Error) => void) => {
         listenerClosed = true;
+        cb?.(); // a drained listener invokes the close callback
       },
     } as unknown as ServerType;
 
     // A scan-level failure must FAIL BOOT — never report ready without scheduling.
-    await expect(startSchedulerOrFailBoot(b.scheduler, fakeServer)).rejects.toThrow();
+    // The thrown error carries a FIXED message: the scan's original exception
+    // (DB internals) must not reach the entry layer's logs.
+    await expect(startSchedulerOrFailBoot(b.scheduler, fakeServer)).rejects.toThrow(
+      "scheduler startup scan failed",
+    );
     expect(listenerClosed).toBe(true);
 
     // The failed boot released its resources: a fresh bootstrap on the same
@@ -115,6 +120,64 @@ describe("bootstrapServer", () => {
     const second = await boot(dir);
     expect(second.handle.dataDir).toBe(dir);
   });
+
+  it("scheduler scan failure waits for IN-FLIGHT HTTP requests before the DB may close", async () => {
+    const dir = await tmpDataDir();
+    const b = await bootstrapServer({ host: "127.0.0.1", port: 0, dataDir: dir });
+
+    // A route that hangs until the test releases it — the in-flight request
+    // the drain must wait for.
+    let releaseHang!: () => void;
+    const hang = new Promise<void>((resolve) => {
+      releaseHang = resolve;
+    });
+    b.app.get("/hang", async (c) => {
+      await hang;
+      return c.json({ ok: true });
+    });
+
+    const server: ServerType = serve({ fetch: b.app.fetch, port: 0, hostname: "127.0.0.1" });
+    await waitForListening(server);
+    const port = (server.address() as net.AddressInfo).port;
+
+    // Start an in-flight request (connection: close — no keep-alive residue)
+    const responsePromise = fetch(`http://127.0.0.1:${port}/hang`, {
+      headers: { connection: "close" },
+    });
+    await new Promise((r) => setTimeout(r, 100)); // let it arrive and park
+
+    // Break the scheduler scan
+    await closeDb(b.handle);
+
+    let bootSettled = false;
+    const bootPromise = startSchedulerOrFailBoot(b.scheduler, server).then(
+      () => {
+        bootSettled = true;
+        throw new Error("scheduler start should have failed");
+      },
+      (err: unknown) => {
+        bootSettled = true;
+        expect(String(err)).toContain("scheduler startup scan failed");
+      },
+    );
+
+    // While the request hangs, the cleanup must NOT complete (HTTP drain
+    // precedes the DB close the outer catch would run).
+    await new Promise((r) => setTimeout(r, 200));
+    expect(bootSettled).toBe(false);
+
+    // Release the request: it completes normally, the listener drains, and
+    // only then does the boot failure propagate.
+    releaseHang();
+    const res = await responsePromise;
+    expect(res.status).toBe(200);
+    await bootPromise;
+    expect(bootSettled).toBe(true);
+
+    // Resources released: a fresh bootstrap re-acquires the same dataDir.
+    const second = await boot(dir);
+    expect(second.handle.dataDir).toBe(dir);
+  }, 30_000);
 
   it("restart durability: machine, run and ACTIVE LEASE survive close/reopen — a pre-restart claim still reports (T4)", async () => {
     const dir = await tmpDataDir();
