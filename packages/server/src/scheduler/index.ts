@@ -152,11 +152,17 @@ export function createScheduler(deps: SchedulerDeps) {
           const capturedTimezone = loop.timezone;
 
           // Calculate canonical occurrence using latestOccurrence
-          const now = clock.now();
-          const scheduledFor = latestOccurrence(
-            { cron: capturedCron, timezone: capturedTimezone },
-            now,
-          );
+          let scheduledFor: Date | null = null;
+          try {
+            const now = clock.now();
+            scheduledFor = latestOccurrence(
+              { cron: capturedCron, timezone: capturedTimezone },
+              now,
+            );
+          } catch (err) {
+            log(`scheduler: latestOccurrence failed for loop ${loop.id}: ${String(err)}`);
+            return;
+          }
 
           if (scheduledFor === null) {
             log(`scheduler: failed to calculate occurrence for loop ${loop.id}`);
@@ -169,6 +175,13 @@ export function createScheduler(deps: SchedulerDeps) {
               kind: "scheduled",
               scheduledFor: scheduledFor.toISOString(),
               scheduleRevision: capturedRevision,
+            })
+            .then((result) => {
+              if (!result.enqueued) {
+                log(
+                  `scheduler: enqueue skipped for loop ${loop.id}, reason: ${result.reason}, occurrence: ${scheduledFor!.toISOString()}`
+                );
+              }
             })
             .catch((err) => {
               log(`scheduler: enqueue failed for loop ${loop.id}: ${String(err)}`);
@@ -211,9 +224,13 @@ export function createScheduler(deps: SchedulerDeps) {
       // Filter to only those with cron
       const scheduledLoops = activeLoops.filter((loop) => loop.cron !== null);
 
+      console.log(`[scheduler] starting: found ${scheduledLoops.length} active scheduled loops`);
+
       for (const loop of scheduledLoops) {
         reconcile(loop);
       }
+
+      console.log(`[scheduler] started: ${registry.size} jobs registered`);
     },
 
     /**

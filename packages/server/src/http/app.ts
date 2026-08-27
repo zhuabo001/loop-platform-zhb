@@ -244,7 +244,22 @@ export function createServerApp(
         scheduler.reconcile(result.loop);
       }
 
-      // Map to LoopSummary with nextFireAt calculation
+      // Query lastRun (latest exec run for this loop)
+      const { runs } = await import("../db/schema.js");
+      const { eq, and, desc } = await import("drizzle-orm");
+      const { toRunSummary } = await import("../admin/views.js");
+      const { runSummaryColumns } = await import("../admin/index.js");
+
+      const lastRunRows = await db
+        .select(runSummaryColumns)
+        .from(runs)
+        .where(and(eq(runs.loopId, result.loop.id), eq(runs.role, "exec")))
+        .orderBy(desc(runs.ts), desc(runs.id))
+        .limit(1);
+
+      const lastRun = lastRunRows.length > 0 ? toRunSummary(lastRunRows[0]) : null;
+
+      // Calculate nextFireAt
       let nextFireAt: string | null = null;
       if (result.loop.enabled && result.loop.cron !== null) {
         try {
@@ -258,7 +273,7 @@ export function createServerApp(
         }
       }
 
-      const loopSummary = toLoopSummary(result.loop, null, nextFireAt);
+      const loopSummary = toLoopSummary(result.loop, lastRun, nextFireAt);
 
       return c.json({ loop: loopSummary }, 200);
     } catch (err) {
