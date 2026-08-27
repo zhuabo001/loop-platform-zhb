@@ -226,3 +226,39 @@ function advanceWithinFivePartMinute(cursor: Date): Date {
   const minuteEnd = Math.floor(cursor.getTime() / 60_000) * 60_000 + 59_999;
   return new Date(minuteEnd > cursor.getTime() ? minuteEnd : cursor.getTime() + 1);
 }
+
+/**
+ * Calculates the latest (most recent) occurrence at or before a given time.
+ *
+ * This function is used by the Scheduler to reconstruct the canonical occurrence
+ * timestamp when a Croner callback fires. The callback's actual firing time may
+ * be slightly after the scheduled minute due to system load or execution delay.
+ *
+ * Algorithm:
+ *  1. Use Croner's nextRun to find the occurrence that would fire after (atInclusive - 1 minute)
+ *  2. If that occurrence is at or before atInclusive, it's the latest occurrence
+ *  3. Otherwise, no valid occurrence exists at or before atInclusive
+ *
+ * DST handling mirrors nextOccurrence: gaps are skipped, overlaps use first occurrence.
+ *
+ * @param schedule - Validated and normalized schedule configuration
+ * @param atInclusive - Reference time (find the latest occurrence at or before this)
+ * @returns Latest occurrence as an absolute Date, or null if no past occurrence exists
+ */
+export function latestOccurrence(schedule: NormalizedSchedule, atInclusive: Date): Date | null {
+  // Look back one minute to find the occurrence that would fire at or before atInclusive
+  const lookbackStart = new Date(atInclusive.getTime() - 60_000);
+
+  const candidate = nextOccurrence(schedule, lookbackStart);
+
+  if (candidate === null) return null;
+
+  // Check if the candidate is at or before our reference time
+  if (candidate.getTime() <= atInclusive.getTime()) {
+    return candidate;
+  }
+
+  // Candidate is after atInclusive, no valid occurrence exists
+  return null;
+}
+
