@@ -1,7 +1,7 @@
 # ADR-008: Online Scheduler Architecture
 
-**Status**: Accepted  
-**Date**: 2026-08-27  
+**Status**: Accepted
+**Date**: 2026-08-27
 **Context**: Phase 3 Batch 2 - Scheduled Loop Execution
 
 ## Context and Problem Statement
@@ -16,7 +16,7 @@ Phase 3 Batch 2 introduces automatic cron-based loop execution. The system needs
 **Key Constraints**:
 - Single-process, file-backed SQLite (no distributed scheduling needed)
 - Phase 1-2 manual-trigger semantics remain unchanged
-- Scheduler failures are non-fatal (server continues without scheduling)
+- Scan-level scheduler startup failure is a BOOT failure (cleanup + non-zero exit); per-loop registration/callback failures are isolated and non-fatal
 - Zero-downtime reconcile on schedule updates
 
 ## Decision
@@ -56,11 +56,11 @@ function latestOccurrence(schedule: NormalizedSchedule, atInclusive: Date): Date
 ```
 
 **Algorithm**:
-1. Look back 1 minute from callback firing time
-2. Use `nextOccurrence()` to find the scheduled occurrence
-3. If that occurrence ≤ firing time, it's the canonical timestamp
+1. Find the first occurrence after (firing time - 2 minutes)
+2. Walk forward occurrence-by-occurrence, keeping the last one ≤ firing time (dense schedules have several occurrences inside the window; the first is NOT the latest)
+3. If even the first occurrence is after the firing time, no occurrence exists and the tick is skipped
 
-This ensures deterministic `scheduledFor` values across callback delays.
+This ensures deterministic `scheduledFor` values across callback delays. The 2-minute lookback accommodates delays under system load; a callback delayed beyond the window finds no occurrence and the tick is skipped (no catch-up — consistent with the batch's at-most-once, no-backfill stance). The walk is bounded: 5-part cron resolution is one minute, so at most ~120 steps.
 
 ### 3. Scheduled Enqueue Transaction
 
@@ -76,11 +76,15 @@ type ExecTrigger =
 1. Re-read loop within transaction for latest state
 2. Validate `scheduleRevision` matches (reject stale)
 3. Validate `enabled=true` AND `cron IS NOT NULL` (reject inactive)
-4. Validate `scheduledFor > scheduleActivatedAt` (reject before activation)
-5. Validate `scheduledFor > lastScheduledAt` (reject duplicate/old)
-6. **Atomically advance `lastScheduledAt = scheduledFor`** (watermark)
-7. If running run exists, skip new pending but **watermark still advances**
-8. Supersede old pending runs and insert new pending
+4. Validate `scheduledFor` parses and IS a genuine occurrence of the loop's current cron/timezone (`isOccurrence` — reject `not_an_occurrence`)
+5. Validate `scheduledFor` is not in the future (reject `future_occurrence`)
+6. Validate `scheduledFor > scheduleActivatedAt` (reject before activation)
+7. Validate `scheduledFor > lastScheduledAt` (reject duplicate/old)
+8. **Atomically advance `lastScheduledAt = scheduledFor`** (watermark)
+9. If running run exists, skip new pending but **watermark still advances**
+10. Supersede old pending runs and insert new pending
+
+Steps 4–5 close the watermark-pollution path: an arbitrary or future timestamp can never advance `lastScheduledAt` and thereby swallow later real ticks.
 
 **Manual triggers** bypass all schedule validation (Phase 1-2 semantics preserved).
 
@@ -110,14 +114,14 @@ type ExecTrigger =
 - Callback errors caught and logged, don't crash scheduler
 
 **Startup failure handling**:
-- `scheduler.start()` errors are caught in `main()`
-- Server continues without scheduling (non-fatal)
-- Logged as `[scheduler] startup failed`
+- A scan-level DB error from `scheduler.start()` is a BOOT failure: `main()` drains the scheduler, closes the listener, closes the DB, and exits non-zero — the server never reports ready without scheduling
+- Per-loop registration errors are isolated: logged with a fixed classification, loop skipped, startup continues
 
 **Callback error handling**:
-- Croner's `catch` option logs errors
-- Coordinator enqueue failures logged per-loop
-- Other callbacks continue normally
+- Croner's `catch` option logs a fixed classification
+- The callback RETURNS the enqueue promise, so Croner's `protect` sees the job as busy until the write settles — overrun protection actually blocks re-entrant ticks
+- A callback firing after `stopAndDrain()` returns immediately (stopped guard) and never touches a closed database
+- Coordinator enqueue failures logged per-loop with fixed classifications
 
 ### 6. Lifecycle Integration
 
@@ -152,19 +156,19 @@ type ExecTrigger =
 
 ### Positive
 
-✅ **Zero-downtime updates**: Schedule changes take effect immediately via reconcile  
-✅ **Deterministic occurrence**: `latestOccurrence` ensures canonical timestamps  
-✅ **Isolation**: One loop's failure doesn't affect others  
-✅ **Graceful shutdown**: In-flight callbacks complete before process exit  
-✅ **Manual-trigger preserved**: Phase 1-2 semantics unchanged  
-✅ **Non-fatal failures**: Scheduler errors don't crash server  
+✅ **Zero-downtime updates**: Schedule changes take effect immediately via reconcile
+✅ **Deterministic occurrence**: `latestOccurrence` ensures canonical timestamps
+✅ **Isolation**: One loop's failure doesn't affect others
+✅ **Graceful shutdown**: In-flight callbacks complete before process exit
+✅ **Manual-trigger preserved**: Phase 1-2 semantics unchanged
+✅ **Fail-fast boot**: A scheduler scan failure fails boot with full cleanup instead of falsely reporting ready
 ✅ **Testable**: FakeCronFactory enables deterministic testing
 
 ### Negative
 
-⚠️ **Single-process only**: No distributed scheduling (Phase 6 concern)  
-⚠️ **Clock skew**: System clock changes affect scheduling (acceptable for Phase 3)  
-⚠️ **Memory overhead**: One Croner job per active scheduled loop  
+⚠️ **Single-process only**: No distributed scheduling (Phase 6 concern)
+⚠️ **Clock skew**: System clock changes affect scheduling (acceptable for Phase 3)
+⚠️ **Memory overhead**: One Croner job per active scheduled loop
 ⚠️ **Reconcile latency**: HTTP PATCH waits for job registration (typically <10ms)
 
 ### Trade-offs
@@ -187,7 +191,7 @@ type ExecTrigger =
 
 Poll DB periodically for loops with `nextFireAt <= NOW()`, enqueue, update `nextFireAt`.
 
-**Rejected**: 
+**Rejected**:
 - Adds polling overhead
 - Harder to test deterministically
 - `nextFireAt` persistence creates consistency challenges
@@ -207,29 +211,40 @@ Don't skip occurrences when running run exists; let pendings accumulate.
 
 ## Implementation Notes
 
-**Production Croner factory** (`src/scheduler/croner-factory.ts`):
+**Production Croner factory** (`src/scheduler/croner-factory.ts`) — fixed options per plan §2:
 ```typescript
 export const productionCronFactory: CronFactory = {
   create(pattern, options, callback) {
-    const cron = new Cron(pattern, { timezone: options.timezone }, callback);
+    const cron = new Cron(
+      pattern,
+      {
+        timezone: options.timezone,
+        protect: options.protect,
+        catch: options.catch,
+        mode: "5-part",  // lock five-segment parsing
+        unref: true,     // timers never keep the process alive
+      },
+      callback,
+    );
     return { stop: () => cron.stop() };
   },
 };
 ```
 
-**Scheduler logs** (fixed classifications, no user data):
-- `scheduler: failed to register job for loop ${loopId}: ${error}`
-- `scheduler: failed to stop job for loop ${loopId}: ${error}`
-- `scheduler: overrun protection triggered for loop ${loopId}`
-- `scheduler: croner error for loop ${loopId}: ${error}`
-- `scheduler: failed to calculate occurrence for loop ${loopId}`
-- `scheduler: enqueue failed for loop ${loopId}: ${error}`
+**Scheduler logs** (fixed classifications, no user data — never an exception message, cron pattern or timezone):
+- `scheduler: job_register_failed loop=<id>`
+- `scheduler: job_stop_failed loop=<id>`
+- `scheduler: overrun loop=<id>`
+- `scheduler: croner_error loop=<id>`
+- `scheduler: occurrence_rebuild_failed loop=<id>`
+- `scheduler: enqueue_failed loop=<id>`
+- `scheduler: enqueue_skipped loop=<id> reason=<fixed enum>`
 
 All logs include loop ID (public) but never expose task content, workdir, or user data.
 
 ## References
 
-- **Plan**: `docs/phase3-batch2-plan.md`
+- **Plan**: `docs/plan/codex-phase3-batch2-plan.md`
 - **Protocol**: `packages/protocol/src/admin.ts` (UpdateScheduleRequest/Response)
 - **Time semantics**: `packages/server/src/schedule/time-semantics.ts`
 - **Coordinator**: `packages/server/src/coordinator/index.ts` (ExecTrigger)

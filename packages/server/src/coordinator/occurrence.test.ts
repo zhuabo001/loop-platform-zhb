@@ -5,6 +5,12 @@
  *  - O1–O4: First occurrence, duplicate rejection, occurrence validation
  *  - O5–O8: Revision guard, watermark progression, activation boundary
  *  - O9–O12: Running skip, pending supersede, transaction rollback, concurrency
+ *  - O13–O15: Future occurrence, non-occurrence, real transaction rollback
+ *
+ * All scheduledFor values are GENUINE occurrences of the seeded loop's cron
+ * (review: watermark semantics can only be pinned by real occurrences).
+ * The loop seeds cron "0 10 * * *" (daily 10:00 UTC), activation
+ * 2026-08-27T09:00Z; the clock starts at 2026-08-27T10:00Z.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
@@ -110,17 +116,18 @@ describe("O-group: scheduled trigger and atomic occurrence", () => {
     });
 
     test("O3: rejects older occurrence than watermark", async () => {
-      // First enqueue at 10:00
+      // First enqueue the 2026-08-28 occurrence (clock advanced to it)
+      clock.advance(24 * 60 * 60 * 1000);
       await coordinator.enqueueExecRun(loopId, {
         kind: "scheduled",
-        scheduledFor: "2026-08-27T10:00:00.000Z",
+        scheduledFor: "2026-08-28T10:00:00.000Z",
         scheduleRevision: 0,
       });
 
-      // Try to enqueue earlier occurrence
+      // Try to enqueue the previous day's genuine occurrence (older than watermark)
       const result = await coordinator.enqueueExecRun(loopId, {
         kind: "scheduled",
-        scheduledFor: "2026-08-27T09:30:00.000Z",
+        scheduledFor: "2026-08-27T10:00:00.000Z",
         scheduleRevision: 0,
       });
 
@@ -133,9 +140,10 @@ describe("O-group: scheduled trigger and atomic occurrence", () => {
     });
 
     test("O4: rejects occurrence before activation", async () => {
+      // 2026-08-26T10:00 is a genuine cron occurrence, but before activation (09:00 on the 27th)
       const result = await coordinator.enqueueExecRun(loopId, {
         kind: "scheduled",
-        scheduledFor: "2026-08-27T08:00:00.000Z", // Before scheduleActivatedAt
+        scheduledFor: "2026-08-26T10:00:00.000Z",
         scheduleRevision: 0,
       });
 
@@ -252,17 +260,18 @@ describe("O-group: scheduled trigger and atomic occurrence", () => {
     });
 
     test("O10: supersedes old pending when enqueueing new occurrence", async () => {
-      // Create old pending
+      // Create old pending (2026-08-27 occurrence)
       await coordinator.enqueueExecRun(loopId, {
         kind: "scheduled",
         scheduledFor: "2026-08-27T10:00:00.000Z",
         scheduleRevision: 0,
       });
 
-      // Enqueue newer occurrence
+      // Enqueue the next day's genuine occurrence (clock advances with time)
+      clock.advance(24 * 60 * 60 * 1000);
       const result = await coordinator.enqueueExecRun(loopId, {
         kind: "scheduled",
-        scheduledFor: "2026-08-27T11:00:00.000Z",
+        scheduledFor: "2026-08-28T10:00:00.000Z",
         scheduleRevision: 0,
       });
 
@@ -300,7 +309,7 @@ describe("O-group: scheduled trigger and atomic occurrence", () => {
       });
     });
 
-    test("O12: transaction rolls back on any failure", async () => {
+    test("O12: loop_not_found performs zero writes", async () => {
       // Force a failure by using invalid loop ID after watermark would update
       const result = await coordinator.enqueueExecRun("loop-nonexistent", {
         kind: "scheduled",
@@ -318,6 +327,73 @@ describe("O-group: scheduled trigger and atomic occurrence", () => {
 
       const allRuns = await snapshotRuns(db);
       expect(allRuns).toHaveLength(0);
+    });
+  });
+
+  describe("Occurrence authenticity guards", () => {
+    test("O13: rejects future occurrence, watermark untouched", async () => {
+      // 2026-08-28T10:00 is a genuine occurrence but one day in the FUTURE
+      // (clock is at 2026-08-27T10:00). Advancing the watermark to a future
+      // instant would swallow every real tick until then.
+      const result = await coordinator.enqueueExecRun(loopId, {
+        kind: "scheduled",
+        scheduledFor: "2026-08-28T10:00:00.000Z",
+        scheduleRevision: 0,
+      });
+
+      expect(result.enqueued).toBe(false);
+      if (result.enqueued) return;
+      expect(result.reason).toBe("future_occurrence");
+
+      const [loop] = await db.select().from(loops).where(eq(loops.id, loopId));
+      expect(loop.lastScheduledAt).toBeNull();
+      expect(await snapshotRuns(db)).toHaveLength(0);
+    });
+
+    test("O14: rejects timestamps that are not occurrences of the loop's cron", async () => {
+      // One second past the real occurrence, and a wrong minute entirely.
+      // Neither may advance the watermark (review: arbitrary-timestamp pollution).
+      for (const scheduledFor of ["2026-08-27T10:00:01.000Z", "2026-08-27T09:59:00.000Z"]) {
+        const result = await coordinator.enqueueExecRun(loopId, {
+          kind: "scheduled",
+          scheduledFor,
+          scheduleRevision: 0,
+        });
+
+        expect(result.enqueued).toBe(false);
+        if (result.enqueued) return;
+        expect(result.reason).toBe("not_an_occurrence");
+      }
+
+      const [loop] = await db.select().from(loops).where(eq(loops.id, loopId));
+      expect(loop.lastScheduledAt).toBeNull();
+      expect(await snapshotRuns(db)).toHaveLength(0);
+    });
+
+    test("O15: a mid-transaction failure rolls back the watermark (zero partial writes)", async () => {
+      // The run-id factory throws at the INSERT step — AFTER the watermark
+      // update inside the same transaction. The whole transaction must roll
+      // back: no run row, and lastScheduledAt stays null.
+      const failing = createRunCoordinator({
+        db,
+        clock,
+        newRunId: () => {
+          throw new Error("injected id-factory failure");
+        },
+        mintRunCredential: () => "rk_testcred_x",
+      });
+
+      await expect(
+        failing.enqueueExecRun(loopId, {
+          kind: "scheduled",
+          scheduledFor: "2026-08-27T10:00:00.000Z",
+          scheduleRevision: 0,
+        }),
+      ).rejects.toThrow("injected id-factory failure");
+
+      const [loop] = await db.select().from(loops).where(eq(loops.id, loopId));
+      expect(loop.lastScheduledAt).toBeNull();
+      expect(await snapshotRuns(db)).toHaveLength(0);
     });
   });
 });

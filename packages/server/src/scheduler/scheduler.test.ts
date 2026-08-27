@@ -5,15 +5,23 @@
  *  - S1–S4: Active loop scanning, job registration, Croner parameters
  *  - S5–S8: Dynamic reconcile, revision replacement, job removal
  *  - S9–S12: Callback isolation, exception handling, shutdown drain
+ *  - S13–S19: Fixed Croner options, stale callback, occurrence reconstruction,
+ *    beyond-lookback skip, overrun (callback pending until enqueue settles),
+ *    startup failure propagation, stopped guard
+ *
+ * All loops that will FIRE a callback seed scheduleActivatedAt strictly BEFORE
+ * the reconstructed occurrence (10:00 tick vs 09:00 activation) — an
+ * occurrence equal to activation is correctly rejected as before_activation.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { eq } from "drizzle-orm";
 
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
 import { loops, runs } from "../db/schema.js";
 import { updateSchedule } from "../schedule/index.js";
-import { FakeClock, seedMachine, seedLoop, testDeps } from "../testkit/index.js";
-import { createRunCoordinator } from "../coordinator/index.js";
+import { FakeClock, seedMachine, seedLoop, snapshotRuns, testDeps } from "../testkit/index.js";
+import { createRunCoordinator, type RunCoordinator } from "../coordinator/index.js";
 import { createScheduler, type CronJob, type CronFactory, type Scheduler } from "./index.js";
 
 const handles: DbHandle[] = [];
@@ -21,11 +29,23 @@ afterEach(async () => {
   await Promise.all(handles.splice(0).map((h) => closeDb(h).catch(() => {})));
 });
 
+/** Occurrence of the seeded "0 10 * * *" UTC cron on the test day. */
+const OCCURRENCE_10AM = "2026-08-27T10:00:00.000Z";
+/** Activation strictly before the 10:00 occurrence (activation boundary). */
+const ACTIVATION_9AM = "2026-08-27T09:00:00.000Z";
+
+interface FakeJobEntry {
+  pattern: string;
+  options: { timezone: string; protect?: (job: unknown) => void; catch?: (err: unknown) => void };
+  callback: () => void | Promise<void>;
+  stopped: boolean;
+}
+
 /**
- * Fake Croner factory for testing — jobs fire on demand via trigger().
+ * Fake Croner factory for testing — jobs fire on demand via trigger()/fireAll().
  */
 class FakeCronFactory implements CronFactory {
-  public jobs = new Map<string, { callback: () => void | Promise<void>; stopped: boolean }>();
+  public jobs = new Map<string, FakeJobEntry>();
   private idSeq = 0;
 
   create(
@@ -34,7 +54,7 @@ class FakeCronFactory implements CronFactory {
     callback: () => void | Promise<void>,
   ): CronJob {
     const id = `job-${++this.idSeq}`;
-    this.jobs.set(id, { callback, stopped: false });
+    this.jobs.set(id, { pattern, options, callback, stopped: false });
 
     return {
       stop: () => {
@@ -44,20 +64,31 @@ class FakeCronFactory implements CronFactory {
     };
   }
 
-  /** Triggers all active jobs (test helper). */
+  /** Triggers all active jobs and waits for every callback to settle. */
   async triggerAll(): Promise<void> {
-    const promises: Promise<void>[] = [];
+    await Promise.all(this.fireAll());
+  }
+
+  /** Fires all active jobs and returns the RAW callback promises — the exact
+   *  promise Croner would track for overrun (protect) purposes. */
+  fireAll(): Promise<unknown>[] {
+    const promises: Promise<unknown>[] = [];
     for (const entry of this.jobs.values()) {
       if (!entry.stopped) {
         promises.push(Promise.resolve(entry.callback()));
       }
     }
-    await Promise.all(promises);
+    return promises;
   }
 
   /** Returns count of active (non-stopped) jobs. */
   activeCount(): number {
     return Array.from(this.jobs.values()).filter((e) => !e.stopped).length;
+  }
+
+  /** All entries (including stopped) in registration order. */
+  entries(): FakeJobEntry[] {
+    return [...this.jobs.values()];
   }
 }
 
@@ -66,7 +97,9 @@ describe("S-group: Scheduler registration and lifecycle", () => {
   let clock: FakeClock;
   let scheduler: Scheduler;
   let cronFactory: FakeCronFactory;
+  let coordinator: RunCoordinator;
   let machineId: string;
+  let logs: string[];
 
   beforeEach(async () => {
     const h = await openMigratedDb();
@@ -74,10 +107,11 @@ describe("S-group: Scheduler registration and lifecycle", () => {
     db = h.db;
     clock = new FakeClock(new Date("2026-08-27T10:00:00Z"));
     machineId = "m-test123456789a";
+    logs = [];
 
     await seedMachine(db, machineId);
 
-    const coordinator = createRunCoordinator(testDeps(db, clock));
+    coordinator = createRunCoordinator(testDeps(db, clock));
     cronFactory = new FakeCronFactory();
 
     scheduler = createScheduler({
@@ -85,6 +119,7 @@ describe("S-group: Scheduler registration and lifecycle", () => {
       coordinator,
       clock,
       cronFactory,
+      log: (line) => logs.push(line),
     });
   });
 
@@ -98,7 +133,7 @@ describe("S-group: Scheduler registration and lifecycle", () => {
         timezone: "UTC",
         enabled: true,
         scheduleRevision: 0,
-        scheduleActivatedAt: clock.now().toISOString(),
+        scheduleActivatedAt: ACTIVATION_9AM,
       });
       await seedLoop(db, {
         id: "loop-2",
@@ -107,7 +142,7 @@ describe("S-group: Scheduler registration and lifecycle", () => {
         timezone: "Asia/Shanghai",
         enabled: true,
         scheduleRevision: 0,
-        scheduleActivatedAt: clock.now().toISOString(),
+        scheduleActivatedAt: ACTIVATION_9AM,
       });
       await seedLoop(db, {
         id: "loop-3",
@@ -165,7 +200,7 @@ describe("S-group: Scheduler registration and lifecycle", () => {
         timezone: "UTC",
         enabled: true,
         scheduleRevision: 0,
-        scheduleActivatedAt: clock.now().toISOString(),
+        scheduleActivatedAt: ACTIVATION_9AM,
       });
 
       await scheduler.start();
@@ -186,7 +221,7 @@ describe("S-group: Scheduler registration and lifecycle", () => {
         timezone: "UTC",
         enabled: true,
         scheduleRevision: 0,
-        scheduleActivatedAt: clock.now().toISOString(),
+        scheduleActivatedAt: ACTIVATION_9AM,
       });
 
       await scheduler.start();
@@ -210,7 +245,7 @@ describe("S-group: Scheduler registration and lifecycle", () => {
         timezone: "UTC",
         enabled: true,
         scheduleRevision: 0,
-        scheduleActivatedAt: clock.now().toISOString(),
+        scheduleActivatedAt: ACTIVATION_9AM,
       });
 
       await scheduler.start();
@@ -232,7 +267,7 @@ describe("S-group: Scheduler registration and lifecycle", () => {
         timezone: "UTC",
         enabled: true,
         scheduleRevision: 0,
-        scheduleActivatedAt: clock.now().toISOString(),
+        scheduleActivatedAt: ACTIVATION_9AM,
       });
 
       await scheduler.start();
@@ -256,7 +291,7 @@ describe("S-group: Scheduler registration and lifecycle", () => {
         timezone: "UTC",
         enabled: true,
         scheduleRevision: 0,
-        scheduleActivatedAt: clock.now().toISOString(),
+        scheduleActivatedAt: ACTIVATION_9AM,
       });
 
       await scheduler.start();
@@ -274,27 +309,29 @@ describe("S-group: Scheduler registration and lifecycle", () => {
       });
     });
 
-    test("S10: one loop's error doesn't block others", async () => {
-      // Create one bad loop (invalid config will fail in callback)
+    test("S10: one loop's callback failure doesn't block others", async () => {
+      // A loop whose persisted cron cannot be evaluated (bypassed write-time
+      // validation — defensive depth): occurrence reconstruction throws inside
+      // its callback, and the failure must stay isolated to that loop.
       await seedLoop(db, {
         id: "loop-bad",
-        machineId: "m-nonexistent", // Invalid machine
+        machineId,
+        cron: "not-a-cron",
+        timezone: "UTC",
+        enabled: true,
+        scheduleRevision: 0,
+        scheduleActivatedAt: ACTIVATION_9AM,
+      });
+
+      // One good loop
+      await seedLoop(db, {
+        id: "loop-good",
+        machineId,
         cron: "0 10 * * *",
         timezone: "UTC",
         enabled: true,
         scheduleRevision: 0,
-        scheduleActivatedAt: clock.now().toISOString(),
-      });
-
-      // Create one good loop
-      await seedLoop(db, {
-        id: "loop-good",
-        machineId,
-        cron: "0 14 * * *",
-        timezone: "UTC",
-        enabled: true,
-        scheduleRevision: 0,
-        scheduleActivatedAt: clock.now().toISOString(),
+        scheduleActivatedAt: ACTIVATION_9AM,
       });
 
       await scheduler.start();
@@ -302,10 +339,13 @@ describe("S-group: Scheduler registration and lifecycle", () => {
       // Trigger all jobs (one will fail, one will succeed)
       await cronFactory.triggerAll();
 
-      // Good loop should still enqueue
-      const allRuns = await db.select().from(runs);
-      expect(allRuns.length).toBeGreaterThanOrEqual(1);
-      expect(allRuns.some((r) => r.loopId === "loop-good")).toBe(true);
+      // Good loop enqueued; bad loop produced nothing
+      const allRuns = await snapshotRuns(db);
+      expect(allRuns).toHaveLength(1);
+      expect(allRuns[0]!.loopId).toBe("loop-good");
+
+      // The failure was logged with its fixed classification
+      expect(logs.some((l) => l === "scheduler: occurrence_rebuild_failed loop=loop-bad")).toBe(true);
     });
 
     test("S11: stopped scheduler rejects reconcile", async () => {
@@ -316,7 +356,7 @@ describe("S-group: Scheduler registration and lifecycle", () => {
         timezone: "UTC",
         enabled: true,
         scheduleRevision: 0,
-        scheduleActivatedAt: clock.now().toISOString(),
+        scheduleActivatedAt: ACTIVATION_9AM,
       });
 
       await scheduler.start();
@@ -337,7 +377,7 @@ describe("S-group: Scheduler registration and lifecycle", () => {
         timezone: "UTC",
         enabled: true,
         scheduleRevision: 0,
-        scheduleActivatedAt: clock.now().toISOString(),
+        scheduleActivatedAt: ACTIVATION_9AM,
       });
 
       await scheduler.start();
@@ -352,6 +392,201 @@ describe("S-group: Scheduler registration and lifecycle", () => {
       await triggerPromise;
 
       expect(cronFactory.activeCount()).toBe(0);
+    });
+  });
+
+  describe("Croner wiring and occurrence reconstruction", () => {
+    test("S13: registers jobs with timezone and protect/catch handlers", async () => {
+      await seedLoop(db, {
+        id: "loop-1",
+        machineId,
+        cron: "0 10 * * *",
+        timezone: "Asia/Shanghai",
+        enabled: true,
+        scheduleRevision: 0,
+        scheduleActivatedAt: ACTIVATION_9AM,
+      });
+
+      await scheduler.start();
+
+      const entry = cronFactory.entries()[0]!;
+      expect(entry.pattern).toBe("0 10 * * *");
+      expect(entry.options.timezone).toBe("Asia/Shanghai");
+      // Overrun and error handlers are ALWAYS wired (production adds the fixed
+      // mode/unref options on top — pinned in croner-factory.test.ts).
+      expect(typeof entry.options.protect).toBe("function");
+      expect(typeof entry.options.catch).toBe("function");
+
+      // The handlers log fixed classifications only
+      entry.options.protect!(null);
+      entry.options.catch!(new Error("sensitive detail"));
+      expect(logs).toEqual(["scheduler: overrun loop=loop-1", "scheduler: croner_error loop=loop-1"]);
+    });
+
+    test("S14: a stale callback from a replaced job is rejected by revision", async () => {
+      await seedLoop(db, {
+        id: "loop-1",
+        machineId,
+        cron: "0 10 * * *",
+        timezone: "UTC",
+        enabled: true,
+        scheduleRevision: 0,
+        scheduleActivatedAt: ACTIVATION_9AM,
+      });
+
+      await scheduler.start();
+      const oldEntry = cronFactory.entries()[0]!;
+
+      // Config change → revision 1 → reconcile stops the old job
+      await updateSchedule({ db, clock }, "loop-1", { cron: "0 14 * * *" });
+      const [updatedLoop] = await db.select().from(loops);
+      scheduler.reconcile(updatedLoop!);
+      expect(oldEntry.stopped).toBe(true);
+
+      // A leaked/late firing of the OLD callback carries the captured revision 0
+      await oldEntry.callback();
+
+      // Rejected as stale — zero runs, watermark of the NEW config untouched
+      expect(await snapshotRuns(db)).toHaveLength(0);
+      const [loop] = await db.select().from(loops).where(eq(loops.id, "loop-1"));
+      expect(loop!.lastScheduledAt).toBeNull();
+      expect(logs).toEqual(["scheduler: enqueue_skipped loop=loop-1 reason=stale_revision"]);
+    });
+
+    test("S15: callback reconstructs the canonical occurrence from a delayed firing", async () => {
+      await seedLoop(db, {
+        id: "loop-1",
+        machineId,
+        cron: "0 10 * * *",
+        timezone: "UTC",
+        enabled: true,
+        scheduleRevision: 0,
+        scheduleActivatedAt: ACTIVATION_9AM,
+      });
+
+      await scheduler.start();
+
+      // The 10:00 tick fires 37 seconds late (system load) — still within the
+      // 2-minute lookback, so the canonical occurrence is reconstructed.
+      clock.advance(37_000);
+      await cronFactory.triggerAll();
+
+      const [loop] = await db.select().from(loops).where(eq(loops.id, "loop-1"));
+      expect(loop!.lastScheduledAt).toBe(OCCURRENCE_10AM);
+      expect(await snapshotRuns(db)).toHaveLength(1);
+    });
+
+    test("S16: a firing delayed beyond the 2-minute lookback skips the tick", async () => {
+      await seedLoop(db, {
+        id: "loop-1",
+        machineId,
+        cron: "0 10 * * *", // daily — no other occurrence within the lookback
+        timezone: "UTC",
+        enabled: true,
+        scheduleRevision: 0,
+        scheduleActivatedAt: ACTIVATION_9AM,
+      });
+
+      await scheduler.start();
+
+      // 150s late: the lookback window no longer contains the 10:00 occurrence
+      clock.advance(150_000);
+      await cronFactory.triggerAll();
+
+      // Tick skipped — no run, no watermark advance, classified log
+      expect(await snapshotRuns(db)).toHaveLength(0);
+      const [loop] = await db.select().from(loops).where(eq(loops.id, "loop-1"));
+      expect(loop!.lastScheduledAt).toBeNull();
+      expect(logs).toEqual(["scheduler: occurrence_rebuild_failed loop=loop-1"]);
+    });
+
+    test("S17: the callback promise stays pending until the enqueue settles (overrun protection)", async () => {
+      await seedLoop(db, {
+        id: "loop-1",
+        machineId,
+        cron: "0 10 * * *",
+        timezone: "UTC",
+        enabled: true,
+        scheduleRevision: 0,
+        scheduleActivatedAt: ACTIVATION_9AM,
+      });
+
+      // Gate the enqueue INSIDE the coordinator: the callback cannot complete
+      // until the gate opens — exactly what Croner's protect needs to see.
+      let release: (() => void) | undefined;
+      const gate = new Promise<void>((r) => {
+        release = r;
+      });
+      const gatedCoordinator = createRunCoordinator(
+        testDeps(db, clock, { hooks: { beforeEnqueueTx: () => gate } }),
+      );
+      const gatedScheduler = createScheduler({
+        db,
+        coordinator: gatedCoordinator,
+        clock,
+        cronFactory,
+        log: (line) => logs.push(line),
+      });
+      await gatedScheduler.start();
+
+      const [cbPromise] = cronFactory.fireAll();
+      let settled = false;
+      void cbPromise!.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        },
+      );
+
+      // Flush microtasks — the callback is parked on the gated enqueue
+      await new Promise((r) => setImmediate(r));
+      expect(settled).toBe(false); // Croner would see the job as busy → skip re-entry
+
+      release!();
+      await cbPromise;
+      expect(settled).toBe(true);
+      expect(await snapshotRuns(db)).toHaveLength(1);
+    });
+
+    test("S18: start() propagates a scan-level DB failure (boot must fail)", async () => {
+      const h = await openMigratedDb();
+      await closeDb(h); // scan against a closed database
+
+      const deadScheduler = createScheduler({
+        db: h.db,
+        coordinator,
+        clock,
+        cronFactory,
+        log: (line) => logs.push(line),
+      });
+
+      await expect(deadScheduler.start()).rejects.toThrow();
+      expect(cronFactory.activeCount()).toBe(0);
+    });
+
+    test("S19: a callback firing after stopAndDrain touches nothing (stopped guard)", async () => {
+      await seedLoop(db, {
+        id: "loop-1",
+        machineId,
+        cron: "0 10 * * *",
+        timezone: "UTC",
+        enabled: true,
+        scheduleRevision: 0,
+        scheduleActivatedAt: ACTIVATION_9AM,
+      });
+
+      await scheduler.start();
+      const entry = cronFactory.entries()[0]!;
+      await scheduler.stopAndDrain();
+
+      // A timer that outlived stop() fires into the guard — no DB access, no
+      // logs, no runs. (Proven against a CLOSED database: any access throws.)
+      await closeDb(handles.splice(0)[0]!);
+      await entry.callback();
+
+      expect(logs).toEqual([]);
     });
   });
 });

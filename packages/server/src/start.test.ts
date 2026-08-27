@@ -15,7 +15,7 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { serve } from "@hono/node-server";
+import { serve, type ServerType } from "@hono/node-server";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { isRunTokenShape, pollResponseSchema } from "@loopzhb/protocol";
@@ -24,7 +24,7 @@ import { machineIdFromToken } from "@loopzhb/protocol/node";
 import { mintRunCredential } from "./coordinator/index.js";
 import { closeDb, type DbHandle } from "./db/index.js";
 import { loops } from "./db/schema.js";
-import { bootstrapServer, main, waitForListening, type BootedServer } from "./start.js";
+import { bootstrapServer, main, startSchedulerOrFailBoot, waitForListening, type BootedServer } from "./start.js";
 
 const handles: DbHandle[] = [];
 afterEach(async () => {
@@ -87,6 +87,30 @@ describe("bootstrapServer", () => {
       await new Promise<void>((resolve) => blocker.close(() => resolve()));
     }
     // The failed boot CLOSED its DB handle: a fresh bootstrap on the same
+    // dataDir acquires the PGlite dir lock without contention.
+    const second = await boot(dir);
+    expect(second.handle.dataDir).toBe(dir);
+  });
+
+  it("scheduler scan failure fails boot: drains scheduler, closes listener, rethrows (Batch 2 plan §2)", async () => {
+    const dir = await tmpDataDir();
+    const b = await bootstrapServer({ host: "127.0.0.1", port: 3000, dataDir: dir });
+    // Break the scheduler's startup scan by closing the DB underneath it.
+    // (Not via boot() — we close this handle ourselves.)
+    await closeDb(b.handle);
+
+    let listenerClosed = false;
+    const fakeServer = {
+      close: () => {
+        listenerClosed = true;
+      },
+    } as unknown as ServerType;
+
+    // A scan-level failure must FAIL BOOT — never report ready without scheduling.
+    await expect(startSchedulerOrFailBoot(b.scheduler, fakeServer)).rejects.toThrow();
+    expect(listenerClosed).toBe(true);
+
+    // The failed boot released its resources: a fresh bootstrap on the same
     // dataDir acquires the PGlite dir lock without contention.
     const second = await boot(dir);
     expect(second.handle.dataDir).toBe(dir);

@@ -11,6 +11,7 @@
 import type { LoopSummary, MachineSummary, RunSummary } from "@loopzhb/protocol";
 
 import type { Loop, Machine, Run } from "../db/schema.js";
+import { nextOccurrence } from "../schedule/time-semantics.js";
 
 /** The deliberately narrow row shapes observation queries may load: large,
  *  unopened or sensitive columns (runs.transcript/artifacts/usage/session/
@@ -107,4 +108,24 @@ export function toLoopSummary(
     timezone: row.timezone,
     nextFireAt,
   };
+}
+
+/**
+ * The ONE nextFireAt computation for the observation surface: the schedule's
+ * next occurrence after `now`, or null for paused/manual-only loops. A schedule
+ * that fails to compute (corrupted persisted state, DST discontinuity) degrades
+ * to null rather than failing the whole response — persisted rows were already
+ * validated on write, so a throw here is defensive depth, not a data error.
+ */
+export function nextFireAtIso(
+  row: Pick<LoopSummaryRow, "enabled" | "cron" | "timezone">,
+  now: Date,
+): string | null {
+  if (!row.enabled || row.cron === null) return null;
+  try {
+    const next = nextOccurrence({ cron: row.cron, timezone: row.timezone }, now);
+    return next === null ? null : next.toISOString();
+  } catch {
+    return null;
+  }
 }

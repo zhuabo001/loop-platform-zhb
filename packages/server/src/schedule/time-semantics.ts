@@ -235,14 +235,20 @@ function advanceWithinFivePartMinute(cursor: Date): Date {
  * be slightly after the scheduled minute due to system load or execution delay.
  *
  * Algorithm:
- *  1. Use Croner's nextRun to find the occurrence that would fire after (atInclusive - 2 minutes)
- *  2. If that occurrence is at or before atInclusive, it's the latest occurrence
- *  3. Otherwise, no valid occurrence exists at or before atInclusive
+ *  1. Use Croner's nextRun to find the first occurrence after (atInclusive - 2 minutes)
+ *  2. Walk forward occurrence-by-occurrence, keeping the last one ≤ atInclusive
+ *  3. If even the first occurrence is after atInclusive, no valid occurrence exists
+ *
+ * The walk-forward (step 2) matters for schedules denser than the lookback
+ * window (e.g. minutely crons): the first occurrence in the window is NOT the
+ * latest one. At most ~120 iterations are possible (5-part cron resolution is
+ * one minute), so the walk is bounded.
  *
  * DST handling mirrors nextOccurrence: gaps are skipped, overlaps use first occurrence.
  *
  * The 2-minute lookback accommodates callback delays under system load while remaining
- * safe for minutely schedules (won't skip back past the previous occurrence).
+ * bounded; a firing delayed beyond the window finds no occurrence and the tick is
+ * skipped (no catch-up — the batch's at-most-once stance).
  *
  * @param schedule - Validated and normalized schedule configuration
  * @param atInclusive - Reference time (find the latest occurrence at or before this)
@@ -252,15 +258,37 @@ export function latestOccurrence(schedule: NormalizedSchedule, atInclusive: Date
   // Look back 2 minutes to accommodate callback delays
   const lookbackStart = new Date(atInclusive.getTime() - 120_000);
 
-  const candidate = nextOccurrence(schedule, lookbackStart);
-
-  if (candidate === null) return null;
-
-  // Check if the candidate is at or before our reference time
-  if (candidate.getTime() <= atInclusive.getTime()) {
-    return candidate;
+  let candidate = nextOccurrence(schedule, lookbackStart);
+  if (candidate === null || candidate.getTime() > atInclusive.getTime()) {
+    return null;
   }
 
-  // Candidate is after atInclusive, no valid occurrence exists
-  return null;
+  // Walk forward to the LATEST occurrence ≤ atInclusive (dense schedules have
+  // multiple occurrences inside the lookback window).
+  let latest = candidate;
+  while (true) {
+    candidate = nextOccurrence(schedule, latest);
+    if (candidate === null || candidate.getTime() > atInclusive.getTime()) {
+      return latest;
+    }
+    latest = candidate;
+  }
+}
+
+/**
+ * Checks whether a given instant IS a canonical occurrence of the schedule.
+ *
+ * The check runs through the same nextOccurrence machinery the Scheduler's
+ * latestOccurrence uses to build `scheduledFor`, so a scheduler-produced
+ * occurrence can never be rejected here. DST behavior is inherited: gap-normalized
+ * instants are not occurrences; both instants of an ambiguous wall time match
+ * (Croner fires both — the watermark, not this check, dedupes the overlap).
+ *
+ * @param schedule - Validated and normalized schedule configuration
+ * @param at - Candidate instant
+ * @returns True when `at` is exactly the next occurrence after `at - 1ms`
+ */
+export function isOccurrence(schedule: NormalizedSchedule, at: Date): boolean {
+  const next = nextOccurrence(schedule, new Date(at.getTime() - 1));
+  return next !== null && next.getTime() === at.getTime();
 }

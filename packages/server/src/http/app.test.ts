@@ -348,6 +348,67 @@ describe("POST /api/loops", () => {
     await expectJsonError(res, 413, { error: "request body too large" });
     expect(await snapshotLoops(db)).toEqual([]);
   });
+
+  it("400 (never 500) for an invalid cron — ScheduleValidationError maps into the taxonomy", async () => {
+    await fresh();
+    await seedMachine(db, MACHINE_ID);
+    const bad = [
+      { machineId: MACHINE_ID, cron: "not a cron" },
+      { machineId: MACHINE_ID, cron: "@daily" }, // macros rejected
+      { machineId: MACHINE_ID, cron: "0 10 * * * *" }, // six segments rejected
+      { machineId: MACHINE_ID, cron: "61 10 * * *" }, // out-of-range minute
+    ];
+    for (const body of bad) {
+      await expectJsonError(await createLoopReq(body), 400, { error: "invalid request" });
+    }
+    expect(await snapshotLoops(db)).toEqual([]);
+  });
+
+  it("400 for an invalid timezone — including timezone-ONLY creation (no cron)", async () => {
+    await fresh();
+    await seedMachine(db, MACHINE_ID);
+    // Timezone-only creation must not bypass validation: a manual-only loop
+    // still persists its timezone, so an invalid one is rejected up front.
+    await expectJsonError(
+      await createLoopReq({ machineId: MACHINE_ID, timezone: "Not/AZone" }),
+      400,
+      { error: "invalid request" },
+    );
+    await expectJsonError(
+      await createLoopReq({ machineId: MACHINE_ID, cron: "0 10 * * *", timezone: "Not/AZone" }),
+      400,
+      { error: "invalid request" },
+    );
+    expect(await snapshotLoops(db)).toEqual([]);
+  });
+
+  it("201 for timezone-only creation — timezone persisted, cron stays null", async () => {
+    await fresh();
+    await seedMachine(db, MACHINE_ID);
+    const res = await createLoopReq({ machineId: MACHINE_ID, timezone: "Asia/Shanghai" });
+    expect(res.status).toBe(201);
+    const parsed = createLoopResponseSchema.parse(await res.json());
+    expect(parsed.loop).toMatchObject({ cron: null, timezone: "Asia/Shanghai", nextFireAt: null });
+    const rows = await snapshotLoops(db);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ cron: null, timezone: "Asia/Shanghai" });
+  });
+
+  it("201 for scheduled creation — cron normalized, nextFireAt computed", async () => {
+    await fresh();
+    await seedMachine(db, MACHINE_ID);
+    const res = await createLoopReq({
+      machineId: MACHINE_ID,
+      cron: "  0   10  * *  * ", // whitespace normalizes
+      timezone: "UTC",
+    });
+    expect(res.status).toBe(201);
+    const parsed = createLoopResponseSchema.parse(await res.json());
+    expect(parsed.loop.cron).toBe("0 10 * * *");
+    expect(parsed.loop.timezone).toBe("UTC");
+    // Clock is the FakeClock default (2026-07-29T00:00Z) → next 10:00 UTC
+    expect(parsed.loop.nextFireAt).toBe("2026-07-29T10:00:00.000Z");
+  });
 });
 
 describe("POST /api/loops/:id/run", () => {

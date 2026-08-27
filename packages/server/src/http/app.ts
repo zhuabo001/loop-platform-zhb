@@ -41,12 +41,12 @@ import {
 
 import { LoopValidationError } from "../admin/errors.js";
 import type { LoopAdmin } from "../admin/index.js";
-import { toLoopSummary } from "../admin/views.js";
 import { InvalidMachineCredentialError, RunCapabilityInvalidError } from "../coordinator/errors.js";
 import type { RunCoordinator } from "../coordinator/index.js";
 import type { OwnerControl } from "../owner/index.js";
-import { ScheduleValidationError, updateSchedule, nextOccurrence } from "../schedule/index.js";
+import { ScheduleValidationError, updateSchedule } from "../schedule/index.js";
 import type { Scheduler } from "../scheduler/index.js";
+import { getLoop } from "../store/runs.js";
 import type { Db } from "../db/index.js";
 import type { Clock } from "../time.js";
 
@@ -177,7 +177,6 @@ export function createServerApp(
       // Reconcile scheduler if loop has active schedule
       if (scheduler && result.loop.cron !== null && result.loop.enabled) {
         // Re-read loop from DB to get full row for reconcile
-        const { getLoop } = await import("../store/runs.js");
         const loopRow = await getLoop(db, result.loop.id);
         if (loopRow) {
           scheduler.reconcile(loopRow);
@@ -187,7 +186,12 @@ export function createServerApp(
       return c.json({ loop: result.loop }, 201);
     } catch (err) {
       if (err instanceof LoopValidationError) {
-        console.warn("[http] create-loop cap rejected", err.message);
+        console.warn("[http] create-loop cap rejected", err.field);
+        return jsonError(c, 400, "invalid request");
+      }
+      if (err instanceof ScheduleValidationError) {
+        // Fixed classification only — the message embeds user input.
+        console.warn("[http] create-loop schedule rejected", err.field);
         return jsonError(c, 400, "invalid request");
       }
       throw err;
@@ -244,41 +248,16 @@ export function createServerApp(
         scheduler.reconcile(result.loop);
       }
 
-      // Query lastRun (latest exec run for this loop)
-      const { runs } = await import("../db/schema.js");
-      const { eq, and, desc } = await import("drizzle-orm");
-      const { toRunSummary } = await import("../admin/views.js");
-      const { runSummaryColumns } = await import("../admin/index.js");
-
-      const lastRunRows = await db
-        .select(runSummaryColumns)
-        .from(runs)
-        .where(and(eq(runs.loopId, result.loop.id), eq(runs.role, "exec")))
-        .orderBy(desc(runs.ts), desc(runs.id))
-        .limit(1);
-
-      const lastRun = lastRunRows.length > 0 ? toRunSummary(lastRunRows[0]) : null;
-
-      // Calculate nextFireAt
-      let nextFireAt: string | null = null;
-      if (result.loop.enabled && result.loop.cron !== null) {
-        try {
-          const next = nextOccurrence(
-            { cron: result.loop.cron, timezone: result.loop.timezone },
-            clock.now()
-          );
-          nextFireAt = next ? next.toISOString() : null;
-        } catch {
-          // Invalid schedule state; nextFireAt stays null
-        }
-      }
-
-      const loopSummary = toLoopSummary(result.loop, lastRun, nextFireAt);
+      // The wire response is the admin view (LoopSummary with lastRun and
+      // computed nextFireAt) — never the raw DB row (ADR-002 wire boundary).
+      const loopSummary = await admin.getLoopSummary(result.loop.id);
+      if (!loopSummary) return jsonError(c, 404, "not found");
 
       return c.json({ loop: loopSummary }, 200);
     } catch (err) {
       if (err instanceof ScheduleValidationError) {
-        console.warn("[http] update-schedule validation failed", err.message);
+        // Fixed classification only — the message embeds user input.
+        console.warn("[http] update-schedule validation failed", err.field);
         return jsonError(c, 400, "invalid request");
       }
       throw err;

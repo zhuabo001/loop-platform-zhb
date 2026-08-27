@@ -12,7 +12,7 @@
 
 import { describe, expect, test } from "vitest";
 
-import { nextOccurrence, ScheduleValidationError, validateSchedule } from "./time-semantics.js";
+import { isOccurrence, latestOccurrence, nextOccurrence, ScheduleValidationError, validateSchedule } from "./time-semantics.js";
 
 describe("D: Cron, timezone, and DST", () => {
   test("D1: accept legal five-segment cron and normalize whitespace", () => {
@@ -218,5 +218,59 @@ describe("D: Cron, timezone, and DST", () => {
     // hour for this range and must not be skipped while recovering.
     const range = validateSchedule("0 1-2 * * *", "America/New_York");
     expect(nextOccurrence(range, insideSecondRepeatedHour)).toEqual(new Date("2026-11-01T07:00:00.000Z"));
+  });
+});
+
+describe("latestOccurrence / isOccurrence (Batch 2 occurrence reconstruction)", () => {
+  const daily10 = validateSchedule("0 10 * * *", "UTC");
+  const minutely = validateSchedule("* * * * *", "UTC");
+
+  test("reconstructs the exact occurrence from an on-time or slightly delayed firing", () => {
+    // Firing exactly at the occurrence, 37s late, and 119s late (within lookback)
+    expect(latestOccurrence(daily10, new Date("2026-08-27T10:00:00.000Z"))).toEqual(
+      new Date("2026-08-27T10:00:00.000Z"),
+    );
+    expect(latestOccurrence(daily10, new Date("2026-08-27T10:00:37.000Z"))).toEqual(
+      new Date("2026-08-27T10:00:00.000Z"),
+    );
+    expect(latestOccurrence(daily10, new Date("2026-08-27T10:01:59.000Z"))).toEqual(
+      new Date("2026-08-27T10:00:00.000Z"),
+    );
+  });
+
+  test("returns null when no occurrence lies inside the 2-minute lookback", () => {
+    // 10:02:30 with a daily cron: the 10:00 occurrence fell out of the window
+    expect(latestOccurrence(daily10, new Date("2026-08-27T10:02:30.000Z"))).toBeNull();
+    // Before the first occurrence of the day entirely
+    expect(latestOccurrence(daily10, new Date("2026-08-27T09:58:00.000Z"))).toBeNull();
+  });
+
+  test("dense schedules: returns the LATEST occurrence in the window, not the first", () => {
+    // Regression pin: a minutely cron inside a 2-minute lookback has THREE
+    // candidate occurrences; the reconstruction must be the newest one.
+    expect(latestOccurrence(minutely, new Date("2026-08-27T10:01:30.000Z"))).toEqual(
+      new Date("2026-08-27T10:01:00.000Z"),
+    );
+    expect(latestOccurrence(minutely, new Date("2026-08-27T10:01:00.000Z"))).toEqual(
+      new Date("2026-08-27T10:01:00.000Z"),
+    );
+    expect(latestOccurrence(minutely, new Date("2026-08-27T10:01:59.999Z"))).toEqual(
+      new Date("2026-08-27T10:01:00.000Z"),
+    );
+  });
+
+  test("isOccurrence: exact occurrence true, off-by-one-second and wrong minute false", () => {
+    expect(isOccurrence(daily10, new Date("2026-08-27T10:00:00.000Z"))).toBe(true);
+    expect(isOccurrence(daily10, new Date("2026-08-27T10:00:01.000Z"))).toBe(false);
+    expect(isOccurrence(daily10, new Date("2026-08-27T09:59:00.000Z"))).toBe(false);
+    expect(isOccurrence(minutely, new Date("2026-08-27T10:01:00.000Z"))).toBe(true);
+    expect(isOccurrence(minutely, new Date("2026-08-27T10:01:30.000Z"))).toBe(false);
+  });
+
+  test("isOccurrence honors the schedule timezone", () => {
+    const shanghai10 = validateSchedule("0 10 * * *", "Asia/Shanghai");
+    // 10:00 Asia/Shanghai = 02:00 UTC
+    expect(isOccurrence(shanghai10, new Date("2026-08-27T02:00:00.000Z"))).toBe(true);
+    expect(isOccurrence(shanghai10, new Date("2026-08-27T10:00:00.000Z"))).toBe(false);
   });
 });

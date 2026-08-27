@@ -20,6 +20,7 @@ import type { RunProgress, RunRole } from "@loopzhb/protocol";
 
 import type { Db } from "../db/index.js";
 import { loops, runLeases, runs, type Loop, type Run, type RunProgressRow } from "../db/schema.js";
+import { isOccurrence } from "../schedule/time-semantics.js";
 import { isHeartbeatWatermarkAnomalous } from "./machines.js";
 import type { Clock } from "../time.js";
 import type { ExecTrigger } from "../coordinator/index.js";
@@ -49,6 +50,8 @@ export type EnqueueExecRunResult =
         | "running_exists"
         | "stale_revision"
         | "not_active"
+        | "not_an_occurrence"
+        | "future_occurrence"
         | "before_activation"
         | "occurrence_too_old"
         | "already_scheduled";
@@ -70,6 +73,17 @@ export class EnqueueGuardLostError extends Error {
 
 export async function getLoop(db: Db, loopId: string): Promise<Loop | undefined> {
   return (await db.select().from(loops).where(eq(loops.id, loopId)))[0];
+}
+
+/** The enqueue transaction's running-run probe — ONE implementation shared by
+ *  the manual and scheduled branches so the skip rule cannot drift. */
+async function hasRunningExecRun(tx: Db, loopId: string): Promise<boolean> {
+  const rows = await tx
+    .select({ id: runs.id })
+    .from(runs)
+    .where(and(eq(runs.loopId, loopId), eq(runs.phase, "running")))
+    .limit(1);
+  return rows.length > 0;
 }
 
 export async function getRun(db: Db, runId: string): Promise<Run | undefined> {
@@ -115,6 +129,21 @@ export async function enqueueExecRunTx(
         return { enqueued: false as const, reason: "not_active" as const };
       }
 
+      // Validate scheduledFor is a well-formed, genuine occurrence of the
+      // loop's CURRENT cron/timezone and not in the future. Without these
+      // guards an arbitrary (or future) timestamp would advance the watermark
+      // and silently swallow every later real tick.
+      const scheduledMs = Date.parse(trigger.scheduledFor);
+      if (
+        Number.isNaN(scheduledMs) ||
+        !isOccurrence({ cron: currentLoop.cron, timezone: currentLoop.timezone }, new Date(scheduledMs))
+      ) {
+        return { enqueued: false as const, reason: "not_an_occurrence" as const };
+      }
+      if (scheduledMs > clock.now().getTime()) {
+        return { enqueued: false as const, reason: "future_occurrence" as const };
+      }
+
       // Validate occurrence is after activation
       if (
         currentLoop.scheduleActivatedAt !== null &&
@@ -128,13 +157,6 @@ export async function enqueueExecRunTx(
         return { enqueued: false as const, reason: "already_scheduled" as const };
       }
 
-      // Check if running exists BEFORE updating watermark
-      const running = await tx
-        .select({ id: runs.id })
-        .from(runs)
-        .where(and(eq(runs.loopId, loop.id), eq(runs.phase, "running")))
-        .limit(1);
-
       // Atomically advance watermark (even if running exists)
       await tx
         .update(loops)
@@ -142,17 +164,14 @@ export async function enqueueExecRunTx(
         .where(eq(loops.id, loop.id));
 
       // If running exists, skip creating new run but watermark is advanced
-      if (running.length > 0) {
+      if (await hasRunningExecRun(tx, loop.id)) {
         return { enqueued: false as const, reason: "running_exists" as const };
       }
     } else {
       // Manual trigger: original behavior
-      const running = await tx
-        .select({ id: runs.id })
-        .from(runs)
-        .where(and(eq(runs.loopId, loop.id), eq(runs.phase, "running")))
-        .limit(1);
-      if (running.length > 0) return { enqueued: false as const, reason: "running_exists" as const };
+      if (await hasRunningExecRun(tx, loop.id)) {
+        return { enqueued: false as const, reason: "running_exists" as const };
+      }
     }
 
     // Supersede all pending exec runs

@@ -15,6 +15,7 @@ export {
   validateSchedule,
   nextOccurrence,
   latestOccurrence,
+  isOccurrence,
   ScheduleValidationError,
   type NormalizedSchedule,
 } from "./time-semantics.js";

@@ -25,9 +25,16 @@ import { loops, machines, runs } from "../db/schema.js";
 import { getMachine } from "../store/machines.js";
 import { getLoop } from "../store/runs.js";
 import type { Clock } from "../time.js";
-import { nextOccurrence, validateSchedule } from "../schedule/index.js";
+import { validateSchedule } from "../schedule/index.js";
 import { LoopValidationError } from "./errors.js";
-import { toLoopSummary, toMachineSummary, toRunSummary, type LoopSummaryRow, type RunSummaryRow } from "./views.js";
+import {
+  nextFireAtIso,
+  toLoopSummary,
+  toMachineSummary,
+  toRunSummary,
+  type LoopSummaryRow,
+  type RunSummaryRow,
+} from "./views.js";
 
 /** Server-side length ceilings (goal §2). Exceeding ⇒ LoopValidationError. */
 export const LOOP_NAME_CAP = 255;
@@ -139,7 +146,10 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
       const machine = await getMachine(deps.db, input.machineId);
       if (!machine) return { created: false as const, reason: "machine_not_found" as const };
 
-      // Validate and normalize schedule if provided
+      // Validate and normalize schedule if provided. A timezone WITHOUT a cron
+      // still passes through the shared validator (dummy-cron form, same rule
+      // as updateSchedule) — a manual-only loop persists its timezone, so an
+      // invalid one must be rejected here rather than at first schedule PATCH.
       const timezone = input.timezone ?? "UTC";
       let normalizedCron: string | null = null;
       let normalizedTimezone = timezone;
@@ -148,6 +158,8 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
         const normalized = validateSchedule(input.cron, timezone);
         normalizedCron = normalized.cron;
         normalizedTimezone = normalized.timezone;
+      } else if (input.timezone !== undefined) {
+        normalizedTimezone = validateSchedule("0 0 * * *", timezone).timezone;
       }
 
       const nowIso = deps.clock.now().toISOString();
@@ -176,16 +188,7 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
 
       const row = inserted[0]!;
 
-      // Calculate nextFireAt for active scheduled loops
-      let nextFireAt: string | null = null;
-      if (row.enabled && row.cron !== null) {
-        const next = nextOccurrence({ cron: row.cron, timezone: row.timezone }, deps.clock.now());
-        if (next !== null) {
-          nextFireAt = next.toISOString();
-        }
-      }
-
-      return { created: true as const, loop: toLoopSummary(row, null, nextFireAt) };
+      return { created: true as const, loop: toLoopSummary(row, null, nextFireAtIso(row, deps.clock.now())) };
     },
 
     /** `name ASC, id ASC`, capped — the machine picker for loop creation. */
@@ -234,18 +237,30 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
       const now = deps.clock.now();
       return loopRows.map((row) => {
         const lastRun = latestByLoop.get(row.id);
-
-        // Calculate nextFireAt for active scheduled loops
-        let nextFireAt: string | null = null;
-        if (row.enabled && row.cron !== null) {
-          const next = nextOccurrence({ cron: row.cron, timezone: row.timezone }, now);
-          if (next !== null) {
-            nextFireAt = next.toISOString();
-          }
-        }
-
-        return toLoopSummary(row, lastRun ? toRunSummary(lastRun) : null, nextFireAt);
+        return toLoopSummary(row, lastRun ? toRunSummary(lastRun) : null, nextFireAtIso(row, now));
       });
+    },
+
+    /**
+     * Single-loop summary by id (the PATCH /schedule response shape):
+     * the summary row plus its latest EXEC run and computed nextFireAt.
+     * `undefined` when the loop does not exist.
+     */
+    async getLoopSummary(loopId: string): Promise<LoopSummary | undefined> {
+      const row = (
+        await deps.db.select(loopSummaryColumns).from(loops).where(eq(loops.id, loopId)).limit(1)
+      )[0];
+      if (!row) return undefined;
+
+      const lastRunRows = await deps.db
+        .select(runSummaryColumns)
+        .from(runs)
+        .where(and(eq(runs.loopId, loopId), eq(runs.role, "exec")))
+        .orderBy(desc(runs.ts), desc(runs.id))
+        .limit(1);
+
+      const lastRun = lastRunRows[0];
+      return toLoopSummary(row, lastRun ? toRunSummary(lastRun) : null, nextFireAtIso(row, deps.clock.now()));
     },
 
     /** `ts DESC, id DESC`, capped; `undefined` when the loop does not exist

@@ -18,7 +18,11 @@
  *  - cronFactory: injectable Croner factory (real in prod, fake in tests)
  *  - log: error classification (no user data)
  *
- * See ADR-007 for the complete scheduler contract.
+ * Log discipline (Batch 2 plan §2): every line is a FIXED classification plus
+ * the loop id — never an exception message, cron pattern or timezone (those
+ * can carry user input and newline injection).
+ *
+ * See ADR-008 for the complete scheduler contract.
  */
 
 import type { Db } from "../db/index.js";
@@ -104,8 +108,8 @@ export function createScheduler(deps: SchedulerDeps) {
       if (existing) {
         try {
           existing.job.stop();
-        } catch (err) {
-          log(`scheduler: failed to stop job for loop ${loop.id}: ${String(err)}`);
+        } catch {
+          log(`scheduler: job_stop_failed loop=${loop.id}`);
         }
         registry.delete(loop.id);
       }
@@ -127,8 +131,8 @@ export function createScheduler(deps: SchedulerDeps) {
     if (existing) {
       try {
         existing.job.stop();
-      } catch (err) {
-        log(`scheduler: failed to stop old job for loop ${loop.id}: ${String(err)}`);
+      } catch {
+        log(`scheduler: job_stop_failed loop=${loop.id}`);
       }
     }
 
@@ -139,13 +143,17 @@ export function createScheduler(deps: SchedulerDeps) {
         {
           timezone: loop.timezone,
           protect: () => {
-            log(`scheduler: overrun protection triggered for loop ${loop.id}`);
+            log(`scheduler: overrun loop=${loop.id}`);
           },
-          catch: (err) => {
-            log(`scheduler: croner error for loop ${loop.id}: ${String(err)}`);
+          catch: () => {
+            log(`scheduler: croner_error loop=${loop.id}`);
           },
         },
         async () => {
+          // A stopped scheduler must never touch the (possibly already closed)
+          // database — a timer that outlived stop() fires into this guard.
+          if (stopped) return;
+
           // Callback captures loop state at registration time
           const capturedRevision = loop.scheduleRevision;
           const capturedCron = loop.cron!;
@@ -159,17 +167,19 @@ export function createScheduler(deps: SchedulerDeps) {
               { cron: capturedCron, timezone: capturedTimezone },
               now,
             );
-          } catch (err) {
-            log(`scheduler: latestOccurrence failed for loop ${loop.id}: ${String(err)}`);
+          } catch {
+            log(`scheduler: occurrence_rebuild_failed loop=${loop.id}`);
             return;
           }
 
           if (scheduledFor === null) {
-            log(`scheduler: failed to calculate occurrence for loop ${loop.id}`);
+            log(`scheduler: occurrence_rebuild_failed loop=${loop.id}`);
             return;
           }
 
-          // Enqueue with scheduled trigger
+          // Enqueue with scheduled trigger. The enqueue promise is RETURNED to
+          // Croner: the job stays "busy" until the write settles, which is what
+          // makes the protect (overrun) handler able to skip a re-entrant tick.
           const promise = coordinator
             .enqueueExecRun(loop.id, {
               kind: "scheduled",
@@ -178,20 +188,20 @@ export function createScheduler(deps: SchedulerDeps) {
             })
             .then((result) => {
               if (!result.enqueued) {
-                log(
-                  `scheduler: enqueue skipped for loop ${loop.id}, reason: ${result.reason}, occurrence: ${scheduledFor!.toISOString()}`
-                );
+                log(`scheduler: enqueue_skipped loop=${loop.id} reason=${result.reason}`);
               }
             })
-            .catch((err) => {
-              log(`scheduler: enqueue failed for loop ${loop.id}: ${String(err)}`);
+            .catch(() => {
+              log(`scheduler: enqueue_failed loop=${loop.id}`);
             });
 
           // Track in-flight callback
           inFlightCallbacks.add(promise);
-          promise.finally(() => {
+          try {
+            await promise;
+          } finally {
             inFlightCallbacks.delete(promise);
-          });
+          }
         },
       );
 
@@ -201,8 +211,8 @@ export function createScheduler(deps: SchedulerDeps) {
         timezone: loop.timezone,
         job,
       });
-    } catch (err) {
-      log(`scheduler: failed to register job for loop ${loop.id}: ${String(err)}`);
+    } catch {
+      log(`scheduler: job_register_failed loop=${loop.id}`);
     }
   }
 
@@ -250,8 +260,8 @@ export function createScheduler(deps: SchedulerDeps) {
       for (const [loopId, entry] of registry.entries()) {
         try {
           entry.job.stop();
-        } catch (err) {
-          log(`scheduler: failed to stop job for loop ${loopId}: ${String(err)}`);
+        } catch {
+          log(`scheduler: job_stop_failed loop=${loopId}`);
         }
       }
       registry.clear();

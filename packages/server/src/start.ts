@@ -100,11 +100,9 @@ export async function main(): Promise<void> {
       throw err;
     }
 
-    // Phase 3 Batch 2: Start scheduler AFTER listener is bound
-    await scheduler.start().catch((err) => {
-      console.error("[scheduler] startup failed", err);
-      // Scheduler failure is non-fatal; server continues without scheduling
-    });
+    // Phase 3 Batch 2: Start scheduler AFTER listener is bound (plan §2 fixed
+    // startup order: DB → listener bind → scheduler start → sweep arm → ready).
+    await startSchedulerOrFailBoot(scheduler, server);
 
     // The sweep arms ONLY after the listener is actually bound (plan §1): one
     // immediate async pass, then the unref'd interval.
@@ -136,6 +134,24 @@ export async function main(): Promise<void> {
     if (handle) {
       await closeDb(handle).catch(() => {});
     }
+    throw err;
+  }
+}
+
+/**
+ * Scheduler start is a BOOT gate (Batch 2 plan §2): a scan-level failure means
+ * the server must NOT report ready without scheduling. Drain the scheduler,
+ * close the listener, and rethrow — the caller's catch closes the DB and boot
+ * exits non-zero. Extracted from main() so tests can drive the failure path
+ * without binding a port.
+ */
+export async function startSchedulerOrFailBoot(scheduler: Scheduler, server: ServerType): Promise<void> {
+  try {
+    await scheduler.start();
+  } catch (err) {
+    console.error("[scheduler] startup scan failed — closing listener and DB");
+    await scheduler.stopAndDrain().catch(() => {});
+    server.close();
     throw err;
   }
 }
