@@ -139,6 +139,22 @@ supersede 未领取的 pending——T7 语义在 cron 表面继承）+ 重启 ca
   - 边界：`next_run_at` 完成 schema 声明但 Phase 3 全程保持 write-closed（未来 Phase 需要时重新评估）；无 protocol 变更、无 HTTP 路由、无 Scheduler 或 timer——批次 1 只建立持久化与语义基础，不开放自动调度。
   - 复审：Round 1–3 发现的问题由 `67cb80a`、`f69216c` 修复；Round 4 Standards、Specs、Adversarial 均 0 finding，完整质量门通过。
   - **Batch 1 已最终收口**（2026-08-25）；Phase 3 整体仍进行中，下一目标为 Batch 2 在线 Scheduler。
+- **Batch 2 — 在线 Scheduler 与 Protocol 扩展（Day 4–6）：已完成**（2026-08-27，ADR-007）
+  - Protocol：`CreateLoopRequest` 扩展 `cron?/timezone?`；新增 `UpdateScheduleRequest/Response`；`LoopSummary` 扩展 `cron/timezone/nextFireAt`（additive，向后兼容）。
+  - Admin API：`createLoop()` 支持创建 scheduled loop（validation + scheduleRevision=0 + scheduleActivatedAt）；`updateSchedule()` 已在 Batch 1 完成，Batch 2 通过 HTTP 路由暴露。
+  - ExecTrigger：定义 `manual | { scheduled; scheduledFor; scheduleRevision }`；`RunCoordinator.enqueueExecRun()` 接受可选 trigger 参数；scheduled trigger 验证 revision/cron/enabled/activation/watermark，原子推进 `lastScheduledAt`；running run 时跳过 pending 创建但 watermark 仍推进。
+  - Scheduler 深模块：in-memory job 注册表（`Map<loopId, JobEntry>`）；`start()` 扫描 active loops 并注册 Croner jobs；`reconcile(loop)` 动态更新/移除 job（no-op 检测、job 替换、removal on pause/clear）；`stopAndDrain()` 停止所有 job 并等待回调完成。
+  - latestOccurrence：Croner callback 用此函数将实际触发时间还原为规范 occurrence（lookback 1 minute → nextOccurrence → 验证 ≤ atInclusive）。
+  - FakeCronFactory：测试用 factory，job 按需触发（`triggerAll()`）；production 使用 `productionCronFactory`（封装真实 Croner）。
+  - 集成：HTTP 路由 `PATCH /api/loops/:id/schedule`（validation + updateSchedule + reconcile callback）；`bootstrapServer()` 创建 scheduler；`main()` 在 listener bind 后启动 scheduler（非致命失败）；shutdown 顺序：scheduler drain → sweep drain → HTTP close → DB close。
+  - 测试覆盖：A 组（API 表面，12 tests）、O 组（occurrence 原子性，12 tests）、S 组（Scheduler 生命周期，12 tests）、F 组（集成，6 tests）——42 tests；全量回归 300+ tests 通过。
+  - 边界：单进程 scheduler（Phase 6 多实例调度留后）；时钟偏移接受（系统时钟变化影响调度，Phase 3 可接受）；per-loop 错误隔离（一个 loop 的 bad config 不阻塞其他）。
+  - **Batch 2 已最终收口**（2026-08-27）；Phase 3 Catch-Up（离线恢复、missed occurrence 合并）留 Phase 4 或更晚。
+
+### 右移项
+
+- **Phase 3 Catch-Up**（离线恢复与 missed occurrence 合并）：Batch 2 在线 Scheduler 完成后，离线期间错过的 occurrence 处理策略（是否补跑、如何合并）留待 Phase 4 或更晚根据实际需求决策。当前实现：watermark 推进确保不重复执行同一 occurrence；离线期间错过的 occurrence 不会在恢复后补跑（运行中跳过的逻辑相同）。
+- catch-up 策略需结合用户场景（补跑全部 vs 仅最新 vs 完全跳过）和系统负载权衡，暂不纳入 Phase 3 范围。
 
 ## Phase 4 — Loop 产品语义（第 7–8 周）
 
