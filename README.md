@@ -3,6 +3,68 @@
 多用户可调度 Agent 循环平台的能力复刻（路线图见 `docs/roadmap.md`，决策见 `docs/adr/`）。
 仓库为 pnpm workspace：`packages/protocol`（wire DTO 单一来源）、`packages/server`、`packages/daemon`。
 
+## 核心功能
+
+### Loop 调度模式
+
+**手动触发**（Phase 1-2）：
+```bash
+POST /api/loops/:id/run
+```
+显式触发单次执行。
+
+**定时调度**（Phase 3 Batch 2）：
+创建或更新 Loop 时指定 cron 表达式和时区，系统自动按计划触发执行。
+
+```bash
+# 创建定时 Loop（每天 UTC 10:00 执行）
+POST /api/loops
+{
+  "machineId": "m-xxx",
+  "name": "daily-report",
+  "workdir": "/home/user/project",
+  "cron": "0 10 * * *",
+  "timezone": "UTC"
+}
+
+# 更新 Loop 调度配置
+PATCH /api/loops/:id/schedule
+{
+  "cron": "0 14 * * *",      // 修改执行时间
+  "timezone": "Asia/Shanghai"  // 修改时区
+}
+
+# 暂停定时调度（保留配置）
+PATCH /api/loops/:id/schedule
+{
+  "enabled": false
+}
+
+# 恢复定时调度
+PATCH /api/loops/:id/schedule
+{
+  "enabled": true
+}
+
+# 转为手动触发（清除 cron）
+PATCH /api/loops/:id/schedule
+{
+  "cron": null
+}
+```
+
+**Cron 表达式格式**：标准五段式 `minute hour day month weekday`（不支持秒/年段和宏）。
+
+**时区**：IANA 时区标识符（如 `UTC`、`Asia/Shanghai`、`America/New_York`）。
+
+**调度语义**：
+- `nextFireAt` 字段显示下次计划执行时间（计算字段，不持久化）
+- 执行中的 Loop 不会积累待执行队列（新的计划触发推进水位但跳过入队）
+- 配置更新立即生效（零停机 reconcile）
+- 手动触发和定时调度可共存（手动触发不受 cron 配置影响）
+
+详见 `docs/adr/008-phase3-batch2-online-scheduler.md`。
+
 ## Daemon 运行
 
 daemon 在用户本机执行 Agent Run；server 只调度与存储，绝不执行用户代码。

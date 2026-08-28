@@ -15,16 +15,23 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { serve } from "@hono/node-server";
-import { afterEach, describe, expect, it } from "vitest";
+import { serve, type ServerType } from "@hono/node-server";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { isRunTokenShape, pollResponseSchema } from "@loopzhb/protocol";
 import { machineIdFromToken } from "@loopzhb/protocol/node";
 
 import { mintRunCredential } from "./coordinator/index.js";
-import { closeDb, type DbHandle } from "./db/index.js";
+import { closeDb, openMigratedDb, type DbHandle } from "./db/index.js";
 import { loops } from "./db/schema.js";
-import { bootstrapServer, main, waitForListening, type BootedServer } from "./start.js";
+import {
+  bootstrapServer,
+  main,
+  startSchedulerOrFailBoot,
+  startSchedulerOrFailBootWithDatabase,
+  waitForListening,
+  type BootedServer,
+} from "./start.js";
 
 const handles: DbHandle[] = [];
 afterEach(async () => {
@@ -90,6 +97,243 @@ describe("bootstrapServer", () => {
     // dataDir acquires the PGlite dir lock without contention.
     const second = await boot(dir);
     expect(second.handle.dataDir).toBe(dir);
+  });
+
+  it("scheduler scan failure fails boot: drains scheduler, closes listener, rethrows (Batch 2 plan §2)", async () => {
+    const dir = await tmpDataDir();
+    const b = await bootstrapServer({ host: "127.0.0.1", port: 3000, dataDir: dir });
+    // Break the scheduler's startup scan by closing the DB underneath it.
+    // (Not via boot() — we close this handle ourselves.)
+    await closeDb(b.handle);
+
+    let listenerClosed = false;
+    const fakeServer = {
+      close: (cb?: (err?: Error) => void) => {
+        listenerClosed = true;
+        cb?.(); // a drained listener invokes the close callback
+      },
+    } as unknown as ServerType;
+
+    // A scan-level failure must FAIL BOOT — never report ready without scheduling.
+    // The thrown error carries a FIXED message: the scan's original exception
+    // (DB internals) must not reach the entry layer's logs.
+    await expect(startSchedulerOrFailBoot(b.scheduler, fakeServer)).rejects.toThrow(
+      "scheduler startup scan failed",
+    );
+    expect(listenerClosed).toBe(true);
+
+    // The failed boot released its resources: a fresh bootstrap on the same
+    // dataDir acquires the PGlite dir lock without contention.
+    const second = await boot(dir);
+    expect(second.handle.dataDir).toBe(dir);
+  });
+
+  it("scheduler scan failure waits for IN-FLIGHT HTTP requests before the DB may close", async () => {
+    const dir = await tmpDataDir();
+    const b = await bootstrapServer({ host: "127.0.0.1", port: 0, dataDir: dir });
+
+    // A route that hangs until the test releases it — the in-flight request
+    // the drain must wait for.
+    let releaseHang!: () => void;
+    const hang = new Promise<void>((resolve) => {
+      releaseHang = resolve;
+    });
+    b.app.get("/hang", async (c) => {
+      await hang;
+      return c.json({ ok: true });
+    });
+
+    const server: ServerType = serve({ fetch: b.app.fetch, port: 0, hostname: "127.0.0.1" });
+    await waitForListening(server);
+    const port = (server.address() as net.AddressInfo).port;
+
+    // Start an in-flight request (connection: close — no keep-alive residue)
+    const responsePromise = fetch(`http://127.0.0.1:${port}/hang`, {
+      headers: { connection: "close" },
+    });
+    await new Promise((r) => setTimeout(r, 100)); // let it arrive and park
+
+    // Break the scheduler scan
+    await closeDb(b.handle);
+
+    let bootSettled = false;
+    const bootPromise = startSchedulerOrFailBoot(b.scheduler, server).then(
+      () => {
+        bootSettled = true;
+        throw new Error("scheduler start should have failed");
+      },
+      (err: unknown) => {
+        bootSettled = true;
+        expect(String(err)).toContain("scheduler startup scan failed");
+      },
+    );
+
+    // While the request hangs, the cleanup must NOT complete (HTTP drain
+    // precedes the DB close the outer catch would run).
+    await new Promise((r) => setTimeout(r, 200));
+    expect(bootSettled).toBe(false);
+
+    // Release the request: it completes normally, the listener drains, and
+    // only then does the boot failure propagate.
+    releaseHang();
+    const res = await responsePromise;
+    expect(res.status).toBe(200);
+    await bootPromise;
+    expect(bootSettled).toBe(true);
+
+    // Resources released: a fresh bootstrap re-acquires the same dataDir.
+    const second = await boot(dir);
+    expect(second.handle.dataDir).toBe(dir);
+  }, 30_000);
+
+  it("scheduler scan failure closes the DB only after scheduler and listener drains", async () => {
+    const events: string[] = [];
+    let releaseListener!: () => void;
+    const scheduler = {
+      start: async () => {
+        throw new Error("scan failed");
+      },
+      stopAndDrain: async () => {
+        events.push("scheduler-drained");
+      },
+    } as unknown as BootedServer["scheduler"];
+    const server = {
+      close: (callback?: (err?: Error) => void) => {
+        events.push("listener-closing");
+        releaseListener = () => {
+          events.push("listener-drained");
+          callback?.();
+        };
+      },
+    } as unknown as ServerType;
+
+    const bootFailure = startSchedulerOrFailBoot(scheduler, server, {
+      closeDatabase: async () => {
+        events.push("database-closed");
+      },
+    });
+    await vi.waitFor(() => expect(events).toEqual(["scheduler-drained", "listener-closing"]));
+    expect(events).not.toContain("database-closed");
+
+    releaseListener();
+    await expect(bootFailure).rejects.toThrow("scheduler startup scan failed");
+    expect(events).toEqual([
+      "scheduler-drained",
+      "listener-closing",
+      "listener-drained",
+      "database-closed",
+    ]);
+  });
+
+  it("production startup-failure wiring drains HTTP before closing the real DB handle", async () => {
+    const handle = await openMigratedDb();
+    handles.push(handle);
+    const events: string[] = [];
+    let releaseListener!: () => void;
+    const scheduler = {
+      start: async () => {
+        throw new Error("scan failed");
+      },
+      stopAndDrain: async () => {
+        events.push("scheduler-drained");
+      },
+    } as unknown as BootedServer["scheduler"];
+    const server = {
+      close: (callback?: (err?: Error) => void) => {
+        events.push("listener-closing");
+        releaseListener = () => {
+          events.push("listener-drained");
+          callback?.();
+        };
+      },
+    } as unknown as ServerType;
+
+    const bootFailure = startSchedulerOrFailBootWithDatabase(scheduler, server, handle);
+    await vi.waitFor(() => expect(events).toEqual(["scheduler-drained", "listener-closing"]));
+
+    // The actual PGlite handle is still usable while HTTP is draining.
+    await expect(handle.db.select().from(loops)).resolves.toEqual([]);
+
+    releaseListener();
+    await expect(bootFailure).rejects.toThrow("scheduler startup scan failed");
+    expect(events).toEqual(["scheduler-drained", "listener-closing", "listener-drained"]);
+    await expect(handle.db.select().from(loops)).rejects.toThrow();
+  });
+
+  it("scheduler scan failure force-closes a listener whose close callback never fires", async () => {
+    const events: string[] = [];
+    const scheduler = {
+      start: async () => {
+        throw new Error("scan failed");
+      },
+      stopAndDrain: async () => {
+        events.push("scheduler-drained");
+      },
+    } as unknown as BootedServer["scheduler"];
+    const server = {
+      close: () => {
+        events.push("listener-closing");
+      },
+      closeAllConnections: () => {
+        events.push("listener-forced");
+      },
+    } as unknown as ServerType;
+
+    const outcome = await Promise.race([
+      startSchedulerOrFailBoot(scheduler, server, {
+        closeTimeoutMs: 20,
+        closeDatabase: async () => {
+          events.push("database-closed");
+        },
+      }).then(
+        () => "unexpected-success",
+        () => "failed",
+      ),
+      new Promise<string>((resolve) => setTimeout(() => resolve("timed-out"), 500)),
+    ]);
+
+    expect(outcome).toBe("failed");
+    expect(events).toEqual([
+      "scheduler-drained",
+      "listener-closing",
+      "listener-forced",
+      "database-closed",
+    ]);
+  });
+
+  it("scheduler scan failure force-closes before DB cleanup when listener close reports an error", async () => {
+    const events: string[] = [];
+    const scheduler = {
+      start: async () => {
+        throw new Error("scan failed");
+      },
+      stopAndDrain: async () => {
+        events.push("scheduler-drained");
+      },
+    } as unknown as BootedServer["scheduler"];
+    const server = {
+      close: (callback?: (err?: Error) => void) => {
+        events.push("listener-closing");
+        callback?.(new Error("close failed"));
+      },
+      closeAllConnections: () => {
+        events.push("listener-forced");
+      },
+    } as unknown as ServerType;
+
+    await expect(
+      startSchedulerOrFailBoot(scheduler, server, {
+        closeDatabase: async () => {
+          events.push("database-closed");
+        },
+      }),
+    ).rejects.toThrow("scheduler startup scan failed");
+    expect(events).toEqual([
+      "scheduler-drained",
+      "listener-closing",
+      "listener-forced",
+      "database-closed",
+    ]);
   });
 
   it("restart durability: machine, run and ACTIVE LEASE survive close/reopen — a pre-restart claim still reports (T4)", async () => {

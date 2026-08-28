@@ -135,6 +135,9 @@ describe("listLoops", () => {
       createdAt: "2026-07-29T00:00:00.000Z",
       updatedAt: "2026-07-29T00:00:00.000Z",
       lastRun: null,
+      cron: null,
+      timezone: "UTC",
+      nextFireAt: null,
     });
   });
 
@@ -216,10 +219,10 @@ describe("listRuns", () => {
 describe("observation projections stay in lockstep with the wire DTOs", () => {
   it("every projected column set equals its summary DTO's key set (default-exclude for new columns)", () => {
     expect(Object.keys(machineSummaryColumns).sort()).toEqual(Object.keys(machineSummarySchema.shape).sort());
-    // lastRun is the one DTO field with no backing column (joined aggregate).
+    // lastRun and nextFireAt are computed fields with no backing columns.
     expect(Object.keys(loopSummaryColumns).sort()).toEqual(
       Object.keys(loopSummarySchema.shape)
-        .filter((k) => k !== "lastRun")
+        .filter((k) => k !== "lastRun" && k !== "nextFireAt")
         .sort(),
     );
     expect(Object.keys(runSummaryColumns).sort()).toEqual(Object.keys(runSummarySchema.shape).sort());

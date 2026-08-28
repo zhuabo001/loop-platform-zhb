@@ -11,6 +11,7 @@
 import type { LoopSummary, MachineSummary, RunSummary } from "@loopzhb/protocol";
 
 import type { Loop, Machine, Run } from "../db/schema.js";
+import { nextOccurrence } from "../schedule/time-semantics.js";
 
 /** The deliberately narrow row shapes observation queries may load: large,
  *  unopened or sensitive columns (runs.transcript/artifacts/usage/session/
@@ -24,7 +25,18 @@ export type MachineSummaryRow = Pick<
 
 export type LoopSummaryRow = Pick<
   Loop,
-  "id" | "machineId" | "name" | "workdir" | "taskFile" | "agent" | "allowControl" | "enabled" | "createdAt" | "updatedAt"
+  | "id"
+  | "machineId"
+  | "name"
+  | "workdir"
+  | "taskFile"
+  | "agent"
+  | "allowControl"
+  | "enabled"
+  | "createdAt"
+  | "updatedAt"
+  | "cron"
+  | "timezone"
 >;
 
 export type RunSummaryRow = Pick<
@@ -75,7 +87,11 @@ export function toRunSummary(row: RunSummaryRow): RunSummary {
   };
 }
 
-export function toLoopSummary(row: LoopSummaryRow, lastRun: RunSummary | null): LoopSummary {
+export function toLoopSummary(
+  row: LoopSummaryRow,
+  lastRun: RunSummary | null,
+  nextFireAt: string | null = null
+): LoopSummary {
   return {
     id: row.id,
     machineId: row.machineId,
@@ -88,5 +104,28 @@ export function toLoopSummary(row: LoopSummaryRow, lastRun: RunSummary | null): 
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
     lastRun,
+    cron: row.cron ?? null,
+    timezone: row.timezone,
+    nextFireAt,
   };
+}
+
+/**
+ * The ONE nextFireAt computation for the observation surface: the schedule's
+ * next occurrence after `now`, or null for paused/manual-only loops. A schedule
+ * that fails to compute (corrupted persisted state, DST discontinuity) degrades
+ * to null rather than failing the whole response — persisted rows were already
+ * validated on write, so a throw here is defensive depth, not a data error.
+ */
+export function nextFireAtIso(
+  row: Pick<LoopSummaryRow, "enabled" | "cron" | "timezone">,
+  now: Date,
+): string | null {
+  if (!row.enabled || row.cron === null) return null;
+  try {
+    const next = nextOccurrence({ cron: row.cron, timezone: row.timezone }, now);
+    return next === null ? null : next.toISOString();
+  } catch {
+    return null;
+  }
 }

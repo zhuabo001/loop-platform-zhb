@@ -21,16 +21,24 @@ import { and, asc, desc, eq, inArray } from "drizzle-orm";
 import type { CreateLoopRequest, LoopSummary, MachineSummary, RunSummary } from "@loopzhb/protocol";
 
 import type { Db } from "../db/index.js";
-import { loops, machines, runs } from "../db/schema.js";
+import { loops, machines, runs, type Loop } from "../db/schema.js";
 import { getMachine } from "../store/machines.js";
 import { getLoop } from "../store/runs.js";
 import type { Clock } from "../time.js";
+import { validateSchedule } from "../schedule/index.js";
 import { LoopValidationError } from "./errors.js";
-import { toLoopSummary, toMachineSummary, toRunSummary, type LoopSummaryRow, type RunSummaryRow } from "./views.js";
+import {
+  nextFireAtIso,
+  toLoopSummary,
+  toMachineSummary,
+  toRunSummary,
+  type RunSummaryRow,
+} from "./views.js";
 
 /** Server-side length ceilings (goal §2). Exceeding ⇒ LoopValidationError. */
 export const LOOP_NAME_CAP = 255;
 export const LOOP_PATH_CAP = 4096;
+export const SCHEDULE_FIELD_CAP = 255;
 
 /** Observation-surface page caps (goal §4): fixed, no pagination params in
  *  Phase 1. The SQL ORDER BY lands BEFORE the LIMIT — sort-then-truncate is
@@ -67,6 +75,8 @@ export const loopSummaryColumns = {
   enabled: loops.enabled,
   createdAt: loops.createdAt,
   updatedAt: loops.updatedAt,
+  cron: loops.cron,
+  timezone: loops.timezone,
 } as const;
 
 export const runSummaryColumns = {
@@ -96,7 +106,15 @@ export function newUuidLoopId(): string {
 }
 
 export type CreateLoopResult =
-  | { created: true; loop: LoopSummary }
+  | {
+      created: true;
+      /** The wire-safe view — the HTTP response body. */
+      loop: LoopSummary;
+      /** The inserted full row — for the schedule-commit seam ONLY (the
+       *  scheduler's reconcile needs scheduleRevision/activation, which the
+       *  wire view deliberately lacks). Never serialized to a response. */
+      row: Loop;
+    }
   | { created: false; reason: "machine_not_found" };
 
 export function createLoopAdmin(deps: LoopAdminDeps) {
@@ -110,6 +128,10 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
      * relying on DDL defaults: the values are this batch's fixed policy, and
      * not-yet-open caller fields never reach the row (tolerant-reader strip
      * happened at the route; only declared fields arrive here).
+     *
+     * Phase 3 Batch 2: Supports cron/timezone for scheduled loops. Validates
+     * schedule semantics before insertion. Sets scheduleRevision=0 and
+     * scheduleActivatedAt for active scheduled loops.
      */
     async createLoop(input: CreateLoopRequest): Promise<CreateLoopResult> {
       if (input.name !== undefined && input.name.length > LOOP_NAME_CAP) {
@@ -121,12 +143,39 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
       if (input.taskFile !== undefined && input.taskFile.length > LOOP_PATH_CAP) {
         throw new LoopValidationError("taskFile");
       }
+      if (input.cron !== undefined && input.cron.length > SCHEDULE_FIELD_CAP) {
+        throw new LoopValidationError("cron");
+      }
+      if (input.timezone !== undefined && input.timezone.length > SCHEDULE_FIELD_CAP) {
+        throw new LoopValidationError("timezone");
+      }
 
       const machine = await getMachine(deps.db, input.machineId);
       if (!machine) return { created: false as const, reason: "machine_not_found" as const };
 
+      // Validate and normalize schedule if provided. A timezone WITHOUT a cron
+      // still passes through the shared validator (dummy-cron form, same rule
+      // as updateSchedule) — a manual-only loop persists its timezone, so an
+      // invalid one must be rejected here rather than at first schedule PATCH.
+      const timezone = input.timezone ?? "UTC";
+      let normalizedCron: string | null = null;
+      let normalizedTimezone = timezone;
+
+      if (input.cron !== undefined) {
+        const normalized = validateSchedule(input.cron, timezone);
+        normalizedCron = normalized.cron;
+        normalizedTimezone = normalized.timezone;
+      } else if (input.timezone !== undefined) {
+        normalizedTimezone = validateSchedule("0 0 * * *", timezone).timezone;
+      }
+
       const nowIso = deps.clock.now().toISOString();
-      const inserted: LoopSummaryRow[] = await deps.db
+      const isActive = normalizedCron !== null; // enabled=true by default
+
+      // Insert with a FULL-row returning: the wire view is mapped from the row,
+      // and the row itself feeds the schedule-commit seam (no post-commit
+      // re-read — a failed re-read would turn a committed create into a 500).
+      const inserted: Loop[] = await deps.db
         .insert(loops)
         .values({
           id: deps.newLoopId(),
@@ -137,11 +186,19 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
           agent: "claude-code",
           allowControl: true,
           enabled: true,
+          cron: normalizedCron,
+          timezone: normalizedTimezone,
+          scheduleRevision: 0,
+          scheduleActivatedAt: isActive ? nowIso : null,
+          lastScheduledAt: null,
           createdAt: nowIso,
           updatedAt: nowIso,
         })
-        .returning(loopSummaryColumns);
-      return { created: true as const, loop: toLoopSummary(inserted[0]!, null) };
+        .returning();
+
+      const row = inserted[0]!;
+
+      return { created: true as const, loop: toLoopSummary(row, null, nextFireAtIso(row, deps.clock.now())), row };
     },
 
     /** `name ASC, id ASC`, capped — the machine picker for loop creation. */
@@ -161,6 +218,8 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
      * LOOP_LIST_CAP rows regardless of Run history size. Non-exec roles never
      * appear — they are Phase 3's surface, and `ts` is the last TRANSITION time
      * (ADR-003 决策 6), so a run re-enters the top after a lifecycle write.
+     *
+     * Phase 3 Batch 2: Computes nextFireAt for active scheduled loops.
      */
     async listLoops(): Promise<LoopSummary[]> {
       const loopRows = await deps.db
@@ -184,10 +243,34 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
         )
         .orderBy(asc(runs.loopId), desc(runs.ts), desc(runs.id));
       const latestByLoop = new Map<string, RunSummaryRow>(runRows.map((row) => [row.loopId, row]));
+
+      const now = deps.clock.now();
       return loopRows.map((row) => {
         const lastRun = latestByLoop.get(row.id);
-        return toLoopSummary(row, lastRun ? toRunSummary(lastRun) : null);
+        return toLoopSummary(row, lastRun ? toRunSummary(lastRun) : null, nextFireAtIso(row, now));
       });
+    },
+
+    /**
+     * Single-loop summary by id (the PATCH /schedule response shape):
+     * the summary row plus its latest EXEC run and computed nextFireAt.
+     * `undefined` when the loop does not exist.
+     */
+    async getLoopSummary(loopId: string): Promise<LoopSummary | undefined> {
+      const row = (
+        await deps.db.select(loopSummaryColumns).from(loops).where(eq(loops.id, loopId)).limit(1)
+      )[0];
+      if (!row) return undefined;
+
+      const lastRunRows = await deps.db
+        .select(runSummaryColumns)
+        .from(runs)
+        .where(and(eq(runs.loopId, loopId), eq(runs.role, "exec")))
+        .orderBy(desc(runs.ts), desc(runs.id))
+        .limit(1);
+
+      const lastRun = lastRunRows[0];
+      return toLoopSummary(row, lastRun ? toRunSummary(lastRun) : null, nextFireAtIso(row, deps.clock.now()));
     },
 
     /** `ts DESC, id DESC`, capped; `undefined` when the loop does not exist

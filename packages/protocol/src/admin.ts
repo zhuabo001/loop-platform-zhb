@@ -53,6 +53,10 @@ export const createLoopRequestSchema = z.object({
   workdir: nulFreeString().min(1).optional(),
   /** Machine-side path to the loop's durable context+log doc. */
   taskFile: nulFreeString().min(1).optional(),
+  /** Five-part cron expression (255-char ceiling is server policy). */
+  cron: nulFreeString().min(1).optional(),
+  /** IANA timezone (255-char ceiling is server policy); defaults to UTC. */
+  timezone: nulFreeString().min(1).optional(),
 });
 export type CreateLoopRequest = z.infer<typeof createLoopRequestSchema>;
 
@@ -102,7 +106,9 @@ export const runSummarySchema = z.object({
 export type RunSummary = z.infer<typeof runSummarySchema>;
 
 /** Safe loop view: no workflow/model/state/task-file content (not open in
- *  Phase 1). `lastRun` is the latest EXEC run by `ts DESC, id DESC`. */
+ *  Phase 1). `lastRun` is the latest EXEC run by `ts DESC, id DESC`. Phase 3
+ *  additive schedule fields: `cron`, `timezone`, `nextFireAt` (null when
+ *  paused or manual-only). */
 export const loopSummarySchema = z.object({
   id: z.string(),
   machineId: z.string(),
@@ -115,6 +121,9 @@ export const loopSummarySchema = z.object({
   createdAt: isoTimestampSchema,
   updatedAt: isoTimestampSchema,
   lastRun: runSummarySchema.nullable(),
+  cron: z.string().nullable().optional(),
+  timezone: z.string().optional(),
+  nextFireAt: isoTimestampSchema.nullable().optional(),
 });
 export type LoopSummary = z.infer<typeof loopSummarySchema>;
 
@@ -179,3 +188,29 @@ export const runListResponseSchema = z.object({
   runs: z.array(runSummarySchema),
 });
 export type RunListResponse = z.infer<typeof runListResponseSchema>;
+
+// ---- PATCH /api/loops/:id/schedule ----
+
+/** PATCH /api/loops/:id/schedule — update cron schedule configuration.
+ *  Empty object or only unknown fields is a no-op. `cron: null` clears the
+ *  schedule (manual-only). All fields are additive optional (ADR-002). */
+export const updateScheduleRequestSchema = z.object({
+  /** Five-part cron expression; null clears scheduling (manual-only). */
+  cron: nulFreeString().min(1).nullable().optional(),
+  /** IANA timezone; 255-char ceiling is server policy. */
+  timezone: nulFreeString().min(1).optional(),
+  /** Controls automatic scheduling only; manual Run Now remains available. */
+  enabled: z.boolean().optional(),
+});
+export type UpdateScheduleRequest = z.infer<typeof updateScheduleRequestSchema>;
+
+/** PATCH /api/loops/:id/schedule response: returns updated loop on success
+ *  (200). Loop not found → 404; invalid cron/timezone → 400. A 500 may occur
+ *  after the atomic update committed but before this representation was read;
+ *  clients recover by retrying the exact request. Equal normalized values are
+ *  a state-machine no-op, so retry never increments revision or reconciles the
+ *  scheduler a second time. */
+export const updateScheduleResponseSchema = z.object({
+  loop: loopSummarySchema,
+});
+export type UpdateScheduleResponse = z.infer<typeof updateScheduleResponseSchema>;

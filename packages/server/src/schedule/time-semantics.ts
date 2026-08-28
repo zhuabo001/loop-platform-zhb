@@ -226,3 +226,87 @@ function advanceWithinFivePartMinute(cursor: Date): Date {
   const minuteEnd = Math.floor(cursor.getTime() / 60_000) * 60_000 + 59_999;
   return new Date(minuteEnd > cursor.getTime() ? minuteEnd : cursor.getTime() + 1);
 }
+
+/**
+ * Calculates the latest (most recent) occurrence at or before a given time.
+ *
+ * This function is used by the Scheduler to reconstruct the canonical occurrence
+ * timestamp when a Croner callback fires. The callback's actual firing time may
+ * be delayed by system load, event-loop stalls, or process suspension — the
+ * reconstruction must succeed for ANY such delay (a fired callback is a live
+ * occurrence that must never be silently dropped).
+ *
+ * Uses an exponential backward probe followed by a millisecond binary search
+ * for the boundary where `nextOccurrence(cursor)` stops being ≤ atInclusive.
+ * This has no arbitrary year cap and its cost is logarithmic in elapsed time,
+ * independent of the number of intervening occurrences (important for dense
+ * schedules separated by long gaps).
+ *
+ * DST handling mirrors nextOccurrence: gaps are skipped, overlaps use first occurrence.
+ * Returns null only when Croner cannot find any earlier occurrence.
+ *
+ * @param schedule - Validated and normalized schedule configuration
+ * @param atInclusive - Reference time (find the latest occurrence at or before this)
+ * @returns Latest occurrence as an absolute Date, or null if no past occurrence exists
+ */
+export function latestOccurrence(schedule: NormalizedSchedule, atInclusive: Date): Date | null {
+  const atMs = atInclusive.getTime();
+  if (!Number.isFinite(atMs)) return null;
+
+  // Cron expressions operate on four-digit calendar years. This is a domain
+  // boundary, not a lookback duration: every representable schedule history
+  // from year 0001 remains searchable.
+  const earliest = new Date(0);
+  earliest.setUTCFullYear(1, 0, 1);
+  earliest.setUTCHours(0, 0, 0, 0);
+  const earliestMs = earliest.getTime();
+
+  let low = atMs;
+  let windowMs = 120_000;
+  while (true) {
+    const startMs = Math.max(earliestMs, atMs - windowMs);
+    const probeMs = Math.max(earliestMs, startMs - 1);
+    const candidate = nextOccurrence(schedule, new Date(probeMs));
+    if (candidate !== null && candidate.getTime() <= atMs) {
+      low = probeMs;
+      break;
+    }
+    if (startMs === earliestMs) return null;
+    windowMs = Math.min(windowMs * 2, atMs - earliestMs);
+  }
+
+  // P(cursor) := nextOccurrence(cursor) <= atInclusive. P is true before the
+  // latest occurrence and false at/after it, so its boundary identifies the
+  // answer without enumerating dense intervening ticks.
+  let high = atMs;
+  while (high - low > 1) {
+    const middle = low + Math.floor((high - low) / 2);
+    const candidate = nextOccurrence(schedule, new Date(middle));
+    if (candidate !== null && candidate.getTime() <= atMs) {
+      low = middle;
+    } else {
+      high = middle;
+    }
+  }
+
+  const latest = nextOccurrence(schedule, new Date(low));
+  return latest !== null && latest.getTime() <= atMs ? latest : null;
+}
+
+/**
+ * Checks whether a given instant IS a canonical occurrence of the schedule.
+ *
+ * The check runs through the same nextOccurrence machinery the Scheduler's
+ * latestOccurrence uses to build `scheduledFor`, so a scheduler-produced
+ * occurrence can never be rejected here. DST behavior is inherited: gap-normalized
+ * instants are not occurrences; both instants of an ambiguous wall time match
+ * (Croner fires both — the watermark, not this check, dedupes the overlap).
+ *
+ * @param schedule - Validated and normalized schedule configuration
+ * @param at - Candidate instant
+ * @returns True when `at` is exactly the next occurrence after `at - 1ms`
+ */
+export function isOccurrence(schedule: NormalizedSchedule, at: Date): boolean {
+  const next = nextOccurrence(schedule, new Date(at.getTime() - 1));
+  return next !== null && next.getTime() === at.getTime();
+}

@@ -8,6 +8,10 @@
  *  - claim (Step 2): conditional `pending → running` UPDATE + lease INSERT in
  *    ONE transaction;
  *  - report finalize (Step 3): run UPDATE + lease DELETE in ONE transaction.
+ *
+ * Phase 3 Batch 2: enqueue accepts optional trigger metadata for scheduled
+ * runs. Scheduled triggers validate revision/cron/enabled and atomically
+ * advance lastScheduledAt watermark.
  */
 import { and, asc, eq, inArray, isNull } from "drizzle-orm";
 
@@ -16,8 +20,10 @@ import type { RunProgress, RunRole } from "@loopzhb/protocol";
 
 import type { Db } from "../db/index.js";
 import { loops, runLeases, runs, type Loop, type Run, type RunProgressRow } from "../db/schema.js";
+import { isOccurrence } from "../schedule/time-semantics.js";
 import { isHeartbeatWatermarkAnomalous } from "./machines.js";
 import type { Clock } from "../time.js";
+import type { ExecTrigger } from "../coordinator/index.js";
 
 /** The slice of coordinator dependencies the run store needs. */
 export interface RunStoreDeps {
@@ -37,7 +43,19 @@ export const RECLAIM_RUN_ERROR = "machine timed out / disconnected";
 
 export type EnqueueExecRunResult =
   | { enqueued: true; runId: string; supersededRunIds: string[] }
-  | { enqueued: false; reason: "loop_not_found" | "running_exists" };
+  | {
+      enqueued: false;
+      reason:
+        | "loop_not_found"
+        | "running_exists"
+        | "stale_revision"
+        | "not_active"
+        | "not_an_occurrence"
+        | "future_occurrence"
+        | "before_activation"
+        | "occurrence_too_old"
+        | "already_scheduled";
+    };
 
 /**
  * A phase guard inside the enqueue transaction lost a race (the row was no
@@ -53,8 +71,74 @@ export class EnqueueGuardLostError extends Error {
   }
 }
 
+/** Parse the exact RFC 3339 subset accepted at the scheduled-trigger edge.
+ * Native Date.parse normalizes impossible dates (for example February 30),
+ * which would let a non-existent spelling advance the occurrence watermark. */
+function parseScheduledFor(value: string): number | undefined {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|([+-])(\d{2}):(\d{2}))$/.exec(
+    value,
+  );
+  if (!match) return undefined;
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const millisecond = Number((match[7] ?? "").padEnd(3, "0"));
+  const offsetHour = Number(match[10] ?? 0);
+  const offsetMinute = Number(match[11] ?? 0);
+
+  if (
+    year < 1 ||
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > 31 ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59 ||
+    offsetHour > 23 ||
+    offsetMinute > 59
+  ) {
+    return undefined;
+  }
+
+  const wallClock = new Date(0);
+  wallClock.setUTCFullYear(year, month - 1, day);
+  wallClock.setUTCHours(hour, minute, second, millisecond);
+  if (
+    wallClock.getUTCFullYear() !== year ||
+    wallClock.getUTCMonth() !== month - 1 ||
+    wallClock.getUTCDate() !== day ||
+    wallClock.getUTCHours() !== hour ||
+    wallClock.getUTCMinutes() !== minute ||
+    wallClock.getUTCSeconds() !== second ||
+    wallClock.getUTCMilliseconds() !== millisecond
+  ) {
+    return undefined;
+  }
+
+  const offsetSign = match[9] === "-" ? -1 : 1;
+  const offsetMs = offsetSign * (offsetHour * 60 + offsetMinute) * 60_000;
+  const timestamp = wallClock.getTime() - offsetMs;
+  return Number.isFinite(timestamp) ? timestamp : undefined;
+}
+
 export async function getLoop(db: Db, loopId: string): Promise<Loop | undefined> {
   return (await db.select().from(loops).where(eq(loops.id, loopId)))[0];
+}
+
+/** The enqueue transaction's running-run probe — ONE implementation shared by
+ *  the manual and scheduled branches so the skip rule cannot drift. */
+async function hasRunningExecRun(tx: Db, loopId: string): Promise<boolean> {
+  const rows = await tx
+    .select({ id: runs.id })
+    .from(runs)
+    .where(and(eq(runs.loopId, loopId), eq(runs.phase, "running")))
+    .limit(1);
+  return rows.length > 0;
 }
 
 export async function getRun(db: Db, runId: string): Promise<Run | undefined> {
@@ -70,17 +154,89 @@ export async function getRun(db: Db, runId: string): Promise<Run | undefined> {
  * out of scope — Phase 3 roles), then insert exactly one new pending run.
  * Any failure — a lost phase guard, a factory throw, an insert error —
  * propagates and rolls the whole transaction back.
+ *
+ * Phase 3 Batch 2: scheduled triggers validate revision/cron/enabled state
+ * and atomically advance lastScheduledAt watermark. Running runs still skip
+ * but watermark advances. Manual triggers (default) bypass all schedule checks.
  */
-export async function enqueueExecRunTx(deps: RunStoreDeps, loop: Loop): Promise<EnqueueExecRunResult> {
+export async function enqueueExecRunTx(
+  deps: RunStoreDeps,
+  loop: Loop,
+  trigger?: ExecTrigger,
+): Promise<EnqueueExecRunResult> {
   const { db, clock, newRunId } = deps;
   return db.transaction(async (tx) => {
-    const running = await tx
-      .select({ id: runs.id })
-      .from(runs)
-      .where(and(eq(runs.loopId, loop.id), eq(runs.phase, "running")))
-      .limit(1);
-    if (running.length > 0) return { enqueued: false as const, reason: "running_exists" as const };
+    // For scheduled triggers, validate and advance watermark
+    if (trigger?.kind === "scheduled") {
+      // Re-read loop within transaction for latest schedule state
+      const [currentLoop] = await tx.select().from(loops).where(eq(loops.id, loop.id)).limit(1);
+      if (!currentLoop) {
+        return { enqueued: false as const, reason: "loop_not_found" as const };
+      }
 
+      // Validate revision
+      if (currentLoop.scheduleRevision !== trigger.scheduleRevision) {
+        return { enqueued: false as const, reason: "stale_revision" as const };
+      }
+
+      // Validate active (enabled && cron not null)
+      if (!currentLoop.enabled || currentLoop.cron === null) {
+        return { enqueued: false as const, reason: "not_active" as const };
+      }
+
+      // Validate scheduledFor is a well-formed, genuine occurrence of the
+      // loop's CURRENT cron/timezone and not in the future. Without these
+      // guards an arbitrary (or future) timestamp would advance the watermark
+      // and silently swallow every later real tick.
+      const scheduledMs = parseScheduledFor(trigger.scheduledFor);
+      if (
+        scheduledMs === undefined ||
+        !isOccurrence({ cron: currentLoop.cron, timezone: currentLoop.timezone }, new Date(scheduledMs))
+      ) {
+        return { enqueued: false as const, reason: "not_an_occurrence" as const };
+      }
+      if (scheduledMs > clock.now().getTime()) {
+        return { enqueued: false as const, reason: "future_occurrence" as const };
+      }
+
+      // Canonicalize to UTC ISO before ANY comparison or persistence: every
+      // equivalent representation of the same instant (`+08:00` offsets,
+      // `+00:00`, …) must behave identically. Stored activation/watermark are
+      // canonical by construction (toISOString writes only), so string
+      // comparison on canonical forms is exact.
+      const canonicalFor = new Date(scheduledMs).toISOString();
+
+      // Validate occurrence is after activation
+      if (
+        currentLoop.scheduleActivatedAt !== null &&
+        canonicalFor <= currentLoop.scheduleActivatedAt
+      ) {
+        return { enqueued: false as const, reason: "before_activation" as const };
+      }
+
+      // Validate occurrence is after watermark
+      if (currentLoop.lastScheduledAt !== null && canonicalFor <= currentLoop.lastScheduledAt) {
+        return { enqueued: false as const, reason: "already_scheduled" as const };
+      }
+
+      // Atomically advance watermark — the CANONICAL form only (even if running exists)
+      await tx
+        .update(loops)
+        .set({ lastScheduledAt: canonicalFor })
+        .where(eq(loops.id, loop.id));
+
+      // If running exists, skip creating new run but watermark is advanced
+      if (await hasRunningExecRun(tx, loop.id)) {
+        return { enqueued: false as const, reason: "running_exists" as const };
+      }
+    } else {
+      // Manual trigger: original behavior
+      if (await hasRunningExecRun(tx, loop.id)) {
+        return { enqueued: false as const, reason: "running_exists" as const };
+      }
+    }
+
+    // Supersede all pending exec runs
     const pendings = await tx
       .select({ id: runs.id })
       .from(runs)

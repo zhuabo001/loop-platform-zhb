@@ -12,7 +12,7 @@
 
 import { describe, expect, test } from "vitest";
 
-import { nextOccurrence, ScheduleValidationError, validateSchedule } from "./time-semantics.js";
+import { isOccurrence, latestOccurrence, nextOccurrence, ScheduleValidationError, validateSchedule } from "./time-semantics.js";
 
 describe("D: Cron, timezone, and DST", () => {
   test("D1: accept legal five-segment cron and normalize whitespace", () => {
@@ -218,5 +218,117 @@ describe("D: Cron, timezone, and DST", () => {
     // hour for this range and must not be skipped while recovering.
     const range = validateSchedule("0 1-2 * * *", "America/New_York");
     expect(nextOccurrence(range, insideSecondRepeatedHour)).toEqual(new Date("2026-11-01T07:00:00.000Z"));
+  });
+});
+
+describe("latestOccurrence / isOccurrence (Batch 2 occurrence reconstruction)", () => {
+  const daily10 = validateSchedule("0 10 * * *", "UTC");
+  const minutely = validateSchedule("* * * * *", "UTC");
+
+  test("reconstructs the exact occurrence from an on-time or slightly delayed firing", () => {
+    // Firing exactly at the occurrence, 37s late, and 119s late (within lookback)
+    expect(latestOccurrence(daily10, new Date("2026-08-27T10:00:00.000Z"))).toEqual(
+      new Date("2026-08-27T10:00:00.000Z"),
+    );
+    expect(latestOccurrence(daily10, new Date("2026-08-27T10:00:37.000Z"))).toEqual(
+      new Date("2026-08-27T10:00:00.000Z"),
+    );
+    expect(latestOccurrence(daily10, new Date("2026-08-27T10:01:59.000Z"))).toEqual(
+      new Date("2026-08-27T10:00:00.000Z"),
+    );
+  });
+
+  test("reconstructs across arbitrary callback delays — no drop window (Round 2 regression)", () => {
+    // A daily 10:00 callback arriving 2.5 minutes, 3 hours, or 26 hours late
+    // still reconstructs its occurrence (a fired callback is a live occurrence).
+    expect(latestOccurrence(daily10, new Date("2026-08-27T10:02:30.000Z"))).toEqual(
+      new Date("2026-08-27T10:00:00.000Z"),
+    );
+    expect(latestOccurrence(daily10, new Date("2026-08-27T13:00:00.000Z"))).toEqual(
+      new Date("2026-08-27T10:00:00.000Z"),
+    );
+    expect(latestOccurrence(daily10, new Date("2026-08-28T09:59:59.000Z"))).toEqual(
+      new Date("2026-08-27T10:00:00.000Z"),
+    );
+
+    // Hourly cron delayed 90 minutes: latest occurrence ≤ now
+    const hourly = validateSchedule("0 * * * *", "UTC");
+    expect(latestOccurrence(hourly, new Date("2026-08-27T11:35:00.000Z"))).toEqual(
+      new Date("2026-08-27T11:00:00.000Z"),
+    );
+
+    // Before today's occurrence, the answer is YESTERDAY's (walk-back across days)
+    expect(latestOccurrence(daily10, new Date("2026-08-27T09:58:00.000Z"))).toEqual(
+      new Date("2026-08-26T10:00:00.000Z"),
+    );
+
+    // Feb-29-only cron: the adaptive window spans the multi-year gap
+    const leapDay = validateSchedule("0 10 29 2 *", "UTC");
+    expect(latestOccurrence(leapDay, new Date("2027-03-01T00:00:00.000Z"))).toEqual(
+      new Date("2024-02-29T10:00:00.000Z"),
+    );
+  });
+
+  test("dense schedules: returns the LATEST occurrence in the window, not the first", () => {
+    // Regression pin: a minutely cron inside a 2-minute lookback has THREE
+    // candidate occurrences; the reconstruction must be the newest one.
+    expect(latestOccurrence(minutely, new Date("2026-08-27T10:01:30.000Z"))).toEqual(
+      new Date("2026-08-27T10:01:00.000Z"),
+    );
+    expect(latestOccurrence(minutely, new Date("2026-08-27T10:01:00.000Z"))).toEqual(
+      new Date("2026-08-27T10:01:00.000Z"),
+    );
+    expect(latestOccurrence(minutely, new Date("2026-08-27T10:01:59.999Z"))).toEqual(
+      new Date("2026-08-27T10:01:00.000Z"),
+    );
+  });
+
+  test("reconstructs leap-day schedules across a non-leap century gap (Round 3 regression)", () => {
+    const leapDay = validateSchedule("0 10 29 2 *", "UTC");
+
+    expect(latestOccurrence(leapDay, new Date("2103-03-01T00:00:00.000Z"))).toEqual(
+      new Date("2096-02-29T10:00:00.000Z"),
+    );
+  });
+
+  test("sparse seasonal schedules do not walk every occurrence on the event loop (Round 3 regression)", () => {
+    const januaryMinutely = validateSchedule("* * * 1 *", "UTC");
+    const startedAt = performance.now();
+
+    expect(latestOccurrence(januaryMinutely, new Date("2026-12-31T23:59:59.999Z"))).toEqual(
+      new Date("2026-01-31T23:59:00.000Z"),
+    );
+    expect(performance.now() - startedAt).toBeLessThan(1_000);
+  }, 15_000);
+
+  test("reconstructs the canonical latest occurrence across DST gap and overlap (Round 3)", () => {
+    const gap = validateSchedule("30 2 * * *", "America/New_York");
+    // March 8 02:30 does not exist; after the gap, the latest canonical tick
+    // is still March 7 02:30 EST (07:30Z).
+    expect(latestOccurrence(gap, new Date("2026-03-08T08:00:00.000Z"))).toEqual(
+      new Date("2026-03-07T07:30:00.000Z"),
+    );
+
+    const overlap = validateSchedule("30 1 * * *", "America/New_York");
+    // The repeated 01:30 uses only its first occurrence (EDT, 05:30Z); the
+    // second wall-clock spelling in EST is not a second canonical tick.
+    expect(latestOccurrence(overlap, new Date("2026-11-01T06:45:00.000Z"))).toEqual(
+      new Date("2026-11-01T05:30:00.000Z"),
+    );
+  });
+
+  test("isOccurrence: exact occurrence true, off-by-one-second and wrong minute false", () => {
+    expect(isOccurrence(daily10, new Date("2026-08-27T10:00:00.000Z"))).toBe(true);
+    expect(isOccurrence(daily10, new Date("2026-08-27T10:00:01.000Z"))).toBe(false);
+    expect(isOccurrence(daily10, new Date("2026-08-27T09:59:00.000Z"))).toBe(false);
+    expect(isOccurrence(minutely, new Date("2026-08-27T10:01:00.000Z"))).toBe(true);
+    expect(isOccurrence(minutely, new Date("2026-08-27T10:01:30.000Z"))).toBe(false);
+  });
+
+  test("isOccurrence honors the schedule timezone", () => {
+    const shanghai10 = validateSchedule("0 10 * * *", "Asia/Shanghai");
+    // 10:00 Asia/Shanghai = 02:00 UTC
+    expect(isOccurrence(shanghai10, new Date("2026-08-27T02:00:00.000Z"))).toBe(true);
+    expect(isOccurrence(shanghai10, new Date("2026-08-27T10:00:00.000Z"))).toBe(false);
   });
 });

@@ -36,13 +36,18 @@ import {
   reportRequestSchema,
   RUN_CAPABILITY_INVALID_CODE,
   triggerRunRequestSchema,
+  updateScheduleRequestSchema,
 } from "@loopzhb/protocol";
 
 import { LoopValidationError } from "../admin/errors.js";
 import type { LoopAdmin } from "../admin/index.js";
 import { InvalidMachineCredentialError, RunCapabilityInvalidError } from "../coordinator/errors.js";
 import type { RunCoordinator } from "../coordinator/index.js";
+import type { Loop } from "../db/schema.js";
 import type { OwnerControl } from "../owner/index.js";
+import { ScheduleValidationError, updateSchedule } from "../schedule/index.js";
+import type { Db } from "../db/index.js";
+import type { Clock } from "../time.js";
 
 /** Both machine endpoints share one wire body cap (plan §HTTP). */
 const BODY_CAP_BYTES = 2 * 1024 * 1024;
@@ -80,8 +85,31 @@ async function parseJsonBodyOrEmpty(c: Context): Promise<unknown> {
   }
 }
 
-export function createServerApp(coordinator: RunCoordinator, admin: LoopAdmin, ownerControl: OwnerControl): Hono {
+export function createServerApp(
+  coordinator: RunCoordinator,
+  admin: LoopAdmin,
+  ownerControl: OwnerControl,
+  db: Db,
+  clock: Clock,
+  onScheduleCommitted?: (loop: Loop) => void,
+): Hono {
   const app = new Hono();
+
+  /**
+   * The ONE schedule-commit seam (Batch 2 plan §2): invoked synchronously after
+   * a committed create/PATCH with the authoritative loop row. A seam failure
+   * is logged with a fixed classification and NEVER fails the request — the
+   * configuration is already committed, and rolling the response back would
+   * leave client and server disagreeing about state.
+   */
+  const commitSchedule = (loop: Loop): void => {
+    if (!onScheduleCommitted) return;
+    try {
+      onScheduleCommitted(loop);
+    } catch {
+      console.warn("[http] schedule_commit_sync_failed");
+    }
+  };
 
   app.onError((err, c) => {
     console.error("[http] unhandled error", err);
@@ -160,10 +188,23 @@ export function createServerApp(coordinator: RunCoordinator, admin: LoopAdmin, o
     try {
       const result = await admin.createLoop(parsed.data);
       if (!result.created) return jsonError(c, 404, "not found");
+
+      // Hot-register the schedule through the seam with the authoritative row
+      // from the INSERT (no post-commit re-read). The seam never blocks or
+      // fails the response — the committed loop stands either way.
+      if (result.row.enabled && result.row.cron !== null) {
+        commitSchedule(result.row);
+      }
+
       return c.json({ loop: result.loop }, 201);
     } catch (err) {
       if (err instanceof LoopValidationError) {
-        console.warn("[http] create-loop cap rejected", err.message);
+        console.warn("[http] create-loop cap rejected", err.field);
+        return jsonError(c, 400, "invalid request");
+      }
+      if (err instanceof ScheduleValidationError) {
+        // Fixed classification only — the message embeds user input.
+        console.warn("[http] create-loop schedule rejected", err.field);
         return jsonError(c, 400, "invalid request");
       }
       throw err;
@@ -200,6 +241,41 @@ export function createServerApp(coordinator: RunCoordinator, admin: LoopAdmin, o
     if (result.canceled) return c.json({ canceled: true }, 200);
     if (result.reason === "not_found") return jsonError(c, 404, "not found");
     return c.json({ canceled: false, reason: "not_cancelable" }, 200);
+  });
+
+  app.patch("/api/loops/:id/schedule", cap, async (c) => {
+    const raw = await parseJsonBody(c);
+    if (raw === undefined) return jsonError(c, 400, "invalid request");
+    const parsed = updateScheduleRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      console.warn("[http] update-schedule DTO rejected", parsed.error.issues);
+      return jsonError(c, 400, "invalid request");
+    }
+    try {
+      const result = await updateSchedule({ db, clock }, c.req.param("id"), parsed.data);
+
+      if (!result.found) return jsonError(c, 404, "not found");
+
+      // Sync the in-memory scheduler through the seam on an EFFECTIVE change
+      // (a no-op patch must not replace the job).
+      if (result.changed) {
+        commitSchedule(result.loop);
+      }
+
+      // The wire response is the admin view (LoopSummary with lastRun and
+      // computed nextFireAt) — never the raw DB row (ADR-002 wire boundary).
+      const loopSummary = await admin.getLoopSummary(result.loop.id);
+      if (!loopSummary) return jsonError(c, 404, "not found");
+
+      return c.json({ loop: loopSummary }, 200);
+    } catch (err) {
+      if (err instanceof ScheduleValidationError) {
+        // Fixed classification only — the message embeds user input.
+        console.warn("[http] update-schedule validation failed", err.field);
+        return jsonError(c, 400, "invalid request");
+      }
+      throw err;
+    }
   });
 
   return app;

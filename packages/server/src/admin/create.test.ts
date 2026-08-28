@@ -60,6 +60,9 @@ describe("createLoop", () => {
       createdAt: clock.iso(),
       updatedAt: clock.iso(),
       lastRun: null,
+      cron: null,
+      timezone: "UTC",
+      nextFireAt: null,
     });
 
     const rows = await snapshotLoops(db);

@@ -68,7 +68,7 @@ async function fresh(): Promise<void> {
   let loopN = 0;
   admin = createLoopAdmin({ db, clock, newLoopId: () => `loop-${++loopN}` });
   ownerControl = createOwnerControl({ db, clock });
-  app = createServerApp(coordinator, admin, ownerControl);
+  app = createServerApp(coordinator, admin, ownerControl, db, clock);
 }
 
 async function pollReq(body: unknown = {}, token: string | null = TOKEN): Promise<Response> {
@@ -130,7 +130,7 @@ async function expectJsonError(res: Response, status: number, body: { error: str
 describe("createServerApp: seam properties", () => {
   it("returns an independent app per call and constructs with no DB/env/listener side effects", async () => {
     await fresh();
-    const other = createServerApp(coordinator, admin, ownerControl);
+    const other = createServerApp(coordinator, admin, ownerControl, db, clock);
     expect(other).not.toBe(app);
     // Both serve independently.
     expect((await app.request("/api/machine/poll", { method: "GET" })).status).toBe(404);
@@ -278,6 +278,9 @@ describe("POST /api/loops", () => {
         createdAt: clock.iso(),
         updatedAt: clock.iso(),
         lastRun: null,
+        cron: null,
+        timezone: "UTC",
+        nextFireAt: null,
       },
     });
     expect(await snapshotLoops(db)).toHaveLength(1);
@@ -344,6 +347,67 @@ describe("POST /api/loops", () => {
     const res = await createLoopReq({ machineId: MACHINE_ID, name: "x".repeat(2 * 1024 * 1024) });
     await expectJsonError(res, 413, { error: "request body too large" });
     expect(await snapshotLoops(db)).toEqual([]);
+  });
+
+  it("400 (never 500) for an invalid cron — ScheduleValidationError maps into the taxonomy", async () => {
+    await fresh();
+    await seedMachine(db, MACHINE_ID);
+    const bad = [
+      { machineId: MACHINE_ID, cron: "not a cron" },
+      { machineId: MACHINE_ID, cron: "@daily" }, // macros rejected
+      { machineId: MACHINE_ID, cron: "0 10 * * * *" }, // six segments rejected
+      { machineId: MACHINE_ID, cron: "61 10 * * *" }, // out-of-range minute
+    ];
+    for (const body of bad) {
+      await expectJsonError(await createLoopReq(body), 400, { error: "invalid request" });
+    }
+    expect(await snapshotLoops(db)).toEqual([]);
+  });
+
+  it("400 for an invalid timezone — including timezone-ONLY creation (no cron)", async () => {
+    await fresh();
+    await seedMachine(db, MACHINE_ID);
+    // Timezone-only creation must not bypass validation: a manual-only loop
+    // still persists its timezone, so an invalid one is rejected up front.
+    await expectJsonError(
+      await createLoopReq({ machineId: MACHINE_ID, timezone: "Not/AZone" }),
+      400,
+      { error: "invalid request" },
+    );
+    await expectJsonError(
+      await createLoopReq({ machineId: MACHINE_ID, cron: "0 10 * * *", timezone: "Not/AZone" }),
+      400,
+      { error: "invalid request" },
+    );
+    expect(await snapshotLoops(db)).toEqual([]);
+  });
+
+  it("201 for timezone-only creation — timezone persisted, cron stays null", async () => {
+    await fresh();
+    await seedMachine(db, MACHINE_ID);
+    const res = await createLoopReq({ machineId: MACHINE_ID, timezone: "Asia/Shanghai" });
+    expect(res.status).toBe(201);
+    const parsed = createLoopResponseSchema.parse(await res.json());
+    expect(parsed.loop).toMatchObject({ cron: null, timezone: "Asia/Shanghai", nextFireAt: null });
+    const rows = await snapshotLoops(db);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ cron: null, timezone: "Asia/Shanghai" });
+  });
+
+  it("201 for scheduled creation — cron normalized, nextFireAt computed", async () => {
+    await fresh();
+    await seedMachine(db, MACHINE_ID);
+    const res = await createLoopReq({
+      machineId: MACHINE_ID,
+      cron: "  0   10  * *  * ", // whitespace normalizes
+      timezone: "UTC",
+    });
+    expect(res.status).toBe(201);
+    const parsed = createLoopResponseSchema.parse(await res.json());
+    expect(parsed.loop.cron).toBe("0 10 * * *");
+    expect(parsed.loop.timezone).toBe("UTC");
+    // Clock is the FakeClock default (2026-07-29T00:00Z) → next 10:00 UTC
+    expect(parsed.loop.nextFireAt).toBe("2026-07-29T10:00:00.000Z");
   });
 });
 
@@ -549,6 +613,9 @@ describe("GET observation surface", () => {
         enabled: true,
         createdAt: "2026-07-01T00:00:00.000Z",
         updatedAt: "2026-07-01T00:00:00.000Z",
+        cron: null,
+        timezone: "UTC",
+        nextFireAt: null,
         lastRun: {
           id: "run-1",
           loopId: "loop-1",
@@ -661,6 +728,8 @@ describe("unified error surface", () => {
       },
       admin,
       ownerControl,
+      db,
+      clock,
     );
     const res = await sabotaged.request("/api/machine/poll", {
       method: "POST",

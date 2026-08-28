@@ -80,7 +80,14 @@ async function bootFake(dataDir?: string): Promise<FakeBoot> {
   const sweepLogs: string[] = [];
   const sweep = createInactivitySweep({ db: handle.db, clock, log: (line) => sweepLogs.push(line) });
   const ownerControl = createOwnerControl({ db: handle.db, clock });
-  return { app: createServerApp(coordinator, admin, ownerControl), db: handle.db, handle, clock, sweep, sweepLogs };
+  return {
+    app: createServerApp(coordinator, admin, ownerControl, handle.db, clock),
+    db: handle.db,
+    handle,
+    clock,
+    sweep,
+    sweepLogs
+  };
 }
 
 /** Adapt the Hono app into the daemon's fetch (same seam as daemon-e2e). */
