@@ -27,7 +27,7 @@ import { createLoopResponseSchema, loopListResponseSchema, machineListResponseSc
 import { machineIdFromToken } from "@loopzhb/protocol/node";
 
 import { closeDb, type DbHandle } from "./db/index.js";
-import { loops, runLeases } from "./db/schema.js";
+import { loops, runLeases, runs } from "./db/schema.js";
 import { bootstrapServer, waitForListening, type BootedServer } from "./start.js";
 import { FakeClock } from "./testkit/index.js";
 import type { Clock } from "./time.js";
@@ -128,8 +128,8 @@ async function listRuns(rs: RunningServer, loopId: string) {
 
 /** Read-only watermark/revision probe — the wire deliberately lacks these
  *  (plan §2.4: no new protocol fields for tests). */
-async function scheduleStateOf(rs: RunningServer, loopId: string) {
-  const [row] = await rs.handle.db.select().from(loops).where(eq(loops.id, loopId));
+async function scheduleStateOf(handle: DbHandle, loopId: string) {
+  const [row] = await handle.db.select().from(loops).where(eq(loops.id, loopId));
   return {
     lastScheduledAt: row?.lastScheduledAt ?? null,
     scheduleRevision: row?.scheduleRevision ?? -1,
@@ -208,7 +208,7 @@ describe("E-group: file-backed DB + real HTTP restart E2E", () => {
     const allRuns = await listRuns(second, loopId);
     expect(allRuns).toHaveLength(1);
     expect(allRuns[0]).toMatchObject({ phase: "pending", role: "exec" });
-    expect(await scheduleStateOf(second, loopId)).toMatchObject({
+    expect(await scheduleStateOf(second.handle, loopId)).toMatchObject({
       lastScheduledAt: "2026-08-27T12:30:00.000Z",
     });
 
@@ -229,7 +229,7 @@ describe("E-group: file-backed DB + real HTTP restart E2E", () => {
     const second = await boot(dir, clock);
     openHandles.push(second.handle);
     expect(await listRuns(second, loopId)).toHaveLength(1);
-    const stateAfterSecond = await scheduleStateOf(second, loopId);
+    const stateAfterSecond = await scheduleStateOf(second.handle, loopId);
     await shutdown(second);
 
     // Third boot, same instant: the occurrence is already covered.
@@ -238,7 +238,7 @@ describe("E-group: file-backed DB + real HTTP restart E2E", () => {
     const allRuns = await listRuns(third, loopId);
     expect(allRuns).toHaveLength(1);
     expect(allRuns[0]).toMatchObject({ phase: "pending" });
-    expect(await scheduleStateOf(third, loopId)).toEqual(stateAfterSecond);
+    expect(await scheduleStateOf(third.handle, loopId)).toEqual(stateAfterSecond);
 
     await shutdown(third);
   });
@@ -351,7 +351,7 @@ describe("E-group: file-backed DB + real HTTP restart E2E", () => {
     const allRuns = await listRuns(second, loopId);
     expect(allRuns).toHaveLength(1);
     expect(allRuns[0]).toMatchObject({ phase: "running" });
-    expect((await scheduleStateOf(second, loopId)).lastScheduledAt).toBe("2026-08-27T12:30:00.000Z");
+    expect((await scheduleStateOf(second.handle, loopId)).lastScheduledAt).toBe("2026-08-27T12:30:00.000Z");
 
     // The daemon's poll redelivers nothing.
     let runnerCalls = 0;
@@ -368,7 +368,7 @@ describe("E-group: file-backed DB + real HTTP restart E2E", () => {
     await shutdown(second);
   });
 
-  it("E10: after a scheduler drain + HTTP/DB close, leaked firings touch nothing and the next boot recovers cleanly", async () => {
+  it("E10: stopAndDrain waits for an in-flight catch-up before the DB closes; leaked firings afterwards touch nothing", async () => {
     const dir = await freshDataDir();
     const clock = new FakeClock(T0);
 
@@ -376,25 +376,90 @@ describe("E-group: file-backed DB + real HTTP restart E2E", () => {
     openHandles.push(first.handle);
     await makeDaemon(first).pollOnce();
     const loopId = await createScheduledLoop(first, "* * * * *");
-    const leakedCallbacks = first.cronFactory.entries().map((e) => e.callback);
-    expect(leakedCallbacks).toHaveLength(1);
     await shutdown(first);
+
+    // Restart at 09:02: the catch-up for the 09:02 occurrence (the cutoff
+    // instant is itself a minutely tick) is parked at the enqueue gate
+    // (in-flight), and stopAndDrain() MUST wait for it — the DB may only
+    // close after the write settles (plan §2.1 step 6, review P2-1,
+    // Issue #29).
+    clock.advance(2 * 60 * 1000);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    let entered!: () => void;
+    const catchupParked = new Promise<void>((r) => {
+      entered = r;
+    });
+    let gateUsed = false;
+    const secondCronFactory = new FakeCronFactory();
+    const second = await bootstrapServer(
+      { host: "127.0.0.1", port: 0, dataDir: dir },
+      {
+        clock,
+        cronFactory: secondCronFactory,
+        coordinatorHooks: {
+          beforeEnqueueTx: () => {
+            if (gateUsed) return undefined;
+            gateUsed = true;
+            entered();
+            return gate;
+          },
+        },
+      },
+    );
+    const secondServer = serve({ fetch: second.app.fetch, port: 0, hostname: "127.0.0.1" });
+    await waitForListening(secondServer);
+    openHandles.push(second.handle);
+    const startPromise = second.scheduler.start();
+
+    await catchupParked; // the catch-up enqueue is REALLY in flight
+    let drained = false;
+    const drainPromise = second.scheduler.stopAndDrain().then(() => {
+      drained = true;
+    });
+    // The gate is still held, so the drain CANNOT have completed — the
+    // in-flight catch-up promise shares the drain set with online callbacks.
+    expect(await Promise.race([drainPromise.then(() => "drained" as const), Promise.resolve("waiting" as const)])).toBe(
+      "waiting",
+    );
+    release();
+    await startPromise;
+    await drainPromise;
+    expect(drained).toBe(true);
+
+    // The drained catch-up write LANDED before any close: one pending run,
+    // watermark at the 09:02 occurrence (read-only probes on the open handle).
+    const landed = await second.handle.db.select().from(runs);
+    expect(landed).toHaveLength(1);
+    expect(landed[0]).toMatchObject({ phase: "pending" });
+    expect(await scheduleStateOf(second.handle, loopId)).toMatchObject({
+      lastScheduledAt: "2026-08-27T09:02:00.000Z",
+    });
+
+    // Production close order after the drain: listener, then DB.
+    const leakedCallbacks = secondCronFactory.entries().map((e) => e.callback);
+    await new Promise<void>((resolve) => secondServer.close(() => resolve()));
+    openHandles.splice(openHandles.indexOf(second.handle), 1);
+    await closeDb(second.handle);
 
     // A timer that outlived the drain fires into the stopped guard — against
     // an already-CLOSED database any access would throw.
-    clock.advance(2 * 60 * 1000);
+    clock.advance(60 * 1000);
     for (const cb of leakedCallbacks) {
       await cb();
     }
 
-    // The next boot over the same dataDir recovers normally.
-    const second = await boot(dir, clock);
-    openHandles.push(second.handle);
-    const allRuns = await listRuns(second, loopId);
-    expect(allRuns).toHaveLength(1);
-    expect(allRuns[0]).toMatchObject({ phase: "pending" });
-    expect((await scheduleStateOf(second, loopId)).lastScheduledAt).toBe("2026-08-27T09:02:00.000Z");
+    // The next boot over the same dataDir recovers normally: the 09:03
+    // occurrence supersedes the drained 09:02 pending — still at most one.
+    const third = await boot(dir, clock);
+    openHandles.push(third.handle);
+    const allRuns = await listRuns(third, loopId);
+    expect(allRuns).toHaveLength(2);
+    expect(allRuns.filter((r) => r.phase === "pending")).toHaveLength(1);
+    expect((await scheduleStateOf(third.handle, loopId)).lastScheduledAt).toBe("2026-08-27T09:03:00.000Z");
 
-    await shutdown(second);
+    await shutdown(third);
   });
 });
