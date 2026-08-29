@@ -154,10 +154,10 @@ supersede 未领取的 pending——T7 语义在 cron 表面继承）+ 重启 ca
 - **Batch 3 — 重启 catch-up 与阶段收口（Day 6）：已完成**（2026-08-29，ADR-007 批次三追加裁决；验收证据 `docs/tests/phase3-acceptance.md`）
   - `Scheduler.start()` 重启恢复：fail-closed 持久化状态校验（扫描侧跳过损坏 Loop）→ 先注册全部 job → registry 回读定义恢复集合（`entry.revision === loop.scheduleRevision`）→ 统一截取 recoveryCutoff → 逐 Loop 只恢复 `latestOccurrence` 重建的最新真实 occurrence（严格晚于 activation 与 watermark）；catch-up 串行 await、与在线 callback 共用 in-flight 集合统一 drain、逐 Loop 检查 `stopped`。
   - Scheduled enqueue fail-closed：活跃 scheduled Loop 的 activation 缺失/非规范、非空 watermark 非规范、revision 非法时返回内部 skip 原因 `invalid_schedule_state`，零写入；规范 UTC ISO 判定为 round-trip 相等；判定规则单一实现（`isValidPersistedScheduleState`）供扫描与事务两路共享。
-  - 组合根注入缝（仅内部可见）：`bootstrapServer(config, overrides)` 的单一注入 Clock 替换全部 `systemClock` 使用点（coordinator/admin/ownerControl/sweep/scheduler/HTTP app），CronFactory 可注入；生产路径不传 overrides。
-  - 测试覆盖：R 组（重启 catch-up R1–R12）、E 组（文件型 PGlite + 真实 HTTP + daemon runtime + Fake Runner 的确定性 E2E E1–E10）、X 组（故障隔离与日志纪律 X1–X3，X4 为完整质量门）、V 组（fail-closed 校验 V1–V6）；watermark/revision 等内部状态经测试自持 DbHandle 只读断言，不新增 wire 字段。
+  - 组合根注入缝（仅内部可见）：`bootstrapServer(config, overrides)` 的单一注入 Clock 替换全部 `systemClock` 使用点（coordinator/admin/ownerControl/sweep/scheduler/HTTP app），CronFactory 与 test-only coordinator hooks 可注入；生产路径不传 overrides。
+  - 测试覆盖：R 组（重启 catch-up R1–R12）、E 组（文件型 PGlite + 真实 HTTP + daemon runtime + Fake Runner 的确定性 E2E E1–E10）、X 组（故障隔离与日志纪律 X1–X3，X4 为完整质量门）、V 组（fail-closed 校验 V1–V7）；watermark/revision 等内部状态经测试自持 DbHandle 只读断言，不新增 wire 字段。
   - 边界：无 protocol/HTTP 路由/migration/`next_run_at` 变更；无多实例调度与后台 retry worker（Phase 6）；无真实 Claude 调用。
-  - 复审状态：计划评审 P1-1/P1-2/P2-1/P2-2/P2-3/P3-2 已采纳并入计划正文，P3-1 经裁决为 [无效审查]（并发恢复不改变 boot gate 语义；真实挂起需独立启动裁决）。
+  - 复审状态：计划评审与实施后两轮三轨复审的全部发现已登记为 `phase-3` Issues #26–#32（核销状态以 Issue 为准）；逐轮审查证据留 `docs/handoff/`（不进库），裁决见 ADR-007 批次三追加裁决与 ADR-008。
   - **Phase 3（cron 与离线恢复）整体收口**：server 重启 / 机器离线恢复后最多补跑一次，绝不双跑。
 
 ### 右移项

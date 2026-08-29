@@ -131,41 +131,9 @@ git diff --check
 
 ## 六、计划评审结论（对照 Batch 2 代码基线 `37d4c92`）
 
-### 6.1 总体结论
+计划评审（实施前）处置结论：
 
-计划与现有架构高度契合：唯一写入口 `enqueueExecRun`、watermark 原子推进、running skip、pending supersede（T7）、per-loop 串行化、`latestOccurrence` 对数重建与 DST 语义、in-flight drain 全部复用 Batch 2 已落地机制，无重复造轮子。§2.2 的 fail-closed 校验补的是真实缺口（`runs.ts` 的 canonical 假设对损坏持久化行失效）。目标界定、显式边界、日志纪律与 Phase 6 划分干净，R/E/X 测试编组覆盖完整。
+- **已采纳并并入正文（实施不得回退）**：P1-1（§2.4 注入 Clock 必须替换组合根全部 `systemClock` 使用点）、P1-2（§2.1 步骤 3 的注册成功判定为 registry 回读 `entry.revision === loop.scheduleRevision`）、P2-1（§2.1 步骤 6 逐 Loop 检查 `stopped` + catch-up 共享 in-flight drain）、P2-2（§2.2 规范 UTC ISO 判定为 round-trip 相等）、P2-3（§2.4 watermark/revision 经测试自持 DbHandle 只读断言，不新增 wire 字段）、P3-2（manual pending 可被 catch-up supersede 的取舍显式进 ADR-007）。
+- **[无效审查]**：P3-1（单 Loop catch-up 挂起拖住 readiness）——裁决理由沉淀于 ADR-007 批次三追加裁决第 6 条，不在本节保留。
 
-以下发现按严重度排列；P1 必须在实现开始前钉死口径，P2 建议在实现前明确，P3 可在实现/复审阶段处理。
-
-### 6.2 已核对无误的计划假设
-
-- `coordinator.enqueueExecRun(loopId, { kind: "scheduled", scheduledFor, scheduleRevision })` 签名一致（`coordinator/index.ts:131`）。
-- catch-up 遇 running 仅推进 watermark 不创建 pending：已实现（`store/runs.ts:222-231`）。
-- T7 supersede-all 语义（R5/R7 依据）：已实现（`store/runs.ts:239-256`）。
-- per-loop 串行化裁决并发（R8/R10 依据）：`serialize()` 已存在（`coordinator/index.ts:108-137`）。
-- `latestOccurrence` 指数回探 + 二分、不枚举历史（R2 依据）：已实现（`time-semantics.ts:252-294`）；DST gap/overlap 语义已在 `nextOccurrence` 落地（R11 依据）。
-- §2.2 的缺口属实：`store/runs.ts:204-207` 注释假设 "canonical by construction (toISOString writes only)"，损坏行会让非规范字符串参与字典序比较并污染 watermark。
-- in-flight 集合与 `stopAndDrain` 已存在（`scheduler/index.ts:92, 264-281`）。
-- `invalid_schedule_state` 为内部 `EnqueueExecRunResult` 联合类型新增成员，不触碰公共 wire 与 protocol。
-- ADR-008 与 roadmap 中"Batch 3 尚未实现"的历史边界确实存在（`008-phase3-batch2-online-scheduler.md:63`、`roadmap.md:157`）。
-- 质量门命令（`test`/`typecheck`/`build`/`db:check`）脚本全部存在。
-
-### 6.3 Findings
-
-**P1-1：§2.4 组合根注入范围不完整，FakeClock E2E 会口径分裂。** `bootstrapServer()` 把 `systemClock` 传给五个组件：coordinator、admin、ownerControl、sweep、scheduler（`start.ts:59-73`）。若 override 只替换 scheduler 的 clock，则 E2E 中 run `ts`、lease `createdAt/expiresAt`、progress 心跳 `at`（均来自 coordinator clock）仍走真实墙钟，而 occurrence/watermark 走 FakeClock，E3–E9 的确定性断言失守。**修订：注入的 Clock 必须替换组合根中所有 `systemClock` 出现处，生产默认值不变。**
-
-**P1-2：§2.1 步骤 3"确实成功注册"的判定方式未定义。** `reconcile()` 返回 `void`，注册失败只 log `job_register_failed` 后吞掉（`scheduler/index.ts:222-224`），start() 无从直接得知注册结果。若实现退化为"调用过 reconcile 即进入恢复集合"，注册失败的 Loop 会被错误纳入 catch-up。**修订：写明成功判定的具体读取路径（如回读 registry 确认 `entry.revision === loop.scheduleRevision`）。**
-
-**P2-1：恢复循环被 stop 打断后的行为未规定。** 生产 `main()` 中信号处理器注册在 `scheduler.start()` 完成之后（`start.ts:142`），生产路径基本安全；但测试组合根可并发调用 `stopAndDrain()`，恢复循环在步骤 4–6 之间被打断后仍可能对已关闭 DB 调 `enqueueExecRun`——正是 E10 守护的场景。**修订：恢复循环每迭代一个 Loop 前检查 `stopped`；catch-up 工作全部挂入现有 in-flight 集合统一 drain。**
-
-**P2-2："规范 UTC ISO"的判定算法未钉死。** `toISOString()` 恒输出 `YYYY-MM-DDTHH:MM:SS.sssZ`（3 位毫秒 + `Z`）；现有 `parseScheduledFor`（`store/runs.ts:77-127`）接受 `+08:00` 等 offset 形式，不能直接当作 canonical 校验。**修订：明确判定算法为 round-trip 相等——`parse(value) !== undefined && new Date(ms).toISOString() === value`。**
-
-**P2-3：R1/E4 等的 watermark 断言路径与"真实 HTTP"承诺有张力。** HTTP 观察面 `LoopSummary` 只暴露 `cron`/`timezone`/`nextFireAt`（`protocol/src/admin.ts:110-126`），不暴露 `lastScheduledAt`/`scheduleRevision`/`scheduleActivatedAt`，R1、E4 的 watermark 断言无法经 HTTP 完成。**修订：显式选择"HTTP 驱动行为、测试通过自己持有的 DbHandle 只读断言 watermark/revision"（不违反 §五），并写入 §2.4 与 §三；不得为此新增 wire 字段。**
-
-**[无效审查] P3-1：单 Loop catch-up 挂起会拖住整体 readiness。** 步骤 6 要求逐 Loop 串行 await；X2 隔离了单 Loop **错误**，但**挂起**会阻塞后续所有 Loop 的恢复并卡住 boot gate。coordinator 已有 per-loop 串行化，catch-up 本身可并发。**不采纳：各 Loop 并发后仍需等待全部 catch-up 才能完成当前 boot gate，无法解决所述 readiness 阻塞；“接受串行延迟及上限”也没有定义可实施的 timeout/中断语义。若未来需要处理真实挂起，应另行裁决启动是否改为非阻塞恢复及其超时、可观测性和 shutdown 合约，不能以本建议替代。**
-
-**P3-2：R7/R8 的"manual 被吞"语义建议显式进 ADR。** 停机期间的 manual Run Now 请求可能被重启 catch-up supersede 而静默取消。计划已隐含接受该取舍，但这是产品语义层面的决定，**建议在 ADR-007 追加时显式声明**，避免三轨复审阶段争议。
-
-### 6.4 处置建议
-
-已采纳 P1-1、P1-2、P2-1、P2-2、P2-3 与 P3-2：相应约束已写入 §2、§三和 §四，实施不得回退。P3-1 已标记为 `[无效审查]`，不纳入本批设计或验收；如将来要解决真实挂起，须先形成独立的启动/超时裁决。
+逐轮审查证据与发现细节属当批物流：保存于 `docs/handoff/`（不进库）与 GitHub Issues（`phase-3`），本节不复制。

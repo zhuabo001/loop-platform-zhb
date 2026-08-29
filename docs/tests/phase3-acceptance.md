@@ -24,9 +24,9 @@
 | 编组 | 文件 | 覆盖 |
 |---|---|---|
 | R1–R12 重启 catch-up | `packages/server/src/scheduler/catchup.test.ts` | 单次/长停机/latest-only、连续重启（文件库）、pending/running/manual-pending supersede、manual 双序交错、在线 callback 去重、schedule 更新竞态、DST gap/overlap、注入故障完整回滚与重启重试 |
-| E1–E10 文件库 + 真实 HTTP E2E | `packages/server/src/restart-e2e.test.ts` | 配置跨重启持久化、HTTP 观察字段、停机多 occurrence 只恢复最新、claim 前再重启零新增、daemon 唯一 claim、Fake Runner 单次执行 done/exec、lease 消费、二次 poll 零投递、running 不重投、drain 后无已关闭 DB 回调 |
-| X1–X3 故障隔离 | `packages/server/src/scheduler/catchup-isolation.test.ts` | 全维度损坏状态 fail-closed、单 Loop 故障不阻塞 readiness、日志固定分类（无 cron/timezone/异常消息） |
-| V1–V6 fail-closed 校验 | `packages/server/src/coordinator/occurrence.test.ts` | 缺失/非规范 activation、非规范 watermark、非法 revision、损坏 cron 均 `invalid_schedule_state` 零写入；manual trigger 不受影响 |
+| E1–E10 文件库 + 真实 HTTP E2E | `packages/server/src/restart-e2e.test.ts` | 配置跨重启持久化、HTTP 观察字段、停机多 occurrence 只恢复最新、claim 前再重启零新增、daemon 唯一 claim、Fake Runner 单次执行 done/exec、lease 消费、二次 poll 零投递、running 不重投、stopAndDrain 等待在途 catch-up 后才允许关库、drain 后泄漏回调不触已关闭 DB |
+| X1–X3 故障隔离 | `packages/server/src/scheduler/catchup-isolation.test.ts` | 全维度损坏状态 fail-closed、单 Loop enqueue 失败与 job 注册失败均不阻塞 readiness、日志固定分类（无 cron/timezone/异常消息） |
+| V1–V7 fail-closed 校验 | `packages/server/src/coordinator/occurrence.test.ts` | 缺失/非规范 activation、非规范 watermark、非法 revision、损坏 cron、非规范化持久化 cron/timezone 均 `invalid_schedule_state` 零写入；manual trigger 不受影响 |
 | 规范 ISO 与持久化状态判定 | `packages/server/src/schedule/time-semantics.test.ts` | `parseRfc3339Ms` / `isCanonicalUtcIso`（round-trip 相等）/ `isValidPersistedScheduleState` |
 | 组合根注入缝 | `packages/server/src/start.test.ts` | 单一注入 Clock 同时抵达 coordinator、admin、scheduler 与 HTTP app |
 
@@ -58,10 +58,10 @@ $ pnpm build           # Done
 $ pnpm --filter @loopzhb/server db:check
 No schema changes, nothing to migrate 😴   # 无新增 migration（显式边界成立）
 
-$ git diff --check     # 无输出（clean）
+$ git diff --check 37d4c92...HEAD   # 分支范围检查（裸 git diff --check 只查工作区，不证明已提交 diff 干净）——无输出（clean）
 ```
 
-（1 个 skipped 为 Batch 前既有的跳过用例，非本批引入。`packages/server/vitest.config.ts` 的 `hookTimeout` 已提升至 60s——复审发现默认 10s 在高负载并行下是 PGlite WASM 启动超时的实际来源；见下文复审记录。）
+（1 个 skipped 为 Batch 前既有的跳过用例，非本批引入。`packages/server/vitest.config.ts` 的 `hookTimeout` 为 60s——复审发现默认 10s 在高负载并行下是 PGlite WASM 启动超时的实际来源；追溯登记见 Issue #32。）
 
 ## 显式边界核对（相对基线 `37d4c92` 的变更面）
 
@@ -82,18 +82,11 @@ packages/server/src/**/*.test.ts                      # R/E/X/V 编组与既有 
 
 ## 复审与 Issue 收口
 
-- 计划评审（P1-1/P1-2/P2-1/P2-2/P2-3/P3-2 已采纳并入正文；P3-1 经裁决为 [无效审查]，理由留存于计划 §6.3）。
-- 实施后 Standards / Spec / Adversarial 三轨复审（2026-08-29，范围为 `37d4c92..HEAD` 全量 diff）：
-  - **Standards 轨：0 finding**（仅一条 diff 范围外的既有观察：`scheduler/index.ts` 的启动计数行使用 `console.log` 而非注入的 log seam——不含任何不可信数据，维持现状）。
-  - **Adversarial 轨：1 × P2（已修复核销）+ 2 × P3**。
-    - P2（实质性）：非规范化持久化 cron/timezone（如 `"  UTC  "`）绕过 fail-closed 校验后在 Croner 内静默破坏该 Loop。修复：`isValidPersistedScheduleState` 增加规范化 round-trip 相等检查；补测 time-semantics 单测 + X1b + V7；修复提交 `a4edbbc`，Adversarial 复审代理核销通过。对应 Issue #26（`phase-3`）已建并按"修复 + 补测 + 复审核销"流程关闭。
-    - P3-1（已修复）：启动扫描 SQL 补 `cron IS NOT NULL` 谓词（计划 §2.1 步骤 1 口径，命中部分索引）——同提交 `a4edbbc`。
-    - P3-2（不处理）：启动计数日志走 `console.log`（同 Standards 轨观察，仅计数无不可信数据）。
-    - 主动攻击面均验证无误：catch-up 与在线 callback 竞态不双跑、stopAndDrain 中 drain 语义、registry 回读拒绝 stale revision、cutoff 后 occurrence 由已注册 timer 覆盖、注入缝生产默认值不变。
-  - **Spec 轨：1 × P2（已修复）+ 2 × P3，计划符合性逐项核验通过**（P1-1/P1-2/P2-1/P2-2/P2-3/P3-2 与 §2.1/§2.2/§2.3/§2.4 全部落地）。
-    - P2：默认并行测试在高负载下因 vitest 默认 `hookTimeout`(10s) 对 PGlite WASM 启动过短而间歇超时。修复：`hookTimeout: 60_000`（仅为竞争余量，健康运行远低于此）。修复后全量套件 387 passed 稳定通过。
-    - P3（已修复）：本文档测试计数与首跑结果不一致——已按最终全量结果更正为 387 passed | 1 skipped。
-    - P3（无需处理）：复审期间其他轨道的临时复现文件一度残留工作区（未入库），复审结束已自清。
+按 `AGENTS.md` 文档分层：本节只保留蒸馏结论与指针，逐轮发现、复现与核销证据属当批物流，保存于 `docs/handoff/`（不进库）；问题的当前状态与关闭条件以 GitHub Issues 为唯一权威。
+
+- 计划评审（实施前）：P1-1/P1-2/P2-1/P2-2/P2-3/P3-2 已采纳并入计划正文；P3-1 经裁决为 [无效审查]（理由见 ADR-007 批次三追加裁决第 6 条）。
+- 实施后两轮三轨复审（Standards / Spec / Adversarial，范围 `37d4c92..HEAD`）：全部实质性发现已登记为 `phase-3` Issues #26（持久化 cron/timezone 规范化 round-trip）、#27（R9/R10 竞态真实性）、#28（R12 cancel 回滚）、#29（E10 drain 竞态）、#30（分支范围 diff 检查）、#31（文档分层与验收锚点）、#32（hookTimeout 修复追溯登记）；核销状态以各 Issue 为准。
+- 长期裁决只沉淀于 ADR-007（批次三追加裁决）与 ADR-008（边界与日志分类更新）。
 
 ## 结论
 
