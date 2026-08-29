@@ -27,10 +27,11 @@
 
 import type { Db } from "../db/index.js";
 import { loops, type Loop } from "../db/schema.js";
-import { eq } from "drizzle-orm";
+import { and, eq, isNotNull } from "drizzle-orm";
 import type { RunCoordinator } from "../coordinator/index.js";
+import type { EnqueueExecRunResult } from "../store/runs.js";
 import type { Clock } from "../time.js";
-import { latestOccurrence } from "../schedule/time-semantics.js";
+import { isValidPersistedScheduleState, latestOccurrence } from "../schedule/time-semantics.js";
 
 /**
  * Croner job interface — abstracts the real Croner for testing.
@@ -93,6 +94,36 @@ export function createScheduler(deps: SchedulerDeps) {
 
   // Shutdown flag
   let stopped = false;
+
+  /**
+   * Shared in-flight enqueue lifecycle — the ONE shape used by both the
+   * online callback and the restart catch-up (review P3: the two paths used
+   * to duplicate it). The promise is added to the SHARED drain set
+   * SYNCHRONOUSLY, before any await, so stopAndDrain() covers both paths
+   * alike; a thrown enqueue always earns the fixed `enqueue_failed`
+   * classification. A resolved non-enqueue is a benign race outcome: only the
+   * online callback observes it (`enqueue_skipped` with the reason); the
+   * catch-up passes no observer and stays silent (§2.3).
+   */
+  async function drainTrackedEnqueue(
+    loopId: string,
+    result: Promise<EnqueueExecRunResult>,
+    onSkip?: (reason: Extract<EnqueueExecRunResult, { enqueued: false }>["reason"]) => void,
+  ): Promise<void> {
+    const promise = result
+      .then((r) => {
+        if (!r.enqueued) onSkip?.(r.reason);
+      })
+      .catch(() => {
+        log(`scheduler: enqueue_failed loop=${loopId}`);
+      });
+    inFlightCallbacks.add(promise);
+    try {
+      await promise;
+    } finally {
+      inFlightCallbacks.delete(promise);
+    }
+  }
 
   /**
    * Registers or updates a Croner job for the given loop.
@@ -185,31 +216,18 @@ export function createScheduler(deps: SchedulerDeps) {
             return;
           }
 
-          // Enqueue with scheduled trigger. The enqueue promise is RETURNED to
-          // Croner: the job stays "busy" until the write settles, which is what
-          // makes the protect (overrun) handler able to skip a re-entrant tick.
-          const promise = coordinator
-            .enqueueExecRun(loop.id, {
+          // The enqueue is awaited INSIDE the callback so the promise Croner
+          // sees stays pending until the write settles — that is what makes
+          // the protect (overrun) handler able to skip a re-entrant tick.
+          await drainTrackedEnqueue(
+            loop.id,
+            coordinator.enqueueExecRun(loop.id, {
               kind: "scheduled",
               scheduledFor: scheduledFor.toISOString(),
               scheduleRevision: capturedRevision,
-            })
-            .then((result) => {
-              if (!result.enqueued) {
-                log(`scheduler: enqueue_skipped loop=${loop.id} reason=${result.reason}`);
-              }
-            })
-            .catch(() => {
-              log(`scheduler: enqueue_failed loop=${loop.id}`);
-            });
-
-          // Track in-flight callback
-          inFlightCallbacks.add(promise);
-          try {
-            await promise;
-          } finally {
-            inFlightCallbacks.delete(promise);
-          }
+            }),
+            (reason) => log(`scheduler: enqueue_skipped loop=${loop.id} reason=${reason}`),
+          );
         },
       );
 
@@ -226,29 +244,107 @@ export function createScheduler(deps: SchedulerDeps) {
 
   return {
     /**
-     * Starts the scheduler: scans active loops and registers jobs.
-     * Scan-level DB errors propagate (startup failure); per-loop
-     * registration errors are isolated and logged.
+     * Starts the scheduler: scans active loops, registers jobs, then runs the
+     * Batch 3 restart catch-up.
+     *
+     * Scan-level DB errors propagate (startup failure); per-loop errors are
+     * isolated and logged with fixed classifications.
+     *
+     * Catch-up contract (Batch 3 plan §2.1):
+     *  1. Scan-level DB errors fail the boot (propagate).
+     *  2. Persisted schedule state is validated per loop (shared fail-closed
+     *     rule) — a corrupt row is logged + skipped: NO job, NO catch-up.
+     *  3. Jobs are ALL registered first; a loop joins the recovery set only
+     *     when the registry (same lexical scope) holds its CURRENT revision —
+     *     a failed registration (`job_register_failed`) never catches up.
+     *     Timers therefore already cover occurrences past the cutoff while a
+     *     slow recovery is still running.
+     *  4. ONE recovery cutoff is snapshot after registration.
+     *  5. Only a latest occurrence STRICTLY after both the scan row's
+     *     activation and watermark reaches the single write entry point; the
+     *     transaction re-decides from the latest row (the snapshot is an
+     *     eligibility hint only).
+     *  6. Every catch-up enqueue is awaited serially, shares the in-flight
+     *     set with online callbacks (registered SYNCHRONOUSLY before any
+     *     await), and re-checks `stopped` before each loop — a mid-recovery
+     *     stopAndDrain() never writes into a closing DB (E10).
      */
     async start(): Promise<void> {
       if (stopped) throw new Error("Scheduler already stopped");
 
-      // Scan active loops (enabled=true AND cron IS NOT NULL)
-      const activeLoops = await db
+      // Scan active loops (enabled=true AND cron IS NOT NULL) — the SQL
+      // predicate matches the loops_active_schedule_idx partial index.
+      const scheduledLoops = await db
         .select()
         .from(loops)
-        .where(eq(loops.enabled, true));
-
-      // Filter to only those with cron
-      const scheduledLoops = activeLoops.filter((loop) => loop.cron !== null);
+        .where(and(eq(loops.enabled, true), isNotNull(loops.cron)));
 
       console.log(`[scheduler] starting: found ${scheduledLoops.length} active scheduled loops`);
 
+      // Step 2: fail-closed persisted-state validation. Corrupt rows are
+      // skipped entirely — the classification never carries the cron,
+      // timezone or any other untrusted value (X1/X3).
+      const validLoops: Loop[] = [];
       for (const loop of scheduledLoops) {
+        if (!isValidPersistedScheduleState({ ...loop, cron: loop.cron! })) {
+          log(`scheduler: invalid_schedule_state loop=${loop.id}`);
+          continue;
+        }
+        validLoops.push(loop);
+      }
+
+      // Step 3: register every job BEFORE any catch-up work.
+      for (const loop of validLoops) {
         reconcile(loop);
       }
 
       console.log(`[scheduler] started: ${registry.size} jobs registered`);
+
+      // Step 4: one cutoff for the whole recovery pass.
+      const recoveryCutoff = clock.now();
+
+      for (const loop of validLoops) {
+        // A stop mid-recovery abandons the remaining loops (they recover on
+        // the next restart or the next normal tick) — and must never touch a
+        // closing database.
+        if (stopped) return;
+
+        // Registry read-back: only a loop whose CURRENT revision has a live
+        // job may catch up. reconcile() swallows registration failures into
+        // `job_register_failed`, so this read is the success signal.
+        const entry = registry.get(loop.id);
+        if (entry === undefined || entry.revision !== loop.scheduleRevision) continue;
+
+        let occurrence: Date | null = null;
+        try {
+          occurrence = latestOccurrence({ cron: loop.cron!, timezone: loop.timezone }, recoveryCutoff);
+        } catch {
+          log(`scheduler: occurrence_rebuild_failed loop=${loop.id}`);
+          continue;
+        }
+        // No occurrence yet — the normal case, deliberately NOT logged.
+        if (occurrence === null) continue;
+
+        // Snapshot eligibility: strictly after BOTH activation and watermark.
+        // The enqueue transaction re-validates against the latest row, so a
+        // stale snapshot can only cause a benign controlled skip, never a
+        // double run.
+        const occIso = occurrence.toISOString();
+        if (loop.scheduleActivatedAt !== null && occIso <= loop.scheduleActivatedAt) continue;
+        if (loop.lastScheduledAt !== null && occIso <= loop.lastScheduledAt) continue;
+
+        // Benign skips (already_scheduled, running_exists, stale_revision, …)
+        // are normal race outcomes and stay silent (§2.3); only a thrown
+        // enqueue is an error worth a line.
+        await drainTrackedEnqueue(
+          loop.id,
+          coordinator.enqueueExecRun(loop.id, {
+            kind: "scheduled",
+            scheduledFor: occIso,
+            scheduleRevision: loop.scheduleRevision,
+          }),
+        );
+      }
     },
 
     /**

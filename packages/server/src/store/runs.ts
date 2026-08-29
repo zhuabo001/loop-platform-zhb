@@ -20,7 +20,7 @@ import type { RunProgress, RunRole } from "@loopzhb/protocol";
 
 import type { Db } from "../db/index.js";
 import { loops, runLeases, runs, type Loop, type Run, type RunProgressRow } from "../db/schema.js";
-import { isOccurrence } from "../schedule/time-semantics.js";
+import { isOccurrence, isValidPersistedScheduleState, parseRfc3339Ms } from "../schedule/time-semantics.js";
 import { isHeartbeatWatermarkAnomalous } from "./machines.js";
 import type { Clock } from "../time.js";
 import type { ExecTrigger } from "../coordinator/index.js";
@@ -54,7 +54,8 @@ export type EnqueueExecRunResult =
         | "future_occurrence"
         | "before_activation"
         | "occurrence_too_old"
-        | "already_scheduled";
+        | "already_scheduled"
+        | "invalid_schedule_state";
     };
 
 /**
@@ -69,61 +70,6 @@ export class EnqueueGuardLostError extends Error {
     super(`enqueue supersede guard lost for run ${runId}`);
     this.name = "EnqueueGuardLostError";
   }
-}
-
-/** Parse the exact RFC 3339 subset accepted at the scheduled-trigger edge.
- * Native Date.parse normalizes impossible dates (for example February 30),
- * which would let a non-existent spelling advance the occurrence watermark. */
-function parseScheduledFor(value: string): number | undefined {
-  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|([+-])(\d{2}):(\d{2}))$/.exec(
-    value,
-  );
-  if (!match) return undefined;
-
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-  const hour = Number(match[4]);
-  const minute = Number(match[5]);
-  const second = Number(match[6]);
-  const millisecond = Number((match[7] ?? "").padEnd(3, "0"));
-  const offsetHour = Number(match[10] ?? 0);
-  const offsetMinute = Number(match[11] ?? 0);
-
-  if (
-    year < 1 ||
-    month < 1 ||
-    month > 12 ||
-    day < 1 ||
-    day > 31 ||
-    hour > 23 ||
-    minute > 59 ||
-    second > 59 ||
-    offsetHour > 23 ||
-    offsetMinute > 59
-  ) {
-    return undefined;
-  }
-
-  const wallClock = new Date(0);
-  wallClock.setUTCFullYear(year, month - 1, day);
-  wallClock.setUTCHours(hour, minute, second, millisecond);
-  if (
-    wallClock.getUTCFullYear() !== year ||
-    wallClock.getUTCMonth() !== month - 1 ||
-    wallClock.getUTCDate() !== day ||
-    wallClock.getUTCHours() !== hour ||
-    wallClock.getUTCMinutes() !== minute ||
-    wallClock.getUTCSeconds() !== second ||
-    wallClock.getUTCMilliseconds() !== millisecond
-  ) {
-    return undefined;
-  }
-
-  const offsetSign = match[9] === "-" ? -1 : 1;
-  const offsetMs = offsetSign * (offsetHour * 60 + offsetMinute) * 60_000;
-  const timestamp = wallClock.getTime() - offsetMs;
-  return Number.isFinite(timestamp) ? timestamp : undefined;
 }
 
 export async function getLoop(db: Db, loopId: string): Promise<Loop | undefined> {
@@ -184,11 +130,22 @@ export async function enqueueExecRunTx(
         return { enqueued: false as const, reason: "not_active" as const };
       }
 
+      // Fail-closed persisted-state validation (Batch 3 §2.2): an ACTIVE
+      // scheduled loop whose activation is missing/non-canonical, whose
+      // non-null watermark is non-canonical, or whose revision is not a
+      // non-negative safe integer is CORRUPT. Zero writes — corrupt strings
+      // must never feed the lexicographic comparisons below or pollute the
+      // watermark (the write paths only ever emit toISOString() forms, so a
+      // violation means the row was damaged outside them).
+      if (!isValidPersistedScheduleState({ ...currentLoop, cron: currentLoop.cron })) {
+        return { enqueued: false as const, reason: "invalid_schedule_state" as const };
+      }
+
       // Validate scheduledFor is a well-formed, genuine occurrence of the
       // loop's CURRENT cron/timezone and not in the future. Without these
       // guards an arbitrary (or future) timestamp would advance the watermark
       // and silently swallow every later real tick.
-      const scheduledMs = parseScheduledFor(trigger.scheduledFor);
+      const scheduledMs = parseRfc3339Ms(trigger.scheduledFor);
       if (
         scheduledMs === undefined ||
         !isOccurrence({ cron: currentLoop.cron, timezone: currentLoop.timezone }, new Date(scheduledMs))
@@ -202,8 +159,8 @@ export async function enqueueExecRunTx(
       // Canonicalize to UTC ISO before ANY comparison or persistence: every
       // equivalent representation of the same instant (`+08:00` offsets,
       // `+00:00`, …) must behave identically. Stored activation/watermark are
-      // canonical by construction (toISOString writes only), so string
-      // comparison on canonical forms is exact.
+      // guaranteed canonical here — the fail-closed guard above rejected the
+      // row otherwise — so string comparison on canonical forms is exact.
       const canonicalFor = new Date(scheduledMs).toISOString();
 
       // Validate occurrence is after activation

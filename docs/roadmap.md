@@ -151,10 +151,18 @@ supersede 未领取的 pending——T7 语义在 cron 表面继承）+ 重启 ca
   - 测试覆盖：A 组（API 表面与 schedule 校验）、O 组（occurrence 原子性：真实回滚/未来时间/非 occurrence/等价 ISO 规范化/并发 callback/manual-scheduled 竞争）、S 组（Scheduler 生命周期：固定参数/旧回调/occurrence 重建/长延迟重建/overrun/启动失败传播/stopped guard/update-callback 竞态）、F 组（集成：multi-tick 合并/恢复只领最新/tick-claim 竞态/暂停后 Run Now/热注册/seam 故障）；全量回归通过。
   - 边界：单进程 scheduler（Phase 6 多实例调度留后）；时钟偏移接受（系统时钟变化影响调度，Phase 3 可接受）；per-loop 错误隔离（一个 loop 的 bad config 不阻塞其他）。
   - 复审状态：Round 1–3 的 Standards/Specs/Adversarial 发现均已修复；Round 4 三轨 0 finding，完整质量门通过，Issue #23 已关闭。Phase 3 整体仍进行中，下一目标为 Batch 3 重启 catch-up。
+- **Batch 3 — 重启 catch-up 与阶段收口（Day 6）：已完成**（2026-08-29，ADR-007 批次三追加裁决；验收证据 `docs/tests/phase3-acceptance.md`）
+  - `Scheduler.start()` 重启恢复：fail-closed 持久化状态校验（扫描侧跳过损坏 Loop）→ 先注册全部 job → registry 回读定义恢复集合（`entry.revision === loop.scheduleRevision`）→ 统一截取 recoveryCutoff → 逐 Loop 只恢复 `latestOccurrence` 重建的最新真实 occurrence（严格晚于 activation 与 watermark）；catch-up 串行 await、与在线 callback 共用 in-flight 集合统一 drain、逐 Loop 检查 `stopped`。
+  - Scheduled enqueue fail-closed：活跃 scheduled Loop 的 activation 缺失/非规范、非空 watermark 非规范、revision 非法时返回内部 skip 原因 `invalid_schedule_state`，零写入；规范 UTC ISO 判定为 round-trip 相等；判定规则单一实现（`isValidPersistedScheduleState`）供扫描与事务两路共享。
+  - 组合根注入缝（仅内部可见）：`bootstrapServer(config, overrides)` 的单一注入 Clock 替换全部 `systemClock` 使用点（coordinator/admin/ownerControl/sweep/scheduler/HTTP app），CronFactory 与 test-only coordinator hooks 可注入；生产路径不传 overrides。
+  - 测试覆盖：R 组（重启 catch-up R1–R12）、E 组（文件型 PGlite + 真实 HTTP + daemon runtime + Fake Runner 的确定性 E2E E1–E10）、X 组（故障隔离与日志纪律 X1–X3，X4 为完整质量门）、V 组（fail-closed 校验 V1–V7）；watermark/revision 等内部状态经测试自持 DbHandle 只读断言，不新增 wire 字段。
+  - 边界：无 protocol/HTTP 路由/migration/`next_run_at` 变更；无多实例调度与后台 retry worker（Phase 6）；无真实 Claude 调用。
+  - 复审状态：计划评审与实施后两轮三轨复审的全部发现已登记为 `phase-3` Issues #26–#32（核销状态以 Issue 为准）；逐轮审查证据留 `docs/handoff/`（不进库），裁决见 ADR-007 批次三追加裁决与 ADR-008。
+  - **Phase 3（cron 与离线恢复）整体收口**：server 重启 / 机器离线恢复后最多补跑一次，绝不双跑。
 
 ### 右移项
 
-- **Phase 3 Batch 3 — 重启 catch-up（离线恢复与 missed occurrence 合并）**：属 Phase 3 既定范围（见 `docs/plan/codex-phase3-plan-roadmap.md`），Batch 2 仅交付在线调度；catch-up 尚未完成。当前实现：watermark 推进确保同一 occurrence 不重复执行；进程重启不补跑停机期间的 occurrence（Batch 3 交付"只补最新一个"的合并语义）；在线期间进程挂起导致的迟到 callback 由 latestOccurrence 自适应重建恢复（最新一个 occurrence，水位去重）。
+- 无。（Phase 3 Batch 3 的 catch-up 右移项已随本批交付移除。）
 
 ## Phase 4 — Loop 产品语义（第 7–8 周）
 

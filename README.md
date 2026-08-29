@@ -62,8 +62,9 @@ PATCH /api/loops/:id/schedule
 - 执行中的 Loop 不会积累待执行队列（新的计划触发推进水位但跳过入队）
 - 配置更新立即生效（零停机 reconcile）
 - 手动触发和定时调度可共存（手动触发不受 cron 配置影响）
+- **重启 catch-up（Phase 3 Batch 3）**：Server 停机跨越任意多次 occurrence，重启后只恢复**最新一次**（不补跑历史 backlog）；同一 occurrence 经水位去重绝不双跑；连续重启不重复恢复；执行中的 Run 不被重新投递
 
-详见 `docs/adr/008-phase3-batch2-online-scheduler.md`。
+详见 `docs/adr/008-phase3-batch2-online-scheduler.md` 与 `docs/adr/007-phase3-batch1-schedule-foundation.md`（批次三追加裁决）。
 
 ## Daemon 运行
 

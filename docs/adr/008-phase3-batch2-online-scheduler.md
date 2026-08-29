@@ -60,7 +60,7 @@ function latestOccurrence(schedule: NormalizedSchedule, atInclusive: Date): Date
 2. Binary-search the millisecond cursor boundary where `nextOccurrence(cursor)` changes from `<= firingTime` to `> firingTime`.
 3. Return the occurrence at that boundary through the same DST-aware `nextOccurrence` implementation.
 
-A fired callback is a live occurrence: it must NEVER be silently dropped because of its delay (Round 2 review). Runtime is logarithmic in elapsed time and independent of intervening occurrence count, so a dense January-only cron cannot block the event loop while reconstructing a December callback. Century leap-year gaps (for example 2096 → 2104) have no special cap. Multiple late callbacks firing after a suspension collapse onto the SAME latest occurrence, and the watermark dedups them to at most one run (no catch-up backlog — full restart catch-up remains Batch 3 scope).
+A fired callback is a live occurrence: it must NEVER be silently dropped because of its delay (Round 2 review). Runtime is logarithmic in elapsed time and independent of intervening occurrence count, so a dense January-only cron cannot block the event loop while reconstructing a December callback. Century leap-year gaps (for example 2096 → 2104) have no special cap. Multiple late callbacks firing after a suspension collapse onto the SAME latest occurrence, and the watermark dedups them to at most one run (no catch-up backlog). *(Historical boundary, superseded: full restart catch-up was Batch 3 scope at the time of writing — it has since been delivered; see ADR-007 批次三追加裁决 for the final catch-up adjudication.)*
 
 ### 3. Scheduled Enqueue Transaction
 
@@ -252,6 +252,7 @@ export const productionCronFactory: CronFactory = {
 - `scheduler: occurrence_rebuild_failed loop=<id>`
 - `scheduler: enqueue_failed loop=<id>`
 - `scheduler: enqueue_skipped loop=<id> reason=<fixed enum>`
+- `scheduler: invalid_schedule_state loop=<id>` *(Batch 3: corrupt persisted schedule state rejected at the startup scan — fail-closed, no job and no catch-up for that loop)*
 
 All logs include loop ID (public) but never expose task content, workdir, or user data.
 

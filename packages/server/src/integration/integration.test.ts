@@ -336,7 +336,9 @@ describe("F-group: Integration and production wiring", () => {
 
       await scheduler.start();
 
-      // Three ticks while the machine is offline
+      // Batch 3: start()'s catch-up already enqueued the 10:00 occurrence
+      // (minutely cron, activation 09:00) — the first of the offline backlog.
+      // Three further ticks while the machine is offline
       for (let i = 0; i < 3; i++) {
         clock.advance(60_000);
         await cronFactory.triggerAll();
@@ -344,9 +346,9 @@ describe("F-group: Integration and production wiring", () => {
 
       // Exactly one pending survives (the latest); earlier ones were superseded
       const allRuns = await snapshotRuns(db);
-      expect(allRuns).toHaveLength(3);
+      expect(allRuns).toHaveLength(4);
       expect(allRuns.filter((r) => r.phase === "pending")).toHaveLength(1);
-      expect(allRuns.filter((r) => r.phase === "canceled" && r.outcome === "skipped")).toHaveLength(2);
+      expect(allRuns.filter((r) => r.phase === "canceled" && r.outcome === "skipped")).toHaveLength(3);
 
       // Recovery: the machine polls and claims exactly the latest pending run
       const pollResult = await coordinator.poll(TOKEN, {
@@ -356,7 +358,7 @@ describe("F-group: Integration and production wiring", () => {
         version: "0.0.0-test",
       });
       expect(pollResult.deliveries).toHaveLength(1);
-      expect(pollResult.deliveries[0]!.runId).toBe(allRuns[2]!.id);
+      expect(pollResult.deliveries[0]!.runId).toBe(allRuns[3]!.id);
 
       // A second poll finds nothing left to claim
       const second = await coordinator.poll(TOKEN, {
@@ -412,6 +414,10 @@ describe("F-group: Integration and production wiring", () => {
       await scheduler.start();
       expect(cronFactory.activeCount()).toBe(1);
 
+      // Batch 3: the start catch-up enqueued the 10:00 occurrence while the
+      // loop was still enabled.
+      expect(await snapshotRuns(db)).toHaveLength(1);
+
       // Pause via HTTP — job removed
       const pauseRes = await app.request("/api/loops/loop-1/schedule", {
         method: "PATCH",
@@ -422,6 +428,7 @@ describe("F-group: Integration and production wiring", () => {
       expect(cronFactory.activeCount()).toBe(0);
 
       // Manual Run Now still enqueues (paused only stops AUTOMATIC scheduling)
+      // — and supersedes the catch-up's still-pending run (T7).
       const runRes = await app.request("/api/loops/loop-1/run", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -432,8 +439,9 @@ describe("F-group: Integration and production wiring", () => {
       expect(json.enqueued).toBe(true);
 
       const allRuns = await snapshotRuns(db);
-      expect(allRuns).toHaveLength(1);
-      expect(allRuns[0]).toMatchObject({ loopId: "loop-1", phase: "pending" });
+      expect(allRuns).toHaveLength(2);
+      expect(allRuns[0]).toMatchObject({ loopId: "loop-1", phase: "canceled", outcome: "skipped" });
+      expect(allRuns[1]).toMatchObject({ loopId: "loop-1", phase: "pending" });
     });
 
     test("F11: a tick racing a poll claim converges to one running run (real interleaving)", async () => {

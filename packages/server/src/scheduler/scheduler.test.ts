@@ -20,9 +20,9 @@ import { eq } from "drizzle-orm";
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
 import { loops, runs } from "../db/schema.js";
 import { updateSchedule } from "../schedule/index.js";
-import { FakeClock, seedMachine, seedLoop, snapshotRuns, testDeps } from "../testkit/index.js";
+import { FakeClock, FakeCronFactory, seedMachine, seedLoop, snapshotRuns, testDeps } from "../testkit/index.js";
 import { createRunCoordinator, type RunCoordinator } from "../coordinator/index.js";
-import { createScheduler, type CronJob, type CronFactory, type Scheduler } from "./index.js";
+import { createScheduler, type Scheduler } from "./index.js";
 
 const handles: DbHandle[] = [];
 afterEach(async () => {
@@ -33,64 +33,6 @@ afterEach(async () => {
 const OCCURRENCE_10AM = "2026-08-27T10:00:00.000Z";
 /** Activation strictly before the 10:00 occurrence (activation boundary). */
 const ACTIVATION_9AM = "2026-08-27T09:00:00.000Z";
-
-interface FakeJobEntry {
-  pattern: string;
-  options: { timezone: string; protect?: (job: unknown) => void; catch?: (err: unknown) => void };
-  callback: () => void | Promise<void>;
-  stopped: boolean;
-}
-
-/**
- * Fake Croner factory for testing — jobs fire on demand via trigger()/fireAll().
- */
-class FakeCronFactory implements CronFactory {
-  public jobs = new Map<string, FakeJobEntry>();
-  private idSeq = 0;
-
-  create(
-    pattern: string,
-    options: { timezone: string; protect?: (job: unknown) => void; catch?: (err: unknown) => void },
-    callback: () => void | Promise<void>,
-  ): CronJob {
-    const id = `job-${++this.idSeq}`;
-    this.jobs.set(id, { pattern, options, callback, stopped: false });
-
-    return {
-      stop: () => {
-        const entry = this.jobs.get(id);
-        if (entry) entry.stopped = true;
-      },
-    };
-  }
-
-  /** Triggers all active jobs and waits for every callback to settle. */
-  async triggerAll(): Promise<void> {
-    await Promise.all(this.fireAll());
-  }
-
-  /** Fires all active jobs and returns the RAW callback promises — the exact
-   *  promise Croner would track for overrun (protect) purposes. */
-  fireAll(): Promise<unknown>[] {
-    const promises: Promise<unknown>[] = [];
-    for (const entry of this.jobs.values()) {
-      if (!entry.stopped) {
-        promises.push(Promise.resolve(entry.callback()));
-      }
-    }
-    return promises;
-  }
-
-  /** Returns count of active (non-stopped) jobs. */
-  activeCount(): number {
-    return Array.from(this.jobs.values()).filter((e) => !e.stopped).length;
-  }
-
-  /** All entries (including stopped) in registration order. */
-  entries(): FakeJobEntry[] {
-    return [...this.jobs.values()];
-  }
-}
 
 describe("S-group: Scheduler registration and lifecycle", () => {
   let db: Db;
@@ -336,10 +278,11 @@ describe("S-group: Scheduler registration and lifecycle", () => {
       });
     });
 
-    test("S10: one loop's callback failure doesn't block others", async () => {
+    test("S10: one loop's corrupt persisted cron stays isolated at scan; the healthy loop catches up and ticks", async () => {
       // A loop whose persisted cron cannot be evaluated (bypassed write-time
-      // validation — defensive depth): occurrence reconstruction throws inside
-      // its callback, and the failure must stay isolated to that loop.
+      // validation) is now rejected by the START scan's fail-closed state
+      // validation (Batch 3 §2.1 step 2) — no job, no catch-up — and the
+      // failure must stay isolated to that loop.
       await seedLoop(db, {
         id: "loop-bad",
         machineId,
@@ -363,16 +306,16 @@ describe("S-group: Scheduler registration and lifecycle", () => {
 
       await scheduler.start();
 
-      // Trigger all jobs (one will fail, one will succeed)
-      await cronFactory.triggerAll();
-
-      // Good loop enqueued; bad loop produced nothing
+      // Only the good loop registered a job; its restart catch-up already
+      // enqueued the 10:00 occurrence.
+      expect(cronFactory.activeCount()).toBe(1);
       const allRuns = await snapshotRuns(db);
       expect(allRuns).toHaveLength(1);
       expect(allRuns[0]!.loopId).toBe("loop-good");
 
-      // The failure was logged with its fixed classification
-      expect(logs.some((l) => l === "scheduler: occurrence_rebuild_failed loop=loop-bad")).toBe(true);
+      // The failure was logged with its fixed classification — the corrupt
+      // cron string itself never reaches the log.
+      expect(logs).toEqual(["scheduler: invalid_schedule_state loop=loop-bad"]);
     });
 
     test("S11: stopped scheduler rejects reconcile", async () => {
@@ -464,6 +407,11 @@ describe("S-group: Scheduler registration and lifecycle", () => {
       await scheduler.start();
       const oldEntry = cronFactory.entries()[0]!;
 
+      // Batch 3: start()'s restart catch-up already enqueued the 10:00
+      // occurrence — the stale-callback proof is that NO FURTHER write lands.
+      const runsAfterStart = await snapshotRuns(db);
+      expect(runsAfterStart).toHaveLength(1);
+
       // Config change → revision 1 → reconcile stops the old job
       await updateSchedule({ db, clock }, "loop-1", { cron: "0 14 * * *" });
       const [updatedLoop] = await db.select().from(loops);
@@ -473,8 +421,8 @@ describe("S-group: Scheduler registration and lifecycle", () => {
       // A leaked/late firing of the OLD callback carries the captured revision 0
       await oldEntry.callback();
 
-      // Rejected as stale — zero runs, watermark of the NEW config untouched
-      expect(await snapshotRuns(db)).toHaveLength(0);
+      // Rejected as stale — no new run, watermark of the NEW config untouched
+      expect(await snapshotRuns(db)).toHaveLength(1);
       const [loop] = await db.select().from(loops).where(eq(loops.id, "loop-1"));
       expect(loop!.lastScheduledAt).toBeNull();
       expect(logs).toEqual(["scheduler: enqueue_skipped loop=loop-1 reason=stale_revision"]);
@@ -540,12 +488,15 @@ describe("S-group: Scheduler registration and lifecycle", () => {
 
       // Gate the enqueue INSIDE the coordinator: the callback cannot complete
       // until the gate opens — exactly what Croner's protect needs to see.
+      // The gate is ARMED ONLY AFTER start(): Batch 3's restart catch-up is
+      // also an enqueue and must not deadlock boot.
       let release: (() => void) | undefined;
+      let gateEnabled = false;
       const gate = new Promise<void>((r) => {
         release = r;
       });
       const gatedCoordinator = createRunCoordinator(
-        testDeps(db, clock, { hooks: { beforeEnqueueTx: () => gate } }),
+        testDeps(db, clock, { hooks: { beforeEnqueueTx: () => (gateEnabled ? gate : undefined) } }),
       );
       const gatedScheduler = createScheduler({
         db,
@@ -556,6 +507,10 @@ describe("S-group: Scheduler registration and lifecycle", () => {
       });
       await gatedScheduler.start();
 
+      // Catch-up at start already enqueued the 10:00 occurrence.
+      expect(await snapshotRuns(db)).toHaveLength(1);
+
+      gateEnabled = true;
       const [cbPromise] = cronFactory.fireAll();
       let settled = false;
       void cbPromise!.then(
@@ -574,6 +529,8 @@ describe("S-group: Scheduler registration and lifecycle", () => {
       release!();
       await cbPromise;
       expect(settled).toBe(true);
+      // The tick's occurrence was already covered by the catch-up watermark —
+      // controlled skip, still exactly one run.
       expect(await snapshotRuns(db)).toHaveLength(1);
     });
 
@@ -628,13 +585,15 @@ describe("S-group: Scheduler registration and lifecycle", () => {
       });
 
       // Gate the enqueue INSIDE the coordinator so the callback is parked
-      // mid-flight while the schedule update commits.
+      // mid-flight while the schedule update commits. The gate arms ONLY
+      // AFTER start() so Batch 3's restart catch-up cannot deadlock boot.
       let release: (() => void) | undefined;
+      let gateEnabled = false;
       const gate = new Promise<void>((r) => {
         release = r;
       });
       const gatedCoordinator = createRunCoordinator(
-        testDeps(db, clock, { hooks: { beforeEnqueueTx: () => gate } }),
+        testDeps(db, clock, { hooks: { beforeEnqueueTx: () => (gateEnabled ? gate : undefined) } }),
       );
       const gatedScheduler = createScheduler({
         db,
@@ -645,7 +604,11 @@ describe("S-group: Scheduler registration and lifecycle", () => {
       });
       await gatedScheduler.start();
 
+      // Catch-up at start enqueued the 10:00 occurrence under revision 0.
+      expect(await snapshotRuns(db)).toHaveLength(1);
+
       // Tick fires, callback parks inside the gated enqueue
+      gateEnabled = true;
       const [cbPromise] = cronFactory.fireAll();
 
       // The schedule update COMMITS while the callback is in flight (rev 0→1)
@@ -657,9 +620,9 @@ describe("S-group: Scheduler registration and lifecycle", () => {
       release!();
       await cbPromise;
 
-      // Rejected by the revision guard — zero runs, and the NEW config's
+      // Rejected by the revision guard — no NEW run, and the NEW config's
       // watermark was not polluted by the stale callback
-      expect(await snapshotRuns(db)).toHaveLength(0);
+      expect(await snapshotRuns(db)).toHaveLength(1);
       const [loop] = await db.select().from(loops).where(eq(loops.id, "loop-1"));
       expect(loop!.scheduleRevision).toBe(1);
       expect(loop!.lastScheduledAt).toBeNull();

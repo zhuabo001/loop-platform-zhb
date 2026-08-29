@@ -16,8 +16,12 @@ export {
   nextOccurrence,
   latestOccurrence,
   isOccurrence,
+  parseRfc3339Ms,
+  isCanonicalUtcIso,
+  isValidPersistedScheduleState,
   ScheduleValidationError,
   type NormalizedSchedule,
+  type PersistedScheduleState,
 } from "./time-semantics.js";
 
 export {

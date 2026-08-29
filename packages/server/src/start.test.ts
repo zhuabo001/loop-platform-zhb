@@ -22,8 +22,10 @@ import { isRunTokenShape, pollResponseSchema } from "@loopzhb/protocol";
 import { machineIdFromToken } from "@loopzhb/protocol/node";
 
 import { mintRunCredential } from "./coordinator/index.js";
+import { FakeClock } from "./testkit/index.js";
+import type { CronFactory, CronJob } from "./scheduler/index.js";
 import { closeDb, openMigratedDb, type DbHandle } from "./db/index.js";
-import { loops } from "./db/schema.js";
+import { loops, machines, runs } from "./db/schema.js";
 import {
   bootstrapServer,
   main,
@@ -56,6 +58,40 @@ function poll(app: BootedServer["app"], token: string, body: unknown = {}) {
     headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
     body: JSON.stringify(body),
   });
+}
+
+/** Minimal on-demand Croner fake for the bootstrap-override seam test. */
+class FakeCronFactory implements CronFactory {
+  private callbacks: { stopped: boolean; callback: () => void | Promise<void> }[] = [];
+  private active = 0;
+
+  create(
+    _pattern: string,
+    _options: { timezone: string },
+    callback: () => void | Promise<void>,
+  ): CronJob {
+    const entry = { stopped: false, callback };
+    this.callbacks.push(entry);
+    this.active += 1;
+    return {
+      stop: () => {
+        if (!entry.stopped) {
+          entry.stopped = true;
+          this.active -= 1;
+        }
+      },
+    };
+  }
+
+  activeCount(): number {
+    return this.active;
+  }
+
+  async triggerAll(): Promise<void> {
+    await Promise.all(
+      this.callbacks.filter((e) => !e.stopped).map((e) => Promise.resolve(e.callback())),
+    );
+  }
 }
 
 describe("bootstrapServer", () => {
@@ -371,6 +407,49 @@ describe("bootstrapServer", () => {
       body: JSON.stringify({ ok: true }),
     });
     expect(again.status).toBe(401);
+  });
+  it("bootstrap overrides: ONE injected Clock reaches coordinator, admin, scheduler and the HTTP app (Batch 3 §2.4)", async () => {
+    const dir = await tmpDataDir();
+    const clock = new FakeClock(new Date("2026-08-27T09:00:00.000Z"));
+    const cronFactory = new FakeCronFactory();
+    const b = await bootstrapServer(
+      { host: "127.0.0.1", port: 3000, dataDir: dir },
+      { clock, cronFactory },
+    );
+    handles.push(b.handle);
+
+    // Machine registration stamps lastSeen from the coordinator clock.
+    await poll(b.app, "dk_boot_clock");
+    const machineId = machineIdFromToken("dk_boot_clock");
+    const machine = (await b.handle.db.select().from(machines))[0]!;
+    expect(machine.lastSeen).toBe("2026-08-27T09:00:00.000Z");
+
+    // Loop creation stamps from the admin clock; the seam hot-registers the
+    // job with the INJECTED cron factory (not the production Croner).
+    const createRes = await b.app.request("/api/loops", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ machineId, cron: "0 10 * * *", timezone: "UTC" }),
+    });
+    expect(createRes.status).toBe(201);
+    const { loop } = (await createRes.json()) as any;
+    const loopRow = (await b.handle.db.select().from(loops))[0]!;
+    expect(loopRow.createdAt).toBe("2026-08-27T09:00:00.000Z");
+    expect(loopRow.scheduleActivatedAt).toBe("2026-08-27T09:00:00.000Z");
+    expect(cronFactory.activeCount()).toBe(1);
+
+    // The scheduler's occurrence reconstruction reads the SAME fake clock:
+    // before the tick nothing fires...
+    await cronFactory.triggerAll();
+    expect(await b.handle.db.select().from(runs)).toHaveLength(0);
+
+    // ...past the 10:00 occurrence the tick enqueues, stamped by the fake clock.
+    clock.advance(70 * 60 * 1000); // 10:10
+    await cronFactory.triggerAll();
+    const allRuns = await b.handle.db.select().from(runs);
+    expect(allRuns).toHaveLength(1);
+    expect(allRuns[0]!.ts).toBe("2026-08-27T10:10:00.000Z");
+    expect(loop.id).toBe(loopRow.id);
   });
 });
 

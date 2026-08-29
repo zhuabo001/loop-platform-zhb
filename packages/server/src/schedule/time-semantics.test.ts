@@ -12,7 +12,16 @@
 
 import { describe, expect, test } from "vitest";
 
-import { isOccurrence, latestOccurrence, nextOccurrence, ScheduleValidationError, validateSchedule } from "./time-semantics.js";
+import {
+  isCanonicalUtcIso,
+  isOccurrence,
+  isValidPersistedScheduleState,
+  latestOccurrence,
+  nextOccurrence,
+  parseRfc3339Ms,
+  ScheduleValidationError,
+  validateSchedule,
+} from "./time-semantics.js";
 
 describe("D: Cron, timezone, and DST", () => {
   test("D1: accept legal five-segment cron and normalize whitespace", () => {
@@ -330,5 +339,87 @@ describe("latestOccurrence / isOccurrence (Batch 2 occurrence reconstruction)", 
     // 10:00 Asia/Shanghai = 02:00 UTC
     expect(isOccurrence(shanghai10, new Date("2026-08-27T02:00:00.000Z"))).toBe(true);
     expect(isOccurrence(shanghai10, new Date("2026-08-27T10:00:00.000Z"))).toBe(false);
+  });
+});
+
+describe("Batch 3: canonical-ISO and persisted-state validation (plan §2.2)", () => {
+  test("parseRfc3339Ms accepts the RFC 3339 subset incl. offsets, rejects impossible dates", () => {
+    expect(parseRfc3339Ms("2026-08-27T10:00:00.000Z")).toBe(Date.parse("2026-08-27T10:00:00.000Z"));
+    expect(parseRfc3339Ms("2026-08-27T18:00:00+08:00")).toBe(Date.parse("2026-08-27T10:00:00.000Z"));
+    expect(parseRfc3339Ms("2026-08-27T10:00:00.5Z")).toBe(Date.parse("2026-08-27T10:00:00.500Z"));
+    expect(parseRfc3339Ms("2026-02-30T10:00:00.000Z")).toBeUndefined();
+    expect(parseRfc3339Ms("2026-08-27")).toBeUndefined();
+    expect(parseRfc3339Ms("not-a-date")).toBeUndefined();
+  });
+
+  test("isCanonicalUtcIso is round-trip equality: offsets and short fractions are NOT canonical", () => {
+    expect(isCanonicalUtcIso("2026-08-27T10:00:00.000Z")).toBe(true);
+    expect(isCanonicalUtcIso("2026-08-27T10:00:00.001Z")).toBe(true);
+    // Same instant, non-canonical spellings
+    expect(isCanonicalUtcIso("2026-08-27T18:00:00+08:00")).toBe(false);
+    expect(isCanonicalUtcIso("2026-08-27T10:00:00+00:00")).toBe(false);
+    expect(isCanonicalUtcIso("2026-08-27T10:00:00.0Z")).toBe(false);
+    expect(isCanonicalUtcIso("2026-08-27T10:00:00Z")).toBe(false);
+    expect(isCanonicalUtcIso("2026-08-27T10:00:00.000Z\n")).toBe(false);
+    expect(isCanonicalUtcIso("corrupt")).toBe(false);
+  });
+
+  test("isValidPersistedScheduleState: healthy active-schedule row passes", () => {
+    expect(
+      isValidPersistedScheduleState({
+        cron: "0 10 * * *",
+        timezone: "UTC",
+        scheduleRevision: 0,
+        scheduleActivatedAt: "2026-08-27T09:00:00.000Z",
+        lastScheduledAt: null,
+      }),
+    ).toBe(true);
+    expect(
+      isValidPersistedScheduleState({
+        cron: "0 10 * * *",
+        timezone: "Asia/Shanghai",
+        scheduleRevision: 3,
+        scheduleActivatedAt: "2026-08-27T09:00:00.000Z",
+        lastScheduledAt: "2026-08-27T10:00:00.000Z",
+      }),
+    ).toBe(true);
+  });
+
+  test("isValidPersistedScheduleState: non-normalized stored cron/timezone fails closed (adversarial P2)", () => {
+    // Every write path persists validateSchedule's NORMALIZED output. A stored
+    // value that differs (padded timezone, double-spaced cron) is corrupt by
+    // definition — and the raw padded string would silently break Croner's
+    // occurrence rebuild downstream.
+    const healthy = {
+      cron: "0 10 * * *",
+      timezone: "UTC",
+      scheduleRevision: 0,
+      scheduleActivatedAt: "2026-08-27T09:00:00.000Z",
+      lastScheduledAt: null,
+    };
+    expect(isValidPersistedScheduleState(healthy)).toBe(true);
+    expect(isValidPersistedScheduleState({ ...healthy, timezone: "  UTC  " })).toBe(false);
+    expect(isValidPersistedScheduleState({ ...healthy, cron: "0  10 * * *" })).toBe(false);
+    expect(isValidPersistedScheduleState({ ...healthy, cron: " 0 10 * * *" })).toBe(false);
+  });
+
+  test("isValidPersistedScheduleState: every corrupt dimension fails closed", () => {
+    const healthy = {
+      cron: "0 10 * * *",
+      timezone: "UTC",
+      scheduleRevision: 0,
+      scheduleActivatedAt: "2026-08-27T09:00:00.000Z",
+      lastScheduledAt: "2026-08-27T10:00:00.000Z",
+    };
+    expect(isValidPersistedScheduleState({ ...healthy, cron: "not-a-cron" })).toBe(false);
+    expect(isValidPersistedScheduleState({ ...healthy, timezone: "Not/AZone" })).toBe(false);
+    expect(isValidPersistedScheduleState({ ...healthy, scheduleRevision: -1 })).toBe(false);
+    expect(isValidPersistedScheduleState({ ...healthy, scheduleRevision: 1.5 })).toBe(false);
+    expect(isValidPersistedScheduleState({ ...healthy, scheduleActivatedAt: null })).toBe(false);
+    expect(
+      isValidPersistedScheduleState({ ...healthy, scheduleActivatedAt: "2026-08-27T17:00:00+08:00" }),
+    ).toBe(false);
+    expect(isValidPersistedScheduleState({ ...healthy, lastScheduledAt: "garbage" })).toBe(false);
+    expect(isValidPersistedScheduleState({ ...healthy, lastScheduledAt: "2026-08-27T10:00:00Z" })).toBe(false);
   });
 });
