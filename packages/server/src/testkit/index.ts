@@ -26,6 +26,7 @@ import {
   type RunLeaseRow,
 } from "../db/schema.js";
 import type { Clock } from "../time.js";
+import type { CronFactory, CronJob } from "../scheduler/index.js";
 
 export const FIXTURE_T0 = new Date("2026-07-29T00:00:00.000Z");
 
@@ -42,6 +43,57 @@ export class FakeClock implements Clock {
   }
   iso(): string {
     return this.now().toISOString();
+  }
+}
+
+export interface FakeCronJobEntry {
+  pattern: string;
+  options: { timezone: string; protect?: (job: unknown) => void; catch?: (err: unknown) => void };
+  callback: () => void | Promise<void>;
+  stopped: boolean;
+}
+
+/**
+ * On-demand Croner double shared by scheduler tests. Jobs never tick on their
+ * own: tests may inspect registration, fire callbacks, or retain callbacks
+ * past stop() to verify the stopped guard.
+ */
+export class FakeCronFactory implements CronFactory {
+  public jobs = new Map<string, FakeCronJobEntry>();
+  private idSeq = 0;
+
+  create(
+    pattern: string,
+    options: { timezone: string; protect?: (job: unknown) => void; catch?: (err: unknown) => void },
+    callback: () => void | Promise<void>,
+  ): CronJob {
+    const id = `job-${++this.idSeq}`;
+    this.jobs.set(id, { pattern, options, callback, stopped: false });
+    return {
+      stop: () => {
+        const entry = this.jobs.get(id);
+        if (entry) entry.stopped = true;
+      },
+    };
+  }
+
+  async triggerAll(): Promise<void> {
+    await Promise.all(this.fireAll());
+  }
+
+  /** Returns raw callback promises so race tests control their own awaits. */
+  fireAll(): Promise<unknown>[] {
+    return [...this.jobs.values()]
+      .filter((entry) => !entry.stopped)
+      .map((entry) => Promise.resolve(entry.callback()));
+  }
+
+  activeCount(): number {
+    return [...this.jobs.values()].filter((entry) => !entry.stopped).length;
+  }
+
+  entries(): FakeCronJobEntry[] {
+    return [...this.jobs.values()];
   }
 }
 

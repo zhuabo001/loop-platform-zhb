@@ -20,9 +20,9 @@ import { eq } from "drizzle-orm";
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
 import { loops, runs } from "../db/schema.js";
 import { updateSchedule } from "../schedule/index.js";
-import { FakeClock, seedMachine, seedLoop, snapshotRuns, testDeps } from "../testkit/index.js";
+import { FakeClock, FakeCronFactory, seedMachine, seedLoop, snapshotRuns, testDeps } from "../testkit/index.js";
 import { createRunCoordinator, type RunCoordinator } from "../coordinator/index.js";
-import { createScheduler, type CronJob, type CronFactory, type Scheduler } from "./index.js";
+import { createScheduler, type Scheduler } from "./index.js";
 
 const handles: DbHandle[] = [];
 afterEach(async () => {
@@ -33,64 +33,6 @@ afterEach(async () => {
 const OCCURRENCE_10AM = "2026-08-27T10:00:00.000Z";
 /** Activation strictly before the 10:00 occurrence (activation boundary). */
 const ACTIVATION_9AM = "2026-08-27T09:00:00.000Z";
-
-interface FakeJobEntry {
-  pattern: string;
-  options: { timezone: string; protect?: (job: unknown) => void; catch?: (err: unknown) => void };
-  callback: () => void | Promise<void>;
-  stopped: boolean;
-}
-
-/**
- * Fake Croner factory for testing — jobs fire on demand via trigger()/fireAll().
- */
-class FakeCronFactory implements CronFactory {
-  public jobs = new Map<string, FakeJobEntry>();
-  private idSeq = 0;
-
-  create(
-    pattern: string,
-    options: { timezone: string; protect?: (job: unknown) => void; catch?: (err: unknown) => void },
-    callback: () => void | Promise<void>,
-  ): CronJob {
-    const id = `job-${++this.idSeq}`;
-    this.jobs.set(id, { pattern, options, callback, stopped: false });
-
-    return {
-      stop: () => {
-        const entry = this.jobs.get(id);
-        if (entry) entry.stopped = true;
-      },
-    };
-  }
-
-  /** Triggers all active jobs and waits for every callback to settle. */
-  async triggerAll(): Promise<void> {
-    await Promise.all(this.fireAll());
-  }
-
-  /** Fires all active jobs and returns the RAW callback promises — the exact
-   *  promise Croner would track for overrun (protect) purposes. */
-  fireAll(): Promise<unknown>[] {
-    const promises: Promise<unknown>[] = [];
-    for (const entry of this.jobs.values()) {
-      if (!entry.stopped) {
-        promises.push(Promise.resolve(entry.callback()));
-      }
-    }
-    return promises;
-  }
-
-  /** Returns count of active (non-stopped) jobs. */
-  activeCount(): number {
-    return Array.from(this.jobs.values()).filter((e) => !e.stopped).length;
-  }
-
-  /** All entries (including stopped) in registration order. */
-  entries(): FakeJobEntry[] {
-    return [...this.jobs.values()];
-  }
-}
 
 describe("S-group: Scheduler registration and lifecycle", () => {
   let db: Db;

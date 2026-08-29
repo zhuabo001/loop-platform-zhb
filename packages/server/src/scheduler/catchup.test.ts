@@ -27,9 +27,9 @@ import { eq } from "drizzle-orm";
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
 import { loops } from "../db/schema.js";
 import { updateSchedule } from "../schedule/index.js";
-import { FakeClock, seedMachine, seedLoop, seedRun, snapshotRuns, testDeps } from "../testkit/index.js";
+import { FakeClock, FakeCronFactory, seedMachine, seedLoop, seedRun, snapshotRuns, testDeps } from "../testkit/index.js";
 import { createRunCoordinator, type RunCoordinator } from "../coordinator/index.js";
-import { createScheduler, type CronJob, type CronFactory, type Scheduler } from "./index.js";
+import { createScheduler, type Scheduler } from "./index.js";
 
 const handles: DbHandle[] = [];
 afterEach(async () => {
@@ -39,50 +39,6 @@ afterEach(async () => {
 const MACHINE_ID = "m-test123456789a";
 /** Activation strictly before every occurrence used below. */
 const ACTIVATION_9AM = "2026-08-27T09:00:00.000Z";
-
-interface FakeJobEntry {
-  pattern: string;
-  options: { timezone: string; protect?: (job: unknown) => void; catch?: (err: unknown) => void };
-  callback: () => void | Promise<void>;
-  stopped: boolean;
-}
-
-/** Fake Croner factory (same shape as the S-group's): jobs fire on demand. */
-class FakeCronFactory implements CronFactory {
-  public jobs = new Map<string, FakeJobEntry>();
-  private idSeq = 0;
-
-  create(
-    pattern: string,
-    options: { timezone: string; protect?: (job: unknown) => void; catch?: (err: unknown) => void },
-    callback: () => void | Promise<void>,
-  ): CronJob {
-    const id = `job-${++this.idSeq}`;
-    this.jobs.set(id, { pattern, options, callback, stopped: false });
-    return {
-      stop: () => {
-        const entry = this.jobs.get(id);
-        if (entry) entry.stopped = true;
-      },
-    };
-  }
-
-  async triggerAll(): Promise<void> {
-    await Promise.all(this.fireAll());
-  }
-
-  fireAll(): Promise<unknown>[] {
-    const promises: Promise<unknown>[] = [];
-    for (const entry of this.jobs.values()) {
-      if (!entry.stopped) promises.push(Promise.resolve(entry.callback()));
-    }
-    return promises;
-  }
-
-  activeCount(): number {
-    return [...this.jobs.values()].filter((e) => !e.stopped).length;
-  }
-}
 
 async function watermarkOf(db: Db, loopId: string): Promise<string | null> {
   const [loop] = await db.select().from(loops).where(eq(loops.id, loopId));

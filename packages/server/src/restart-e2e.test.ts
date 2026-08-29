@@ -29,45 +29,18 @@ import { machineIdFromToken } from "@loopzhb/protocol/node";
 import { closeDb, type DbHandle } from "./db/index.js";
 import { loops, runLeases, runs } from "./db/schema.js";
 import { bootstrapServer, waitForListening, type BootedServer } from "./start.js";
-import { FakeClock } from "./testkit/index.js";
+import { FakeClock, FakeCronFactory } from "./testkit/index.js";
 import type { Clock } from "./time.js";
-import type { CronFactory, CronJob } from "./scheduler/index.js";
 
 const TOKEN = "dk_restart_e2e";
 const MACHINE_ID = machineIdFromToken(TOKEN);
 /** Every test starts at 09:00Z; activation equals the creation instant. */
 const T0 = new Date("2026-08-27T09:00:00.000Z");
 
-const openHandles: DbHandle[] = [];
+const runningServers = new Set<RunningServer>();
 afterEach(async () => {
-  await Promise.all(openHandles.splice(0).map((h) => closeDb(h).catch(() => {})));
+  await Promise.all([...runningServers].map((rs) => shutdown(rs).catch(() => {})));
 });
-
-/** On-demand Croner fake — jobs never fire by themselves; entries() exposes
- *  the raw callbacks so E10 can prove a post-drain firing touches nothing. */
-class FakeCronFactory implements CronFactory {
-  private seq = 0;
-  private entriesList: { stopped: boolean; callback: () => void | Promise<void> }[] = [];
-
-  create(
-    _pattern: string,
-    _options: { timezone: string; protect?: (job: unknown) => void; catch?: (err: unknown) => void },
-    callback: () => void | Promise<void>,
-  ): CronJob {
-    const id = `job-${++this.seq}`;
-    const entry = { stopped: false, callback, id };
-    this.entriesList.push(entry);
-    return {
-      stop: () => {
-        entry.stopped = true;
-      },
-    };
-  }
-
-  entries() {
-    return [...this.entriesList];
-  }
-}
 
 interface RunningServer extends BootedServer {
   server: ServerType;
@@ -76,25 +49,59 @@ interface RunningServer extends BootedServer {
   clock: Clock;
 }
 
+async function closeListener(server: ServerType): Promise<void> {
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+}
+
+/** Registers a fully listening lifetime before any test assertion can fail. */
+async function attachListener(
+  booted: BootedServer,
+  clock: Clock,
+  cronFactory: FakeCronFactory,
+): Promise<RunningServer> {
+  const server = serve({ fetch: booted.app.fetch, port: 0, hostname: "127.0.0.1" });
+  try {
+    await waitForListening(server);
+    const address = server.address();
+    const port = typeof address === "object" && address !== null ? address.port : 0;
+    const rs = { ...booted, server, baseUrl: `http://127.0.0.1:${port}`, cronFactory, clock };
+    runningServers.add(rs);
+    return rs;
+  } catch (err) {
+    await closeListener(server).catch(() => {});
+    await booted.scheduler.stopAndDrain().catch(() => {});
+    await closeDb(booted.handle).catch(() => {});
+    throw err;
+  }
+}
+
 /** One server lifetime — production boot order (listener bound BEFORE the
  *  scheduler starts), fully injectable clock/cron. */
 async function boot(dataDir: string, clock: FakeClock): Promise<RunningServer> {
   const cronFactory = new FakeCronFactory();
-  const b = await bootstrapServer({ host: "127.0.0.1", port: 0, dataDir }, { clock, cronFactory });
-  const server = serve({ fetch: b.app.fetch, port: 0, hostname: "127.0.0.1" });
-  await waitForListening(server);
-  const address = server.address();
-  const port = typeof address === "object" && address !== null ? address.port : 0;
-  await b.scheduler.start();
-  return { ...b, server, baseUrl: `http://127.0.0.1:${port}`, cronFactory, clock };
+  const booted = await bootstrapServer({ host: "127.0.0.1", port: 0, dataDir }, { clock, cronFactory });
+  const rs = await attachListener(booted, clock, cronFactory);
+  try {
+    await rs.scheduler.start();
+    return rs;
+  } catch (err) {
+    await shutdown(rs).catch(() => {});
+    throw err;
+  }
 }
 
 /** Production shutdown order: scheduler drain → listener close → DB close. */
 async function shutdown(rs: RunningServer): Promise<void> {
-  await rs.scheduler.stopAndDrain();
-  await new Promise<void>((resolve) => rs.server.close(() => resolve()));
-  openHandles.splice(openHandles.indexOf(rs.handle), 1);
-  await closeDb(rs.handle);
+  runningServers.delete(rs);
+  try {
+    await rs.scheduler.stopAndDrain();
+  } finally {
+    try {
+      await closeListener(rs.server);
+    } finally {
+      await closeDb(rs.handle);
+    }
+  }
 }
 
 /** The daemon runtime pointed at the REAL listener (default fetch). */
@@ -146,13 +153,11 @@ describe("E-group: file-backed DB + real HTTP restart E2E", () => {
     const clock = new FakeClock(T0);
 
     const first = await boot(dir, clock);
-    openHandles.push(first.handle);
     await makeDaemon(first).pollOnce(); // machine self-registration
     const loopId = await createScheduledLoop(first, "0 10 * * *");
     await shutdown(first);
 
     const second = await boot(dir, clock);
-    openHandles.push(second.handle);
 
     const machinesRes = await fetch(`${second.baseUrl}/api/machines`);
     expect(machinesRes.status).toBe(200);
@@ -174,7 +179,6 @@ describe("E-group: file-backed DB + real HTTP restart E2E", () => {
     const dir = await freshDataDir();
     const clock = new FakeClock(T0);
     const rs = await boot(dir, clock);
-    openHandles.push(rs.handle);
 
     await makeDaemon(rs).pollOnce();
     const loopId = await createScheduledLoop(rs, "0 10 * * *");
@@ -194,7 +198,6 @@ describe("E-group: file-backed DB + real HTTP restart E2E", () => {
     const clock = new FakeClock(T0);
 
     const first = await boot(dir, clock);
-    openHandles.push(first.handle);
     await makeDaemon(first).pollOnce();
     const loopId = await createScheduledLoop(first, "* * * * *");
     await shutdown(first);
@@ -203,7 +206,6 @@ describe("E-group: file-backed DB + real HTTP restart E2E", () => {
     clock.advance(3.5 * 60 * 60 * 1000); // now 12:30
 
     const second = await boot(dir, clock);
-    openHandles.push(second.handle);
 
     const allRuns = await listRuns(second, loopId);
     expect(allRuns).toHaveLength(1);
@@ -220,21 +222,18 @@ describe("E-group: file-backed DB + real HTTP restart E2E", () => {
     const clock = new FakeClock(T0);
 
     const first = await boot(dir, clock);
-    openHandles.push(first.handle);
     await makeDaemon(first).pollOnce();
     const loopId = await createScheduledLoop(first, "* * * * *");
     await shutdown(first);
 
     clock.advance(3.5 * 60 * 60 * 1000);
     const second = await boot(dir, clock);
-    openHandles.push(second.handle);
     expect(await listRuns(second, loopId)).toHaveLength(1);
     const stateAfterSecond = await scheduleStateOf(second.handle, loopId);
     await shutdown(second);
 
     // Third boot, same instant: the occurrence is already covered.
     const third = await boot(dir, clock);
-    openHandles.push(third.handle);
     const allRuns = await listRuns(third, loopId);
     expect(allRuns).toHaveLength(1);
     expect(allRuns[0]).toMatchObject({ phase: "pending" });
@@ -248,14 +247,12 @@ describe("E-group: file-backed DB + real HTTP restart E2E", () => {
     const clock = new FakeClock(T0);
 
     const first = await boot(dir, clock);
-    openHandles.push(first.handle);
     await makeDaemon(first).pollOnce();
     const loopId = await createScheduledLoop(first, "* * * * *");
     await shutdown(first);
 
     clock.advance(3.5 * 60 * 60 * 1000);
     const second = await boot(dir, clock);
-    openHandles.push(second.handle);
 
     let runnerCalls = 0;
     const fake = createFakeRunner();
@@ -281,14 +278,12 @@ describe("E-group: file-backed DB + real HTTP restart E2E", () => {
     const clock = new FakeClock(T0);
 
     const first = await boot(dir, clock);
-    openHandles.push(first.handle);
     await makeDaemon(first).pollOnce();
     const loopId = await createScheduledLoop(first, "* * * * *");
     await shutdown(first);
 
     clock.advance(3.5 * 60 * 60 * 1000);
     const second = await boot(dir, clock);
-    openHandles.push(second.handle);
 
     let runnerCalls = 0;
     const fake = createFakeRunner();
@@ -325,7 +320,6 @@ describe("E-group: file-backed DB + real HTTP restart E2E", () => {
     const clock = new FakeClock(T0);
 
     const first = await boot(dir, clock);
-    openHandles.push(first.handle);
     await makeDaemon(first).pollOnce();
     const loopId = await createScheduledLoop(first, "* * * * *");
 
@@ -345,7 +339,6 @@ describe("E-group: file-backed DB + real HTTP restart E2E", () => {
     // Downtime crosses many occurrences; restart.
     clock.advance(3.5 * 60 * 60 * 1000);
     const second = await boot(dir, clock);
-    openHandles.push(second.handle);
 
     // Catch-up saw the running run: watermark advanced, NO new pending.
     const allRuns = await listRuns(second, loopId);
@@ -373,7 +366,6 @@ describe("E-group: file-backed DB + real HTTP restart E2E", () => {
     const clock = new FakeClock(T0);
 
     const first = await boot(dir, clock);
-    openHandles.push(first.handle);
     await makeDaemon(first).pollOnce();
     const loopId = await createScheduledLoop(first, "* * * * *");
     await shutdown(first);
@@ -394,7 +386,7 @@ describe("E-group: file-backed DB + real HTTP restart E2E", () => {
     });
     let gateUsed = false;
     const secondCronFactory = new FakeCronFactory();
-    const second = await bootstrapServer(
+    const booted = await bootstrapServer(
       { host: "127.0.0.1", port: 0, dataDir: dir },
       {
         clock,
@@ -409,9 +401,7 @@ describe("E-group: file-backed DB + real HTTP restart E2E", () => {
         },
       },
     );
-    const secondServer = serve({ fetch: second.app.fetch, port: 0, hostname: "127.0.0.1" });
-    await waitForListening(secondServer);
-    openHandles.push(second.handle);
+    const second = await attachListener(booted, clock, secondCronFactory);
     const startPromise = second.scheduler.start();
 
     await catchupParked; // the catch-up enqueue is REALLY in flight
@@ -419,11 +409,12 @@ describe("E-group: file-backed DB + real HTTP restart E2E", () => {
     const drainPromise = second.scheduler.stopAndDrain().then(() => {
       drained = true;
     });
-    // The gate is still held, so the drain CANNOT have completed — the
-    // in-flight catch-up promise shares the drain set with online callbacks.
-    expect(await Promise.race([drainPromise.then(() => "drained" as const), Promise.resolve("waiting" as const)])).toBe(
-      "waiting",
-    );
+    // The gate is still held, so a broken drain that resolves immediately
+    // would flip this sentinel during the next macrotask. Waiting a turn is
+    // essential: Promise.race(..., Promise.resolve("waiting")) would pass
+    // even for that broken implementation.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(drained).toBe(false);
     release();
     await startPromise;
     await drainPromise;
@@ -440,9 +431,7 @@ describe("E-group: file-backed DB + real HTTP restart E2E", () => {
 
     // Production close order after the drain: listener, then DB.
     const leakedCallbacks = secondCronFactory.entries().map((e) => e.callback);
-    await new Promise<void>((resolve) => secondServer.close(() => resolve()));
-    openHandles.splice(openHandles.indexOf(second.handle), 1);
-    await closeDb(second.handle);
+    await shutdown(second);
 
     // A timer that outlived the drain fires into the stopped guard — against
     // an already-CLOSED database any access would throw.
@@ -454,7 +443,6 @@ describe("E-group: file-backed DB + real HTTP restart E2E", () => {
     // The next boot over the same dataDir recovers normally: the 09:03
     // occurrence supersedes the drained 09:02 pending — still at most one.
     const third = await boot(dir, clock);
-    openHandles.push(third.handle);
     const allRuns = await listRuns(third, loopId);
     expect(allRuns).toHaveLength(2);
     expect(allRuns.filter((r) => r.phase === "pending")).toHaveLength(1);

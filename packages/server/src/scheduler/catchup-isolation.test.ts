@@ -15,9 +15,9 @@ import { eq } from "drizzle-orm";
 
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
 import { loops } from "../db/schema.js";
-import { FakeClock, seedMachine, seedLoop, snapshotRuns, testDeps } from "../testkit/index.js";
+import { FakeClock, FakeCronFactory, seedMachine, seedLoop, snapshotRuns, testDeps } from "../testkit/index.js";
 import { createRunCoordinator, type RunCoordinator } from "../coordinator/index.js";
-import { createScheduler, type CronJob, type CronFactory, type Scheduler } from "./index.js";
+import { createScheduler, type CronFactory, type Scheduler } from "./index.js";
 
 const handles: DbHandle[] = [];
 afterEach(async () => {
@@ -26,22 +26,6 @@ afterEach(async () => {
 
 const MACHINE_ID = "m-test123456789a";
 const ACTIVATION_9AM = "2026-08-27T09:00:00.000Z";
-
-class FakeCronFactory implements CronFactory {
-  private entriesList: { stopped: boolean }[] = [];
-  create(
-    _pattern: string,
-    _options: { timezone: string },
-    _callback: () => void | Promise<void>,
-  ): CronJob {
-    const entry = { stopped: false };
-    this.entriesList.push(entry);
-    return { stop: () => (entry.stopped = true) };
-  }
-  activeCount(): number {
-    return this.entriesList.filter((e) => !e.stopped).length;
-  }
-}
 
 describe("X-group: catch-up fault isolation and log discipline", () => {
   let db: Db;
