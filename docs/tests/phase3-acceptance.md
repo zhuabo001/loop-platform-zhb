@@ -9,6 +9,7 @@
 - **Node.js**: v22.17.0
 - **pnpm**: 10.6.1
 - **分支**: `feat/phase3-batch3-dev`
+- **验收 HEAD**: `7b14f1c`（全部代码、测试与文档证据固定于该提交；其后仅有本文件的计数/锚点收尾这一纯文档提交）
 - **计划**: `docs/plan/codex-phase3-batch3-plan.md`（评审结论已并入正文，P3-1 标记 [无效审查]）
 - **基线**: Batch 2 收口提交 `37d4c92`
 
@@ -48,10 +49,10 @@ E3–E8 链路（`* * * * *` 分钟级 cron，FakeClock 注入全部组合根组
 ```text
 $ pnpm --filter @loopzhb/server test
  Test Files  33 passed | 1 skipped (34)
-      Tests  387 passed | 1 skipped (388)
+      Tests  388 passed | 1 skipped (389)
 
 $ pnpm test            # 全仓（protocol + daemon + server）
-      Tests  387 passed | 1 skipped (388)   # server；其余包随构建链通过
+      Tests  388 passed | 1 skipped (389)   # server；其余包随构建链通过
 
 $ pnpm typecheck       # Done（protocol / daemon / server 全部通过）
 $ pnpm build           # Done
@@ -85,7 +86,7 @@ packages/server/src/**/*.test.ts                      # R/E/X/V 编组与既有 
 按 `AGENTS.md` 文档分层：本节只保留蒸馏结论与指针，逐轮发现、复现与核销证据属当批物流，保存于 `docs/handoff/`（不进库）；问题的当前状态与关闭条件以 GitHub Issues 为唯一权威。
 
 - 计划评审（实施前）：P1-1/P1-2/P2-1/P2-2/P2-3/P3-2 已采纳并入计划正文；P3-1 经裁决为 [无效审查]（理由见 ADR-007 批次三追加裁决第 6 条）。
-- 实施后两轮三轨复审（Standards / Spec / Adversarial，范围 `37d4c92..HEAD`）：全部实质性发现已登记为 `phase-3` Issues #26（持久化 cron/timezone 规范化 round-trip）、#27（R9/R10 竞态真实性）、#28（R12 cancel 回滚）、#29（E10 drain 竞态）、#30（分支范围 diff 检查）、#31（文档分层与验收锚点）、#32（hookTimeout 修复追溯登记）；核销状态以各 Issue 为准。
+- 实施后两轮三轨复审（Standards / Spec / Adversarial，范围 `37d4c92..HEAD`）：全部实质性发现已登记为 `phase-3` Issues #26（持久化 cron/timezone 规范化 round-trip）、#27（R9/R10 竞态真实性）、#28（R12 cancel 回滚）、#29（E10 drain 竞态）、#30（分支范围 diff 检查）、#31（文档分层与验收锚点）、#32（hookTimeout 修复追溯登记），全部按"修复 + 补测 + 复审核销"流程关闭；第二轮三轨复审（范围 `7b8784c..HEAD`）Standards 6 项核验通过、Spec 与 Adversarial 均 APPROVE。
 - 长期裁决只沉淀于 ADR-007（批次三追加裁决）与 ADR-008（边界与日志分类更新）。
 
 ## 结论
