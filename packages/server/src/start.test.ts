@@ -439,7 +439,7 @@ describe("bootstrapServer", () => {
     expect(cronFactory.activeCount()).toBe(1);
 
     // The scheduler's occurrence reconstruction reads the SAME fake clock:
-    // before the tick nothing fires... 
+    // before the tick nothing fires...
     await cronFactory.triggerAll();
     expect(await b.handle.db.select().from(runs)).toHaveLength(0);
 
