@@ -86,7 +86,7 @@ packages/server/src/**/*.test.ts                      # R/E/X/V 编组与既有 
 - 实施后 Standards / Spec / Adversarial 三轨复审（2026-08-29，范围为 `37d4c92..HEAD` 全量 diff）：
   - **Standards 轨：0 finding**（仅一条 diff 范围外的既有观察：`scheduler/index.ts` 的启动计数行使用 `console.log` 而非注入的 log seam——不含任何不可信数据，维持现状）。
   - **Adversarial 轨：1 × P2（已修复核销）+ 2 × P3**。
-    - P2（实质性）：非规范化持久化 cron/timezone（如 `"  UTC  "`）绕过 fail-closed 校验后在 Croner 内静默破坏该 Loop。修复：`isValidPersistedScheduleState` 增加规范化 round-trip 相等检查；补测 time-semantics 单测 + X1b + V7；修复提交 `a4edbbc`。对应 `phase-3` Issue 创建被会话权限策略拦截，需人工补建后关闭（发现、修复、测试均已记录于 `a4edbbc` 提交信息）。
+    - P2（实质性）：非规范化持久化 cron/timezone（如 `"  UTC  "`）绕过 fail-closed 校验后在 Croner 内静默破坏该 Loop。修复：`isValidPersistedScheduleState` 增加规范化 round-trip 相等检查；补测 time-semantics 单测 + X1b + V7；修复提交 `a4edbbc`，Adversarial 复审代理核销通过。对应 Issue #26（`phase-3`）已建并按"修复 + 补测 + 复审核销"流程关闭。
     - P3-1（已修复）：启动扫描 SQL 补 `cron IS NOT NULL` 谓词（计划 §2.1 步骤 1 口径，命中部分索引）——同提交 `a4edbbc`。
     - P3-2（不处理）：启动计数日志走 `console.log`（同 Standards 轨观察，仅计数无不可信数据）。
     - 主动攻击面均验证无误：catch-up 与在线 callback 竞态不双跑、stopAndDrain 中 drain 语义、registry 回读拒绝 stale revision、cutoff 后 occurrence 由已注册 timer 覆盖、注入缝生产默认值不变。
