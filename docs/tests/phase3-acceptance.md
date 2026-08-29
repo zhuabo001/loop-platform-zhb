@@ -48,10 +48,10 @@ E3–E8 链路（`* * * * *` 分钟级 cron，FakeClock 注入全部组合根组
 ```text
 $ pnpm --filter @loopzhb/server test
  Test Files  33 passed | 1 skipped (34)
-      Tests  384 passed | 1 skipped (385)
+      Tests  387 passed | 1 skipped (388)
 
 $ pnpm test            # 全仓（protocol + daemon + server）
-      Tests  384 passed | 1 skipped (385)   # server；其余包随构建链通过
+      Tests  387 passed | 1 skipped (388)   # server；其余包随构建链通过
 
 $ pnpm typecheck       # Done（protocol / daemon / server 全部通过）
 $ pnpm build           # Done
@@ -61,7 +61,7 @@ No schema changes, nothing to migrate 😴   # 无新增 migration（显式边�
 $ git diff --check     # 无输出（clean）
 ```
 
-（1 个 skipped 为 Batch 前既有的跳过用例，非本批引入。）
+（1 个 skipped 为 Batch 前既有的跳过用例，非本批引入。`packages/server/vitest.config.ts` 的 `hookTimeout` 已提升至 60s——复审发现默认 10s 在高负载并行下是 PGlite WASM 启动超时的实际来源；见下文复审记录。）
 
 ## 显式边界核对（相对基线 `37d4c92` 的变更面）
 
@@ -83,7 +83,17 @@ packages/server/src/**/*.test.ts                      # R/E/X/V 编组与既有 
 ## 复审与 Issue 收口
 
 - 计划评审（P1-1/P1-2/P2-1/P2-2/P2-3/P3-2 已采纳并入正文；P3-1 经裁决为 [无效审查]，理由留存于计划 §6.3）。
-- 实施后 Standards / Spec / Adversarial 三轨复审结论与新发现 Issue 随本批收口更新于本节。
+- 实施后 Standards / Spec / Adversarial 三轨复审（2026-08-29，范围为 `37d4c92..HEAD` 全量 diff）：
+  - **Standards 轨：0 finding**（仅一条 diff 范围外的既有观察：`scheduler/index.ts` 的启动计数行使用 `console.log` 而非注入的 log seam——不含任何不可信数据，维持现状）。
+  - **Adversarial 轨：1 × P2（已修复核销）+ 2 × P3**。
+    - P2（实质性）：非规范化持久化 cron/timezone（如 `"  UTC  "`）绕过 fail-closed 校验后在 Croner 内静默破坏该 Loop。修复：`isValidPersistedScheduleState` 增加规范化 round-trip 相等检查；补测 time-semantics 单测 + X1b + V7；修复提交 `a4edbbc`。对应 `phase-3` Issue 创建被会话权限策略拦截，需人工补建后关闭（发现、修复、测试均已记录于 `a4edbbc` 提交信息）。
+    - P3-1（已修复）：启动扫描 SQL 补 `cron IS NOT NULL` 谓词（计划 §2.1 步骤 1 口径，命中部分索引）——同提交 `a4edbbc`。
+    - P3-2（不处理）：启动计数日志走 `console.log`（同 Standards 轨观察，仅计数无不可信数据）。
+    - 主动攻击面均验证无误：catch-up 与在线 callback 竞态不双跑、stopAndDrain 中 drain 语义、registry 回读拒绝 stale revision、cutoff 后 occurrence 由已注册 timer 覆盖、注入缝生产默认值不变。
+  - **Spec 轨：1 × P2（已修复）+ 2 × P3，计划符合性逐项核验通过**（P1-1/P1-2/P2-1/P2-2/P2-3/P3-2 与 §2.1/§2.2/§2.3/§2.4 全部落地）。
+    - P2：默认并行测试在高负载下因 vitest 默认 `hookTimeout`(10s) 对 PGlite WASM 启动过短而间歇超时。修复：`hookTimeout: 60_000`（仅为竞争余量，健康运行远低于此）。修复后全量套件 387 passed 稳定通过。
+    - P3（已修复）：本文档测试计数与首跑结果不一致——已按最终全量结果更正为 387 passed | 1 skipped。
+    - P3（无需处理）：复审期间其他轨道的临时复现文件一度残留工作区（未入库），复审结束已自清。
 
 ## 结论
 
