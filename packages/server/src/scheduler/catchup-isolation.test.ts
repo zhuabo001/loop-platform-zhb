@@ -220,6 +220,61 @@ describe("X-group: catch-up fault isolation and log discipline", () => {
     expect(logs.join("\n")).not.toContain("sensitive detail");
   });
 
+  test("X2b: a loop whose job REGISTRATION fails never catches up (registry read-back), while the healthy loop recovers", async () => {
+    // Adversarial P3: reconcile() swallows a CronFactory.create() throw into
+    // `job_register_failed`; the recovery set is defined by the registry
+    // read-back, so an unregistered loop must get NO catch-up run and NO
+    // watermark movement.
+    await seedLoop(db, {
+      id: "loop-unregistrable",
+      machineId: MACHINE_ID,
+      cron: "0 11 * * *",
+      timezone: "UTC",
+      enabled: true,
+      scheduleRevision: 0,
+      scheduleActivatedAt: ACTIVATION_9AM,
+    });
+    await seedLoop(db, {
+      id: "loop-healthy",
+      machineId: MACHINE_ID,
+      cron: "0 10 * * *",
+      timezone: "UTC",
+      enabled: true,
+      scheduleRevision: 0,
+      scheduleActivatedAt: ACTIVATION_9AM,
+    });
+
+    let registered = 0;
+    const throwingFactory: CronFactory = {
+      create(pattern) {
+        if (pattern === "0 11 * * *") throw new Error("injected registration failure with sensitive detail");
+        registered += 1;
+        return { stop: () => {} };
+      },
+    };
+    const isolated = createScheduler({
+      db,
+      coordinator,
+      clock,
+      cronFactory: throwingFactory,
+      log: (line) => logs.push(line),
+    });
+    await isolated.start();
+
+    // The healthy loop registered AND caught up; the unregistrable loop got
+    // neither a job nor a catch-up run nor a watermark move.
+    expect(registered).toBe(1);
+    const allRuns = await snapshotRuns(db);
+    expect(allRuns).toHaveLength(1);
+    expect(allRuns[0]).toMatchObject({ loopId: "loop-healthy", phase: "pending" });
+    const [unregistrable] = await db.select().from(loops).where(eq(loops.id, "loop-unregistrable"));
+    expect(unregistrable!.lastScheduledAt).toBeNull();
+
+    // Fixed classification only — the thrown message never reaches the log.
+    expect(logs).toEqual(["scheduler: job_register_failed loop=loop-unregistrable"]);
+    expect(logs.join("\n")).not.toContain("sensitive detail");
+  });
+
   test("X3: logs never carry cron, timezone, exception messages or other untrusted values", async () => {
     const EVIL_CRON = "0 10 * * *\nFORGED-LOG-LINE";
     const EVIL_TZ = "UTC\nFORGED-TZ-LINE";

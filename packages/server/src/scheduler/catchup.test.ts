@@ -359,8 +359,7 @@ describe("R-group: restart catch-up", () => {
 
   test("R9: an online callback and the catch-up hitting the SAME occurrence dedupe on the watermark", async () => {
     // Reboot exactly at the 10:00 tick: the recovery pass and the live job
-    // both target 10:00. The catch-up is gated mid-flight so the online tick
-    // REALLY interleaves instead of merely following.
+    // both target 10:00.
     clock = new FakeClock(new Date("2026-08-27T10:00:00.000Z"));
     await seedLoop(db, {
       id: "loop-1",
@@ -372,28 +371,46 @@ describe("R-group: restart catch-up", () => {
       scheduleActivatedAt: ACTIVATION_9AM,
     });
 
+    // Park the catch-up at the enqueue gate — beforeEnqueueTx runs INSIDE the
+    // per-loop serialized section, so the parked catch-up HOLDS the loop's
+    // mutex. (Issue #27: the previous version triggered the jobs before
+    // start() had registered them — the "online callback" never fired.)
     let release: (() => void) | undefined;
     const gate = new Promise<void>((r) => {
       release = r;
     });
-    let gateUsed = false;
+    let entered!: () => void;
+    const catchupParked = new Promise<void>((r) => {
+      entered = r;
+    });
+    let hookCalls = 0;
     const { scheduler, cronFactory } = bootScheduler({
       hooks: {
         beforeEnqueueTx: () => {
-          if (gateUsed) return undefined;
-          gateUsed = true;
+          hookCalls += 1;
+          if (hookCalls > 1) return undefined; // the online tick passes through
+          entered();
           return gate;
         },
       },
     });
 
     const startPromise = scheduler.start();
-    // Jobs are registered BEFORE the catch-up pass — the live tick fires while
-    // the gated catch-up is parked, and serializes behind it per loop.
-    await cronFactory.triggerAll();
+    // Jobs are registered BEFORE the recovery pass, so once the catch-up is
+    // parked the live job is real — firing it now IS the interleaving.
+    await catchupParked;
+    expect(cronFactory.activeCount()).toBe(1);
+    // Fire WITHOUT awaiting: the online enqueue queues behind the parked
+    // catch-up on the per-loop mutex — awaiting it here would deadlock.
+    const onlineTicks = cronFactory.fireAll();
+    expect(onlineTicks).toHaveLength(1);
     release!();
     await startPromise;
+    await Promise.all(onlineTicks);
 
+    // BOTH entry points really ran (hook fired exactly twice) and the
+    // watermark deduped them: exactly one pending, whichever won.
+    expect(hookCalls).toBe(2);
     const allRuns = await snapshotRuns(db);
     expect(allRuns).toHaveLength(1);
     expect(allRuns[0]).toMatchObject({ phase: "pending" });
@@ -411,29 +428,39 @@ describe("R-group: restart catch-up", () => {
       scheduleActivatedAt: ACTIVATION_9AM,
     });
 
-    // Park the catch-up enqueue mid-flight, then commit the schedule update.
+    // Park the catch-up at the enqueue gate, then commit the schedule update
+    // — awaiting `entered` proves the update lands AFTER the catch-up entered
+    // its enqueue section (Issue #27: the previous version raced the update
+    // against start() without proving the order).
     let release: (() => void) | undefined;
     const gate = new Promise<void>((r) => {
       release = r;
     });
-    let gateUsed = false;
+    let entered!: () => void;
+    const catchupParked = new Promise<void>((r) => {
+      entered = r;
+    });
+    let hookCalls = 0;
     const { scheduler } = bootScheduler({
       hooks: {
         beforeEnqueueTx: () => {
-          if (gateUsed) return undefined;
-          gateUsed = true;
+          hookCalls += 1;
+          entered();
           return gate;
         },
       },
     });
 
     const startPromise = scheduler.start();
+    await catchupParked;
     await updateSchedule({ db, clock }, "loop-1", { cron: "0 14 * * *" });
     release!();
     await startPromise;
 
-    // The old revision's catch-up lost: NO run, and the NEW activation
-    // (12:30) does not backfill the 10:00 occurrence.
+    // The catch-up really reached its enqueue (hook fired once) and LOST to
+    // the committed update: NO run, and the NEW activation (12:30) does not
+    // backfill the 10:00 occurrence.
+    expect(hookCalls).toBe(1);
     expect(await snapshotRuns(db)).toHaveLength(0);
     const [loop] = await db.select().from(loops).where(eq(loops.id, "loop-1"));
     expect(loop).toMatchObject({ scheduleRevision: 1, cron: "0 14 * * *", lastScheduledAt: null });
@@ -487,42 +514,61 @@ describe("R-group: restart catch-up", () => {
   });
 
   test("R12: an injected enqueue failure rolls back watermark/cancel/insert; the next restart retries", async () => {
+    // Hourly cron; the 10:00 tick produced a pending run BEFORE the
+    // "downtime". Its T7 cancel happens inside the same transaction as the
+    // watermark advance and the insert, so the injected failure must roll
+    // ALL THREE back (Issue #28: the previous version had no pre-existing
+    // pending, leaving the cancel rollback unproven).
     await seedLoop(db, {
       id: "loop-1",
       machineId: MACHINE_ID,
-      cron: "0 10 * * *",
+      cron: "0 * * * *",
       timezone: "UTC",
       enabled: true,
       scheduleRevision: 0,
       scheduleActivatedAt: ACTIVATION_9AM,
     });
+    clock = new FakeClock(new Date("2026-08-27T10:05:00.000Z"));
+    const before = bootScheduler();
+    const seeded = await before.coordinator.enqueueExecRun("loop-1", {
+      kind: "scheduled",
+      scheduledFor: "2026-08-27T10:00:00.000Z",
+      scheduleRevision: 0,
+    });
+    expect(seeded.enqueued).toBe(true);
 
-    // First boot: the id factory blows up INSIDE the enqueue transaction.
+    // Downtime across 11:00 and 12:00; restart at 12:30 with an id factory
+    // that blows up INSIDE the enqueue transaction (after the cancel and the
+    // watermark write).
+    clock = new FakeClock(new Date("2026-08-27T12:30:00.000Z"));
     let blowUp = true;
     const failing = bootScheduler({
       newRunId: () => {
         if (blowUp) throw new Error("injected id factory failure");
-        return "run-recovered";
+        return `run-${++runSeq}`;
       },
     });
     await failing.scheduler.start();
 
-    // Complete rollback: no run, watermark untouched, fixed classification.
-    expect(await snapshotRuns(db)).toHaveLength(0);
-    expect(await watermarkOf(db, "loop-1")).toBeNull();
+    // Complete rollback: the old pending is STILL pending (its cancel rolled
+    // back), the watermark still points at 10:00, no new run exists.
+    const afterFailure = await snapshotRuns(db);
+    expect(afterFailure).toHaveLength(1);
+    expect(afterFailure[0]).toMatchObject({ id: "run-1", phase: "pending" });
+    expect(await watermarkOf(db, "loop-1")).toBe("2026-08-27T10:00:00.000Z");
     expect(logs).toContain("scheduler: enqueue_failed loop=loop-1");
 
-    // Next restart with the fault cleared: the recovery retries and lands.
+    // Next restart with the fault cleared: the recovery retries and lands —
+    // the old pending is superseded, the recovered one is the only pending.
     blowUp = false;
-    const recovered = bootScheduler({
-      newRunId: () => "run-recovered",
-    });
+    const recovered = bootScheduler();
     await recovered.scheduler.start();
 
     const allRuns = await snapshotRuns(db);
-    expect(allRuns).toHaveLength(1);
-    expect(allRuns[0]).toMatchObject({ id: "run-recovered", phase: "pending" });
-    expect(await watermarkOf(db, "loop-1")).toBe("2026-08-27T10:00:00.000Z");
+    expect(allRuns).toHaveLength(2);
+    expect(allRuns[0]).toMatchObject({ id: "run-1", phase: "canceled", outcome: "skipped" });
+    expect(allRuns[1]).toMatchObject({ phase: "pending" });
+    expect(await watermarkOf(db, "loop-1")).toBe("2026-08-27T12:00:00.000Z");
     await recovered.scheduler.stopAndDrain();
   });
 });
