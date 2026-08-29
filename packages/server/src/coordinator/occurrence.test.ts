@@ -535,4 +535,82 @@ describe("O-group: scheduled trigger and atomic occurrence", () => {
       expect(loop!.lastScheduledAt).toBeNull();
     });
   });
+
+  describe("Fail-closed persisted schedule state (Batch 3 plan section 2.2)", () => {
+    const OCCURRENCE = "2026-08-27T10:00:00.000Z";
+    const trigger = (revision = 0) => ({
+      kind: "scheduled" as const,
+      scheduledFor: OCCURRENCE,
+      scheduleRevision: revision,
+    });
+
+    test("V1: missing activation on an ACTIVE scheduled loop skips with invalid_schedule_state, zero writes", async () => {
+      // A healthy write path never produces this (createLoop/updateSchedule
+      // always stamp activation) — the row is corrupt by definition.
+      await db.update(loops).set({ scheduleActivatedAt: null }).where(eq(loops.id, loopId));
+
+      const result = await coordinator.enqueueExecRun(loopId, trigger());
+
+      expect(result).toEqual({ enqueued: false, reason: "invalid_schedule_state" });
+      expect(await snapshotRuns(db)).toHaveLength(0);
+      const [loop] = await db.select().from(loops).where(eq(loops.id, loopId));
+      expect(loop!.lastScheduledAt).toBeNull();
+    });
+
+    test("V2: non-canonical activation (offset form) skips with invalid_schedule_state, zero writes", async () => {
+      await db
+        .update(loops)
+        .set({ scheduleActivatedAt: "2026-08-27T17:00:00+08:00" }) // === 09:00Z, non-canonical
+        .where(eq(loops.id, loopId));
+
+      const result = await coordinator.enqueueExecRun(loopId, trigger());
+
+      expect(result).toEqual({ enqueued: false, reason: "invalid_schedule_state" });
+      expect(await snapshotRuns(db)).toHaveLength(0);
+    });
+
+    test("V3: non-canonical watermark cannot participate in lexicographic comparison", async () => {
+      // Corrupt watermark spells the same instant as the occurrence WITHOUT
+      // milliseconds. Raw string comparison would misjudge it; fail closed
+      // instead and leave the corrupt value untouched.
+      await db
+        .update(loops)
+        .set({ lastScheduledAt: "2026-08-27T09:00:00Z" })
+        .where(eq(loops.id, loopId));
+
+      const result = await coordinator.enqueueExecRun(loopId, trigger());
+
+      expect(result).toEqual({ enqueued: false, reason: "invalid_schedule_state" });
+      expect(await snapshotRuns(db)).toHaveLength(0);
+      const [loop] = await db.select().from(loops).where(eq(loops.id, loopId));
+      expect(loop!.lastScheduledAt).toBe("2026-08-27T09:00:00Z"); // never rewritten
+    });
+
+    test("V4: illegal persisted revision skips with invalid_schedule_state", async () => {
+      await db.update(loops).set({ scheduleRevision: -1 }).where(eq(loops.id, loopId));
+
+      const result = await coordinator.enqueueExecRun(loopId, trigger(-1));
+
+      expect(result).toEqual({ enqueued: false, reason: "invalid_schedule_state" });
+      expect(await snapshotRuns(db)).toHaveLength(0);
+    });
+
+    test("V5: unparsable cron in an active row fails closed (defense past write-time validation)", async () => {
+      await db.update(loops).set({ cron: "not-a-cron" }).where(eq(loops.id, loopId));
+
+      const result = await coordinator.enqueueExecRun(loopId, trigger());
+
+      expect(result).toEqual({ enqueued: false, reason: "invalid_schedule_state" });
+      expect(await snapshotRuns(db)).toHaveLength(0);
+    });
+
+    test("V6: manual triggers bypass schedule-state validation entirely", async () => {
+      await db.update(loops).set({ scheduleActivatedAt: null }).where(eq(loops.id, loopId));
+
+      const result = await coordinator.enqueueExecRun(loopId);
+
+      expect(result.enqueued).toBe(true);
+      expect(await snapshotRuns(db)).toHaveLength(1);
+    });
+  });
 });
