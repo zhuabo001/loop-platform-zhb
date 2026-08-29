@@ -18,7 +18,7 @@ import { pathToFileURL } from "node:url";
 import { serve, type ServerType } from "@hono/node-server";
 
 import { createLoopAdmin, newUuidLoopId } from "./admin/index.js";
-import { createRunCoordinator, mintRunCredential, newUuidRunId, type RunCoordinator } from "./coordinator/index.js";
+import { createRunCoordinator, mintRunCredential, newUuidRunId, type CoordinatorHooks, type RunCoordinator } from "./coordinator/index.js";
 import { loadServerConfig, unauthenticatedExposureWarning, type ServerConfig } from "./config.js";
 import { closeDb, openMigratedDb, type DbHandle } from "./db/index.js";
 import { createServerApp } from "./http/app.js";
@@ -51,6 +51,10 @@ export interface BootedServer {
 export interface BootstrapOverrides {
   clock?: Clock;
   cronFactory?: CronFactory;
+  /** TEST-ONLY interleaving gates forwarded to the coordinator (E10 parks a
+   *  catch-up enqueue mid-flight to race stopAndDrain). Production passes no
+   *  overrides, so no hooks are ever installed outside tests. */
+  coordinatorHooks?: CoordinatorHooks;
 }
 
 /**
@@ -79,6 +83,7 @@ export async function bootstrapServer(
       clock,
       newRunId: newUuidRunId,
       mintRunCredential,
+      hooks: overrides.coordinatorHooks,
     });
     const admin = createLoopAdmin({ db: handle.db, clock, newLoopId: newUuidLoopId });
     const ownerControl = createOwnerControl({ db: handle.db, clock });
