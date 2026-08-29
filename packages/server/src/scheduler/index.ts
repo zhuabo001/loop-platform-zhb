@@ -29,6 +29,7 @@ import type { Db } from "../db/index.js";
 import { loops, type Loop } from "../db/schema.js";
 import { and, eq, isNotNull } from "drizzle-orm";
 import type { RunCoordinator } from "../coordinator/index.js";
+import type { EnqueueExecRunResult } from "../store/runs.js";
 import type { Clock } from "../time.js";
 import { isValidPersistedScheduleState, latestOccurrence } from "../schedule/time-semantics.js";
 
@@ -93,6 +94,36 @@ export function createScheduler(deps: SchedulerDeps) {
 
   // Shutdown flag
   let stopped = false;
+
+  /**
+   * Shared in-flight enqueue lifecycle — the ONE shape used by both the
+   * online callback and the restart catch-up (review P3: the two paths used
+   * to duplicate it). The promise is added to the SHARED drain set
+   * SYNCHRONOUSLY, before any await, so stopAndDrain() covers both paths
+   * alike; a thrown enqueue always earns the fixed `enqueue_failed`
+   * classification. A resolved non-enqueue is a benign race outcome: only the
+   * online callback observes it (`enqueue_skipped` with the reason); the
+   * catch-up passes no observer and stays silent (§2.3).
+   */
+  async function drainTrackedEnqueue(
+    loopId: string,
+    result: Promise<EnqueueExecRunResult>,
+    onSkip?: (reason: Extract<EnqueueExecRunResult, { enqueued: false }>["reason"]) => void,
+  ): Promise<void> {
+    const promise = result
+      .then((r) => {
+        if (!r.enqueued) onSkip?.(r.reason);
+      })
+      .catch(() => {
+        log(`scheduler: enqueue_failed loop=${loopId}`);
+      });
+    inFlightCallbacks.add(promise);
+    try {
+      await promise;
+    } finally {
+      inFlightCallbacks.delete(promise);
+    }
+  }
 
   /**
    * Registers or updates a Croner job for the given loop.
@@ -185,31 +216,18 @@ export function createScheduler(deps: SchedulerDeps) {
             return;
           }
 
-          // Enqueue with scheduled trigger. The enqueue promise is RETURNED to
-          // Croner: the job stays "busy" until the write settles, which is what
-          // makes the protect (overrun) handler able to skip a re-entrant tick.
-          const promise = coordinator
-            .enqueueExecRun(loop.id, {
+          // The enqueue is awaited INSIDE the callback so the promise Croner
+          // sees stays pending until the write settles — that is what makes
+          // the protect (overrun) handler able to skip a re-entrant tick.
+          await drainTrackedEnqueue(
+            loop.id,
+            coordinator.enqueueExecRun(loop.id, {
               kind: "scheduled",
               scheduledFor: scheduledFor.toISOString(),
               scheduleRevision: capturedRevision,
-            })
-            .then((result) => {
-              if (!result.enqueued) {
-                log(`scheduler: enqueue_skipped loop=${loop.id} reason=${result.reason}`);
-              }
-            })
-            .catch(() => {
-              log(`scheduler: enqueue_failed loop=${loop.id}`);
-            });
-
-          // Track in-flight callback
-          inFlightCallbacks.add(promise);
-          try {
-            await promise;
-          } finally {
-            inFlightCallbacks.delete(promise);
-          }
+            }),
+            (reason) => log(`scheduler: enqueue_skipped loop=${loop.id} reason=${reason}`),
+          );
         },
       );
 
@@ -315,27 +333,17 @@ export function createScheduler(deps: SchedulerDeps) {
         if (loop.scheduleActivatedAt !== null && occIso <= loop.scheduleActivatedAt) continue;
         if (loop.lastScheduledAt !== null && occIso <= loop.lastScheduledAt) continue;
 
-        // The promise is added to the SHARED in-flight set synchronously,
-        // before the await — stopAndDrain() covers catch-up and online
-        // callbacks alike. Benign skips (already_scheduled, running_exists,
-        // stale_revision, …) are normal race outcomes and stay silent
-        // (§2.3); only a thrown enqueue is an error worth a line.
-        const promise = coordinator
-          .enqueueExecRun(loop.id, {
+        // Benign skips (already_scheduled, running_exists, stale_revision, …)
+        // are normal race outcomes and stay silent (§2.3); only a thrown
+        // enqueue is an error worth a line.
+        await drainTrackedEnqueue(
+          loop.id,
+          coordinator.enqueueExecRun(loop.id, {
             kind: "scheduled",
             scheduledFor: occIso,
             scheduleRevision: loop.scheduleRevision,
-          })
-          .then(() => {})
-          .catch(() => {
-            log(`scheduler: enqueue_failed loop=${loop.id}`);
-          });
-        inFlightCallbacks.add(promise);
-        try {
-          await promise;
-        } finally {
-          inFlightCallbacks.delete(promise);
-        }
+          }),
+        );
       }
     },
 
