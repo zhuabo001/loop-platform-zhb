@@ -276,8 +276,21 @@ Batch 1 只有在上述目标全部通过时才能标记完成；任何自动 Ru
 - 验收前审查 Phase 3 Issues：P0/P1 和实质性 P2 必须修复并复核，或经明确批准右移到后续批次
 - PR 描述记录基线提交、迁移文件、M/D/C 结果、完整质量门结果和开放 Issue；不引用或提交 handoff 文档
 
+## 批次三追加裁决（2026-08-29，重启 catch-up 收口）
+
+以下裁决在 Batch 3 落地，与本 ADR 的既有决策同属 Phase 3 调度语义的一部分：
+
+1. **重启 catch-up 语义**：Server 停机跨越任意多次 occurrence，重启后每个活跃 Loop 最多恢复**最新的一个真实 occurrence**（`latestOccurrence` 对数重建，不枚举历史）；最终裁决由 `enqueueExecRun` 事务内的最新行完成，启动扫描的快照只做 eligibility 提示。DST gap 不虚构 occurrence；DST overlap 只恢复第一次真实 occurrence。
+2. **注册先于恢复**：`start()` 先完成所有 Croner job 注册，再以同一词法作用域内的 registry 回读（`entry.revision === loop.scheduleRevision`）定义恢复集合——注册失败的 Loop 绝不 catch-up；恢复较慢时正常 timer 已开始覆盖 cutoff 之后的 occurrence。
+3. **fail-closed 持久化状态校验**：活跃 scheduled Loop 的 `scheduleActivatedAt` 缺失或非规范 UTC ISO、非空 `lastScheduledAt` 非规范、或 `scheduleRevision` 非非负安全整数时，启动扫描与 scheduled enqueue 两条路径统一 fail-closed（扫描侧跳过该 Loop；enqueue 侧返回包内 skip 原因 `invalid_schedule_state`，零写入）。规范 UTC ISO 的唯一判定为 round-trip 相等：`parse(value) !== undefined && new Date(ms).toISOString() === value`。判定规则只有一份实现（`isValidPersistedScheduleState`），两条路径共享。
+4. **catch-up 与 manual Run Now 竞争**：沿用 T7——较晚写入者 supersede 较早的 pending，**包括 manual pending**（停机期间的 manual Run Now 可能被重启 catch-up 取消）。任意时刻最多一个 pending，不出现双跑；这是已接受的产品语义取舍（评审 P3-2）。
+5. **故障隔离**：单 Loop 的时间计算、job 注册或 enqueue 错误只记固定分类后跳过，不阻塞其他 Loop 或 readiness；日志永不输出 cron、timezone、异常消息或其他不可信值。不引入后台 catch-up retry worker——恢复失败由下一次重启或下一个正常 cron tick 合并恢复。
+6. **catch-up 串行与停机安全**：每个 Loop 的 catch-up enqueue 串行 await、与在线 callback 共用同一 in-flight 集合统一 drain；每迭代一个 Loop 前检查 `stopped`，`stopAndDrain()` 后绝不写入正在关闭的数据库。单 Loop catch-up 挂起拖住 boot gate 的问题经评审裁决（P3-1，[无效审查]）不引入并发恢复：并发仍需等待全部 catch-up 完成，无法改变 boot gate 语义；真实挂起的超时/中断/可观测性如需处理，须先形成独立的启动裁决。
+7. **测试观察面**：watermark、activation、revision 不进入公共 wire；E2E 经真实 HTTP 驱动行为，对内部状态的断言只经测试自持的 DbHandle 只读完成，不为此新增 protocol 字段。
+
 ## 修订记录
 
 - 2026-08-25：初始 Proposed。
 - 2026-08-25：Round 2 修复统一 DST gap、真实文件库迁移与数据库故障回滚证据；等待 Round 3 复审后决定是否 Accepted。
 - 2026-08-25：Round 3 修复 overlap `afterExclusive` 单调性和 M1 全字段快照；Round 4 Standards/Specs/Adversarial 均 0 finding，状态改为 Accepted。
+- 2026-08-29：追加批次三裁决（重启 catch-up 语义、fail-closed 状态校验、T7 与 manual pending 的竞争明示、故障隔离与日志纪律）；验收证据见 `docs/tests/phase3-acceptance.md`。
