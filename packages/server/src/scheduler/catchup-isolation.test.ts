@@ -130,6 +130,39 @@ describe("X-group: catch-up fault isolation and log discipline", () => {
     ]);
   });
 
+  test("X1b: a whitespace-padded persisted timezone is rejected at scan instead of silently breaking the loop (adversarial P2 regression)", async () => {
+    // "  UTC  " validates after normalization but is NOT the normalized form
+    // any write path persists. Before the round-trip check it passed the scan
+    // and then EVERY occurrence rebuild threw inside Croner — job registered,
+    // zero runs, forever.
+    await seedLoop(db, {
+      id: "loop-padded",
+      machineId: MACHINE_ID,
+      cron: "0 10 * * *",
+      timezone: "  UTC  ",
+      enabled: true,
+      scheduleRevision: 0,
+      scheduleActivatedAt: ACTIVATION_9AM,
+    });
+    await seedLoop(db, {
+      id: "loop-healthy",
+      machineId: MACHINE_ID,
+      cron: "0 10 * * *",
+      timezone: "UTC",
+      enabled: true,
+      scheduleRevision: 0,
+      scheduleActivatedAt: ACTIVATION_9AM,
+    });
+
+    await scheduler.start();
+
+    expect(cronFactory.activeCount()).toBe(1);
+    const allRuns = await snapshotRuns(db);
+    expect(allRuns).toHaveLength(1);
+    expect(allRuns[0]).toMatchObject({ loopId: "loop-healthy", phase: "pending" });
+    expect(logs).toEqual(["scheduler: invalid_schedule_state loop=loop-padded"]);
+  });
+
   test("X2: one loop's catch-up enqueue failure blocks neither the other loops nor readiness", async () => {
     await seedLoop(db, {
       id: "loop-failing",

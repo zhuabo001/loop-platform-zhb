@@ -409,7 +409,14 @@ export interface PersistedScheduleState {
  */
 export function isValidPersistedScheduleState(state: PersistedScheduleState): boolean {
   try {
-    validateSchedule(state.cron, state.timezone);
+    // Round-trip the NORMALIZATION too: every write path persists the
+    // normalized forms, so a stored value that differs (padded timezone,
+    // double-spaced cron) is corrupt by definition — and passing the raw
+    // padded string on to Croner would silently break occurrence rebuild
+    // (adversarial review: "  UTC  " validated fine, then latestOccurrence
+    // threw on every tick).
+    const normalized = validateSchedule(state.cron, state.timezone);
+    if (normalized.cron !== state.cron || normalized.timezone !== state.timezone) return false;
   } catch {
     return false;
   }

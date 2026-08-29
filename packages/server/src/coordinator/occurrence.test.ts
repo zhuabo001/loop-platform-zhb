@@ -604,6 +604,18 @@ describe("O-group: scheduled trigger and atomic occurrence", () => {
       expect(await snapshotRuns(db)).toHaveLength(0);
     });
 
+    test("V7: a non-normalized persisted timezone fails closed on the enqueue path too (adversarial P2)", async () => {
+      // The transaction path shares isValidPersistedScheduleState with the
+      // startup scan — a padded timezone must be invalid_schedule_state here
+      // as well, not a silent occurrence-rebuild failure.
+      await db.update(loops).set({ timezone: " UTC " }).where(eq(loops.id, loopId));
+
+      const result = await coordinator.enqueueExecRun(loopId, trigger());
+
+      expect(result).toEqual({ enqueued: false, reason: "invalid_schedule_state" });
+      expect(await snapshotRuns(db)).toHaveLength(0);
+    });
+
     test("V6: manual triggers bypass schedule-state validation entirely", async () => {
       await db.update(loops).set({ scheduleActivatedAt: null }).where(eq(loops.id, loopId));
 

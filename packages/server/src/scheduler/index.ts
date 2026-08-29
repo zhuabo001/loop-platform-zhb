@@ -27,7 +27,7 @@
 
 import type { Db } from "../db/index.js";
 import { loops, type Loop } from "../db/schema.js";
-import { eq } from "drizzle-orm";
+import { and, eq, isNotNull } from "drizzle-orm";
 import type { RunCoordinator } from "../coordinator/index.js";
 import type { Clock } from "../time.js";
 import { isValidPersistedScheduleState, latestOccurrence } from "../schedule/time-semantics.js";
@@ -254,14 +254,12 @@ export function createScheduler(deps: SchedulerDeps) {
     async start(): Promise<void> {
       if (stopped) throw new Error("Scheduler already stopped");
 
-      // Scan active loops (enabled=true AND cron IS NOT NULL)
-      const activeLoops = await db
+      // Scan active loops (enabled=true AND cron IS NOT NULL) — the SQL
+      // predicate matches the loops_active_schedule_idx partial index.
+      const scheduledLoops = await db
         .select()
         .from(loops)
-        .where(eq(loops.enabled, true));
-
-      // Filter to only those with cron
-      const scheduledLoops = activeLoops.filter((loop) => loop.cron !== null);
+        .where(and(eq(loops.enabled, true), isNotNull(loops.cron)));
 
       console.log(`[scheduler] starting: found ${scheduledLoops.length} active scheduled loops`);
 

@@ -385,6 +385,24 @@ describe("Batch 3: canonical-ISO and persisted-state validation (plan §2.2)", (
     ).toBe(true);
   });
 
+  test("isValidPersistedScheduleState: non-normalized stored cron/timezone fails closed (adversarial P2)", () => {
+    // Every write path persists validateSchedule's NORMALIZED output. A stored
+    // value that differs (padded timezone, double-spaced cron) is corrupt by
+    // definition — and the raw padded string would silently break Croner's
+    // occurrence rebuild downstream.
+    const healthy = {
+      cron: "0 10 * * *",
+      timezone: "UTC",
+      scheduleRevision: 0,
+      scheduleActivatedAt: "2026-08-27T09:00:00.000Z",
+      lastScheduledAt: null,
+    };
+    expect(isValidPersistedScheduleState(healthy)).toBe(true);
+    expect(isValidPersistedScheduleState({ ...healthy, timezone: "  UTC  " })).toBe(false);
+    expect(isValidPersistedScheduleState({ ...healthy, cron: "0  10 * * *" })).toBe(false);
+    expect(isValidPersistedScheduleState({ ...healthy, cron: " 0 10 * * *" })).toBe(false);
+  });
+
   test("isValidPersistedScheduleState: every corrupt dimension fails closed", () => {
     const healthy = {
       cron: "0 10 * * *",
