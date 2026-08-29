@@ -23,10 +23,10 @@ import { loadServerConfig, unauthenticatedExposureWarning, type ServerConfig } f
 import { closeDb, openMigratedDb, type DbHandle } from "./db/index.js";
 import { createServerApp } from "./http/app.js";
 import { createOwnerControl } from "./owner/index.js";
-import { createScheduler, type Scheduler } from "./scheduler/index.js";
+import { createScheduler, type CronFactory, type Scheduler } from "./scheduler/index.js";
 import { productionCronFactory } from "./scheduler/croner-factory.js";
 import { armInactivitySweep, createInactivitySweep, type InactivitySweep } from "./sweep/index.js";
-import { systemClock } from "./time.js";
+import { systemClock, type Clock } from "./time.js";
 
 export interface BootedServer {
   app: ReturnType<typeof createServerApp>;
@@ -41,6 +41,19 @@ export interface BootedServer {
 }
 
 /**
+ * INTERNAL-ONLY test seam (Phase 3 Batch 3 plan §2.4): an injected Clock
+ * replaces EVERY systemClock use in this composition root (coordinator,
+ * admin, ownerControl, sweep, scheduler AND the HTTP app), so a FakeClock E2E
+ * can never split occurrence/watermark time from run/lease/progress time.
+ * Production callers pass NO overrides and get systemClock +
+ * productionCronFactory exactly as before.
+ */
+export interface BootstrapOverrides {
+  clock?: Clock;
+  cronFactory?: CronFactory;
+}
+
+/**
  * Everything except the listener — the testable core of boot. Creates the
  * data dir, opens+migrates the file-backed DB at `<dataDir>/pgdata`, and
  * wires the production coordinator (systemClock, UUID run ids, `rk_` mint)
@@ -52,27 +65,32 @@ export interface BootedServer {
  *
  * Phase 3 Batch 2: Creates Scheduler with production Croner factory.
  */
-export async function bootstrapServer(config: ServerConfig): Promise<BootedServer> {
+export async function bootstrapServer(
+  config: ServerConfig,
+  overrides: BootstrapOverrides = {},
+): Promise<BootedServer> {
+  const clock = overrides.clock ?? systemClock;
+  const cronFactory = overrides.cronFactory ?? productionCronFactory;
   await fs.promises.mkdir(config.dataDir, { recursive: true });
   const handle = await openMigratedDb({ dataDir: config.dataDir });
   try {
     const coordinator = createRunCoordinator({
       db: handle.db,
-      clock: systemClock,
+      clock,
       newRunId: newUuidRunId,
       mintRunCredential,
     });
-    const admin = createLoopAdmin({ db: handle.db, clock: systemClock, newLoopId: newUuidLoopId });
-    const ownerControl = createOwnerControl({ db: handle.db, clock: systemClock });
-    const sweep = createInactivitySweep({ db: handle.db, clock: systemClock });
+    const admin = createLoopAdmin({ db: handle.db, clock, newLoopId: newUuidLoopId });
+    const ownerControl = createOwnerControl({ db: handle.db, clock });
+    const sweep = createInactivitySweep({ db: handle.db, clock });
     const scheduler = createScheduler({
       db: handle.db,
       coordinator,
-      clock: systemClock,
-      cronFactory: productionCronFactory,
+      clock,
+      cronFactory,
     });
     return {
-      app: createServerApp(coordinator, admin, ownerControl, handle.db, systemClock, (loop) =>
+      app: createServerApp(coordinator, admin, ownerControl, handle.db, clock, (loop) =>
         scheduler.reconcile(loop),
       ),
       coordinator,
