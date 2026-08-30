@@ -1,0 +1,192 @@
+/**
+ * Terminal-policy tests (plan P3/P6/P7): the value rules daemon and server
+ * execute identically (ADR-009; ADR-002 决策 4 的窄例外). Every boundary is
+ * pinned at the exact byte, because both peers must agree bit-for-bit.
+ */
+import { describe, expect, it } from "vitest";
+
+import {
+  GOAL_MAX_UTF8_BYTES,
+  hasTerminalJournalV1,
+  normalizeCapabilities,
+  normalizeGoal,
+  TASK_FILE_CONTENT_MAX_UTF8_BYTES,
+  TERMINAL_JOURNAL_V1_CAPABILITY,
+  TERMINAL_STATE_MAX_COMPACT_UTF8_BYTES,
+  TERMINAL_TEXT_MAX_UTF8_BYTES,
+  validateFinishReason,
+  validateTaskFileSyncResult,
+  validateTerminalMessage,
+  validateTerminalState,
+} from "./index.js"; // P7: the policy rides the MAIN entry, no subpath
+
+describe("normalizeGoal (ADR-009 决策 2)", () => {
+  it("trims and persists the normalized value", () => {
+    expect(normalizeGoal("  ship the audit report  ")).toEqual({ ok: true, goal: "ship the audit report" });
+    expect(normalizeGoal("\tkeep\tinner\twhitespace\t")).toEqual({ ok: true, goal: "keep\tinner\twhitespace" });
+  });
+
+  it("rejects empty-after-trim", () => {
+    expect(normalizeGoal("")).toEqual({ ok: false, failure: "empty" });
+    expect(normalizeGoal("   \t  ")).toEqual({ ok: false, failure: "empty" });
+  });
+
+  it("rejects NUL, CR and LF anywhere in the normalized value", () => {
+    expect(normalizeGoal("a\0b")).toEqual({ ok: false, failure: "contains_nul" });
+    expect(normalizeGoal("a\rb")).toEqual({ ok: false, failure: "not_single_line" });
+    expect(normalizeGoal("a\nb")).toEqual({ ok: false, failure: "not_single_line" });
+    expect(normalizeGoal("a\r\nb")).toEqual({ ok: false, failure: "not_single_line" });
+  });
+
+  it("pins the 2000 UTF-8 byte ceiling exactly (ASCII)", () => {
+    expect(normalizeGoal("a".repeat(GOAL_MAX_UTF8_BYTES))).toEqual({
+      ok: true,
+      goal: "a".repeat(GOAL_MAX_UTF8_BYTES),
+    });
+    expect(normalizeGoal("a".repeat(GOAL_MAX_UTF8_BYTES + 1))).toEqual({ ok: false, failure: "too_long" });
+  });
+
+  it("pins the ceiling in UTF-8 BYTES, not code units (multibyte)", () => {
+    // 'é' (U+00E9): 1 UTF-16 code unit, 2 UTF-8 bytes.
+    expect(normalizeGoal("é".repeat(1000))).toEqual({ ok: true, goal: "é".repeat(1000) });
+    expect(normalizeGoal("é".repeat(1001))).toEqual({ ok: false, failure: "too_long" });
+    // Astral char (2 code units, 4 bytes) fits under the ceiling.
+    expect(normalizeGoal("🚀".repeat(500))).toEqual({ ok: true, goal: "🚀".repeat(500) });
+  });
+
+  it("checks emptiness before NUL and NUL before line breaks (stable first failure)", () => {
+    expect(normalizeGoal("  ")).toEqual({ ok: false, failure: "empty" });
+    expect(normalizeGoal("a\0b\nc")).toEqual({ ok: false, failure: "contains_nul" });
+  });
+});
+
+describe("validateTerminalMessage / validateFinishReason (ADR-009 决策 6)", () => {
+  it("keeps the original text and newlines — no trim, no single-line rule", () => {
+    const messy = "  line one\nline two\r\n  ";
+    expect(validateTerminalMessage(messy)).toEqual({ ok: true });
+    expect(validateFinishReason(messy)).toEqual({ ok: true });
+  });
+
+  it("message may be empty; finish reason must NOT", () => {
+    expect(validateTerminalMessage("")).toEqual({ ok: true });
+    expect(validateFinishReason("")).toEqual({ ok: false, failure: "empty" });
+  });
+
+  it("rejects NUL", () => {
+    expect(validateTerminalMessage("a\0b")).toEqual({ ok: false, failure: "contains_nul" });
+    expect(validateFinishReason("a\0b")).toEqual({ ok: false, failure: "contains_nul" });
+  });
+
+  it("pins the 2000 UTF-8 byte ceiling exactly", () => {
+    expect(validateTerminalMessage("m".repeat(TERMINAL_TEXT_MAX_UTF8_BYTES))).toEqual({ ok: true });
+    expect(validateTerminalMessage("m".repeat(TERMINAL_TEXT_MAX_UTF8_BYTES + 1))).toEqual({
+      ok: false,
+      failure: "too_long",
+    });
+    expect(validateFinishReason("é".repeat(1000))).toEqual({ ok: true });
+    expect(validateFinishReason("é".repeat(1001))).toEqual({ ok: false, failure: "too_long" });
+  });
+});
+
+describe("validateTerminalState (ADR-009 决策 6)", () => {
+  it("requires a top-level JSON object — array/null/string/number are illegal", () => {
+    expect(validateTerminalState({})).toEqual({ ok: true, state: {} });
+    expect(validateTerminalState({ nested: { a: [1, "x", null, true] } })).toEqual({
+      ok: true,
+      state: { nested: { a: [1, "x", null, true] } },
+    });
+    expect(validateTerminalState([])).toEqual({ ok: false, failure: "not_object" });
+    expect(validateTerminalState(null)).toEqual({ ok: false, failure: "not_object" });
+    expect(validateTerminalState("s")).toEqual({ ok: false, failure: "not_object" });
+    expect(validateTerminalState(42)).toEqual({ ok: false, failure: "not_object" });
+  });
+
+  it("pins the 64 KiB COMPACT-encoding ceiling exactly", () => {
+    // Compact form is {"data":"<n x's>"} — derive n from the real wrapper so
+    // the boundary is exact, not hand-counted.
+    const wrapper = '{"data":""}'.length; // 11 compact bytes
+    const fits = { data: "x".repeat(TERMINAL_STATE_MAX_COMPACT_UTF8_BYTES - wrapper) };
+    expect(JSON.stringify(fits).length).toBe(TERMINAL_STATE_MAX_COMPACT_UTF8_BYTES);
+    expect(validateTerminalState(fits)).toEqual({ ok: true, state: fits });
+    const over = { data: "x".repeat(TERMINAL_STATE_MAX_COMPACT_UTF8_BYTES - wrapper + 1) };
+    expect(validateTerminalState(over)).toEqual({ ok: false, failure: "too_large" });
+  });
+
+  it("rejects non-JSON values that stringify would silently drop or mangle", () => {
+    expect(validateTerminalState({ a: undefined })).toEqual({ ok: false, failure: "not_json" });
+    expect(validateTerminalState({ a: Number.NaN })).toEqual({ ok: false, failure: "not_json" });
+    expect(validateTerminalState({ a: 10n })).toEqual({ ok: false, failure: "not_json" });
+    expect(validateTerminalState({ a: () => 1 })).toEqual({ ok: false, failure: "not_json" });
+    expect(validateTerminalState({ a: new Date(0) })).toEqual({ ok: false, failure: "not_json" });
+  });
+
+  it("turns a circular structure into a stable not_json, never a crash", () => {
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    expect(validateTerminalState(circular)).toEqual({ ok: false, failure: "not_json" });
+  });
+
+  it("turns pathological depth into a stable not_json — no stack overflow escapes", () => {
+    // Far beyond any engine's stringify recursion limit; built iteratively.
+    let deep: Record<string, unknown> = { leaf: true };
+    for (let i = 0; i < 200_000; i++) deep = { next: deep };
+    expect(validateTerminalState(deep)).toEqual({ ok: false, failure: "not_json" });
+  });
+});
+
+describe("validateTaskFileSyncResult (ADR-009 决策 6)", () => {
+  it("requires EXACTLY ONE sync result", () => {
+    expect(validateTaskFileSyncResult({ taskFileContent: "# doc" })).toEqual({ ok: true });
+    expect(validateTaskFileSyncResult({ taskFileContent: "" })).toEqual({ ok: true }); // empty is legal
+    for (const error of ["missing", "unreadable", "outside_jail", "changed", "too_large"] as const) {
+      expect(validateTaskFileSyncResult({ taskFileSyncError: error })).toEqual({ ok: true });
+    }
+    expect(validateTaskFileSyncResult({ taskFileContent: "x", taskFileSyncError: "missing" })).toEqual({
+      ok: false,
+      failure: "both_present",
+    });
+    expect(validateTaskFileSyncResult({})).toEqual({ ok: false, failure: "both_missing" });
+  });
+
+  it("pins the 256 KiB UTF-8 content ceiling exactly", () => {
+    expect(validateTaskFileSyncResult({ taskFileContent: "x".repeat(TASK_FILE_CONTENT_MAX_UTF8_BYTES) })).toEqual({
+      ok: true,
+    });
+    expect(
+      validateTaskFileSyncResult({ taskFileContent: "x".repeat(TASK_FILE_CONTENT_MAX_UTF8_BYTES + 1) }),
+    ).toEqual({ ok: false, failure: "content_too_large" });
+    expect(validateTaskFileSyncResult({ taskFileContent: "é".repeat(TASK_FILE_CONTENT_MAX_UTF8_BYTES / 2) })).toEqual(
+      { ok: true },
+    );
+  });
+});
+
+describe("capability snapshot (ADR-009 决策 7)", () => {
+  it("pins the capability name", () => {
+    expect(TERMINAL_JOURNAL_V1_CAPABILITY).toBe("terminal-journal-v1");
+  });
+
+  it("absent or null → null; explicit empty array stays empty", () => {
+    expect(normalizeCapabilities(undefined)).toBeNull();
+    expect(normalizeCapabilities(null)).toBeNull();
+    expect(normalizeCapabilities([])).toEqual([]);
+  });
+
+  it("dedupes, sorts and preserves unknown capabilities", () => {
+    expect(normalizeCapabilities(["zeta", "terminal-journal-v1", "zeta", "alpha"])).toEqual([
+      "alpha",
+      "terminal-journal-v1",
+      "zeta",
+    ]);
+    expect(normalizeCapabilities(["unknown-future-cap"])).toEqual(["unknown-future-cap"]);
+  });
+
+  it("membership check never does version-string comparison", () => {
+    expect(hasTerminalJournalV1(null)).toBe(false);
+    expect(hasTerminalJournalV1(undefined)).toBe(false);
+    expect(hasTerminalJournalV1([])).toBe(false);
+    expect(hasTerminalJournalV1(["terminal-journal-v1"])).toBe(true);
+    expect(hasTerminalJournalV1(["terminal-journal-v2"])).toBe(false);
+    expect(hasTerminalJournalV1(["daemon-9.9.9"])).toBe(false);
+  });
+});

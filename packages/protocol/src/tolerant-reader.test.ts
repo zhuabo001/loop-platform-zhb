@@ -11,11 +11,17 @@ import {
   loopSummarySchema,
   machineListResponseSchema,
   machineSummarySchema,
+  reopenLoopRequestSchema,
+  reopenLoopResponseSchema,
   runListResponseSchema,
   runProgressSnapshotSchema,
   runSummarySchema,
   triggerRunRequestSchema,
   triggerRunResponseSchema,
+  updateGoalRequestSchema,
+  updateGoalResponseSchema,
+  updateTaskFileRequestSchema,
+  updateTaskFileResponseSchema,
 } from "./admin.js";
 import {
   deliveryLoopSchema,
@@ -29,6 +35,8 @@ import {
   reportRequestSchema,
   reportResponseSchema,
   runArtifactSchema,
+  terminalFinishCommandSchema,
+  terminalReportCommandSchema,
   transcriptStepSchema,
 } from "./report.js";
 
@@ -139,6 +147,17 @@ const CASES: ReadonlyArray<readonly [string, z.ZodTypeAny, Record<string, unknow
   ["machineListResponseSchema", machineListResponseSchema, { machines: [] }],
   ["loopListResponseSchema", loopListResponseSchema, { loops: [] }],
   ["runListResponseSchema", runListResponseSchema, { runs: [] }],
+  // Phase 4 additions (ADR-009): terminal command variants + declared-but-
+  // dormant management DTOs. `terminalCommandSchema` itself is a union (the
+  // discriminant is `kind`); its OBJECT variants are listed here.
+  ["terminalReportCommandSchema", terminalReportCommandSchema, { kind: "report", status: "nothing-new" }],
+  ["terminalFinishCommandSchema", terminalFinishCommandSchema, { kind: "finish", reason: "r" }],
+  ["updateGoalRequestSchema", updateGoalRequestSchema, { goal: null }],
+  ["updateGoalResponseSchema", updateGoalResponseSchema, { loop: { ...MINIMAL_LOOP_SUMMARY } }],
+  ["updateTaskFileRequestSchema", updateTaskFileRequestSchema, { taskFile: "/tmp/TASK.md" }],
+  ["updateTaskFileResponseSchema", updateTaskFileResponseSchema, { loop: { ...MINIMAL_LOOP_SUMMARY } }],
+  ["reopenLoopRequestSchema", reopenLoopRequestSchema, {}],
+  ["reopenLoopResponseSchema", reopenLoopResponseSchema, { loop: { ...MINIMAL_LOOP_SUMMARY } }],
 ];
 
 describe("tolerant reader: EVERY exported object schema strips unknown keys", () => {
@@ -153,6 +172,6 @@ describe("tolerant reader: EVERY exported object schema strips unknown keys", ()
   it("covers every object schema — adding a new one requires a row here", () => {
     // Guard against a FUTURE schema silently escaping this suite: the case list
     // is reviewed whenever a schema is added (CI review checklist, ADR-002).
-    expect(CASES.length).toBe(26);
+    expect(CASES.length).toBe(34);
   });
 });
