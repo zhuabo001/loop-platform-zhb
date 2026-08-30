@@ -37,6 +37,12 @@ export type LoopSummaryRow = Pick<
   | "updatedAt"
   | "cron"
   | "timezone"
+  | "goal"
+  | "completedAt"
+  | "completionReason"
+  | "taskFileSyncedAt"
+  | "taskFileSyncAttemptedAt"
+  | "taskFileSyncError"
 >;
 
 export type RunSummaryRow = Pick<
@@ -107,6 +113,13 @@ export function toLoopSummary(
     cron: row.cron ?? null,
     timezone: row.timezone,
     nextFireAt,
+    /** Phase 4 observation fields — explicit nulls, never omitted keys. */
+    goal: row.goal,
+    completedAt: row.completedAt,
+    completionReason: row.completionReason,
+    taskFileSyncedAt: row.taskFileSyncedAt,
+    taskFileSyncAttemptedAt: row.taskFileSyncAttemptedAt,
+    taskFileSyncError: row.taskFileSyncError,
   };
 }
 

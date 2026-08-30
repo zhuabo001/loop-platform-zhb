@@ -80,6 +80,7 @@ describe("round-trips", () => {
       tokenHash: "cafe",
       roots: ["/Users/x/work", "/Users/x/play"],
       lastSeen: "2026-07-27T01:00:00.000Z",
+      capabilities: null,
       createdAt: "2026-07-27T00:00:00.000Z",
     };
     await db.insert(machines).values(row);

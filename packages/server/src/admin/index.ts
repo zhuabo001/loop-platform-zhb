@@ -77,6 +77,15 @@ export const loopSummaryColumns = {
   updatedAt: loops.updatedAt,
   cron: loops.cron,
   timezone: loops.timezone,
+  /** Phase 4 observation fields (ADR-009): safe to expose — no credentials,
+   *  no file content. goalRevision stays internal (it is a concurrency token,
+   *  not observability). */
+  goal: loops.goal,
+  completedAt: loops.completedAt,
+  completionReason: loops.completionReason,
+  taskFileSyncedAt: loops.taskFileSyncedAt,
+  taskFileSyncAttemptedAt: loops.taskFileSyncAttemptedAt,
+  taskFileSyncError: loops.taskFileSyncError,
 } as const;
 
 export const runSummaryColumns = {

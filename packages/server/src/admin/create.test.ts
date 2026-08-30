@@ -63,6 +63,13 @@ describe("createLoop", () => {
       cron: null,
       timezone: "UTC",
       nextFireAt: null,
+      // Phase 4 observation fields: explicit nulls on a fresh loop.
+      goal: null,
+      completedAt: null,
+      completionReason: null,
+      taskFileSyncedAt: null,
+      taskFileSyncAttemptedAt: null,
+      taskFileSyncError: null,
     });
 
     const rows = await snapshotLoops(db);
