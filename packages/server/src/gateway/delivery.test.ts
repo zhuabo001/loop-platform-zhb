@@ -32,6 +32,12 @@ const loopBase: Loop = {
   scheduleRevision: 0,
   scheduleActivatedAt: null,
   lastScheduledAt: null,
+  goal: null,
+  goalRevision: 0,
+  completedAt: null,
+  completionReason: null,
+  taskFileSyncAttemptedAt: null,
+  taskFileSyncError: null,
   createdAt: "2026-07-01T00:00:00.000Z",
   updatedAt: "2026-07-01T00:00:00.000Z",
 };
