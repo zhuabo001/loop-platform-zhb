@@ -16,6 +16,10 @@
  *
  * R5 is the full-repo regression gate (pnpm test / typecheck / build /
  * db:check), run at batch close.
+ *
+ * Round-1 review regressions added on top: SP-1 (a pathologically deep
+ * terminal state is a stable 400 with the lease untouched, never a 500) and
+ * SP-2 (the raw Create/List observation shape carries NO Phase 4 keys).
  */
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -25,7 +29,7 @@ import { eq } from "drizzle-orm";
 
 import { createLoopAdmin, type LoopAdmin } from "../admin/index.js";
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
-import { loops, machines, runLeases } from "../db/schema.js";
+import { loops, machines, runLeases, runs } from "../db/schema.js";
 import { createOwnerControl, type OwnerControl } from "../owner/index.js";
 import { FakeClock, seedLoop, seedMachineForToken, seedRun, snapshotLoops, testDeps } from "../testkit/index.js";
 import { createRunCoordinator, type RunCoordinator } from "../coordinator/index.js";
@@ -98,12 +102,43 @@ describe("R1: Phase 4 management routes are not mounted", () => {
       body: JSON.stringify({ machineId, goal: "should stay dormant" }),
     });
     expect(res.status).toBe(201);
-    const parsed = createLoopResponseSchema.parse(await res.json());
-    expect(parsed.loop.taskFile).toBeNull();
-    expect(parsed.loop.goal).toBeNull(); // parsed but never activated
+    // The RAW response must not carry the Phase 4 observation fields at all
+    // (review SP-2): the production surface stays byte-identical to Phase 3.
+    // Parsing with the current (optional-field) reader and finding nulls
+    // would NOT prove dormancy — key absence does.
+    const raw = (await res.json()) as { loop: Record<string, unknown> };
+    for (const key of [
+      "goal",
+      "completedAt",
+      "completionReason",
+      "taskFileSyncedAt",
+      "taskFileSyncAttemptedAt",
+      "taskFileSyncError",
+    ]) {
+      expect(raw.loop, `response must not carry ${key}`).not.toHaveProperty(key);
+    }
+    expect(createLoopResponseSchema.parse(raw).loop.taskFile).toBeNull();
     const [row] = await snapshotLoops(db);
     expect(row.goal).toBeNull();
     expect(row.goalRevision).toBe(0);
+  });
+
+  it("GET /api/loops emits no Phase 4 keys either (review SP-2)", async () => {
+    const machineId = await fresh();
+    await seedLoop(db, { id: "loop-1", machineId, goal: "stored but unexposed", goalRevision: 2 });
+    const res = await app.request("/api/loops");
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    for (const key of [
+      '"goal"',
+      '"completedAt"',
+      '"completionReason"',
+      '"taskFileSyncedAt"',
+      '"taskFileSyncAttemptedAt"',
+      '"taskFileSyncError"',
+    ]) {
+      expect(text, `response must not contain ${key}`).not.toContain(key);
+    }
   });
 });
 
@@ -214,5 +249,40 @@ describe("R6: protocol version is decided at claim time, not run-creation time",
     expect(res.status).toBe(200);
     const [loop] = await db.select().from(loops).where(eq(loops.id, "loop-1"));
     expect(loop.completedAt).toBeNull();
+  });
+});
+
+describe("SP-1 regression: pathologically deep terminal state is a stable 400, never a 500", () => {
+  it("a 20k-deep state body is rejected at the wire and the lease is NOT consumed", async () => {
+    const machineId = await fresh();
+    await seedLoop(db, { id: "loop-1", machineId });
+    await seedRun(db, { id: "run-1", machineId });
+
+    const poll = pollResponseSchema.parse(await (await pollReq({})).json());
+    const delivery = poll.deliveries[0]!;
+
+    // JSON.stringify cannot build this body (it would recurse), so construct
+    // the JSON text directly: a `{"next":…}` chain 20,000 levels deep.
+    const depth = 20_000;
+    const deepState = `{"next":`.repeat(depth) + "1" + `}`.repeat(depth);
+    const body =
+      `{"runId":"${delivery.runId}","ok":true,` +
+      `"terminal":{"kind":"report","status":"nothing-new","state":${deepState}},` +
+      `"taskFileContent":"x"}`;
+
+    const res = await app.request("/api/machine/report", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${delivery.runToken}` },
+      body,
+    });
+    expect(res.status).toBe(400);
+
+    // The lease survives: the rejection happened at the wire, before any
+    // finalize path could consume it.
+    const leases = await db.select().from(runLeases);
+    expect(leases).toHaveLength(1);
+    expect(leases[0]!.runId).toBe("run-1");
+    const [run] = await db.select().from(runs).where(eq(runs.id, "run-1"));
+    expect(run.phase).toBe("running");
   });
 });

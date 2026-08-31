@@ -281,12 +281,6 @@ describe("POST /api/loops", () => {
         cron: null,
         timezone: "UTC",
         nextFireAt: null,
-        goal: null,
-        completedAt: null,
-        completionReason: null,
-        taskFileSyncedAt: null,
-        taskFileSyncAttemptedAt: null,
-        taskFileSyncError: null,
       },
     });
     expect(await snapshotLoops(db)).toHaveLength(1);
@@ -622,12 +616,6 @@ describe("GET observation surface", () => {
         cron: null,
         timezone: "UTC",
         nextFireAt: null,
-        goal: null,
-        completedAt: null,
-        completionReason: null,
-        taskFileSyncedAt: null,
-        taskFileSyncAttemptedAt: null,
-        taskFileSyncError: null,
         lastRun: {
           id: "run-1",
           loopId: "loop-1",
