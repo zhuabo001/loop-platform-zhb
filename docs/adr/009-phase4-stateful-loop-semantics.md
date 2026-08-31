@@ -116,17 +116,18 @@ Batch 1 交付以上全部契约的 schema、migration、wire 形状与纯领域
 
 ## 修订记录
 
-### 2026-08-31：Batch 1 Round 1 审查核销（docs/handoff/codex-phase4-batch1-code-review.md）
+### 2026-08-31：实现期裁决固化
 
-在不改变任何已裁决语义的前提下，固化审查发现的六处实现/规格落差：
+在不改变任何已裁决语义的前提下，固化实现期确认的八处裁决：
 
-1. **State wire 校验非递归化（SP-1）。** `jsonObjectSchema` 不再用递归 `z.lazy`：wire 层只做非递归顶层 object 形状判断，嵌套 JSON 合法性由 stack-safe、全函数的 `isStrictJsonValue` 承担。深层或循环 state 稳定降级为 schema 拒绝（HTTP 400、Lease 不消费），不再有 `RangeError` 逃逸为 500 的路径。64 KiB 上限与可写域规则仍在 terminal-policy，不进入 wire。
-2. **Policy 合法域 = PostgreSQL 可写域（A-2）。** NUL 与未配对 UTF-16 surrogate 在 jsonb/text 中不可逐字节存储（jsonb 拒绝两者；text 拒绝 NUL，驱动会把孤立 surrogate 静默改写为 U+FFFD）。因此：state 的字符串 key/value 拒绝这两类（归入 `not_json`）；task-file content 拒绝（新失败分类 `content_not_representable`）；goal/message/reason 拒绝（新失败分类 `malformed_unicode`）。**Task File NUL 裁决**：含 NUL 或孤立 surrogate 的 content 属于 policy 非法而非合法同步结果，server 防御层收口 `terminal_protocol_invalid`；daemon 本地如何把此类文件归类为同步失败（读取阶段分类）右移 Batch 2 接线裁决。
-3. **validateTerminalState 全函数化并返回 canonical clone（A-3）。** 原始输入只在异常边界内读取；返回值是单次守护序列化派生的规范化克隆，调用方持久化的正是通过全部校验的值，不再重读可能带 getter/Proxy 的输入。
-4. **v1 success 统一 invariant guard（SP-3）。** 任何 v1 成功分支（普通 report 与 finish）在规划 Loop 写入前都对读取快照 fail-closed；普通 report 命中损坏快照时收口为稳定 Run failure（`invalid_loop_state`、零 Loop 写入、Lease 消费），finish 命中时仍走 `finish_rejected` 形状且分类不变。
-5. **Completion reason 快照校验复用 policy（SP-4）。** `isValidLoopSnapshot` 的 Completed 分支要求 `completionReason` 通过 `validateFinishReason`——写入路径只存 policy 规范值，违规即行外损坏。
-6. **Finish 的可选 message 无条件过 policy（A-1，顺带收敛 S-1）。** terminal 校验改为单次穷尽 switch：每个 variant 在同一处完成文本校验与 message/status 归一化，finish 的 `message` 与 `reason` 一样必须合法。
-7. **Batch 1 生产观察面不输出 Phase 4 字段（SP-2）。** `LoopSummary` 的 goal/completion/sync 字段保持 protocol 声明（optional），但 Batch 1 的 projection/mapper 不包含它们——Create/List 响应与 Phase 3 逐字节一致；Batch 2 通过在 projection 中 opt-in 打开。
+1. **State wire 校验非递归化。** `jsonObjectSchema` 不使用递归 `z.lazy`：wire 层只做非递归顶层 object 形状判断，嵌套 JSON 合法性由 stack-safe、全函数的严格 JSON 检查承担。深层或循环 state 稳定降级为 schema 拒绝（HTTP 400、Lease 不消费），不存在 `RangeError` 逃逸为 500 的路径。64 KiB 上限与可写域规则仍在 terminal-policy，不进入 wire。
+2. **State wire 不得重建输入对象的键。** 解析合法 state 必须按引用透传：以普通对象赋值重建键会把顶层 `__proto__` own property 变成原型设置而静默丢键。合法内容只允许被接受（逐字节保真）或被拒绝，不允许"成功但删除"。
+3. **Policy 合法域 = PostgreSQL 可写域。** NUL 与未配对 UTF-16 surrogate 在 jsonb/text 中不可逐字节存储（jsonb 拒绝两者；text 拒绝 NUL，驱动会把孤立 surrogate 静默改写为 U+FFFD）。因此：state 的字符串 key/value 拒绝这两类（归入 `not_json`）；task-file content 拒绝（失败分类 `content_not_representable`）；goal/message/reason 拒绝（失败分类 `malformed_unicode`）。**Task File NUL 裁决**：含 NUL 或孤立 surrogate 的 content 属于 policy 非法而非合法同步结果，server 防御层收口 `terminal_protocol_invalid`；daemon 本地如何把此类文件归类为同步失败（读取阶段分类）右移 Batch 2 接线裁决。
+4. **state 校验是单次受控读取并直接产出 canonical clone。** 校验遍历对输入每个属性恰好读取一次，并在同一趟构建规范化克隆（键以 defineProperty 定义，`__proto__` 等特殊键保持真实 own property）；序列化、字节上限与可写域检查只作用于该克隆。调用方持久化的正是通过全部校验的值；getter/Proxy 无法借多次读取改写已校验数据，任何深度/遍历/序列化异常稳定视为非法 state。
+5. **v1 success 统一 invariant guard。** 任何 v1 成功分支（普通 report 与 finish）在规划 Loop 写入前都对读取快照 fail-closed；普通 report 命中损坏快照时收口为稳定 Run failure（`invalid_loop_state`、零 Loop 写入、Lease 消费），finish 命中时仍走 `finish_rejected` 形状且分类不变。
+6. **Completion reason 快照校验复用 policy。** `isValidLoopSnapshot` 的 Completed 分支要求 `completionReason` 通过 finish reason 校验——写入路径只存 policy 规范值，违规即行外损坏。
+7. **Finish 的可选 message 无条件过 policy。** terminal 校验为单次穷尽 switch：每个 variant 在同一处完成文本校验与 message/status 归一化，finish 的 `message` 与 `reason` 一样必须合法。
+8. **Batch 1 生产观察面不输出 Phase 4 字段。** `LoopSummary` 的 goal/completion/sync 字段保持 protocol 声明（optional），但 Batch 1 的 projection/mapper 不包含它们——Create/List 响应与 Phase 3 逐字节一致；Batch 2 通过在 projection 中 opt-in 打开。
 
 ## 后果
 

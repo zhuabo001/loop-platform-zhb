@@ -472,12 +472,13 @@ export function planReportWrites(input: ReportPlanInput): ReportWritePlan {
 
   // Every v1 success branch fail-closes on the persisted loop snapshot BEFORE
   // any Loop write is planned (review SP-3; ADR-009 决策 3 — the DB CHECK is
-  // the second line, never the only business judgment). A finish against a
-  // corrupt snapshot keeps the finish_rejected shape with the SAME first
-  // classification planFinish would return.
+  // the second line, never the only business judgment). Keyed off the DERIVED
+  // `finishReason !== null`, not a second `terminal.kind` switch (review
+  // S-1/ST2-2): a finish against a corrupt snapshot keeps the finish_rejected
+  // shape with the SAME first classification planFinish would return.
   if (!isValidLoopSnapshot(loop)) {
     const classification = "invalid_loop_state" as const;
-    if (terminal.kind === "finish") {
+    if (finishReason !== null) {
       return { kind: "finish_rejected", classification, ...stableRunFailure(run, classification, nowIso) };
     }
     return { kind: "loop_state_invalid", ...stableRunFailure(run, classification, nowIso) };

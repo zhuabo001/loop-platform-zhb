@@ -11,11 +11,16 @@
  */
 import { afterEach, describe, expect, it } from "vitest";
 
-import { validateTaskFileSyncResult, validateTerminalState } from "@loopzhb/protocol";
+import { reportRequestSchema, validateTaskFileSyncResult, validateTerminalState } from "@loopzhb/protocol";
 import { eq } from "drizzle-orm";
 
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "./index.js";
-import { loops } from "./schema.js";
+import { loops, type Run } from "./schema.js";
+import {
+  planReportWrites,
+  type LeaseAuthSnapshot,
+  type LoopReportSnapshot,
+} from "../loop-lifecycle/index.js";
 import { seedLoop } from "../testkit/index.js";
 
 const handles: DbHandle[] = [];
@@ -100,5 +105,95 @@ describe("the writable direction: every policy-accepted value round-trips bit-fo
         .where(eq(loops.id, "loop-1"));
       expect(row!.taskFileContent).toBe(content);
     }
+  });
+});
+
+/**
+ * Review SP2-1/AD2-1: a top-level `__proto__` own property is LEGAL state
+ * content. Every stage of the v1 path must carry it verbatim — success that
+ * silently drops a key is data corruption, not validation. This pins the
+ * whole chain end to end: raw JSON text → wire schema → terminal policy →
+ * report write-plan → real jsonb write/read.
+ */
+describe("special-key fidelity across the whole chain (review SP2-1/AD2-1)", () => {
+  const LOOP_SNAPSHOT: LoopReportSnapshot = {
+    goal: "g",
+    goalRevision: 0,
+    completedAt: null,
+    completionReason: null,
+    enabled: true,
+    cron: null,
+    timezone: "UTC",
+    scheduleRevision: 0,
+    state: null,
+    taskFileContent: null,
+    taskFileSyncedAt: null,
+    taskFileSyncAttemptedAt: null,
+    taskFileSyncError: null,
+  };
+  const LEASE: LeaseAuthSnapshot = { role: "exec", canFinish: false, goalRevision: 0, terminalProtocolVersion: 1 };
+  const RUN: Run = {
+    id: "run-1",
+    loopId: "loop-1",
+    machineId: "m-test",
+    phase: "running",
+    role: "exec",
+    ts: "2026-08-30T23:59:00.000Z",
+    outcome: null,
+    status: null,
+    message: null,
+    durationMs: null,
+    error: null,
+    state: null,
+    sessionId: null,
+    costUsd: null,
+    usage: null,
+    artifacts: null,
+    transcript: null,
+    progress: { step: 1, label: "working", at: "2026-08-30T23:59:30.000Z" },
+  };
+  const BOTH_KEYS = ["__proto__", "keep"];
+
+  it("raw JSON → wire → policy → planner → jsonb keeps a top-level __proto__ key verbatim", async () => {
+    const { db } = await fresh();
+    const bodyText =
+      '{"ok":true,"terminal":{"kind":"report","status":"nothing-new",' +
+      '"state":{"__proto__":{"marker":1},"keep":2}},"taskFileContent":"x"}';
+
+    // 1. Wire: parses successfully AND the parsed state keeps both keys.
+    const parsed = reportRequestSchema.safeParse(JSON.parse(bodyText));
+    if (!parsed.success) throw new Error("wire must accept a legal __proto__ state");
+    if (parsed.data.terminal?.kind !== "report") throw new Error("unreachable");
+    const wireState = parsed.data.terminal.state as Record<string, unknown>;
+    expect(Object.keys(wireState).sort()).toEqual(BOTH_KEYS);
+
+    // 2. Policy: accepts AND the canonical clone keeps both keys.
+    const policy = validateTerminalState(wireState);
+    if (!policy.ok) throw new Error("policy must accept a legal __proto__ state");
+    expect(Object.keys(policy.state).sort()).toEqual(BOTH_KEYS);
+
+    // 3. Planner: the v1_success write-plan carries both keys.
+    const plan = planReportWrites({
+      loop: LOOP_SNAPSHOT,
+      lease: LEASE,
+      run: RUN,
+      body: parsed.data,
+      nowIso: "2026-08-31T00:00:00.000Z",
+    });
+    if (plan.kind !== "v1_success" || plan.loopWrites === null) {
+      throw new Error(`planner must accept a legal __proto__ state, got ${plan.kind}`);
+    }
+    const plannedState = plan.loopWrites.state as Record<string, unknown>;
+    expect(Object.keys(plannedState).sort()).toEqual(BOTH_KEYS);
+
+    // 4. Database: the planned state round-trips through real jsonb verbatim.
+    await db.update(loops).set({ state: plannedState }).where(eq(loops.id, "loop-1"));
+    const [row] = await db.select({ state: loops.state }).from(loops).where(eq(loops.id, "loop-1"));
+    const stored = row!.state as Record<string, unknown>;
+    expect(Object.getPrototypeOf(stored)).toBe(Object.prototype);
+    expect(Object.keys(stored).sort()).toEqual(BOTH_KEYS);
+    expect(Object.prototype.hasOwnProperty.call(stored, "__proto__")).toBe(true);
+    expect(stored["__proto__"]).toEqual({ marker: 1 });
+    expect(stored["keep"]).toBe(2);
   });
 });
