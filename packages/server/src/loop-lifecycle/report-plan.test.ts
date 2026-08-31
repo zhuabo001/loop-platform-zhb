@@ -238,6 +238,19 @@ describe("T5: legal finish — the full write-set in one plan", () => {
     if (plan.kind !== "v1_finish") throw new Error("unreachable");
     expect(plan.runWrites.message).toBe("queue empty");
   });
+
+  it("a finish message at EXACTLY the 2000 UTF-8 byte ceiling is legal (A-1 positive boundary)", () => {
+    const message = "é".repeat(1000); // 2000 UTF-8 bytes
+    const plan = planReportWrites({
+      loop: baseLoop(),
+      lease: v1Lease(),
+      run: baseRun(),
+      body: { ok: true, terminal: { kind: "finish", reason: "queue empty", message }, ...SYNC_OK },
+      nowIso: NOW,
+    });
+    if (plan.kind !== "v1_finish") throw new Error("unreachable");
+    expect(plan.runWrites.message).toBe(message);
+  });
 });
 
 describe("T6: every illegal finish classification → Run failure + lease retire, zero Loop writes", () => {
@@ -333,6 +346,19 @@ describe("T8: wire-legal but policy-invalid v1 success → terminal_protocol_inv
       { ok: true, terminal: { kind: "report", status: "new", message: "é".repeat(1001) }, ...SYNC_OK },
     ],
     ["empty finish reason", { ok: true, terminal: { kind: "finish", reason: "" }, ...SYNC_OK }],
+    // A-1: the finish's OPTIONAL message passes the same policy as a report's.
+    [
+      "finish message with NUL",
+      { ok: true, terminal: { kind: "finish", reason: "goal met", message: "bad\0message" }, ...SYNC_OK },
+    ],
+    [
+      "finish message over 2000 UTF-8 bytes",
+      { ok: true, terminal: { kind: "finish", reason: "goal met", message: "m".repeat(2001) }, ...SYNC_OK },
+    ],
+    [
+      "finish message multibyte over ceiling",
+      { ok: true, terminal: { kind: "finish", reason: "goal met", message: "é".repeat(1001) }, ...SYNC_OK },
+    ],
     [
       "state over 64 KiB compact",
       {
@@ -341,9 +367,17 @@ describe("T8: wire-legal but policy-invalid v1 success → terminal_protocol_inv
         ...SYNC_OK,
       },
     ],
+    [
+      "state with a PG-unwritable string (NUL)",
+      { ok: true, terminal: { kind: "report", status: "nothing-new", state: { x: "a\0b" } }, ...SYNC_OK },
+    ],
     ["both sync results", { ok: true, terminal: { kind: "report", status: "nothing-new" }, ...SYNC_OK, taskFileSyncError: "missing" }],
     ["no sync result", { ok: true, terminal: { kind: "report", status: "nothing-new" } }],
     ["content over 256 KiB", { ok: true, terminal: { kind: "report", status: "nothing-new" }, taskFileContent: "x".repeat(262_145) }],
+    [
+      "content not PG-representable (NUL)",
+      { ok: true, terminal: { kind: "report", status: "nothing-new" }, taskFileContent: "binary \0 content" },
+    ],
   ];
 
   for (const [name, body] of invalidBodies) {
@@ -365,6 +399,47 @@ describe("T8: wire-legal but policy-invalid v1 success → terminal_protocol_inv
       nowIso: NOW,
     });
     expect(plan.kind).toBe("terminal_protocol_invalid");
+    expect(plan.loopWrites).toBeNull();
+  });
+});
+
+describe("SP-3: EVERY v1 success branch fail-closes on a corrupt persisted loop snapshot", () => {
+  const reportBody: ReportRequest = {
+    ok: true,
+    terminal: { kind: "report", status: "nothing-new" },
+    ...SYNC_OK,
+  };
+
+  const corruptLoops: Array<[string, LoopReportSnapshot]> = [
+    ["half-completed (completedAt without reason)", baseLoop({ completedAt: NOW })],
+    ["completed but enabled", baseLoop({ enabled: true, completedAt: NOW, completionReason: "r" })],
+    ["completed with a policy-invalid reason", baseLoop({ enabled: false, completedAt: NOW, completionReason: "" })],
+    ["untrimmed persisted goal", baseLoop({ goal: " g", goalRevision: 1 })],
+    ["negative goalRevision", baseLoop({ goalRevision: -1 })],
+    ["goalRevision beyond int32", baseLoop({ goalRevision: 2_147_483_648 })],
+    ["fractional scheduleRevision", baseLoop({ scheduleRevision: 1.5 })],
+  ];
+
+  for (const [name, loop] of corruptLoops) {
+    it(`${name} → loop_state_invalid: Run failure + lease retire, ZERO Loop writes`, () => {
+      const plan = planReportWrites({ loop, lease: v1Lease(), run: baseRun(), body: reportBody, nowIso: NOW });
+      if (plan.kind !== "loop_state_invalid") throw new Error(`expected loop_state_invalid, got ${plan.kind}`);
+      expect(plan.loopWrites).toBeNull();
+      expect(plan.deleteLease).toBe(true);
+      expect(plan.runWrites).toMatchObject({ phase: "error", outcome: "error", error: "invalid_loop_state" });
+    });
+  }
+
+  it("a FINISH against a corrupt snapshot keeps the finish_rejected shape with invalid_loop_state", () => {
+    const plan = planReportWrites({
+      loop: baseLoop({ completedAt: NOW }), // half-completed
+      lease: v1Lease(),
+      run: baseRun(),
+      body: { ok: true, terminal: { kind: "finish", reason: "goal met" }, ...SYNC_OK },
+      nowIso: NOW,
+    });
+    if (plan.kind !== "finish_rejected") throw new Error(`expected finish_rejected, got ${plan.kind}`);
+    expect(plan.classification).toBe("invalid_loop_state");
     expect(plan.loopWrites).toBeNull();
   });
 });

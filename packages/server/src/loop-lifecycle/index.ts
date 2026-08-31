@@ -73,11 +73,13 @@ export type LoopPrimaryStatus = "completed" | "paused" | "open" | "closed";
 
 /**
  * The persisted-state invariant, mirroring the loops_completion_ck CHECK plus
- * the parts a CHECK cannot express: revisions are int32-safe integers and a
- * persisted goal is its OWN normalization (write paths normalize; a violation
- * means the row was damaged outside them). The domain kernel re-validates
- * every snapshot it reads — the database constraint is the second line, never
- * the only business judgment.
+ * the parts a CHECK cannot express: revisions are int32-safe integers, a
+ * persisted goal is its OWN normalization, and a persisted completionReason
+ * passes the terminal finish-reason policy (non-empty, NUL-free, well-formed
+ * UTF-16, within the byte ceiling — review SP-4: the write path stores policy-
+ * canonical reasons, so a violation means the row was damaged outside them).
+ * The domain kernel re-validates every snapshot it reads — the database
+ * constraint is the second line, never the only business judgment.
  */
 export function isValidLoopSnapshot(loop: LoopLifecycleSnapshot): boolean {
   for (const revision of [loop.goalRevision, loop.scheduleRevision]) {
@@ -92,6 +94,7 @@ export function isValidLoopSnapshot(loop: LoopLifecycleSnapshot): boolean {
     loop.goal !== null &&
     loop.completedAt !== null &&
     loop.completionReason !== null &&
+    validateFinishReason(loop.completionReason).ok &&
     loop.enabled === false
   );
 }
@@ -350,6 +353,17 @@ export type ReportWritePlan =
       deleteLease: true;
     }
   | {
+      /** A PLAIN v1 success report against a corrupt persisted loop snapshot
+       *  → stable run failure classified invalid_loop_state, zero Loop writes,
+       *  lease consumed (review SP-3: every v1 success branch fail-closes on
+       *  the read snapshot before any Loop write is planned; a FINISH against
+       *  the same snapshot still reports through the finish_rejected shape). */
+      kind: "loop_state_invalid";
+      runWrites: Partial<NewRun>;
+      loopWrites: null;
+      deleteLease: true;
+    }
+  | {
       /** A finish that failed eligibility → stable run failure with the fixed
        *  classification, zero Loop writes, lease consumed. */
       kind: "finish_rejected";
@@ -409,36 +423,70 @@ export function planReportWrites(input: ReportPlanInput): ReportWritePlan {
     return { kind: "v1_failure", runWrites: buildReportWriteSet(body, run, nowIso), loopWrites: null, deleteLease: true };
   }
 
-  // v1 success: terminal command is mandatory and must pass policy.
+  // v1 success: terminal command is mandatory and must pass policy. ONE
+  // exhaustive variant pass validates every text field — including the
+  // finish's OPTIONAL message (review A-1) — and pins the message/status
+  // mapping, so a future variant cannot forget a policy or a write mapping
+  // (review S-1: no scattered per-kind branches).
   const terminal = body.terminal;
   if (terminal === undefined) {
     return { kind: "terminal_protocol_invalid", ...stableRunFailure(run, TERMINAL_PROTOCOL_INVALID, nowIso) };
   }
-  const textCheck =
-    terminal.kind === "finish"
-      ? validateFinishReason(terminal.reason)
-      : terminal.message !== undefined
-        ? validateTerminalMessage(terminal.message)
-        : { ok: true as const };
-  if (!textCheck.ok) {
-    return { kind: "terminal_protocol_invalid", ...stableRunFailure(run, TERMINAL_PROTOCOL_INVALID, nowIso) };
+  const protocolInvalid = {
+    kind: "terminal_protocol_invalid" as const,
+    ...stableRunFailure(run, TERMINAL_PROTOCOL_INVALID, nowIso),
+  };
+
+  let message: string | null;
+  let status: RunStatus;
+  let finishReason: string | null = null;
+  switch (terminal.kind) {
+    case "report": {
+      if (terminal.message !== undefined && !validateTerminalMessage(terminal.message).ok) return protocolInvalid;
+      message = terminal.message ?? null;
+      status = terminal.status;
+      break;
+    }
+    case "finish": {
+      if (!validateFinishReason(terminal.reason).ok) return protocolInvalid;
+      if (terminal.message !== undefined && !validateTerminalMessage(terminal.message).ok) return protocolInvalid;
+      finishReason = terminal.reason;
+      message = terminal.message ?? terminal.reason; // message falls back to the reason
+      status = "resolved";
+      break;
+    }
   }
-  if (terminal.state !== undefined && !validateTerminalState(terminal.state).ok) {
-    return { kind: "terminal_protocol_invalid", ...stableRunFailure(run, TERMINAL_PROTOCOL_INVALID, nowIso) };
-  }
+
+  // State passes the policy ONCE; the plan carries the validated canonical
+  // clone, never the caller's (possibly getter-backed) object (review A-3).
+  const stateCheck = terminal.state === undefined ? undefined : validateTerminalState(terminal.state);
+  if (stateCheck !== undefined && !stateCheck.ok) return protocolInvalid;
   if (
     !validateTaskFileSyncResult({
       taskFileContent: body.taskFileContent,
       taskFileSyncError: body.taskFileSyncError,
     }).ok
   ) {
-    return { kind: "terminal_protocol_invalid", ...stableRunFailure(run, TERMINAL_PROTOCOL_INVALID, nowIso) };
+    return protocolInvalid;
+  }
+
+  // Every v1 success branch fail-closes on the persisted loop snapshot BEFORE
+  // any Loop write is planned (review SP-3; ADR-009 决策 3 — the DB CHECK is
+  // the second line, never the only business judgment). A finish against a
+  // corrupt snapshot keeps the finish_rejected shape with the SAME first
+  // classification planFinish would return.
+  if (!isValidLoopSnapshot(loop)) {
+    const classification = "invalid_loop_state" as const;
+    if (terminal.kind === "finish") {
+      return { kind: "finish_rejected", classification, ...stableRunFailure(run, classification, nowIso) };
+    }
+    return { kind: "loop_state_invalid", ...stableRunFailure(run, classification, nowIso) };
   }
 
   // Finish runs the fixed eligibility order BEFORE any Loop write is planned.
   let completion: CompletionWrites | null = null;
-  if (terminal.kind === "finish") {
-    const finish = planFinish(loop, lease, terminal.reason, nowIso);
+  if (finishReason !== null) {
+    const finish = planFinish(loop, lease, finishReason, nowIso);
     if (finish.kind === "rejected") {
       return {
         kind: "finish_rejected",
@@ -451,12 +499,6 @@ export function planReportWrites(input: ReportPlanInput): ReportWritePlan {
 
   // All guards passed — assemble the full write-plan (atomically executed by
   // the Batch 2 transaction; T7 pins that no partial plan can exist).
-  const message =
-    terminal.kind === "finish"
-      ? (terminal.message ?? terminal.reason)
-      : (terminal.message ?? null);
-  const status: RunStatus = terminal.kind === "finish" ? "resolved" : terminal.status;
-
   const runWrites: Partial<Omit<NewRun, "state">> & RunTerminalWrites = {
     ...buildReportWriteSet(body, run, nowIso),
     phase: "done",
@@ -464,11 +506,11 @@ export function planReportWrites(input: ReportPlanInput): ReportWritePlan {
     status,
     message,
     error: null,
-    state: terminal.state ?? null,
+    state: stateCheck === undefined ? null : stateCheck.state,
   };
 
   const loopWrites: LoopV1Writes = {
-    ...(terminal.state !== undefined ? { state: terminal.state } : {}),
+    ...(stateCheck !== undefined ? { state: stateCheck.state } : {}),
     ...(body.taskFileContent !== undefined
       ? { taskFileContent: body.taskFileContent, taskFileSyncedAt: nowIso }
       : {}),
@@ -479,7 +521,7 @@ export function planReportWrites(input: ReportPlanInput): ReportWritePlan {
   };
 
   return {
-    kind: terminal.kind === "finish" ? "v1_finish" : "v1_success",
+    kind: finishReason !== null ? "v1_finish" : "v1_success",
     runWrites,
     loopWrites,
     deleteLease: true,

@@ -173,6 +173,23 @@ describe("D4: primary status priority and the goal dimension", () => {
       expect(() => classifyLoop(snapshot), name).toThrow(LoopInvariantViolationError);
     }
   });
+
+  it("a persisted completionReason must pass the terminal reason policy (review SP-4)", () => {
+    const completed = (completionReason: string) =>
+      baseLoop({ enabled: false, goal: "g", goalRevision: 1, completedAt: NOW, completionReason });
+    // Empty, NUL, unpaired surrogate and over-ceiling reasons are NOT legal
+    // persisted completions — the write path only stores policy-canonical
+    // reasons, so these rows were damaged outside it.
+    expect(isValidLoopSnapshot(completed(""))).toBe(false);
+    expect(isValidLoopSnapshot(completed("a\0b"))).toBe(false);
+    expect(isValidLoopSnapshot(completed("a\uD800b"))).toBe(false);
+    expect(isValidLoopSnapshot(completed("x".repeat(2001)))).toBe(false);
+    expect(isValidLoopSnapshot(completed("é".repeat(1001)))).toBe(false);
+    // …and the exact boundaries stay legal (2000 UTF-8 bytes, newlines kept).
+    expect(isValidLoopSnapshot(completed("x".repeat(2000)))).toBe(true);
+    expect(isValidLoopSnapshot(completed("é".repeat(1000)))).toBe(true);
+    expect(isValidLoopSnapshot(completed("line one\nline two"))).toBe(true);
+  });
 });
 
 describe("D5: completion-triple lockstep mirrors the DB CHECK (M4)", () => {
@@ -191,6 +208,15 @@ describe("D5: completion-triple lockstep mirrors the DB CHECK (M4)", () => {
     expect(isValidLoopSnapshot(baseLoop({ enabled: false, completedAt: NOW, completionReason: "r" }))).toBe(false);
     expect(
       isValidLoopSnapshot(baseLoop({ enabled: true, goal: "g", goalRevision: 1, completedAt: NOW, completionReason: "r" })),
+    ).toBe(false);
+    // …and the reason-policy violations the CHECK cannot express (review SP-4).
+    expect(
+      isValidLoopSnapshot(baseLoop({ enabled: false, goal: "g", goalRevision: 1, completedAt: NOW, completionReason: "" })),
+    ).toBe(false);
+    expect(
+      isValidLoopSnapshot(
+        baseLoop({ enabled: false, goal: "g", goalRevision: 1, completedAt: NOW, completionReason: "a\0b" }),
+      ),
     ).toBe(false);
   });
 });
