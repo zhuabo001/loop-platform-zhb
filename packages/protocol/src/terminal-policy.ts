@@ -12,7 +12,7 @@
  * Pure functions only: no I/O, no clock, no node builtins (TextEncoder is a
  * Web standard global, available in browsers and modern node alike).
  */
-import { isStrictJsonValue, type JsonObject } from "./json.js";
+import type { JsonObject } from "./json.js";
 import type { TaskFileSyncError } from "./report.js";
 
 // ---- shared byte measurement ----
@@ -50,8 +50,11 @@ function hasUnpairedSurrogate(value: string): boolean {
  * text into U+FFFD. The policy's legal domain must never exceed the writable
  * domain (review A-2): a policy-accepted value must round-trip bit-for-bit,
  * so a v1 write-plan can never fail at the database step.
+ *
+ * Module-private (review ST2-3): an implementation helper, not a protocol
+ * package promise, until a real cross-module caller exists.
  */
-export function isPgRepresentableText(value: string): boolean {
+function isPgRepresentableText(value: string): boolean {
   return !value.includes("\0") && !hasUnpairedSurrogate(value);
 }
 
@@ -124,10 +127,10 @@ export type TerminalStateValidation =
 /**
  * Iterative PG-writability check over PLAIN JSON data (keys + string values):
  * every string must be storable verbatim (no NUL, no unpaired surrogates —
- * review A-2). Runs on the canonical clone produced by JSON.parse, which is
- * provably plain strict data — no getter, Proxy or cycle can survive parsing,
- * so this walk needs no exception boundary and always terminates.
- */
+ * review A-2). Runs on the canonical clone built by `cloneStrictJsonData`,
+ * which is provably plain strict data — no getter, Proxy or cycle can survive
+ * the cloning pass, so this walk needs no exception boundary and always
+ * terminates. */
 function isPgWritableJsonData(root: unknown): boolean {
   const stack: unknown[] = [root];
   while (stack.length > 0) {
@@ -150,6 +153,96 @@ function isPgWritableJsonData(root: unknown): boolean {
   return true;
 }
 
+/** Sentinel: a node of the input is not strict JSON data. */
+const INVALID_JSON = Symbol("invalid-json");
+
+/**
+ * Validate AND clone an untrusted value in ONE controlled, iterative pass
+ * (review AD2-2): every property of the caller's value is read EXACTLY ONCE —
+ * a getter/Proxy cannot observe a later decision and rewrite an earlier read
+ * (the old stringify-then-walk-then-stringify flow read the same getter up to
+ * three times and could accept tampered data). The walk never recurses, so
+ * pathological depth cannot overflow the stack; cycles reject via the
+ * ancestor set, while shared (DAG) references stay legal and are cloned once.
+ *
+ * Clone keys are DEFINED, never assigned (review SP2-1): assigning a
+ * `__proto__` key would silently set the clone's prototype, so
+ * `Object.defineProperty` gives every key a real own property — exactly the
+ * semantics `JSON.parse` produces.
+ *
+ * Returns INVALID_JSON for any non-strict-JSON node; getter/Proxy exceptions
+ * propagate to the caller's single catch boundary.
+ */
+function cloneStrictJsonData(root: unknown): unknown {
+  const clones = new Map<object, Record<string, unknown> | unknown[]>();
+  const active = new Set<object>();
+  let rootClone: unknown = INVALID_JSON;
+
+  type Event =
+    | { type: "visit"; value: unknown; attach: (clone: unknown) => void }
+    | { type: "leave"; value: object };
+  const events: Event[] = [{ type: "visit", value: root, attach: (clone) => (rootClone = clone) }];
+
+  while (events.length > 0) {
+    const event = events.pop()!;
+    if (event.type === "leave") {
+      active.delete(event.value);
+      continue;
+    }
+    const { value, attach } = event;
+    if (value === null || typeof value === "string" || typeof value === "boolean") {
+      attach(value);
+      continue;
+    }
+    if (typeof value === "number") {
+      if (!Number.isFinite(value)) return INVALID_JSON;
+      attach(value);
+      continue;
+    }
+    if (typeof value !== "object") return INVALID_JSON; // undefined/function/symbol/bigint
+    if (active.has(value)) return INVALID_JSON; // cycle
+    const shared = clones.get(value);
+    if (shared !== undefined) {
+      attach(shared); // legal shared reference — cloned once
+      continue;
+    }
+    if (Array.isArray(value)) {
+      const length = value.length;
+      const clone: unknown[] = new Array(length);
+      clones.set(value, clone);
+      attach(clone);
+      active.add(value);
+      events.push({ type: "leave", value });
+      for (let i = length - 1; i >= 0; i--) {
+        if (!(i in value)) return INVALID_JSON; // sparse arrays are not strict JSON
+        const index = i;
+        events.push({ type: "visit", value: value[index], attach: (c) => (clone[index] = c) });
+      }
+      continue;
+    }
+    const proto: unknown = Object.getPrototypeOf(value);
+    if (proto !== null && proto !== Object.prototype) return INVALID_JSON;
+    const clone: Record<string, unknown> = {};
+    clones.set(value, clone);
+    attach(clone);
+    active.add(value);
+    events.push({ type: "leave", value });
+    const keys = Object.keys(value);
+    // Reverse push order so children complete (and keys are defined) in
+    // source order — the clone's key order matches JSON.parse fidelity.
+    for (let i = keys.length - 1; i >= 0; i--) {
+      const key = keys[i]!;
+      events.push({
+        type: "visit",
+        value: (value as Record<string, unknown>)[key],
+        attach: (c) =>
+          Object.defineProperty(clone, key, { value: c, writable: true, enumerable: true, configurable: true }),
+      });
+    }
+  }
+  return rootClone;
+}
+
 /**
  * Validate a terminal-protocol state value: the top level must be a JSON
  * object (`{}` is legal and means "promote to an empty object"; absence is
@@ -159,24 +252,31 @@ function isPgWritableJsonData(root: unknown): boolean {
  * `not_json` — the policy's legal domain never exceeds the DB's writable
  * domain, review A-2).
  *
- * TOTAL over any input (review A-3): the raw input is read only inside
- * exception boundaries (guarded stringify + the stack-safe strict walk), and
- * the returned `state` is the CANONICAL CLONE derived from that single
- * serialization — callers persist exactly the value that passed every check
- * and never re-read a possibly getter-/Proxy-backed input. Any depth,
- * traversal or serialization exception is a stable `not_json`, never an
- * uncategorized crash.
+ * TOTAL over any input (reviews A-3/AD2-2): the raw input is read only inside
+ * `cloneStrictJsonData`'s single exception boundary, each property exactly
+ * once, and the returned `state` is the CANONICAL CLONE that pass built —
+ * every later check (serialization, byte ceiling, PG writability) runs on
+ * that provably plain clone, never re-reading a possibly getter-/Proxy-backed
+ * input. Any depth, traversal or serialization exception is a stable
+ * `not_json`, never an uncategorized crash.
  */
 export function validateTerminalState(value: unknown): TerminalStateValidation {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return { ok: false, failure: "not_object" };
   }
-  if (!isStrictJsonValue(value)) return { ok: false, failure: "not_json" };
+  let canonical: unknown;
+  try {
+    canonical = cloneStrictJsonData(value);
+  } catch {
+    return { ok: false, failure: "not_json" };
+  }
+  if (canonical === INVALID_JSON) return { ok: false, failure: "not_json" };
+  // From here on only the plain clone is touched. The guarded serialization
+  // still catches the one failure mode the iterative walk does not hit: a
+  // structure too DEEP for JSON.stringify's recursive serializer.
   let compact: string;
   try {
-    // Provably a string: isStrictJsonValue just serialized this input. A
-    // mutating getter could still make this second read throw — caught here.
-    const serialized = JSON.stringify(value);
+    const serialized = JSON.stringify(canonical);
     if (typeof serialized !== "string") return { ok: false, failure: "not_json" };
     compact = serialized;
   } catch {
@@ -185,10 +285,8 @@ export function validateTerminalState(value: unknown): TerminalStateValidation {
   if (utf8BytesExceed(compact, TERMINAL_STATE_MAX_COMPACT_UTF8_BYTES)) {
     return { ok: false, failure: "too_large" };
   }
-  // JSON.parse of a stringify output cannot throw and yields plain data.
-  const canonical = JSON.parse(compact) as JsonObject;
   if (!isPgWritableJsonData(canonical)) return { ok: false, failure: "not_json" };
-  return { ok: true, state: canonical };
+  return { ok: true, state: canonical as JsonObject };
 }
 
 // ---- task file sync result (ADR-009 决策 6) ----

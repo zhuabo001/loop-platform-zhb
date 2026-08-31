@@ -175,6 +175,27 @@ describe("P2: terminal union shape", () => {
     expect(() => terminalCommandSchema.parse({ kind: "report", status: "stuck", message: "m" })).toThrow();
   });
 
+  it("preserves a top-level __proto__ own property — success must never silently DROP a legal key (review SP2-1/AD2-1)", () => {
+    // A record-based schema rebuilds the object by assignment, and assigning
+    // __proto__ sets the PROTOTYPE: the wire would report success while the
+    // parsed state had lost a legal key. The schema must pass the input
+    // through by identity instead.
+    const state = JSON.parse('{"__proto__":{"marker":1},"keep":2}');
+    expect(Object.keys(state).sort()).toEqual(["__proto__", "keep"]);
+    const result = reportRequestSchema.safeParse({
+      ok: true,
+      terminal: { kind: "report", status: "nothing-new", state },
+      taskFileContent: "x",
+    });
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    const parsed = result.data.terminal as { kind: "report"; state: Record<string, unknown> };
+    expect(Object.getPrototypeOf(parsed.state)).toBe(Object.prototype);
+    expect(Object.keys(parsed.state).sort()).toEqual(["__proto__", "keep"]);
+    expect(Object.prototype.hasOwnProperty.call(parsed.state, "__proto__")).toBe(true);
+    expect(parsed.state["__proto__"]).toEqual({ marker: 1 });
+  });
+
   it("rejects non-object state at the boundary (policy re-checks it too)", () => {
     for (const state of [[], null, "s", 42]) {
       expect(() => terminalCommandSchema.parse({ kind: "report", status: "nothing-new", state })).toThrow();

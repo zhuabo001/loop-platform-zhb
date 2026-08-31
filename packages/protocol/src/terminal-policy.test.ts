@@ -168,17 +168,14 @@ describe("validateTerminalState (ADR-009 决策 6)", () => {
   });
 
   it("contains getter/Proxy trap exceptions inside the validation boundary (review A-3)", () => {
-    // First read succeeds (stringify), second read throws (the strict walk) —
-    // the exception must become a stable not_json, never escape.
-    let reads = 0;
-    const boobyTrapped = {
-      get value() {
-        reads++;
-        if (reads > 1) throw new Error("second read");
-        return 1;
+    // A getter that throws on the (single) read, and a Proxy whose ownKeys
+    // trap throws — both must become a stable not_json, never escape.
+    const throwsOnRead = {
+      get value(): number {
+        throw new Error("trap");
       },
     };
-    expect(validateTerminalState(boobyTrapped)).toEqual({ ok: false, failure: "not_json" });
+    expect(validateTerminalState(throwsOnRead)).toEqual({ ok: false, failure: "not_json" });
     const proxied = new Proxy(
       { a: 1 },
       {
@@ -188,6 +185,50 @@ describe("validateTerminalState (ADR-009 决策 6)", () => {
       },
     );
     expect(validateTerminalState(proxied)).toEqual({ ok: false, failure: "not_json" });
+  });
+
+  it("reads every property EXACTLY ONCE — the single read IS the validated value (review AD2-2)", () => {
+    // The old stringify→walk→stringify flow read the same getter three times:
+    // a getter answering 1, 1, then undefined was ACCEPTED and silently
+    // persisted as {} — data the validator never actually saw. Now the clone
+    // is built from one controlled pass, so whatever the single read returns
+    // is exactly what gets validated and persisted.
+    let reads = 0;
+    const shapeShifter = {
+      get value(): unknown {
+        reads++;
+        return reads === 1 ? 1 : undefined; // any SECOND read would be illegal
+      },
+    };
+    const result = validateTerminalState(shapeShifter);
+    expect(result).toEqual({ ok: true, state: { value: 1 } });
+    expect(reads).toBe(1);
+
+    // And a single read of an ILLEGAL value rejects, of course.
+    expect(validateTerminalState({ get value() { return undefined; } })).toEqual({
+      ok: false,
+      failure: "not_json",
+    });
+    expect(validateTerminalState({ get value() { return Number.NaN; } })).toEqual({
+      ok: false,
+      failure: "not_json",
+    });
+  });
+
+  it("preserves special keys like __proto__ as REAL own properties in the canonical clone (review SP2-1)", () => {
+    // JSON.parse gives __proto__ a genuine own property; the clone must match
+    // — assigning it would silently set the clone's PROTOTYPE and drop the key.
+    const input = JSON.parse('{"__proto__":{"marker":1},"keep":2,"outer":{"__proto__":[3]}}');
+    const result = validateTerminalState(input);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(Object.getPrototypeOf(result.state)).toBe(Object.prototype);
+    expect(Object.keys(result.state).sort()).toEqual(["__proto__", "keep", "outer"]);
+    expect(Object.prototype.hasOwnProperty.call(result.state, "__proto__")).toBe(true);
+    expect((result.state as Record<string, unknown>)["__proto__"]).toEqual({ marker: 1 });
+    const outer = result.state["outer"] as Record<string, unknown>;
+    expect(Object.prototype.hasOwnProperty.call(outer, "__proto__")).toBe(true);
+    expect(outer["__proto__"]).toEqual([3]);
   });
 
   it("turns pathological depth into a stable not_json — no stack overflow escapes", () => {

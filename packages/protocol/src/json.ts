@@ -69,10 +69,22 @@ export function isStrictJsonValue(root: unknown): boolean {
  * of a `RangeError` (review SP-1). Value policy — the 64 KiB compact ceiling
  * and PostgreSQL writability — is deliberately NOT here: it lives in
  * `terminal-policy.ts` and runs in the domain layer.
+ *
+ * The base schema is `z.unknown()`, NOT `z.record(...)` (review SP2-1): a
+ * record REBUILDS the object by ordinary assignment, and assigning a
+ * `__proto__` key sets the prototype instead of an own property — a legal
+ * state like `{"__proto__":{...},"keep":2}` would parse successfully with the
+ * key silently DELETED, corrupting the state the Loop later promotes. The
+ * identity passthrough never rebuilds keys, so every own property of the
+ * parsed JSON survives verbatim.
  */
 export const jsonObjectSchema: z.ZodType<JsonObject> = z
-  .record(z.string(), z.unknown())
+  .unknown()
   .superRefine((value, ctx) => {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      ctx.addIssue({ code: "custom", message: "must be a top-level JSON object" });
+      return;
+    }
     if (!isStrictJsonValue(value)) {
       ctx.addIssue({ code: "custom", message: "must be a strict JSON object" });
     }
