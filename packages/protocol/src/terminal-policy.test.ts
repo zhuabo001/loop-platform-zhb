@@ -38,7 +38,7 @@ describe("normalizeGoal (ADR-009 决策 2)", () => {
     expect(normalizeGoal("a\r\nb")).toEqual({ ok: false, failure: "not_single_line" });
   });
 
-  it("rejects unpaired UTF-16 surrogates — not PG-representable (review A-2)", () => {
+  it("rejects unpaired UTF-16 surrogates — not PG-representable", () => {
     expect(normalizeGoal("a\uD800b")).toEqual({ ok: false, failure: "malformed_unicode" });
     expect(normalizeGoal("a\uDC00b")).toEqual({ ok: false, failure: "malformed_unicode" });
     expect(normalizeGoal("\uD800")).toEqual({ ok: false, failure: "malformed_unicode" });
@@ -85,7 +85,7 @@ describe("validateTerminalMessage / validateFinishReason (ADR-009 决策 6)", ()
     expect(validateFinishReason("a\0b")).toEqual({ ok: false, failure: "contains_nul" });
   });
 
-  it("rejects unpaired UTF-16 surrogates — not PG-representable (review A-2)", () => {
+  it("rejects unpaired UTF-16 surrogates — not PG-representable", () => {
     expect(validateTerminalMessage("bad \uD800 message")).toEqual({ ok: false, failure: "malformed_unicode" });
     expect(validateFinishReason("\uDFFF")).toEqual({ ok: false, failure: "malformed_unicode" });
     expect(validateTerminalMessage("paired 🚀 pair")).toEqual({ ok: true });
@@ -126,6 +126,80 @@ describe("validateTerminalState (ADR-009 决策 6)", () => {
     expect(validateTerminalState(over)).toEqual({ ok: false, failure: "too_large" });
   });
 
+  it("stops reading a wide value as soon as its compact encoding exceeds 64 KiB", () => {
+    let elementReads = 0;
+    const wide = new Proxy(new Array<unknown>(100_000), {
+      getOwnPropertyDescriptor(_target, property) {
+        if (typeof property === "string" && /^\d+$/.test(property)) {
+          return { enumerable: true, configurable: true };
+        }
+        return undefined;
+      },
+      get(target, property, receiver) {
+        if (typeof property === "string" && /^\d+$/.test(property)) {
+          elementReads++;
+          return 0;
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+
+    expect(validateTerminalState({ wide })).toEqual({ ok: false, failure: "too_large" });
+    expect(elementReads).toBeLessThan(40_000);
+  });
+
+  it("does not enumerate a wide object's late properties after it exceeds 64 KiB", () => {
+    const keys = Array.from({ length: 100_000 }, (_, index) => `k${index}`);
+    let descriptorReads = 0;
+    let valueReads = 0;
+    const wide = new Proxy(
+      {},
+      {
+        ownKeys() {
+          return keys;
+        },
+        getOwnPropertyDescriptor() {
+          descriptorReads++;
+          return { enumerable: true, configurable: true };
+        },
+        get() {
+          valueReads++;
+          return 0;
+        },
+      },
+    );
+
+    expect(validateTerminalState(wide)).toEqual({ ok: false, failure: "too_large" });
+    expect(descriptorReads).toBeLessThan(20_000);
+    expect(valueReads).toBeLessThan(20_000);
+  });
+
+  it("rejects an oversized key before reading its value", () => {
+    let valueReads = 0;
+    const state: Record<string, unknown> = {};
+    Object.defineProperty(state, "x".repeat(TERMINAL_STATE_MAX_COMPACT_UTF8_BYTES + 1), {
+      enumerable: true,
+      get() {
+        valueReads++;
+        return 1;
+      },
+    });
+
+    expect(validateTerminalState(state)).toEqual({ ok: false, failure: "too_large" });
+    expect(valueReads).toBe(0);
+  });
+
+  it("sizes a shared DAG without expanding it exponentially", () => {
+    const shared = { value: 1 };
+    const small = validateTerminalState({ left: shared, right: shared });
+    expect(small.ok).toBe(true);
+    if (small.ok) expect(small.state.left).toBe(small.state.right);
+
+    let dag: Record<string, unknown> = { leaf: 1 };
+    for (let depth = 0; depth < 30; depth++) dag = { left: dag, right: dag };
+    expect(validateTerminalState(dag)).toEqual({ ok: false, failure: "too_large" });
+  });
+
   it("rejects non-JSON values that stringify would silently drop or mangle", () => {
     expect(validateTerminalState({ a: undefined })).toEqual({ ok: false, failure: "not_json" });
     expect(validateTerminalState({ a: Number.NaN })).toEqual({ ok: false, failure: "not_json" });
@@ -140,7 +214,7 @@ describe("validateTerminalState (ADR-009 决策 6)", () => {
     expect(validateTerminalState(circular)).toEqual({ ok: false, failure: "not_json" });
   });
 
-  it("rejects strings PostgreSQL jsonb cannot store — NUL and unpaired surrogates, in values AND keys (review A-2)", () => {
+  it("rejects strings PostgreSQL jsonb cannot store — NUL and unpaired surrogates, in values AND keys", () => {
     expect(validateTerminalState({ x: "\0" })).toEqual({ ok: false, failure: "not_json" });
     expect(validateTerminalState({ x: "a\0b" })).toEqual({ ok: false, failure: "not_json" });
     expect(validateTerminalState({ x: "\uD800" })).toEqual({ ok: false, failure: "not_json" });
@@ -155,7 +229,7 @@ describe("validateTerminalState (ADR-009 决策 6)", () => {
     });
   });
 
-  it("returns the CANONICAL CLONE, not the caller's object (review A-3)", () => {
+  it("returns the CANONICAL CLONE, not the caller's object", () => {
     const inner = { b: "x" };
     const input = { a: [1, inner] };
     const result = validateTerminalState(input);
@@ -167,7 +241,7 @@ describe("validateTerminalState (ADR-009 决策 6)", () => {
     expect(result.state).toEqual({ a: [1, { b: "x" }] });
   });
 
-  it("contains getter/Proxy trap exceptions inside the validation boundary (review A-3)", () => {
+  it("contains getter/Proxy trap exceptions inside the validation boundary", () => {
     // A getter that throws on the (single) read, and a Proxy whose ownKeys
     // trap throws — both must become a stable not_json, never escape.
     const throwsOnRead = {
@@ -187,7 +261,17 @@ describe("validateTerminalState (ADR-009 决策 6)", () => {
     expect(validateTerminalState(proxied)).toEqual({ ok: false, failure: "not_json" });
   });
 
-  it("reads every property EXACTLY ONCE — the single read IS the validated value (review AD2-2)", () => {
+  it("contains a revoked Proxy during the top-level shape check", () => {
+    const objectPair = Proxy.revocable({}, {});
+    objectPair.revoke();
+    expect(validateTerminalState(objectPair.proxy)).toEqual({ ok: false, failure: "not_json" });
+
+    const arrayPair = Proxy.revocable([], {});
+    arrayPair.revoke();
+    expect(validateTerminalState(arrayPair.proxy)).toEqual({ ok: false, failure: "not_json" });
+  });
+
+  it("reads every property EXACTLY ONCE — the single read IS the validated value", () => {
     // The old stringify→walk→stringify flow read the same getter three times:
     // a getter answering 1, 1, then undefined was ACCEPTED and silently
     // persisted as {} — data the validator never actually saw. Now the clone
@@ -213,9 +297,22 @@ describe("validateTerminalState (ADR-009 决策 6)", () => {
       ok: false,
       failure: "not_json",
     });
+
+    let lengthReads = 0;
+    const array = new Proxy([1], {
+      get(target, property, receiver) {
+        if (property === "length") {
+          lengthReads++;
+          return lengthReads === 1 ? 1 : 100_000;
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    expect(validateTerminalState({ array })).toEqual({ ok: true, state: { array: [1] } });
+    expect(lengthReads).toBe(1);
   });
 
-  it("preserves special keys like __proto__ as REAL own properties in the canonical clone (review SP2-1)", () => {
+  it("preserves special keys like __proto__ as REAL own properties in the canonical clone", () => {
     // JSON.parse gives __proto__ a genuine own property; the clone must match
     // — assigning it would silently set the clone's PROTOTYPE and drop the key.
     const input = JSON.parse('{"__proto__":{"marker":1},"keep":2,"outer":{"__proto__":[3]}}');
@@ -223,6 +320,8 @@ describe("validateTerminalState (ADR-009 决策 6)", () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(Object.getPrototypeOf(result.state)).toBe(Object.prototype);
+    expect(Object.prototype.hasOwnProperty.call(result.state, "toJSON")).toBe(true);
+    expect(Object.prototype.propertyIsEnumerable.call(result.state, "toJSON")).toBe(false);
     expect(Object.keys(result.state).sort()).toEqual(["__proto__", "keep", "outer"]);
     expect(Object.prototype.hasOwnProperty.call(result.state, "__proto__")).toBe(true);
     expect((result.state as Record<string, unknown>)["__proto__"]).toEqual({ marker: 1 });
@@ -231,11 +330,69 @@ describe("validateTerminalState (ADR-009 决策 6)", () => {
     expect(outer["__proto__"]).toEqual([3]);
   });
 
-  it("turns pathological depth into a stable not_json — no stack overflow escapes", () => {
-    // Far beyond any engine's stringify recursion limit; built iteratively.
+  it("preserves source key order when toJSON is a legal data key", () => {
+    const input = JSON.parse('{"first":1,"toJSON":"data","last":2}');
+    const result = validateTerminalState(input);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(Object.keys(result.state)).toEqual(["first", "toJSON", "last"]);
+    expect(JSON.stringify(result.state)).toBe('{"first":1,"toJSON":"data","last":2}');
+  });
+
+  it("turns pathological depth into a stable size failure — no stack overflow escapes", () => {
+    // Far beyond any engine's stringify recursion limit and the 64 KiB compact
+    // ceiling; the iterative sizer reaches the deterministic size failure.
     let deep: Record<string, unknown> = { leaf: true };
     for (let i = 0; i < 200_000; i++) deep = { next: deep };
-    expect(validateTerminalState(deep)).toEqual({ ok: false, failure: "not_json" });
+    expect(validateTerminalState(deep)).toEqual({ ok: false, failure: "too_large" });
+  });
+
+  it("rejects a compact state that downstream JSON.stringify cannot serialize", () => {
+    let deep: unknown = 1;
+    for (let depth = 0; depth < 8_000; depth++) deep = [deep];
+    expect(validateTerminalState({ deep })).toEqual({ ok: false, failure: "not_json" });
+  });
+
+  it("returns a clone insulated from global toJSON and sparse-array prototype pollution", () => {
+    let inheritedSetterCalls = 0;
+    Object.defineProperty(Object.prototype, "toJSON", {
+      configurable: true,
+      value() {
+        return { corrupted: "\0" };
+      },
+    });
+    Object.defineProperty(Array.prototype, "toJSON", {
+      configurable: true,
+      value() {
+        return ["\0"];
+      },
+    });
+    Object.defineProperty(Array.prototype, "0", {
+      configurable: true,
+      get() {
+        return "\0";
+      },
+      set() {
+        inheritedSetterCalls++;
+      },
+    });
+    let result: ReturnType<typeof validateTerminalState>;
+    let serialized: string | undefined;
+    let sparseResult: ReturnType<typeof validateTerminalState>;
+    try {
+      result = validateTerminalState({ safe: 1, list: [2] });
+      serialized = result.ok ? JSON.stringify(result.state) : undefined;
+      const sparse = new Array(1);
+      sparseResult = validateTerminalState({ sparse });
+    } finally {
+      Reflect.deleteProperty(Object.prototype, "toJSON");
+      Reflect.deleteProperty(Array.prototype, "toJSON");
+      Reflect.deleteProperty(Array.prototype, "0");
+    }
+    expect(result!.ok).toBe(true);
+    expect(serialized).toBe('{"safe":1,"list":[2]}');
+    expect(inheritedSetterCalls).toBe(0);
+    expect(sparseResult!).toEqual({ ok: false, failure: "not_json" });
   });
 });
 
@@ -265,7 +422,7 @@ describe("validateTaskFileSyncResult (ADR-009 决策 6)", () => {
     );
   });
 
-  it("rejects content PostgreSQL text cannot store verbatim — NUL and unpaired surrogates (review A-2)", () => {
+  it("rejects content PostgreSQL text cannot store verbatim — NUL and unpaired surrogates", () => {
     expect(validateTaskFileSyncResult({ taskFileContent: "\0" })).toEqual({
       ok: false,
       failure: "content_not_representable",

@@ -1,5 +1,5 @@
 /**
- * Review A-2 regression: the terminal-policy legal domain must never exceed
+ * The terminal-policy legal domain must never exceed
  * the database's WRITABLE domain. This file pins the agreement in BOTH
  * directions against a real PGlite instance:
  *
@@ -109,13 +109,13 @@ describe("the writable direction: every policy-accepted value round-trips bit-fo
 });
 
 /**
- * Review SP2-1/AD2-1: a top-level `__proto__` own property is LEGAL state
+ * A top-level `__proto__` own property is LEGAL state
  * content. Every stage of the v1 path must carry it verbatim — success that
  * silently drops a key is data corruption, not validation. This pins the
  * whole chain end to end: raw JSON text → wire schema → terminal policy →
  * report write-plan → real jsonb write/read.
  */
-describe("special-key fidelity across the whole chain (review SP2-1/AD2-1)", () => {
+describe("special-key fidelity across the whole chain", () => {
   const LOOP_SNAPSHOT: LoopReportSnapshot = {
     goal: "g",
     goalRevision: 0,

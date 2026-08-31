@@ -17,9 +17,9 @@
  * R5 is the full-repo regression gate (pnpm test / typecheck / build /
  * db:check), run at batch close.
  *
- * Round-1 review regressions added on top: SP-1 (a pathologically deep
- * terminal state is a stable 400 with the lease untouched, never a 500) and
- * SP-2 (the raw Create/List observation shape carries NO Phase 4 keys).
+ * Additional regressions pin that a pathologically deep terminal state is a
+ * stable 400 with the lease untouched, and that the raw Create/List
+ * observation shape carries no Phase 4 keys.
  */
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -103,7 +103,7 @@ describe("R1: Phase 4 management routes are not mounted", () => {
     });
     expect(res.status).toBe(201);
     // The RAW response must not carry the Phase 4 observation fields at all
-    // (review SP-2): the production surface stays byte-identical to Phase 3.
+    // The production surface stays byte-identical to Phase 3.
     // Parsing with the current (optional-field) reader and finding nulls
     // would NOT prove dormancy — key absence does.
     const raw = (await res.json()) as { loop: Record<string, unknown> };
@@ -123,7 +123,7 @@ describe("R1: Phase 4 management routes are not mounted", () => {
     expect(row.goalRevision).toBe(0);
   });
 
-  it("GET /api/loops emits no Phase 4 keys either (review SP-2)", async () => {
+  it("GET /api/loops emits no Phase 4 keys either", async () => {
     const machineId = await fresh();
     await seedLoop(db, { id: "loop-1", machineId, goal: "stored but unexposed", goalRevision: 2 });
     const res = await app.request("/api/loops");
@@ -252,7 +252,7 @@ describe("R6: protocol version is decided at claim time, not run-creation time",
   });
 });
 
-describe("SP-1 regression: pathologically deep terminal state is a stable 400, never a 500", () => {
+describe("pathologically deep terminal state is a stable 400, never a 500", () => {
   it("a 20k-deep state body is rejected at the wire and the lease is NOT consumed", async () => {
     const machineId = await fresh();
     await seedLoop(db, { id: "loop-1", machineId });

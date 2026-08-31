@@ -26,7 +26,7 @@ function utf8BytesExceed(value: string, maxBytes: number): boolean {
   return encoder.encode(value).length > maxBytes;
 }
 
-// ---- PostgreSQL writability (review A-2) ----
+// ---- PostgreSQL writability ----
 
 /** True when `value` contains an unpaired UTF-16 surrogate (lone high or low). */
 function hasUnpairedSurrogate(value: string): boolean {
@@ -48,10 +48,10 @@ function hasUnpairedSurrogate(value: string): boolean {
  * rejects NUL (`0x00` is invalid UTF-8 there); jsonb additionally rejects
  * unpaired UTF-16 surrogates, and drivers silently mangle lone surrogates in
  * text into U+FFFD. The policy's legal domain must never exceed the writable
- * domain (review A-2): a policy-accepted value must round-trip bit-for-bit,
+ * domain: a policy-accepted value must round-trip bit-for-bit,
  * so a v1 write-plan can never fail at the database step.
  *
- * Module-private (review ST2-3): an implementation helper, not a protocol
+ * Module-private: an implementation helper, not a protocol
  * package promise, until a real cross-module caller exists.
  */
 function isPgRepresentableText(value: string): boolean {
@@ -69,7 +69,7 @@ export type GoalValidation = { ok: true; goal: string } | { ok: false; failure: 
 /**
  * Normalize and validate a goal string: JavaScript `trim()`, then reject when
  * empty, containing NUL/CR/LF, containing an unpaired UTF-16 surrogate (not
- * storable verbatim — review A-2), or over 2000 UTF-8 bytes. The NORMALIZED
+ * storable verbatim), or over 2000 UTF-8 bytes. The NORMALIZED
  * value is what gets persisted and compared — equal-after-trim updates are
  * no-ops. `null` (Open Loop) is handled by the domain layer, not here.
  */
@@ -94,7 +94,7 @@ export type TerminalTextValidation = { ok: true } | { ok: false; failure: Termin
 /**
  * message/reason keep their original text and newlines — NO trim, NO
  * single-line rule (unlike goal). Only NUL, unpaired UTF-16 surrogates (not
- * PG-representable — review A-2) and the 2000 UTF-8 byte ceiling reject. The
+ * PG-representable) and the 2000 UTF-8 byte ceiling reject. The
  * finish reason must additionally be non-empty.
  */
 function validateTerminalText(raw: string, requireNonEmpty: boolean): TerminalTextValidation {
@@ -124,123 +124,278 @@ export type TerminalStateValidation =
   | { ok: true; state: JsonObject }
   | { ok: false; failure: TerminalStateFailure };
 
-/**
- * Iterative PG-writability check over PLAIN JSON data (keys + string values):
- * every string must be storable verbatim (no NUL, no unpaired surrogates —
- * review A-2). Runs on the canonical clone built by `cloneStrictJsonData`,
- * which is provably plain strict data — no getter, Proxy or cycle can survive
- * the cloning pass, so this walk needs no exception boundary and always
- * terminates. */
-function isPgWritableJsonData(root: unknown): boolean {
-  const stack: unknown[] = [root];
-  while (stack.length > 0) {
-    const value = stack.pop();
-    if (typeof value === "string") {
-      if (!isPgRepresentableText(value)) return false;
-      continue;
-    }
-    if (Array.isArray(value)) {
-      for (const item of value) stack.push(item);
-      continue;
-    }
-    if (typeof value === "object" && value !== null) {
-      for (const key of Object.keys(value)) {
-        if (!isPgRepresentableText(key)) return false;
-        stack.push((value as Record<string, unknown>)[key]);
-      }
-    }
-  }
-  return true;
+type StrictJsonCloneResult =
+  | { ok: true; state: JsonObject }
+  | { ok: false; failure: "not_json" | "too_large" };
+
+type CloneEntry = {
+  clone: Record<string, unknown> | unknown[];
+  compactUtf8Bytes?: number;
+};
+
+type AttachClone = (clone: unknown, compactUtf8Bytes: number) => void;
+
+type ArrayFrame = {
+  kind: "array";
+  source: unknown[];
+  clone: unknown[];
+  length: number;
+  index: number;
+  compactUtf8Bytes: number;
+  attach: AttachClone;
+};
+
+type ObjectFrame = {
+  kind: "object";
+  source: Record<string, unknown>;
+  clone: Record<string, unknown>;
+  keys: IterableIterator<string>;
+  index: number;
+  compactUtf8Bytes: number;
+  attach: AttachClone;
+};
+
+type CloneFrame = ArrayFrame | ObjectFrame;
+
+type CloneEvent = { type: "visit"; value: unknown; attach: AttachClone } | { type: "next"; frame: CloneFrame };
+
+/** Exact compact-JSON UTF-8 bytes for a primitive or object key. */
+function compactPrimitiveBytes(value: string | number | boolean | null): number {
+  if (value === null) return 4;
+  if (typeof value === "boolean") return value ? 4 : 5;
+  const serialized = JSON.stringify(value);
+  return typeof value === "number" ? serialized.length : encoder.encode(serialized).length;
 }
 
-/** Sentinel: a node of the input is not strict JSON data. */
-const INVALID_JSON = Symbol("invalid-json");
+/** Lazily yields own enumerable string keys in JSON/Object.keys order. */
+function* ownEnumerableKeys(source: object): IterableIterator<string> {
+  for (const key in source) {
+    if (Object.hasOwn(source, key)) yield key;
+  }
+}
+
+function createSafeArray(length: number): unknown[] {
+  const clone: unknown[] = new Array(length);
+  Object.defineProperty(clone, "toJSON", { value: undefined, enumerable: false });
+  return clone;
+}
+
+function createSafeObject(): Record<string, unknown> {
+  const clone: Record<string, unknown> = {};
+  // Drizzle and similar adapters inspect `constructor`, so keep the ordinary
+  // object prototype while shadowing any polluted inherited serializer. A
+  // legal own `toJSON` data key can replace this configurable placeholder.
+  Object.defineProperty(clone, "toJSON", {
+    value: undefined,
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+  return clone;
+}
 
 /**
- * Validate AND clone an untrusted value in ONE controlled, iterative pass
- * (review AD2-2): every property of the caller's value is read EXACTLY ONCE —
- * a getter/Proxy cannot observe a later decision and rewrite an earlier read
- * (the old stringify-then-walk-then-stringify flow read the same getter up to
- * three times and could accept tampered data). The walk never recurses, so
- * pathological depth cannot overflow the stack; cycles reject via the
- * ancestor set, while shared (DAG) references stay legal and are cloned once.
+ * Validate, clone and size an untrusted state in one controlled iterative pass.
+ * The event stack holds one cursor frame per nesting level instead of one event
+ * per remaining sibling, and byte accounting stops the traversal immediately
+ * after the compact encoding exceeds 64 KiB. Shared DAG nodes are cloned once;
+ * their memoized encoded size is charged at every reference without expanding
+ * the subtree. Cycles and every non-JSON value reject.
  *
- * Clone keys are DEFINED, never assigned (review SP2-1): assigning a
- * `__proto__` key would silently set the clone's prototype, so
- * `Object.defineProperty` gives every key a real own property — exactly the
- * semantics `JSON.parse` produces.
- *
- * Returns INVALID_JSON for any non-strict-JSON node; getter/Proxy exceptions
- * propagate to the caller's single catch boundary.
+ * Each source value is read once. Clone keys are defined rather than assigned,
+ * so `__proto__` remains an own property. All caller-controlled reflection and
+ * property access happens inside the caller's exception boundary.
  */
-function cloneStrictJsonData(root: unknown): unknown {
-  const clones = new Map<object, Record<string, unknown> | unknown[]>();
+function cloneTerminalState(root: object): StrictJsonCloneResult {
+  const clones = new Map<object, CloneEntry>();
   const active = new Set<object>();
-  let rootClone: unknown = INVALID_JSON;
+  let rootClone: unknown;
+  let failure: "not_json" | "too_large" | null = null;
 
-  type Event =
-    | { type: "visit"; value: unknown; attach: (clone: unknown) => void }
-    | { type: "leave"; value: object };
-  const events: Event[] = [{ type: "visit", value: root, attach: (clone) => (rootClone = clone) }];
+  const addBytes = (frame: CloneFrame, bytes: number): boolean => {
+    if (bytes > TERMINAL_STATE_MAX_COMPACT_UTF8_BYTES - frame.compactUtf8Bytes) {
+      failure = "too_large";
+      return false;
+    }
+    frame.compactUtf8Bytes += bytes;
+    return true;
+  };
 
-  while (events.length > 0) {
-    const event = events.pop()!;
-    if (event.type === "leave") {
-      active.delete(event.value);
+  // A null-prototype LIFO avoids Array.prototype numeric accessors changing
+  // traversal control flow while validating adversarial input.
+  const events = Object.create(null) as Record<number, CloneEvent>;
+  let eventCount = 0;
+  const pushEvent = (event: CloneEvent): void => {
+    events[eventCount++] = event;
+  };
+  const popEvent = (): CloneEvent => {
+    const index = --eventCount;
+    const event = events[index]!;
+    Reflect.deleteProperty(events, String(index));
+    return event;
+  };
+  pushEvent({
+    type: "visit",
+    value: root,
+    attach: (clone) => {
+      rootClone = clone;
+    },
+  });
+
+  while (eventCount > 0 && failure === null) {
+    const event = popEvent();
+    if (event.type === "next") {
+      const frame = event.frame;
+      if (frame.kind === "array") {
+        if (frame.index >= frame.length) {
+          active.delete(frame.source);
+          clones.get(frame.source)!.compactUtf8Bytes = frame.compactUtf8Bytes;
+          frame.attach(frame.clone, frame.compactUtf8Bytes);
+          continue;
+        }
+        const index = frame.index++;
+        if (index > 0 && !addBytes(frame, 1)) continue; // comma
+        if (!Object.hasOwn(frame.source, index)) {
+          failure = "not_json"; // sparse arrays are not strict JSON
+          continue;
+        }
+        const child = frame.source[index];
+        pushEvent({ type: "next", frame });
+        pushEvent({
+          type: "visit",
+          value: child,
+          attach: (clone, compactUtf8Bytes) => {
+            Object.defineProperty(frame.clone, index, {
+              value: clone,
+              writable: true,
+              enumerable: true,
+              configurable: true,
+            });
+            addBytes(frame, compactUtf8Bytes);
+          },
+        });
+        continue;
+      }
+
+      const keyResult = frame.keys.next();
+      if (keyResult.done) {
+        active.delete(frame.source);
+        clones.get(frame.source)!.compactUtf8Bytes = frame.compactUtf8Bytes;
+        frame.attach(frame.clone, frame.compactUtf8Bytes);
+        continue;
+      }
+      const keyIndex = frame.index++;
+      const key = keyResult.value;
+      // Recreate a legal data key at its source-order position instead of
+      // retaining the earlier non-enumerable prototype-pollution shield.
+      if (key === "toJSON") Reflect.deleteProperty(frame.clone, key);
+      if (!isPgRepresentableText(key)) {
+        failure = "not_json";
+        continue;
+      }
+      // JSON quoting cannot make a string shorter. Avoid allocating the
+      // escaped string and UTF-8 buffer when the raw key alone is over limit.
+      if (key.length > TERMINAL_STATE_MAX_COMPACT_UTF8_BYTES) {
+        failure = "too_large";
+        continue;
+      }
+      const separatorBytes = (keyIndex > 0 ? 1 : 0) + compactPrimitiveBytes(key) + 1; // comma + key + colon
+      if (!addBytes(frame, separatorBytes)) continue;
+      const child = frame.source[key];
+      pushEvent({ type: "next", frame });
+      pushEvent({
+        type: "visit",
+        value: child,
+        attach: (clone, compactUtf8Bytes) => {
+          Object.defineProperty(frame.clone, key, {
+            value: clone,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+          });
+          addBytes(frame, compactUtf8Bytes);
+        },
+      });
       continue;
     }
+
     const { value, attach } = event;
-    if (value === null || typeof value === "string" || typeof value === "boolean") {
-      attach(value);
+    if (value === null || typeof value === "boolean") {
+      attach(value, compactPrimitiveBytes(value));
+      continue;
+    }
+    if (typeof value === "string") {
+      if (!isPgRepresentableText(value)) {
+        failure = "not_json";
+        continue;
+      }
+      if (value.length > TERMINAL_STATE_MAX_COMPACT_UTF8_BYTES) {
+        failure = "too_large";
+        continue;
+      }
+      attach(value, compactPrimitiveBytes(value));
       continue;
     }
     if (typeof value === "number") {
-      if (!Number.isFinite(value)) return INVALID_JSON;
-      attach(value);
+      if (!Number.isFinite(value)) {
+        failure = "not_json";
+        continue;
+      }
+      attach(value, compactPrimitiveBytes(value));
       continue;
     }
-    if (typeof value !== "object") return INVALID_JSON; // undefined/function/symbol/bigint
-    if (active.has(value)) return INVALID_JSON; // cycle
+    if (typeof value !== "object") {
+      failure = "not_json"; // undefined/function/symbol/bigint
+      continue;
+    }
+    if (active.has(value)) {
+      failure = "not_json"; // cycle
+      continue;
+    }
     const shared = clones.get(value);
-    if (shared !== undefined) {
-      attach(shared); // legal shared reference — cloned once
+    if (shared?.compactUtf8Bytes !== undefined) {
+      attach(shared.clone, shared.compactUtf8Bytes);
       continue;
     }
     if (Array.isArray(value)) {
       const length = value.length;
-      const clone: unknown[] = new Array(length);
-      clones.set(value, clone);
-      attach(clone);
+      const clone = createSafeArray(length);
+      const frame: ArrayFrame = {
+        kind: "array",
+        source: value,
+        clone,
+        length,
+        index: 0,
+        compactUtf8Bytes: 2, // []
+        attach,
+      };
+      clones.set(value, { clone });
       active.add(value);
-      events.push({ type: "leave", value });
-      for (let i = length - 1; i >= 0; i--) {
-        if (!(i in value)) return INVALID_JSON; // sparse arrays are not strict JSON
-        const index = i;
-        events.push({ type: "visit", value: value[index], attach: (c) => (clone[index] = c) });
-      }
+      pushEvent({ type: "next", frame });
       continue;
     }
     const proto: unknown = Object.getPrototypeOf(value);
-    if (proto !== null && proto !== Object.prototype) return INVALID_JSON;
-    const clone: Record<string, unknown> = {};
-    clones.set(value, clone);
-    attach(clone);
-    active.add(value);
-    events.push({ type: "leave", value });
-    const keys = Object.keys(value);
-    // Reverse push order so children complete (and keys are defined) in
-    // source order — the clone's key order matches JSON.parse fidelity.
-    for (let i = keys.length - 1; i >= 0; i--) {
-      const key = keys[i]!;
-      events.push({
-        type: "visit",
-        value: (value as Record<string, unknown>)[key],
-        attach: (c) =>
-          Object.defineProperty(clone, key, { value: c, writable: true, enumerable: true, configurable: true }),
-      });
+    if (proto !== null && proto !== Object.prototype) {
+      failure = "not_json";
+      continue;
     }
+    const clone = createSafeObject();
+    const frame: ObjectFrame = {
+      kind: "object",
+      source: value as Record<string, unknown>,
+      clone,
+      keys: ownEnumerableKeys(value),
+      index: 0,
+      compactUtf8Bytes: 2, // {}
+      attach,
+    };
+    clones.set(value, { clone });
+    active.add(value);
+    pushEvent({ type: "next", frame });
   }
-  return rootClone;
+
+  if (failure !== null) return { ok: false, failure };
+  return { ok: true, state: rootClone as JsonObject };
 }
 
 /**
@@ -250,43 +405,36 @@ function cloneStrictJsonData(root: unknown): unknown {
  * strict JSON, the compact encoding must fit 64 KiB, and every string key and
  * value must be PostgreSQL-writable (NUL and unpaired surrogates reject as
  * `not_json` — the policy's legal domain never exceeds the DB's writable
- * domain, review A-2).
+ * domain).
  *
- * TOTAL over any input (reviews A-3/AD2-2): the raw input is read only inside
- * `cloneStrictJsonData`'s single exception boundary, each property exactly
- * once, and the returned `state` is the CANONICAL CLONE that pass built —
- * every later check (serialization, byte ceiling, PG writability) runs on
- * that provably plain clone, never re-reading a possibly getter-/Proxy-backed
- * input. Any depth, traversal or serialization exception is a stable
- * `not_json`, never an uncategorized crash.
+ * TOTAL over any input: the raw input is read only inside one exception
+ * boundary, each property exactly once. That pass builds the CANONICAL CLONE,
+ * validates PostgreSQL writability, and incrementally accounts for the exact
+ * compact JSON bytes; it stops at 64 KiB without re-reading or recursively
+ * serializing a getter-/Proxy-backed input. Any reflection or traversal
+ * exception is a stable `not_json`, never an uncategorized crash.
  */
 export function validateTerminalState(value: unknown): TerminalStateValidation {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+  if (typeof value !== "object" || value === null) {
     return { ok: false, failure: "not_object" };
   }
-  let canonical: unknown;
+  let result: StrictJsonCloneResult;
   try {
-    canonical = cloneStrictJsonData(value);
+    if (Array.isArray(value)) return { ok: false, failure: "not_object" };
+    result = cloneTerminalState(value);
   } catch {
     return { ok: false, failure: "not_json" };
   }
-  if (canonical === INVALID_JSON) return { ok: false, failure: "not_json" };
-  // From here on only the plain clone is touched. The guarded serialization
-  // still catches the one failure mode the iterative walk does not hit: a
-  // structure too DEEP for JSON.stringify's recursive serializer.
-  let compact: string;
+  if (!result.ok) return result;
   try {
-    const serialized = JSON.stringify(canonical);
-    if (typeof serialized !== "string") return { ok: false, failure: "not_json" };
-    compact = serialized;
+    // The exact expanded size is already <= 64 KiB, so this cannot recreate
+    // the earlier resource amplification. It proves that the value accepted
+    // here can pass the same recursive serialization used by DB adapters.
+    if (typeof JSON.stringify(result.state) !== "string") return { ok: false, failure: "not_json" };
   } catch {
     return { ok: false, failure: "not_json" };
   }
-  if (utf8BytesExceed(compact, TERMINAL_STATE_MAX_COMPACT_UTF8_BYTES)) {
-    return { ok: false, failure: "too_large" };
-  }
-  if (!isPgWritableJsonData(canonical)) return { ok: false, failure: "not_json" };
-  return { ok: true, state: canonical as JsonObject };
+  return { ok: true, state: result.state };
 }
 
 // ---- task file sync result (ADR-009 决策 6) ----
@@ -304,7 +452,7 @@ export type TaskFileSyncValidation = { ok: true } | { ok: false; failure: TaskFi
  * invalid. Content must additionally be PostgreSQL-representable — NUL and
  * unpaired surrogates cannot be stored in the text column verbatim, so they
  * reject as `content_not_representable` rather than failing the Batch 2 write
- * step (review A-2; the daemon-side local classification of such a file is a
+ * step (the daemon-side local classification of such a file is a
  * Batch 2 wiring decision).
  */
 export function validateTaskFileSyncResult(input: {

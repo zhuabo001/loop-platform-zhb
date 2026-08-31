@@ -139,7 +139,7 @@ describe("listLoops", () => {
       timezone: "UTC",
       nextFireAt: null,
       // Phase 4 fields (goal/completion/sync) are NOT emitted while dormant
-      // (review SP-2) — the raw-key absence is pinned in phase4-dormant.test.ts.
+      // The raw-key absence is pinned in phase4-dormant.test.ts.
     });
   });
 
@@ -223,7 +223,7 @@ describe("observation projections stay in lockstep with the wire DTOs", () => {
     expect(Object.keys(machineSummaryColumns).sort()).toEqual(Object.keys(machineSummarySchema.shape).sort());
     // lastRun and nextFireAt are computed fields with no backing columns. The
     // Phase 4 loop fields are DECLARED in the DTO but deferred while Batch 1
-    // keeps them dormant (ADR-009 决策 11; review SP-2) — Batch 2 re-opts them
+    // keeps them dormant (ADR-009 决策 11) — Batch 2 re-opts them
     // into the projection by deleting this set.
     const DORMANT_PHASE4_LOOP_FIELDS = [
       "completedAt",

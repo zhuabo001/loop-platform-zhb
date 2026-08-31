@@ -14,6 +14,7 @@ import {
   updateTaskFileRequestSchema,
 } from "./admin.js";
 import { deliverySchema, pollRequestSchema, pollResponseSchema } from "./poll.js";
+import { isStrictJsonValue } from "./json.js";
 import {
   reportRequestSchema,
   TASK_FILE_SYNC_ERRORS,
@@ -175,7 +176,7 @@ describe("P2: terminal union shape", () => {
     expect(() => terminalCommandSchema.parse({ kind: "report", status: "stuck", message: "m" })).toThrow();
   });
 
-  it("preserves a top-level __proto__ own property — success must never silently DROP a legal key (review SP2-1/AD2-1)", () => {
+  it("preserves a top-level __proto__ own property — success must never silently DROP a legal key", () => {
     // A record-based schema rebuilds the object by assignment, and assigning
     // __proto__ sets the PROTOTYPE: the wire would report success while the
     // parsed state had lost a legal key. The schema must pass the input
@@ -202,7 +203,7 @@ describe("P2: terminal union shape", () => {
     }
   });
 
-  it("rejects pathologically DEEP state as a stable schema failure — never a thrown RangeError (review SP-1)", () => {
+  it("rejects pathologically DEEP state as a stable schema failure — never a thrown RangeError", () => {
     // Far beyond any engine's JSON.stringify recursion limit; built
     // iteratively. The wire schema is non-recursive, so safeParse must return
     // { success: false } (→ HTTP 400, lease untouched), not throw.
@@ -214,6 +215,78 @@ describe("P2: terminal union shape", () => {
       taskFileContent: "x",
     });
     expect(result.success).toBe(false);
+  });
+
+  it("turns a revoked Proxy into a stable schema failure", () => {
+    const pair = Proxy.revocable({}, {});
+    pair.revoke();
+    expect(
+      reportRequestSchema.safeParse({
+        ok: true,
+        terminal: { kind: "report", status: "nothing-new", state: pair.proxy },
+        taskFileContent: "x",
+      }).success,
+    ).toBe(false);
+  });
+
+  it("validates a shared DAG without expanding every reference during stringify", () => {
+    let leafReads = 0;
+    const leaf = {
+      get value(): number {
+        leafReads++;
+        return 1;
+      },
+    };
+    let state: Record<string, unknown> = leaf;
+    for (let depth = 0; depth < 20; depth++) state = { left: state, right: state };
+
+    const result = reportRequestSchema.safeParse({
+      ok: true,
+      terminal: { kind: "report", status: "nothing-new", state },
+      taskFileContent: "x",
+    });
+    expect(result.success).toBe(true);
+    expect(leafReads).toBe(1);
+  });
+
+  it("still rejects a deep unique branch when another branch contains sharing", () => {
+    const shared = { value: 1 };
+    let deep: unknown = 1;
+    for (let depth = 0; depth < 8_000; depth++) deep = [deep];
+    const result = reportRequestSchema.safeParse({
+      ok: true,
+      terminal: {
+        kind: "report",
+        status: "nothing-new",
+        state: { left: shared, right: shared, deep },
+      },
+      taskFileContent: "x",
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("does not let inherited array index setters alter strict JSON traversal", () => {
+    let inheritedSetterCalls = 0;
+    Object.defineProperty(Array.prototype, "0", {
+      configurable: true,
+      get() {
+        return undefined;
+      },
+      set() {
+        inheritedSetterCalls++;
+      },
+    });
+    let valid: boolean;
+    let sparseValid: boolean;
+    try {
+      valid = isStrictJsonValue({ list: [2] });
+      sparseValid = isStrictJsonValue({ list: new Array(1) });
+    } finally {
+      Reflect.deleteProperty(Array.prototype, "0");
+    }
+    expect(valid!).toBe(true);
+    expect(sparseValid!).toBe(false);
+    expect(inheritedSetterCalls).toBe(0);
   });
 
   it("rejects state stringify would mangle, without recursing into it", () => {

@@ -174,7 +174,7 @@ describe("D4: primary status priority and the goal dimension", () => {
     }
   });
 
-  it("a persisted completionReason must pass the terminal reason policy (review SP-4)", () => {
+  it("a persisted completionReason must pass the terminal reason policy", () => {
     const completed = (completionReason: string) =>
       baseLoop({ enabled: false, goal: "g", goalRevision: 1, completedAt: NOW, completionReason });
     // Empty, NUL, unpaired surrogate and over-ceiling reasons are NOT legal
@@ -209,7 +209,7 @@ describe("D5: completion-triple lockstep mirrors the DB CHECK (M4)", () => {
     expect(
       isValidLoopSnapshot(baseLoop({ enabled: true, goal: "g", goalRevision: 1, completedAt: NOW, completionReason: "r" })),
     ).toBe(false);
-    // …and the reason-policy violations the CHECK cannot express (review SP-4).
+    // …and the reason-policy violations the CHECK cannot express.
     expect(
       isValidLoopSnapshot(baseLoop({ enabled: false, goal: "g", goalRevision: 1, completedAt: NOW, completionReason: "" })),
     ).toBe(false);

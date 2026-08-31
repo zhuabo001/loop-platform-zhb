@@ -63,7 +63,7 @@ describe("createLoop", () => {
       cron: null,
       timezone: "UTC",
       nextFireAt: null,
-      // Phase 4 fields stay absent while dormant (review SP-2).
+      // Phase 4 fields stay absent while dormant.
     });
 
     const rows = await snapshotLoops(db);

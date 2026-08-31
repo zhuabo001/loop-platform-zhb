@@ -108,8 +108,8 @@ export function toLoopSummary(
     timezone: row.timezone,
     nextFireAt,
     // Phase 4 observation fields (goal/completion/task-file sync) are NOT
-    // emitted while Batch 1 keeps them dormant (ADR-009 决策 11; review
-    // SP-2) — the response stays byte-identical to Phase 3.
+    // emitted while Batch 1 keeps them dormant (ADR-009 决策 11) — the
+    // response stays byte-identical to Phase 3.
   };
 }
 

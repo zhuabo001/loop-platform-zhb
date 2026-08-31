@@ -239,7 +239,7 @@ describe("T5: legal finish — the full write-set in one plan", () => {
     expect(plan.runWrites.message).toBe("queue empty");
   });
 
-  it("a finish message at EXACTLY the 2000 UTF-8 byte ceiling is legal (A-1 positive boundary)", () => {
+  it("a finish message at EXACTLY the 2000 UTF-8 byte ceiling is legal", () => {
     const message = "é".repeat(1000); // 2000 UTF-8 bytes
     const plan = planReportWrites({
       loop: baseLoop(),
@@ -346,7 +346,7 @@ describe("T8: wire-legal but policy-invalid v1 success → terminal_protocol_inv
       { ok: true, terminal: { kind: "report", status: "new", message: "é".repeat(1001) }, ...SYNC_OK },
     ],
     ["empty finish reason", { ok: true, terminal: { kind: "finish", reason: "" }, ...SYNC_OK }],
-    // A-1: the finish's OPTIONAL message passes the same policy as a report's.
+    // The finish's OPTIONAL message passes the same policy as a report's.
     [
       "finish message with NUL",
       { ok: true, terminal: { kind: "finish", reason: "goal met", message: "bad\0message" }, ...SYNC_OK },
@@ -403,7 +403,7 @@ describe("T8: wire-legal but policy-invalid v1 success → terminal_protocol_inv
   });
 });
 
-describe("SP-3: EVERY v1 success branch fail-closes on a corrupt persisted loop snapshot", () => {
+describe("EVERY v1 success branch fail-closes on a corrupt persisted loop snapshot", () => {
   const reportBody: ReportRequest = {
     ok: true,
     terminal: { kind: "report", status: "nothing-new" },

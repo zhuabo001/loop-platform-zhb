@@ -76,7 +76,7 @@ export type LoopPrimaryStatus = "completed" | "paused" | "open" | "closed";
  * the parts a CHECK cannot express: revisions are int32-safe integers, a
  * persisted goal is its OWN normalization, and a persisted completionReason
  * passes the terminal finish-reason policy (non-empty, NUL-free, well-formed
- * UTF-16, within the byte ceiling — review SP-4: the write path stores policy-
+ * UTF-16, within the byte ceiling: the write path stores policy-
  * canonical reasons, so a violation means the row was damaged outside them).
  * The domain kernel re-validates every snapshot it reads — the database
  * constraint is the second line, never the only business judgment.
@@ -355,7 +355,7 @@ export type ReportWritePlan =
   | {
       /** A PLAIN v1 success report against a corrupt persisted loop snapshot
        *  → stable run failure classified invalid_loop_state, zero Loop writes,
-       *  lease consumed (review SP-3: every v1 success branch fail-closes on
+       *  lease consumed (every v1 success branch fail-closes on
        *  the read snapshot before any Loop write is planned; a FINISH against
        *  the same snapshot still reports through the finish_rejected shape). */
       kind: "loop_state_invalid";
@@ -425,9 +425,9 @@ export function planReportWrites(input: ReportPlanInput): ReportWritePlan {
 
   // v1 success: terminal command is mandatory and must pass policy. ONE
   // exhaustive variant pass validates every text field — including the
-  // finish's OPTIONAL message (review A-1) — and pins the message/status
+  // finish's OPTIONAL message — and pins the message/status
   // mapping, so a future variant cannot forget a policy or a write mapping
-  // (review S-1: no scattered per-kind branches).
+  // (no scattered per-kind branches).
   const terminal = body.terminal;
   if (terminal === undefined) {
     return { kind: "terminal_protocol_invalid", ...stableRunFailure(run, TERMINAL_PROTOCOL_INVALID, nowIso) };
@@ -458,7 +458,7 @@ export function planReportWrites(input: ReportPlanInput): ReportWritePlan {
   }
 
   // State passes the policy ONCE; the plan carries the validated canonical
-  // clone, never the caller's (possibly getter-backed) object (review A-3).
+  // clone, never the caller's (possibly getter-backed) object.
   const stateCheck = terminal.state === undefined ? undefined : validateTerminalState(terminal.state);
   if (stateCheck !== undefined && !stateCheck.ok) return protocolInvalid;
   if (
@@ -471,10 +471,10 @@ export function planReportWrites(input: ReportPlanInput): ReportWritePlan {
   }
 
   // Every v1 success branch fail-closes on the persisted loop snapshot BEFORE
-  // any Loop write is planned (review SP-3; ADR-009 决策 3 — the DB CHECK is
+  // any Loop write is planned (ADR-009 决策 3 — the DB CHECK is
   // the second line, never the only business judgment). Keyed off the DERIVED
-  // `finishReason !== null`, not a second `terminal.kind` switch (review
-  // S-1/ST2-2): a finish against a corrupt snapshot keeps the finish_rejected
+  // `finishReason !== null`, not a second `terminal.kind` switch: a finish
+  // against a corrupt snapshot keeps the finish_rejected
   // shape with the SAME first classification planFinish would return.
   if (!isValidLoopSnapshot(loop)) {
     const classification = "invalid_loop_state" as const;
