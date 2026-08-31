@@ -38,6 +38,14 @@ describe("normalizeGoal (ADR-009 决策 2)", () => {
     expect(normalizeGoal("a\r\nb")).toEqual({ ok: false, failure: "not_single_line" });
   });
 
+  it("rejects unpaired UTF-16 surrogates — not PG-representable (review A-2)", () => {
+    expect(normalizeGoal("a\uD800b")).toEqual({ ok: false, failure: "malformed_unicode" });
+    expect(normalizeGoal("a\uDC00b")).toEqual({ ok: false, failure: "malformed_unicode" });
+    expect(normalizeGoal("\uD800")).toEqual({ ok: false, failure: "malformed_unicode" });
+    // A well-formed astral pair is fine.
+    expect(normalizeGoal("ship 🚀 it")).toEqual({ ok: true, goal: "ship 🚀 it" });
+  });
+
   it("pins the 2000 UTF-8 byte ceiling exactly (ASCII)", () => {
     expect(normalizeGoal("a".repeat(GOAL_MAX_UTF8_BYTES))).toEqual({
       ok: true,
@@ -75,6 +83,12 @@ describe("validateTerminalMessage / validateFinishReason (ADR-009 决策 6)", ()
   it("rejects NUL", () => {
     expect(validateTerminalMessage("a\0b")).toEqual({ ok: false, failure: "contains_nul" });
     expect(validateFinishReason("a\0b")).toEqual({ ok: false, failure: "contains_nul" });
+  });
+
+  it("rejects unpaired UTF-16 surrogates — not PG-representable (review A-2)", () => {
+    expect(validateTerminalMessage("bad \uD800 message")).toEqual({ ok: false, failure: "malformed_unicode" });
+    expect(validateFinishReason("\uDFFF")).toEqual({ ok: false, failure: "malformed_unicode" });
+    expect(validateTerminalMessage("paired 🚀 pair")).toEqual({ ok: true });
   });
 
   it("pins the 2000 UTF-8 byte ceiling exactly", () => {
@@ -126,6 +140,56 @@ describe("validateTerminalState (ADR-009 决策 6)", () => {
     expect(validateTerminalState(circular)).toEqual({ ok: false, failure: "not_json" });
   });
 
+  it("rejects strings PostgreSQL jsonb cannot store — NUL and unpaired surrogates, in values AND keys (review A-2)", () => {
+    expect(validateTerminalState({ x: "\0" })).toEqual({ ok: false, failure: "not_json" });
+    expect(validateTerminalState({ x: "a\0b" })).toEqual({ ok: false, failure: "not_json" });
+    expect(validateTerminalState({ x: "\uD800" })).toEqual({ ok: false, failure: "not_json" });
+    expect(validateTerminalState({ x: "\uDC00" })).toEqual({ ok: false, failure: "not_json" });
+    expect(validateTerminalState({ nested: [{ deep: "bad\uD800" }] })).toEqual({ ok: false, failure: "not_json" });
+    expect(validateTerminalState({ "k\0": 1 })).toEqual({ ok: false, failure: "not_json" });
+    expect(validateTerminalState({ "k\uD800": 1 })).toEqual({ ok: false, failure: "not_json" });
+    // Well-formed astral pairs and nested multibyte text are fine.
+    expect(validateTerminalState({ "é🚀": ["pair 🚀 ok"] })).toEqual({
+      ok: true,
+      state: { "é🚀": ["pair 🚀 ok"] },
+    });
+  });
+
+  it("returns the CANONICAL CLONE, not the caller's object (review A-3)", () => {
+    const inner = { b: "x" };
+    const input = { a: [1, inner] };
+    const result = validateTerminalState(input);
+    if (!result.ok) throw new Error("unreachable");
+    expect(result.state).toEqual(input);
+    expect(result.state).not.toBe(input);
+    // Mutating the input after validation cannot alter the validated value.
+    inner.b = "tampered";
+    expect(result.state).toEqual({ a: [1, { b: "x" }] });
+  });
+
+  it("contains getter/Proxy trap exceptions inside the validation boundary (review A-3)", () => {
+    // First read succeeds (stringify), second read throws (the strict walk) —
+    // the exception must become a stable not_json, never escape.
+    let reads = 0;
+    const boobyTrapped = {
+      get value() {
+        reads++;
+        if (reads > 1) throw new Error("second read");
+        return 1;
+      },
+    };
+    expect(validateTerminalState(boobyTrapped)).toEqual({ ok: false, failure: "not_json" });
+    const proxied = new Proxy(
+      { a: 1 },
+      {
+        ownKeys() {
+          throw new Error("trap");
+        },
+      },
+    );
+    expect(validateTerminalState(proxied)).toEqual({ ok: false, failure: "not_json" });
+  });
+
   it("turns pathological depth into a stable not_json — no stack overflow escapes", () => {
     // Far beyond any engine's stringify recursion limit; built iteratively.
     let deep: Record<string, unknown> = { leaf: true };
@@ -158,6 +222,23 @@ describe("validateTaskFileSyncResult (ADR-009 决策 6)", () => {
     expect(validateTaskFileSyncResult({ taskFileContent: "é".repeat(TASK_FILE_CONTENT_MAX_UTF8_BYTES / 2) })).toEqual(
       { ok: true },
     );
+  });
+
+  it("rejects content PostgreSQL text cannot store verbatim — NUL and unpaired surrogates (review A-2)", () => {
+    expect(validateTaskFileSyncResult({ taskFileContent: "\0" })).toEqual({
+      ok: false,
+      failure: "content_not_representable",
+    });
+    expect(validateTaskFileSyncResult({ taskFileContent: "a\0b" })).toEqual({
+      ok: false,
+      failure: "content_not_representable",
+    });
+    expect(validateTaskFileSyncResult({ taskFileContent: "lone \uD800 surrogate" })).toEqual({
+      ok: false,
+      failure: "content_not_representable",
+    });
+    // Newlines, tabs, multibyte and astral pairs round-trip fine.
+    expect(validateTaskFileSyncResult({ taskFileContent: "# TASK\n\t- é 🚀" })).toEqual({ ok: true });
   });
 });
 

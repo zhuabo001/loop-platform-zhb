@@ -181,6 +181,31 @@ describe("P2: terminal union shape", () => {
     }
   });
 
+  it("rejects pathologically DEEP state as a stable schema failure — never a thrown RangeError (review SP-1)", () => {
+    // Far beyond any engine's JSON.stringify recursion limit; built
+    // iteratively. The wire schema is non-recursive, so safeParse must return
+    // { success: false } (→ HTTP 400, lease untouched), not throw.
+    let deep: Record<string, unknown> = { leaf: true };
+    for (let i = 0; i < 200_000; i++) deep = { next: deep };
+    const result = reportRequestSchema.safeParse({
+      ok: true,
+      terminal: { kind: "report", status: "nothing-new", state: deep },
+      taskFileContent: "x",
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects state stringify would mangle, without recursing into it", () => {
+    // Non-JSON nested values are a wire rejection now (stack-safe), not a
+    // policy-later surprise.
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    expect(
+      reportRequestSchema.safeParse({ ok: true, terminal: { kind: "report", status: "nothing-new", state: cyclic } })
+        .success,
+    ).toBe(false);
+  });
+
   it("distinguishes absent state from an explicit empty object", () => {
     const absent = terminalCommandSchema.parse({ kind: "report", status: "nothing-new" });
     expect(absent).not.toHaveProperty("state");

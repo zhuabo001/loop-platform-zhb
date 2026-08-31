@@ -1,27 +1,79 @@
 /**
  * JSON value/object wire shapes for Phase 4 terminal state (ADR-009 决策 6).
  *
- * The schema pins SHAPE only (ADR-002 决策 4): the top level must be a JSON
- * object whose values are JSON values. VALUE policy — the 64 KiB compact
- * UTF-8 ceiling, stack-safe deep validation — lives in `terminal-policy.ts`,
- * the narrow exception both peers execute identically.
+ * The schema pins SHAPE only (ADR-002 决策 4), and it does so STACK-SAFELY
+ * (review SP-1): a recursive `z.lazy` schema threw `RangeError` on
+ * pathologically deep input, escaping `safeParse` as an uncategorized 500
+ * before any policy could run. The wire layer now checks only the top-level
+ * object shape non-recursively and delegates nested legality to the iterative
+ * `isStrictJsonValue`; the 64 KiB ceiling and database-writability rules stay
+ * in `terminal-policy.ts`, the narrow exception both peers execute identically.
  */
 import { z } from "zod";
 
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 export type JsonObject = { [key: string]: JsonValue };
 
-/** Recursive JSON value: string | number | boolean | null | array | object. */
-export const jsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
-  z.union([
-    z.string(),
-    z.number(),
-    z.boolean(),
-    z.null(),
-    z.array(jsonValueSchema),
-    z.record(z.string(), jsonValueSchema),
-  ]),
-);
+/**
+ * Stack-safe, TOTAL strict JSON-value check: rejects `undefined`, functions,
+ * symbols, bigints, non-finite numbers and exotic object prototypes — values
+ * that `JSON.stringify` would silently drop or mangle.
+ *
+ * Totality: the guarded serialization turns pathological depth (RangeError)
+ * and cycles (TypeError) into `false`, and the explicit-stack walk never
+ * recurses. Getter/Proxy traps throwing mid-walk land in the same catch — any
+ * traversal or serialization exception is a rejection, never an escape
+ * (ADR-009 决策 6; review A-3).
+ */
+export function isStrictJsonValue(root: unknown): boolean {
+  try {
+    if (typeof JSON.stringify(root) !== "string") return false;
+    const stack: unknown[] = [root];
+    while (stack.length > 0) {
+      const value = stack.pop();
+      if (value === null) continue;
+      switch (typeof value) {
+        case "string":
+        case "boolean":
+          continue;
+        case "number":
+          if (!Number.isFinite(value)) return false;
+          continue;
+        case "object": {
+          if (Array.isArray(value)) {
+            for (const item of value) stack.push(item);
+            continue;
+          }
+          const proto: unknown = Object.getPrototypeOf(value);
+          if (proto !== null && proto !== Object.prototype) return false;
+          for (const key of Object.keys(value)) {
+            stack.push((value as Record<string, unknown>)[key]);
+          }
+          continue;
+        }
+        default:
+          return false;
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
 
-/** A top-level JSON object (arrays/null/scalars are NOT valid state). */
-export const jsonObjectSchema = z.record(z.string(), jsonValueSchema);
+/**
+ * A top-level JSON object (arrays/null/scalars are NOT valid state). The zod
+ * layer is NON-RECURSIVE (top-level shape only); nested legality rides the
+ * stack-safe `isStrictJsonValue` superRefine, so a deep or cyclic body
+ * degrades to a stable schema rejection (HTTP 400, lease untouched) instead
+ * of a `RangeError` (review SP-1). Value policy — the 64 KiB compact ceiling
+ * and PostgreSQL writability — is deliberately NOT here: it lives in
+ * `terminal-policy.ts` and runs in the domain layer.
+ */
+export const jsonObjectSchema: z.ZodType<JsonObject> = z
+  .record(z.string(), z.unknown())
+  .superRefine((value, ctx) => {
+    if (!isStrictJsonValue(value)) {
+      ctx.addIssue({ code: "custom", message: "must be a strict JSON object" });
+    }
+  }) as z.ZodType<JsonObject>;
