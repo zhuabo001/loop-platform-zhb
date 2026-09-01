@@ -54,3 +54,43 @@ _Avoid_: Invalidation, conflict
 The rejection of an action because a valid Run Capability exists but the Run or lease lifecycle does
 not currently allow that action.
 _Avoid_: Invalidation, denial
+
+**Open Loop**:
+A Loop whose Goal is `null`; it runs until paused and can never Finish.
+_Avoid_: Unbounded loop, free loop
+
+**Closed Loop**:
+A Loop with a non-null Goal; only its qualifying Exec Runs may declare Finish.
+_Avoid_: Bounded loop, task loop
+
+**Paused Loop**:
+A Loop with `enabled=false` that is not Completed; automatic scheduling stops, but Run Now remains
+allowed.
+_Avoid_: Disabled loop, stopped loop
+
+**Completed Loop**:
+A Loop whose Completion triple (goal, completedAt, completionReason) is present; `enabled=false` is
+implied, and only Reopen can make it runnable again.
+_Avoid_: Done loop, finished loop (Finish is the act, Completed is the state)
+
+**Finish**:
+The terminal command by which a qualifying Closed Loop exec Run declares its Goal achieved,
+completing the Loop atomically with its final Report.
+_Avoid_: Complete, close, resolve (resolve is a Run status, not the Loop act)
+
+**Reopen**:
+The management operation that clears a Completed Loop's completion fields, re-enables it, and
+restores its schedule with a new activation boundary—without backfilling occurrences missed while
+completed.
+_Avoid_: Restart, resume, unpause
+
+**Terminal Journal**:
+The per-Run local directory where the daemon's in-run control CLI records exactly one report/finish
+command as a file, with no network access.
+_Avoid_: Control channel, callback socket
+
+**Terminal Protocol**:
+The versioned contract, captured in the RunLease at claim time, that determines whether a final
+Report follows Phase 3 semantics (v0) or consumes the Terminal Journal's terminal command, state,
+and Task File sync result (v1).
+_Avoid_: API version, negotiation handshake

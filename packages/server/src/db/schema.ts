@@ -23,7 +23,7 @@
  * their columns additively (ADR-003 has the full deferral map).
  */
 import { sql } from "drizzle-orm";
-import { boolean, doublePrecision, index, integer, jsonb, pgTable, text, uniqueIndex } from "drizzle-orm/pg-core";
+import { boolean, check, doublePrecision, index, integer, jsonb, pgTable, text, uniqueIndex } from "drizzle-orm/pg-core";
 
 import {
   CODING_AGENTS,
@@ -32,6 +32,7 @@ import {
   RUN_PHASES,
   RUN_ROLES,
   RUN_STATUSES,
+  TASK_FILE_SYNC_ERRORS,
 } from "@loopzhb/protocol";
 import type { RunArtifact, TranscriptStep } from "@loopzhb/protocol";
 
@@ -96,6 +97,11 @@ export const machines = pgTable("machines", {
    *  deliberately no `online` boolean column (even the reference recomputes
    *  `now - lastSeen` on every read; its column is a redundant cache). */
   lastSeen: text("last_seen"),
+  /** Phase 4: the daemon's LATEST capability snapshot (deduped + sorted at the
+   *  store layer; null = never declared / pre-Phase-4 daemon). Batch 1 keeps
+   *  this column write-closed — poll parses capabilities but does not persist
+   *  them (ADR-009 决策 11). */
+  capabilities: jsonb("capabilities").$type<string[]>(),
   createdAt: text("created_at").notNull(),
 });
 
@@ -152,6 +158,24 @@ export const loops = pgTable(
      *  occurrence calculation — cleared on configuration change, advanced on
      *  each automatic trigger. Phase 3 Batch 1 keeps this write-closed. */
     lastScheduledAt: text("last_scheduled_at"),
+    /** Phase 4: the loop's normalized goal (null = Open Loop, ADR-009 决策 2).
+     *  Write-closed in Batch 1 — the goal management route mounts in Batch 2. */
+    goal: text("goal"),
+    /** Monotonic goal-change counter (0 at creation; +1 per effective
+     *  set/change/clear; never reset, never overflowing int32). Leases capture
+     *  it at claim time — a stale-goal finish is rejected (ADR-009 决策 4). */
+    goalRevision: integer("goal_revision").notNull().default(0),
+    /** Phase 4 completion triple: all-or-nothing with completionReason and
+     *  (goal, enabled=false) — enforced by the loops_completion_ck CHECK
+     *  below AND re-validated by the domain kernel (ADR-009 决策 3). */
+    completedAt: text("completed_at"),
+    completionReason: text("completion_reason"),
+    /** Last task-file sync ATTEMPT (ISO) — set on both success and failure,
+     *  unlike task_file_synced_at which only a success advances. */
+    taskFileSyncAttemptedAt: text("task_file_sync_attempted_at"),
+    /** Why the last task-file sync failed (TS-only enum from the protocol's
+     *  TASK_FILE_SYNC_ERRORS single source). Null after a successful sync. */
+    taskFileSyncError: text("task_file_sync_error", { enum: [...TASK_FILE_SYNC_ERRORS] }),
     createdAt: text("created_at").notNull(),
     updatedAt: text("updated_at").notNull(),
   },
@@ -160,6 +184,15 @@ export const loops = pgTable(
     /** Covers the Scheduler's active-schedule scan (enabled loops with cron).
      *  Partial index keeps it small — only rows where enabled=true AND cron IS NOT NULL. */
     index("loops_active_schedule_idx").on(t.id).where(sql`${t.enabled} = true AND ${t.cron} IS NOT NULL`),
+    /** ADR-009 决策 3: the persisted completion state is either fully absent
+     *  or fully present (goal + completed_at + completion_reason, paused).
+     *  Half-completed rows can never be committed. */
+    check(
+      "loops_completion_ck",
+      sql`(${t.completedAt} IS NULL AND ${t.completionReason} IS NULL)
+          OR (${t.goal} IS NOT NULL AND ${t.completedAt} IS NOT NULL
+              AND ${t.completionReason} IS NOT NULL AND ${t.enabled} = false)`,
+    ),
   ],
 );
 
@@ -249,6 +282,13 @@ export const runLeases = pgTable(
     state: text("state", { enum: [...LEASE_STATES] }).notNull().default("active"),
     /** Null while active (never expires); ISO once terminalized (grace window). */
     expiresAt: text("expires_at"),
+    /** Phase 4: the terminal protocol this lease's report must follow (ADR-009
+     *  决策 7 — the AUTHORITATIVE switch; capabilities or request fields can
+     *  never upgrade a v0 lease). Batch 1 claims write 0 explicitly. */
+    terminalProtocolVersion: integer("terminal_protocol_version").notNull().default(0),
+    /** The loop's goalRevision captured at claim time; a finish presented
+     *  against a different current revision is stale_goal (ADR-009 决策 4). */
+    goalRevision: integer("goal_revision").notNull().default(0),
     createdAt: text("created_at").notNull(),
   },
   // runId is UNIQUE: at most one LIVE lease row per run (terminalizeLease

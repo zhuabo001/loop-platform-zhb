@@ -25,6 +25,12 @@
  *  - Batch 2 management API MUST use this entry point, not reimplement logic
  *
  * See ADR-007 for the complete state-machine contract.
+ *
+ * Phase 4 Batch 1: the revision/activation/watermark computation lives in the
+ * pure core `./transition.ts` (ADR-009 决策 5) — this adapter keeps the DB
+ * transaction, the Clock, and cron/timezone validation, and the core computes
+ * the patch. Phase 3 behavior is unchanged (parity-pinned by the C-group and
+ * the D9 equivalence tests).
  */
 
 import { eq } from "drizzle-orm";
@@ -34,17 +40,22 @@ import type { Loop } from "../db/schema.js";
 import { loops } from "../db/schema.js";
 import type { Clock } from "../time.js";
 import { validateSchedule } from "./time-semantics.js";
+import { planScheduleTransition, type ScheduleTransitionPatch } from "./transition.js";
 
 /**
  * Partial schedule configuration update.
  */
-export interface SchedulePatch {
-  /** Cron expression (null = clear to manual-only, undefined = no change). */
-  cron?: string | null;
-  /** IANA timezone (undefined = no change). */
-  timezone?: string;
-  /** Enabled flag (undefined = no change). */
-  enabled?: boolean;
+export type SchedulePatch = ScheduleTransitionPatch;
+
+/** Thrown when scheduleRevision reached the PostgreSQL int32 ceiling — the
+ *  pure core refuses the transition with zero writes (ADR-009 决策 4). Batch 2
+ *  maps this to a stable HTTP conflict at the management routes; it must never
+ *  surface as a database overflow 500. */
+export class ScheduleRevisionExhaustedError extends Error {
+  constructor(readonly loopId: string) {
+    super(`schedule revision exhausted for loop ${loopId}`);
+    this.name = "ScheduleRevisionExhaustedError";
+  }
 }
 
 /**
@@ -93,15 +104,20 @@ export async function updateSchedule(
     // have one owner.
     const normalizedPatch = normalizeAndValidatePatch(currentLoop, patch);
 
-    // 4. Check if this is semantically a no-op
-    if (isNoOp(currentLoop, normalizedPatch)) {
+    // 3. The pure core decides: noop (zero writes), exhausted (zero writes +
+    // stable signal), or the revision/activation/watermark patch.
+    const nowIso = deps.clock.now().toISOString();
+    const transition = planScheduleTransition(currentLoop, normalizedPatch, nowIso);
+    if (transition.kind === "noop") {
       return { found: true, changed: false, loop: currentLoop };
     }
+    if (transition.kind === "schedule_revision_exhausted") {
+      throw new ScheduleRevisionExhaustedError(loopId);
+    }
 
-    // 5. Validate final configuration (cron and timezone semantics)
+    // 4. Validate final configuration (cron and timezone semantics)
     const finalCron = normalizedPatch.cron !== undefined ? normalizedPatch.cron : currentLoop.cron;
     const finalTimezone = normalizedPatch.timezone !== undefined ? normalizedPatch.timezone : currentLoop.timezone;
-    const finalEnabled = normalizedPatch.enabled !== undefined ? normalizedPatch.enabled : currentLoop.enabled;
 
     // Always validate cron and timezone together when either changes OR when timezone changes for manual-only
     // This prevents manual-only loops from persisting invalid timezones
@@ -114,39 +130,8 @@ export async function updateSchedule(
       validateSchedule("0 0 * * *", finalTimezone);
     }
 
-    // 5. Calculate new state
-    const now = deps.clock.now();
-    const nowIso = now.toISOString();
-
-    // Increment revision on any effective change
-    const newRevision = currentLoop.scheduleRevision + 1;
-
-    // Clear watermark on any config change
-    const newLastScheduledAt = null;
-
-    // Set activation timestamp if becoming active, clear if becoming inactive
-    const isActive = finalEnabled && finalCron !== null;
-    const newScheduleActivatedAt = isActive ? nowIso : null;
-
-    // 6. Apply the update
-    const updates: Partial<Loop> = {
-      scheduleRevision: newRevision,
-      updatedAt: nowIso,
-      lastScheduledAt: newLastScheduledAt,
-      scheduleActivatedAt: newScheduleActivatedAt,
-    };
-
-    if (normalizedPatch.cron !== undefined) {
-      updates.cron = normalizedPatch.cron;
-    }
-    if (normalizedPatch.timezone !== undefined) {
-      updates.timezone = normalizedPatch.timezone;
-    }
-    if (normalizedPatch.enabled !== undefined) {
-      updates.enabled = normalizedPatch.enabled;
-    }
-
-    const [updatedLoop] = await tx.update(loops).set(updates).where(eq(loops.id, loopId)).returning();
+    // 5. Apply the core-computed patch.
+    const [updatedLoop] = await tx.update(loops).set(transition.writes).where(eq(loops.id, loopId)).returning();
 
     if (!updatedLoop) {
       throw new Error(`Loop ${loopId} disappeared during transaction`);
@@ -194,44 +179,4 @@ function normalizeAndValidatePatch(currentLoop: Loop, patch: SchedulePatch): Sch
   }
 
   return normalized;
-}
-
-/**
- * Checks if a normalized patch is semantically a no-op (no effective changes).
- *
- * A patch is a no-op if:
- *  - It's empty (no fields specified), OR
- *  - All specified fields are semantically equal to current values
- */
-function isNoOp(currentLoop: Loop, normalizedPatch: SchedulePatch): boolean {
-  // Empty patch is a no-op
-  if (
-    normalizedPatch.cron === undefined &&
-    normalizedPatch.timezone === undefined &&
-    normalizedPatch.enabled === undefined
-  ) {
-    return true;
-  }
-
-  // Check each field for semantic equality
-  if (normalizedPatch.cron !== undefined) {
-    if (normalizedPatch.cron !== currentLoop.cron) {
-      return false;
-    }
-  }
-
-  if (normalizedPatch.timezone !== undefined) {
-    if (normalizedPatch.timezone !== currentLoop.timezone) {
-      return false;
-    }
-  }
-
-  if (normalizedPatch.enabled !== undefined) {
-    if (normalizedPatch.enabled !== currentLoop.enabled) {
-      return false;
-    }
-  }
-
-  // All specified fields are equal
-  return true;
 }

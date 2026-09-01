@@ -77,6 +77,11 @@ export const loopSummaryColumns = {
   updatedAt: loops.updatedAt,
   cron: loops.cron,
   timezone: loops.timezone,
+  // Phase 4 observation fields (goal/completion/task-file sync) are DECLARED
+  // in the wire DTO but deliberately NOT projected here while Batch 1 keeps
+  // them dormant (ADR-009 决策 11): the production observation
+  // surface stays byte-identical to Phase 3. Batch 2 opts them back in — the
+  // lockstep test in list.test.ts names the exact deferred key set.
 } as const;
 
 export const runSummaryColumns = {

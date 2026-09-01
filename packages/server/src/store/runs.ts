@@ -267,6 +267,10 @@ export interface ClaimedRun {
  *
  * Phase 1 lease mint policy (ADR-003): every capability is written FALSE
  * explicitly — never inherited from loop config, never left to DB defaults.
+ *
+ * Phase 4 Batch 1 (ADR-009 决策 11): the dormant boundary is pinned the same
+ * way — `terminalProtocolVersion: 0`, `goalRevision: 0`, `canFinish: false`
+ * are written EXPLICITLY on every claim, never left to DDL defaults.
  */
 export async function claimRunWithLeaseTx(
   deps: ClaimStoreDeps,
@@ -305,6 +309,8 @@ export async function claimRunWithLeaseTx(
       canSetSchema: false,
       canSetWorkflow: false,
       canFinish: false,
+      terminalProtocolVersion: 0,
+      goalRevision: 0,
       state: "active",
       expiresAt: null,
       createdAt: clock.now().toISOString(),

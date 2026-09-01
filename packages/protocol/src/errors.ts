@@ -19,6 +19,13 @@ import { z } from "zod";
  *  Capability is permanently invalid, so a daemon must stop reporting with it. */
 export const RUN_CAPABILITY_INVALID_CODE = "run_capability_invalid" as const;
 
+/** Phase 4 management-conflict codes (ADR-009 决策 10). Both ride the flat
+ *  409 apiError body — the error TEXT is not a machine contract, these codes
+ *  are. Completed-loop Run Now deliberately uses this shape instead of a new
+ *  success-union `reason` literal, which a Phase 3 reader would reject. */
+export const LOOP_COMPLETED_CODE = "loop_completed" as const;
+export const LOOP_NOT_COMPLETED_CODE = "loop_not_completed" as const;
+
 export const apiErrorSchema = z.object({
   error: z.string(),
   code: z.string().optional(),

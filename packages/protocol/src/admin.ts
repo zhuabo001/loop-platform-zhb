@@ -29,6 +29,7 @@
 import { z } from "zod";
 
 import { codingAgentSchema, runOutcomeSchema, runPhaseSchema, runRoleSchema, runStatusSchema } from "./enums.js";
+import { taskFileSyncErrorSchema } from "./report.js";
 
 /** Machine ids derive from the device token (`@loopzhb/protocol/node`
  *  `machineIdFromToken`): `m-<sha256(token)[:16]>` — lowercase hex. */
@@ -57,6 +58,9 @@ export const createLoopRequestSchema = z.object({
   cron: nulFreeString().min(1).optional(),
   /** IANA timezone (255-char ceiling is server policy); defaults to UTC. */
   timezone: nulFreeString().min(1).optional(),
+  /** Phase 4: initial goal — null/omitted creates an Open Loop. Trim/single-
+   *  line/2000-byte rules are terminal-policy, enforced server-side. */
+  goal: nulFreeString().min(1).nullable().optional(),
 });
 export type CreateLoopRequest = z.infer<typeof createLoopRequestSchema>;
 
@@ -124,6 +128,15 @@ export const loopSummarySchema = z.object({
   cron: z.string().nullable().optional(),
   timezone: z.string().optional(),
   nextFireAt: isoTimestampSchema.nullable().optional(),
+  /** Phase 4 additive observation fields (ADR-009). All optional so Phase 3
+   *  servers remain readable; the Phase 4 server always emits them
+   *  explicitly (null when unset). */
+  goal: z.string().nullable().optional(),
+  completedAt: isoTimestampSchema.nullable().optional(),
+  completionReason: z.string().nullable().optional(),
+  taskFileSyncedAt: isoTimestampSchema.nullable().optional(),
+  taskFileSyncAttemptedAt: isoTimestampSchema.nullable().optional(),
+  taskFileSyncError: taskFileSyncErrorSchema.nullable().optional(),
 });
 export type LoopSummary = z.infer<typeof loopSummarySchema>;
 
@@ -214,3 +227,49 @@ export const updateScheduleResponseSchema = z.object({
   loop: loopSummarySchema,
 });
 export type UpdateScheduleResponse = z.infer<typeof updateScheduleResponseSchema>;
+
+// ---- PATCH /api/loops/:id/goal (Phase 4 — declared, routes mount in Batch 2) ----
+
+/** PATCH /api/loops/:id/goal — set or clear the loop's goal. `goal: null`
+ *  makes the loop Open; a string is normalized and validated by
+ *  terminal-policy (trim, single line, ≤2000 UTF-8 bytes). Equal-after-
+ *  normalization updates are server-side no-ops. Completed loops reject with
+ *  409 `loop_completed` (errors.ts). */
+export const updateGoalRequestSchema = z.object({
+  goal: nulFreeString().min(1).nullable(),
+});
+export type UpdateGoalRequest = z.infer<typeof updateGoalRequestSchema>;
+
+export const updateGoalResponseSchema = z.object({
+  loop: loopSummarySchema,
+});
+export type UpdateGoalResponse = z.infer<typeof updateGoalResponseSchema>;
+
+// ---- PATCH /api/loops/:id/task-file (Phase 4 — declared, routes mount in Batch 2) ----
+
+/** PATCH /api/loops/:id/task-file — backfill or retarget the machine-side
+ *  task file path. Non-empty and NUL-free at the boundary (4096-char ceiling
+ *  is server policy); existence and jail checks are the daemon's at run time. */
+export const updateTaskFileRequestSchema = z.object({
+  taskFile: nulFreeString().min(1),
+});
+export type UpdateTaskFileRequest = z.infer<typeof updateTaskFileRequestSchema>;
+
+export const updateTaskFileResponseSchema = z.object({
+  loop: loopSummarySchema,
+});
+export type UpdateTaskFileResponse = z.infer<typeof updateTaskFileResponseSchema>;
+
+// ---- POST /api/loops/:id/reopen (Phase 4 — declared, routes mount in Batch 2) ----
+
+/** POST /api/loops/:id/reopen — clear completion, re-enable, restore the
+ *  schedule with a fresh activation boundary (ADR-009 决策 5). No business
+ *  params: `{}` is the whole request; unknown keys strip away. Only a
+ *  Completed loop may reopen — anything else is 409 `loop_not_completed`. */
+export const reopenLoopRequestSchema = z.object({});
+export type ReopenLoopRequest = z.infer<typeof reopenLoopRequestSchema>;
+
+export const reopenLoopResponseSchema = z.object({
+  loop: loopSummarySchema,
+});
+export type ReopenLoopResponse = z.infer<typeof reopenLoopResponseSchema>;

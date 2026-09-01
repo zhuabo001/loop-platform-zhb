@@ -107,6 +107,9 @@ export function toLoopSummary(
     cron: row.cron ?? null,
     timezone: row.timezone,
     nextFireAt,
+    // Phase 4 observation fields (goal/completion/task-file sync) are NOT
+    // emitted while Batch 1 keeps them dormant (ADR-009 决策 11) — the
+    // response stays byte-identical to Phase 3.
   };
 }
 

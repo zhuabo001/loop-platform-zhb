@@ -39,6 +39,12 @@ export const pollRequestSchema = z.object({
    *  skip the claim scan. ABSENT (old daemon) ⇒ server keeps Phase 1 batch
    *  claim. A signal, not a security boundary — the server does not validate it. */
   availableSlots: z.union([z.literal(0), z.literal(1)]).optional(),
+  /** Phase 4 capability declaration (ADR-002 修订 / ADR-009): the daemon's
+   *  CURRENT complete capability set — new daemons include
+   *  "terminal-journal-v1". Absent ⇒ no capabilities (treated like an old
+   *  daemon). The server snapshots it verbatim after dedupe+sort; it never
+   *  does version-string comparison. */
+  capabilities: z.array(z.string()).optional(),
 });
 export type PollRequest = z.infer<typeof pollRequestSchema>;
 
@@ -56,6 +62,9 @@ export const deliveryLoopSchema = z.object({
   /** Coding agent to execute with. OPTIONAL on the wire: an old server omits
    *  it and the daemon defaults to claude-code. */
   agent: codingAgentSchema.optional(),
+  /** Phase 4: the loop's normalized goal (null = Open Loop). Only servers
+   *  minting v1 terminal leases send it; old daemons strip it (ADR-009). */
+  goal: z.string().nullable().optional(),
 });
 export type DeliveryLoop = z.infer<typeof deliveryLoopSchema>;
 
@@ -82,10 +91,19 @@ export const deliverySchema = z.object({
   systemPrompt: z.string(),
   /** The full first-user-turn instructions. */
   task: z.string(),
+  /** Phase 4: marks this delivery as terminal-protocol v1 (Journal required,
+   *  terminal command mandatory on success). ABSENT ⇒ Phase 3 semantics; a
+   *  new daemon served by an old server keeps the old behavior and must not
+   *  require the Journal (ADR-009 决策 7). */
+  terminalProtocol: z.literal(1).optional(),
 });
 export type Delivery = z.infer<typeof deliverySchema>;
 
 export const pollResponseSchema = z.object({
   deliveries: z.array(deliverySchema),
+  /** Phase 4 upgrade hint: sent ONLY when this machine has claimable runs but
+   *  lacks the capabilities they require (["terminal-journal-v1"]). Never
+   *  sent on an idle poll (ADR-009 决策 7). */
+  requiredCapabilities: z.array(z.string()).optional(),
 });
 export type PollResponse = z.infer<typeof pollResponseSchema>;

@@ -69,3 +69,18 @@ server 与 daemon 是两个独立部署的进程，唯一耦合点是 HTTP wire 
   只增不减的规则原样保留（方案 A「按当前阶段收缩形状」经评审否决：它会破坏
   镜像纪律、推翻 ADR-003 已接受的全量保留决策，且多数字段两个 phase 内就要
   加回）。
+- 2026-08-30（Phase 4 Batch 1，ADR-009）：两处明确的窄例外，均不改变
+  additive/tolerant-reader 纪律本身：
+  1. **capability 协商是决策 2「无协商」的例外**：Poll 请求新增 additive
+     optional `capabilities`，Poll 响应新增 additive optional
+     `requiredCapabilities`。仍无握手、无版本协商、无 daemon semver 字符串
+     比较——Server 只按 `terminal-journal-v1` 的成员关系决定是否开放
+     Phase 4 语义；缺失 capability 的旧 Daemon 继续按旧语义工作，不被拒绝。
+     这是对「能力开放由应用层 guard 决定」（决策 6）的具体化，不是握手协议。
+  2. **terminal policy 是决策 4「裁剪策略不进 protocol」的窄例外**：
+     `terminal-policy.ts` 子模块（主入口 re-export）承载 Goal/message/reason/
+     state/Task File content/capability 的值策略，因为 terminal 命令契约要求
+     Daemon（本地 Journal 稳定失败报告）与 Server（防御层收口）执行**同一套**
+     规则。普通 server 侧裁剪策略（caps/clipText）仍不进入 protocol 主 schema，
+     也不得在 daemon/server 各复制一套规则。该模块保持纯函数、无 Node 专属
+     依赖，主入口的浏览器可 bundle 性不变。

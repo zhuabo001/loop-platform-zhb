@@ -13,7 +13,8 @@
  */
 import { z } from "zod";
 
-import { RUN_OUTCOMES } from "./enums.js";
+import { RUN_OUTCOMES, RUN_STATUSES } from "./enums.js";
+import { jsonObjectSchema } from "./json.js";
 
 /** The outcome subset a daemon may CLAIM. `error`/`skipped` are server-assigned
  *  (sweep reclaim / supersede), never reportable. */
@@ -55,6 +56,45 @@ export const costReportSchema = z.object({
 });
 export type CostReport = z.infer<typeof costReportSchema>;
 
+// ---- Phase 4 terminal command (ADR-009; dormant until Batch 2 wires it) ----
+
+/** Why a task-file sync failed — the daemon's stable classification set. */
+export const TASK_FILE_SYNC_ERRORS = ["missing", "unreadable", "outside_jail", "changed", "too_large"] as const;
+export type TaskFileSyncError = (typeof TASK_FILE_SYNC_ERRORS)[number];
+export const taskFileSyncErrorSchema = z.enum(TASK_FILE_SYNC_ERRORS);
+
+/** terminal report variant: `new`/`resolved` MUST carry a message (enforced
+ *  by the refinement on `terminalCommandSchema`); `nothing-new` may omit it. */
+export const terminalReportCommandSchema = z.object({
+  kind: z.literal("report"),
+  status: z.enum(RUN_STATUSES),
+  message: z.string().optional(),
+  state: jsonObjectSchema.optional(),
+});
+export type TerminalReportCommand = z.infer<typeof terminalReportCommandSchema>;
+
+/** terminal finish variant: `reason` is REQUIRED (non-empty is policy, not
+ *  schema); message is optional and falls back to the reason server-side. */
+export const terminalFinishCommandSchema = z.object({
+  kind: z.literal("finish"),
+  reason: z.string(),
+  message: z.string().optional(),
+  state: jsonObjectSchema.optional(),
+});
+export type TerminalFinishCommand = z.infer<typeof terminalFinishCommandSchema>;
+
+/** The terminal command a v1 success report must carry: the daemon's Journal
+ *  record, discriminated on `kind`. `state` (top-level JSON object, shape
+ *  only — value policy lives in terminal-policy.ts) rides either variant. */
+export const terminalCommandSchema = z
+  .union([terminalReportCommandSchema, terminalFinishCommandSchema])
+  .superRefine((cmd, ctx) => {
+    if (cmd.kind === "report" && cmd.status !== "nothing-new" && cmd.message === undefined) {
+      ctx.addIssue({ code: "custom", message: "message is required for new/resolved", path: ["message"] });
+    }
+  });
+export type TerminalCommand = z.infer<typeof terminalCommandSchema>;
+
 export const reportRequestSchema = z.object({
   /** Echo only — the lease resolved from the Bearer token is authoritative. */
   runId: z.string().optional(),
@@ -71,8 +111,17 @@ export const reportRequestSchema = z.object({
   durationMs: z.number().int().nonnegative().optional(),
   /** Agent session id on the machine (locates the local transcript). */
   sessionId: z.string().optional(),
-  /** Latest content of the loop's task file (durable context+log doc). */
+  /** Latest content of the loop's task file (durable context+log doc). Phase 4
+   *  reinterprets it for v1 reports: with `terminal` present it is THE task
+   *  file sync result — exactly one of content / `taskFileSyncError`
+   *  (terminal-policy.ts). */
   taskFileContent: z.string().optional(),
+  /** Why the task-file sync failed (v1 reports; mutually exclusive with
+   *  `taskFileContent` — enforced by policy, not schema). */
+  taskFileSyncError: taskFileSyncErrorSchema.optional(),
+  /** Phase 4 terminal command (ADR-009). Authoritative ONLY for leases minted
+   *  with terminalProtocolVersion=1; a v0 lease ignores it entirely. */
+  terminal: terminalCommandSchema.optional(),
   artifacts: z.array(runArtifactSchema).optional(),
   transcript: z.array(transcriptStepSchema).optional(),
   cost: costReportSchema.optional(),
