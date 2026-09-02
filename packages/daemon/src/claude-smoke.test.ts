@@ -2,8 +2,10 @@
  * OPT-IN real-Claude sandbox smoke (Phase 2 batch 3, plan Day 5) — the manual
  * acceptance gate before the production switch, NOT part of the default
  * offline suite. It runs the REAL `claude` binary (the developer's own
- * authentication, forwarded by the env whitelist) through the production
- * adapter and asserts on FILESYSTEM EVIDENCE, never on the model's wording:
+ * authentication — explicit env vars plus the user-level provider settings
+ * converged by the SAME startup provider bootstrap the daemon CLI runs,
+ * `resolveClaudeProviderEnv`) through the production adapter and asserts on
+ * FILESYSTEM EVIDENCE, never on the model's wording:
  *
  *   1. IN-ROOT read/write succeeds (the sandbox permits what the roots allow);
  *   2. reading an outside-roots sentinel THROUGH AN IN-ROOT SYMLINK never
@@ -45,6 +47,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
+import { resolveClaudeProviderEnv } from "./claude-provider-env.js";
 import { createClaudeRunner } from "./claude-runner.js";
 import { createClaudeStreamParser } from "./claude-stream.js";
 import { createWorkdirJail, type WorkdirJail } from "./jail.js";
@@ -93,7 +96,9 @@ describe.skipIf(!SMOKE)("real Claude sandbox smoke (opt-in)", () => {
       jail,
       claudeBin: process.env.LOOPZHB_CLAUDE_BIN ?? "claude",
       timeoutMs: TIMEOUT_MS,
-      envSource: process.env,
+      // The SAME provider bootstrap the daemon CLI runs at startup: explicit
+      // env wins, the user-level settings only fill what it lacks.
+      envSource: resolveClaudeProviderEnv(process.env),
       // Test-only duplicate parser: production still exposes semantic labels,
       // while the smoke binds filesystem evidence to the exact Bash input
       // emitted by the real CLI.

@@ -1,22 +1,33 @@
 /**
  * THE daemon composition root (plan §1/§4): validated config → startup jail →
- * Claude CLI probe → Machine client → Claude Runner → runtime foreground
- * loop, with ONE AbortController fanning SIGINT/SIGTERM out to the poll
- * sleep, in-flight HTTP and report retries. The core never calls
- * process.exit: a clean signal shutdown returns from run() (exit 0); config
- * failure, a failed startup jail/probe, or a protocol-fatal poll/report
- * rejects main() and the direct-run wrapper exits non-zero.
+ * Claude CLI probe → provider env bootstrap → Machine client → Claude Runner
+ * → runtime foreground loop, with ONE AbortController fanning SIGINT/SIGTERM
+ * out to the poll sleep, in-flight HTTP and report retries. The core never
+ * calls process.exit: a clean signal shutdown returns from run() (exit 0);
+ * config failure, a failed startup jail/probe/provider bootstrap, or a
+ * protocol-fatal poll/report rejects main() and the direct-run wrapper exits
+ * non-zero.
  *
  * Batch 3 ordering contract (plan §2.2): the jail and the Claude probe run
  * BEFORE the HTTP client exists — a daemon that cannot isolate or cannot run
  * Claude never talks to the server (fail-closed). The probe therefore
  * provably happens before the first poll.
+ *
+ * Provider bootstrap (Issue #38 fix): the runner spawns Claude with
+ * `--setting-sources ""`, so Claude cannot see the user-level provider
+ * configuration itself. `resolveClaudeProviderEnv` converges exactly the
+ * allow-listed provider/TLS/proxy fields of `<configDir>/settings.json` into
+ * the runner's env source — after the (credential-free, raw-env) probe,
+ * before the runner is constructed. Settings-derived values then ride the
+ * existing buildAgentEnv allow-list + collectSecretValues + redactSecrets
+ * pipeline; explicit launch-env values always win.
  */
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { createMachineClient } from "./client.js";
+import { resolveClaudeProviderEnv } from "./claude-provider-env.js";
 import { createClaudeRunner, type ClaudeRunnerDeps } from "./claude-runner.js";
 import { loadDaemonConfig, type DaemonConfig } from "./config.js";
 import { createControlRoot, releaseControlRoot, type ControlRoot } from "./control-root.js";
@@ -65,6 +76,10 @@ export interface PrepareDaemonOptions {
   onControlRoot?: (root: ControlRoot) => void;
   /** Opt-in lifecycle observer for the owned per-start scratch root. */
   onJail?: (jail: WorkdirJail) => void;
+  /** TEST-ONLY seam: observes the provider-bootstrapped env handed to the
+   *  production runner. Production call sites never set it — the merged env
+   *  carries settings-derived credentials and stays inside the composition. */
+  onRunnerEnvSource?: (envSource: NodeJS.ProcessEnv) => void;
 }
 
 async function releasePerStartResources(
@@ -90,6 +105,17 @@ export async function prepareDaemon(
     options.onControlRoot?.(controlRoot);
     const probe = await probeClaudeBinary(config.claudeBin, envSource);
     options.onClaudeProbe?.(probe);
+    // Provider bootstrap (plan `codex-fix-claude-runner-plan` §4, Issue #38):
+    // the runner spawns Claude with `--setting-sources ""`, so Claude never
+    // loads the user-level settings itself — converge the allow-listed
+    // provider/TLS/proxy fields from that settings file into the env ONCE,
+    // here, after the probe and before the runner exists. The probe above
+    // deliberately ran on the RAW envSource: its env is credential-free
+    // (buildProbeEnv) and unchanged by this bootstrap. A bootstrap failure
+    // propagates into the catch below — per-start roots released, no poll
+    // loop ever created.
+    const runnerEnvSource = resolveClaudeProviderEnv(envSource);
+    options.onRunnerEnvSource?.(runnerEnvSource);
     const client = createMachineClient({
       baseUrl: config.serverUrl,
       machineCredential: config.machineCredential,
@@ -100,7 +126,7 @@ export async function prepareDaemon(
         jail,
         claudeBin: config.claudeBin,
         timeoutMs: config.agentTimeoutMs,
-        envSource,
+        envSource: runnerEnvSource,
         controlRoot,
         // The probe-pinned binary identity: every run re-verifies it before
         // spawning (round-1 review P1).

@@ -24,8 +24,9 @@
  *  - Completed guards: Run Now and schedule re-enable both meet the coded
  *    409 `loop_completed`;
  *  - RunLease consumed; a sticky streaming observer scans the daemon's
- *    complete stdout/stderr lifecycle for the machine credential (and the
- *    provider key, when present in the environment);
+ *    complete stdout/stderr lifecycle for the machine credential and EVERY
+ *    provider secret the daemon's startup bootstrap converges (explicit env
+ *    plus the user-level Claude settings);
  *  - the daemon and every observed Claude process group close on SIGTERM
  *    (exit 0, SIGKILL fallback).
  *
@@ -46,6 +47,7 @@ import { serve, type ServerType } from "@hono/node-server";
 import { eq } from "drizzle-orm";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { collectSecretValues, resolveClaudeProviderEnv } from "@loopzhb/daemon";
 import {
   createLoopResponseSchema,
   LOOP_COMPLETED_CODE,
@@ -153,7 +155,12 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 2 real Claude E2E (opt-in)", () => {
       // 3. The production daemon CLI against the REAL claude binary; the
       //    daemon's own probe reports the provenance this test approves.
       const claudeBin = process.env.LOOPZHB_CLAUDE_BIN?.trim() || "claude";
-      const secrets = [TOKEN, process.env.ANTHROPIC_API_KEY ?? ""].filter((s) => s.length > 0);
+      // Scan for every credential the daemon could hold: the machine
+      // credential plus the COMPLETE provider secret set its own startup
+      // bootstrap converges (explicit env + the user-level Claude settings).
+      // The values are never logged here — the observer only reports whether
+      // any needle was seen.
+      const secrets = [TOKEN, ...collectSecretValues(resolveClaudeProviderEnv(process.env))];
       const daemon = spawn(process.execPath, [path.join(__dirname, "../../daemon/dist/cli.js")], {
         env: {
           ...process.env,

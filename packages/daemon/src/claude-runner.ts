@@ -18,7 +18,12 @@
  *    fail, never degrade;
  *  - user/project/local settings sources are disabled (`--setting-sources
  *    ""`, `--safe-mode`), hooks and memory are off, permission mode is
- *    pinned to `dontAsk` (never bypass);
+ *    pinned to `dontAsk` (never bypass). Claude therefore NEVER reads the
+ *    user-level settings at runtime — the provider endpoint/token/model it
+ *    needs arrive as plain environment variables, converged ONCE at daemon
+ *    startup by resolveClaudeProviderEnv (claude-provider-env.ts, Issue #38)
+ *    and forwarded through the buildAgentEnv allow-list below. The runner
+ *    itself performs no settings or credential resolution;
  *  - child-controlled progress text is discarded in favor of fixed semantic
  *    labels; terminal child text (finalText, error narrative, session id) is
  *    redacted with env secrets AND the run token before report/runtime;

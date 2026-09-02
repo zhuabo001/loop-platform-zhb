@@ -24,6 +24,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { Delivery } from "@loopzhb/protocol";
 
+import { resolveClaudeProviderEnv } from "./claude-provider-env.js";
 import { createClaudeRunner, type ClaudeRunnerDeps } from "./claude-runner.js";
 import { createControlRoot, type ControlRoot } from "./control-root.js";
 import { JailError, createWorkdirJail, type ResolvedWorkdir, type WorkdirJail } from "./jail.js";
@@ -156,6 +157,84 @@ describe("A1–A3: the fixed argv and the dynamic sandbox settings", () => {
     expect(events).toHaveLength(2);
     expect(events[0]).toMatchObject({ kind: "started" });
     expect(events[1]).toEqual({ kind: "closed", pgid: events[0]!.pgid });
+  });
+
+  it("A1c: settings sources stay DISABLED — the provider bootstrap never reopens them", async () => {
+    // The Issue #38 fix converges provider config into env vars; it must NOT
+    // relax the runtime isolation. The A1 golden pins the exact argv; this
+    // pin names the regression directly: --setting-sources is always the
+    // empty string, never user/project/local.
+    const configDir = path.join(base, "claude-config");
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(
+      path.join(configDir, "settings.json"),
+      JSON.stringify({ env: { ANTHROPIC_API_KEY: "sk-ant-a1c-settings" } }),
+    );
+    const envSource = resolveClaudeProviderEnv({ ...ENV_SOURCE, CLAUDE_CONFIG_DIR: configDir });
+    const { run } = makeRunner({ envSource });
+    const report = await run(makeDelivery());
+    expect(report.ok).toBe(true);
+
+    const argv = readSidecar().argv;
+    expect(argv[argv.indexOf("--setting-sources") + 1]).toBe("");
+    expect(argv).toContain("--safe-mode");
+    for (const forbidden of ["user", "project", "local"]) {
+      expect(argv[argv.indexOf("--setting-sources") + 1]).not.toBe(forbidden);
+    }
+    // No credential or settings JSON rides argv either (plan §2 boundary 5).
+    expect(argv.join("\n")).not.toContain("sk-ant-a1c-settings");
+  });
+
+  it("A1d: bootstrap-resolved provider env reaches the child — allowed settings fields in, refused fields out", async () => {
+    // The deterministic integration of plan §6 step 5: temp CLAUDE_CONFIG_DIR
+    // fixture → resolveClaudeProviderEnv → runner → fake-claude sidecar env.
+    const configDir = path.join(base, "claude-config");
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(
+      path.join(configDir, "settings.json"),
+      JSON.stringify({
+        env: {
+          ANTHROPIC_API_KEY: "sk-ant-a1d-settings-secret",
+          CLAUDE_CODE_OAUTH_TOKEN: "oauth-a1d-settings",
+          GITHUB_TOKEN: "ghp-a1d-settings-decoy",
+          LOOPZHB_SERVER_URL: "http://a1d-evil.example",
+        },
+      }),
+    );
+    const envSource = resolveClaudeProviderEnv({
+      PATH: ENV_SOURCE.PATH,
+      HOME: ENV_SOURCE.HOME,
+      CLAUDE_CONFIG_DIR: configDir,
+      LOOPZHB_MACHINE_CREDENTIAL: ENV_SOURCE.LOOPZHB_MACHINE_CREDENTIAL,
+    });
+    const { run } = makeRunner({ envSource });
+    const report = await run(makeDelivery());
+    expect(report.ok).toBe(true);
+
+    const sidecar = readSidecar();
+    expect(sidecar.env.ANTHROPIC_API_KEY).toBe("sk-ant-a1d-settings-secret");
+    expect(sidecar.env.CLAUDE_CODE_OAUTH_TOKEN).toBe("oauth-a1d-settings");
+    expect(sidecar.env.GITHUB_TOKEN).toBeNull();
+    expect(sidecar.env.LOOPZHB_MACHINE_CREDENTIAL).toBeNull();
+  });
+
+  it("A1e: a settings-derived secret is redacted out of report-bound child text", async () => {
+    // echo-secret embeds $ANTHROPIC_API_KEY in the terminal text: the value
+    // came from the settings fixture, NOT the launch env — proof that
+    // bootstrap-injected credentials are inside the secretValues net.
+    const settingsSecret = "sk-ant-a1e-settings-secret";
+    const configDir = path.join(base, "claude-config");
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(path.join(configDir, "settings.json"), JSON.stringify({ env: { ANTHROPIC_API_KEY: settingsSecret } }));
+    const envSource = resolveClaudeProviderEnv({
+      PATH: ENV_SOURCE.PATH,
+      HOME: ENV_SOURCE.HOME,
+      CLAUDE_CONFIG_DIR: configDir,
+    });
+    const { run } = makeRunner({ envSource });
+    const report = await run(makeDelivery({ task: "fake-claude://echo-secret" }));
+    expect(report.ok).toBe(true);
+    expect(report.finalText).not.toContain(settingsSecret);
   });
 
   it("A2: --model and --append-system-prompt append only when configured", async () => {

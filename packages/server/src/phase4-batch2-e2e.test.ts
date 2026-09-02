@@ -153,12 +153,18 @@ describe("Phase 4 Batch 2 deterministic E2E: production daemon + fake Claude, tw
       // 3. The production daemon CLI with the fake Claude binary. The
       //    per-start control root is discovered by glob diff (the daemon
       //    mints it inside the inherited TMPDIR before the first poll).
+      //    CLAUDE_CONFIG_DIR is pinned to an EMPTY temp fixture: a
+      //    deterministic test must never read the developer's real
+      //    ~/.claude/settings.json through the daemon's provider bootstrap
+      //    (plan `codex-fix-claude-runner-plan` §5.5).
       const controlRootsBefore = new Set(
         readdirSync(tmpdir()).filter((n) => n.startsWith("loopzhb-control-")),
       );
       const scratchRootsBefore = new Set(
         readdirSync(tmpdir()).filter((n) => n.startsWith("loopzhb-runs-")),
       );
+      const fakeClaudeConfigDir = await mkdtemp(path.join(tmpdir(), `loopzhb-b2e2e-claude-config-${process.pid}-`));
+      tempDirs.push(fakeClaudeConfigDir);
       const fakeClaude = path.join(__dirname, "../../daemon/test-fixtures/fake-claude.mjs");
       const daemon = spawn(process.execPath, [path.join(__dirname, "../../daemon/dist/cli.js")], {
         env: {
@@ -170,6 +176,7 @@ describe("Phase 4 Batch 2 deterministic E2E: production daemon + fake Claude, tw
           LOOPZHB_POLL_MS: "500",
           LOOPZHB_REAL_CLAUDE_E2E: "1",
           ANTHROPIC_API_KEY: FAKE_PROVIDER_KEY,
+          CLAUDE_CONFIG_DIR: fakeClaudeConfigDir,
           NODE_ENV: "production",
         },
         shell: false,
