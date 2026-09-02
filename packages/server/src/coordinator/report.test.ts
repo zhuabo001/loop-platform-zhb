@@ -59,10 +59,12 @@ async function fresh(depsOverrides: Parameters<typeof testDeps>[2] = {}): Promis
   coordinator = createRunCoordinator(testDeps(db, clock, depsOverrides));
 }
 
-/** Seed a pending exec run on this machine and claim it through a real poll. */
+/** Seed a pending exec run on this machine and claim it through a real poll
+ *  (Phase 4: the poll declares terminal-journal-v1, so the claim mints a v1
+ *  lease and the report below exercises the v1 branch). */
 async function claimViaPoll(runId: string): Promise<Delivery> {
   await seedRun(db, { id: runId, machineId });
-  const { deliveries } = await coordinator.poll(TOKEN, {});
+  const { deliveries } = await coordinator.poll(TOKEN, { capabilities: ["terminal-journal-v1"] });
   expect(deliveries).toHaveLength(1);
   return deliveries[0]!;
 }
@@ -102,9 +104,10 @@ describe("report: T3 effect-idempotent finalize", () => {
 
     const result = await coordinator.report(delivery.runToken, {
       ok: true,
-      message: "shipped the fix",
       durationMs: 1234,
       sessionId: "sess-abc",
+      terminal: { kind: "report", status: "resolved", message: "shipped the fix" },
+      taskFileContent: "spec v2",
     });
     expect(result).toEqual({ ok: true });
 

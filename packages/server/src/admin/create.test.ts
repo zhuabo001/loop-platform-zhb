@@ -63,7 +63,13 @@ describe("createLoop", () => {
       cron: null,
       timezone: "UTC",
       nextFireAt: null,
-      // Phase 4 fields stay absent while dormant.
+      // Phase 4 observation fields are ALWAYS emitted (Batch 2 opened them).
+      goal: null,
+      completedAt: null,
+      completionReason: null,
+      taskFileSyncedAt: null,
+      taskFileSyncAttemptedAt: null,
+      taskFileSyncError: null,
     });
 
     const rows = await snapshotLoops(db);
@@ -84,17 +90,47 @@ describe("createLoop", () => {
     expect(await snapshotRuns(db)).toEqual([]);
   });
 
-  it("defaults omitted optional fields to null", async () => {
+  it("defaults omitted optional fields to null (goal omitted → Open Loop)", async () => {
     await seeded();
-    const result = await admin.createLoop({ machineId: "m-0123456789abcdef" });
+    const result = await admin.createLoop({ machineId: "m-0123456789abcdef", taskFile: "/home/dev/TASK.md" });
     expect(result.created).toBe(true);
     if (!result.created) return;
-    expect(result.loop).toMatchObject({ name: null, workdir: null, taskFile: null, lastRun: null });
+    expect(result.loop).toMatchObject({ name: null, workdir: null, goal: null, lastRun: null });
+  });
+
+  it("Phase 4: a missing taskFile is a 400-class rejection with zero writes (application-layer requirement)", async () => {
+    await seeded();
+    await expect(admin.createLoop({ machineId: "m-0123456789abcdef" })).rejects.toMatchObject({
+      name: "LoopValidationError",
+      field: "taskFile",
+    });
+    expect(await snapshotLoops(db)).toEqual([]);
+  });
+
+  it("Phase 4: the goal is normalized (trim) and validated; invalid goals reject with zero writes", async () => {
+    await seeded();
+    const ok = await admin.createLoop({
+      machineId: "m-0123456789abcdef",
+      taskFile: "/home/dev/TASK.md",
+      goal: "  ship the migration  ",
+    });
+    expect(ok.created).toBe(true);
+    if (ok.created) expect(ok.loop.goal).toBe("ship the migration");
+    const [row] = await snapshotLoops(db);
+    expect(row.goal).toBe("ship the migration");
+    expect(row.goalRevision).toBe(0);
+
+    for (const goal of ["   ", "two\nlines", "g".repeat(2001)]) {
+      await expect(
+        admin.createLoop({ machineId: "m-0123456789abcdef", taskFile: "/home/dev/TASK.md", goal }),
+      ).rejects.toMatchObject({ name: "LoopValidationError", field: "goal" });
+    }
+    expect(await snapshotLoops(db)).toHaveLength(1);
   });
 
   it("returns machine_not_found with zero writes for an unregistered (well-shaped) machine", async () => {
     await seeded();
-    const result = await admin.createLoop({ machineId: "m-ffffffffffffffff" });
+    const result = await admin.createLoop({ machineId: "m-ffffffffffffffff", taskFile: "/home/dev/TASK.md" });
     expect(result).toEqual({ created: false, reason: "machine_not_found" });
     expect(await snapshotLoops(db)).toEqual([]);
   });
@@ -112,7 +148,11 @@ describe("createLoop", () => {
     for (const field of ["name", "workdir", "taskFile"] as const) {
       const cap = field === "name" ? LOOP_NAME_CAP : LOOP_PATH_CAP;
       await expect(
-        admin.createLoop({ machineId: "m-0123456789abcdef", [field]: "x".repeat(cap + 1) }),
+        admin.createLoop({
+          machineId: "m-0123456789abcdef",
+          taskFile: "/home/dev/TASK.md",
+          [field]: "x".repeat(cap + 1),
+        }),
       ).rejects.toBeInstanceOf(LoopValidationError);
     }
     // Only the at-cap loop exists.
@@ -122,7 +162,11 @@ describe("createLoop", () => {
   it("checks caps BEFORE the machine lookup — an invalid body is a 400 even for an unknown machine", async () => {
     await seeded();
     await expect(
-      admin.createLoop({ machineId: "m-ffffffffffffffff", name: "n".repeat(LOOP_NAME_CAP + 1) }),
+      admin.createLoop({
+        machineId: "m-ffffffffffffffff",
+        taskFile: "/home/dev/TASK.md",
+        name: "n".repeat(LOOP_NAME_CAP + 1),
+      }),
     ).rejects.toBeInstanceOf(LoopValidationError);
     expect(await snapshotLoops(db)).toEqual([]);
   });

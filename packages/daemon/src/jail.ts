@@ -47,6 +47,9 @@ export interface ResolvedWorkdir {
 export interface WorkdirJail {
   /** Canonicalized (realpath'd, deduped) daemon roots — the intersection input. */
   readonly daemonRoots: readonly string[];
+  /** The owned, unpredictable per-start scratch root. Exposed for lifecycle
+   * observability only; callers must release it through dispose(). */
+  readonly scratchRoot: string;
   resolve(input: ResolveWorkdirInput): Promise<ResolvedWorkdir>;
   /** Pre-spawn re-validation (batch 3, plan §2.2): re-realpath/lstat the cwd
    *  and every effective root and confirm nothing was renamed, deleted or
@@ -55,6 +58,9 @@ export interface WorkdirJail {
    *  TOCTOU window; the OS sandbox remains the runtime boundary. */
   revalidate(resolved: ResolvedWorkdir): Promise<void>;
   release(resolved: ResolvedWorkdir): Promise<void>;
+  /** Owner-level shutdown cleanup. Idempotent for an already-disposed root,
+   * but fail-closed if the path was replaced. */
+  dispose(): Promise<void>;
 }
 
 /** Canonicalize a root set: every root must be an absolute, `..`-free path to
@@ -85,8 +91,10 @@ async function canonicalizeRoots(roots: string[], label: string): Promise<string
 }
 
 /** path.relative() boundary test — NEVER a string-prefix check, which would
- *  confuse "/foo" with "/foobar". Equal counts as within. */
-function isWithinOrEqual(parent: string, child: string): boolean {
+ *  confuse "/foo" with "/foobar". Equal counts as within. Exported for the
+ *  Phase 4 task-file resolver, which applies the same canonical-containment
+ *  discipline to the task file target. */
+export function isWithinOrEqual(parent: string, child: string): boolean {
   const rel = path.relative(parent, child);
   return rel === "" || (rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
 }
@@ -123,15 +131,22 @@ export async function createWorkdirJail(config: {
   const scratchBase = await fs.realpath(config.scratchBase);
   // The scratch ROOT is minted per jail (≈ per daemon start): unpredictable
   // mkdtemp name, 0700 — it cannot collide, be pre-occupied, or be swapped
-  // ahead of time. Stale roots from earlier starts are accepted tmp residue
-  // (the OS janitor reaps them); runs never write into a previous start's
-  // root.
+  // ahead of time. Owner shutdown disposes this root; only an uncatchable
+  // process/host crash can leave tmp residue for the OS janitor. Runs never
+  // write into a previous start's root.
   const scratchRoot = await fs.mkdtemp(path.join(scratchBase, "loopzhb-runs-"));
-  await fs.chmod(scratchRoot, 0o700);
+  try {
+    await fs.chmod(scratchRoot, 0o700);
+  } catch (err) {
+    await fs.rm(scratchRoot, { recursive: true, force: true }).catch(() => {});
+    throw err;
+  }
   /** Every scratch dir THIS jail minted — release() deletes nothing else. */
   const mintedScratch = new Set<string>();
+  let disposed = false;
   return {
     daemonRoots,
+    scratchRoot,
     async resolve(input: ResolveWorkdirInput): Promise<ResolvedWorkdir> {
       const narrowed = input.serverRoots.length > 0;
       const serverRoots = narrowed ? await canonicalizeRoots(input.serverRoots, "server root") : [];
@@ -228,6 +243,29 @@ export async function createWorkdirJail(config: {
       await assertScratchIdentity(dir, "before release");
       await fs.rm(dir, { recursive: true });
       mintedScratch.delete(dir);
+    },
+    async dispose(): Promise<void> {
+      if (disposed) return;
+      if (path.dirname(scratchRoot) !== scratchBase || !path.basename(scratchRoot).startsWith("loopzhb-runs-")) {
+        throw new JailError(`scratch root identity mismatch: ${JSON.stringify(scratchRoot)}`);
+      }
+      let stat;
+      try {
+        stat = await fs.lstat(scratchRoot);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+          mintedScratch.clear();
+          disposed = true;
+          return;
+        }
+        throw err;
+      }
+      if (stat.isSymbolicLink() || !stat.isDirectory()) {
+        throw new JailError(`scratch root was replaced before dispose: ${JSON.stringify(scratchRoot)}`);
+      }
+      await fs.rm(scratchRoot, { recursive: true });
+      mintedScratch.clear();
+      disposed = true;
     },
   };
 

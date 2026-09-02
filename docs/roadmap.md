@@ -173,6 +173,18 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
 |---|
 | 连续 run 能读到前次状态；closed 达标即停；Dashboard 只读 + 一个按钮，不做花活 |
 
+### 状态
+
+- **Batch 1 — Schema、Protocol 与领域基础：已完成**（2026-08-31，`main@6af3b29`，ADR-009）
+  - loops/runs/leases 的 Phase 4 字段与 CHECK、terminal command wire、goal/task-file/state 列、领域 planner 纯函数。
+  - 复审发现登记为 `phase-4` Issues #33/#36（核销状态以 Issue 为准）。
+- **Batch 2 — Task File、State 与 Finish 全链路：确定性验收完成，真实 Claude 门待执行**（分支 `feat/phase4-batch2-dev`，ADR-009 修订记录 2026-09-01/02；证据 `docs/tests/phase4-acceptance.md`）
+  - Daemon：0700 控制根 + 静态无 secret `loopzhb` wrapper（严格 report/finish 文法、`open(wx,0600)` 单条 journal、双层脱敏）；每 Run 控制目录（只读 prev-state + outbox）；Task File 解析/jail/漂移重验/Run 后同步快照；v1 prompt 由 Daemon 构建（v0 golden 字节不变）。
+  - Server：capability 快照与门控（`terminal-journal-v1`）、claim 事务权威 Loop 快照 mint v1 Lease、最终 Report 单事务分支表（stale_goal/迟到冻结/wake finish）、Finish 取消 pending 保留 running、Reopen 旧代际撤销、Completed 全部守卫（claim/cron/catch-up/Run Now/schedule enable/goal）。
+  - 首轮/第二轮 code review 发现已全部修复；第三轮 Standards/Spec/Adversarial 确定性三轨 **PASS**，Issues #39–#47 已核销关闭。修复含 `loops.revision` OCC additive 列、双向真实交错、no-follow 有界读取、encoding-aware 秘密边界、control/scratch root 生命周期与 HTTP 窄接口收口；全量确定性质量门全绿。
+  - **当前收口阻塞**：[Issue #49](https://github.com/zhuabo001/loop-platform-zhb/issues/49) 自包含 wrapper/固定 Node capability 修复与真实 smoke；其后解除 [Issue #38](https://github.com/zhuabo001/loop-platform-zhb/issues/38) 阻塞并执行真实 Claude E2E 门（需有效认证、明确接受模型费用并记录固定 commit/hash/version/命令/结果）。
+- **Batch 3 — 最小 Dashboard 与阶段收口：未开始**（scope 见 `docs/plan/codex-phase4-dev-roadmap.md`）。
+
 ## Phase 5 — 存储与协作（第 9–14 周）
 
 按依赖顺序，每层独立可验：

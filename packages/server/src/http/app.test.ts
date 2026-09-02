@@ -16,10 +16,13 @@ import {
   cancelRunResponseSchema,
   createLoopResponseSchema,
   deliverySchema,
+  LOOP_COMPLETED_CODE,
+  LOOP_NOT_COMPLETED_CODE,
   loopListResponseSchema,
   machineListResponseSchema,
   pollResponseSchema,
   reportResponseSchema,
+  RUN_CAPABILITY_INVALID_CODE,
   runListResponseSchema,
   triggerRunResponseSchema,
 } from "@loopzhb/protocol";
@@ -27,6 +30,12 @@ import { sha256 } from "@loopzhb/protocol/node";
 import { eq } from "drizzle-orm";
 
 import { createLoopAdmin, type LoopAdmin } from "../admin/index.js";
+import { createLifecycleAdmin } from "../loop-lifecycle/admin.js";
+import { LoopValidationError } from "../admin/errors.js";
+import { InvalidMachineCredentialError, RunCapabilityInvalidError } from "../coordinator/errors.js";
+import { ScheduleRevisionExhaustedError, ScheduleValidationError, createScheduleAdmin, type ScheduleAdmin } from "../schedule/index.js";
+import { CapabilityDeclarationInvalidError } from "../store/machines.js";
+import type { LifecycleAdmin } from "../loop-lifecycle/admin.js";
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
 import { machines } from "../db/schema.js";
 import { createOwnerControl, type OwnerControl } from "../owner/index.js";
@@ -68,7 +77,7 @@ async function fresh(): Promise<void> {
   let loopN = 0;
   admin = createLoopAdmin({ db, clock, newLoopId: () => `loop-${++loopN}` });
   ownerControl = createOwnerControl({ db, clock });
-  app = createServerApp(coordinator, admin, ownerControl, db, clock);
+  app = createServerApp(coordinator, admin, createLifecycleAdmin({ db, clock }), createScheduleAdmin({ db, clock }), ownerControl);
 }
 
 async function pollReq(body: unknown = {}, token: string | null = TOKEN): Promise<Response> {
@@ -130,7 +139,7 @@ async function expectJsonError(res: Response, status: number, body: { error: str
 describe("createServerApp: seam properties", () => {
   it("returns an independent app per call and constructs with no DB/env/listener side effects", async () => {
     await fresh();
-    const other = createServerApp(coordinator, admin, ownerControl, db, clock);
+    const other = createServerApp(coordinator, admin, createLifecycleAdmin({ db, clock }), createScheduleAdmin({ db, clock }), ownerControl);
     expect(other).not.toBe(app);
     // Both serve independently.
     expect((await app.request("/api/machine/poll", { method: "GET" })).status).toBe(404);
@@ -155,7 +164,7 @@ describe("POST /api/machine/poll", () => {
     await seedLoop(db, { id: "loop-1", taskFile: "/srv/loop/README.md" });
     await seedRun(db, { id: "run-1", machineId });
 
-    const res = await pollReq();
+    const res = await pollReq({ capabilities: ["terminal-journal-v1"] });
     expect(res.status).toBe(200);
     const json = pollResponseSchema.parse(await res.json());
     expect(json.deliveries).toHaveLength(1);
@@ -207,10 +216,21 @@ describe("POST /api/machine/report", () => {
     const machineId = await seedMachineForToken(db, TOKEN);
     await seedLoop(db, { id: "loop-1" });
     await seedRun(db, { id: "run-1", machineId });
-    const pollJson = pollResponseSchema.parse(await (await pollReq()).json());
+    const pollJson = pollResponseSchema.parse(
+      await (await pollReq({ capabilities: ["terminal-journal-v1"] })).json(),
+    );
     const runToken = pollJson.deliveries[0]!.runToken;
 
-    const res = await reportReq({ ok: true, message: "done" }, runToken);
+    // The claim minted a v1 lease: the success report carries the terminal
+    // command and exactly one task-file sync result (ADR-009 决策 7).
+    const res = await reportReq(
+      {
+        ok: true,
+        terminal: { kind: "report", status: "resolved", message: "done" },
+        taskFileSyncError: "missing",
+      },
+      runToken,
+    );
     expect(res.status).toBe(200);
     const json = await res.json();
     expect(json).toEqual({ ok: true });
@@ -261,6 +281,7 @@ describe("POST /api/loops", () => {
       machineId: MACHINE_ID,
       name: "react-doctor",
       workdir: "/home/dev/project",
+      taskFile: "/home/dev/project/TASK.md",
     });
     expect(res.status).toBe(201);
     const json = await res.json();
@@ -271,7 +292,7 @@ describe("POST /api/loops", () => {
         machineId: MACHINE_ID,
         name: "react-doctor",
         workdir: "/home/dev/project",
-        taskFile: null,
+        taskFile: "/home/dev/project/TASK.md",
         agent: "claude-code",
         allowControl: true,
         enabled: true,
@@ -281,6 +302,13 @@ describe("POST /api/loops", () => {
         cron: null,
         timezone: "UTC",
         nextFireAt: null,
+        // Phase 4 observation fields are always emitted (Batch 2 opened them).
+        goal: null,
+        completedAt: null,
+        completionReason: null,
+        taskFileSyncedAt: null,
+        taskFileSyncAttemptedAt: null,
+        taskFileSyncError: null,
       },
     });
     expect(await snapshotLoops(db)).toHaveLength(1);
@@ -290,7 +318,7 @@ describe("POST /api/loops", () => {
 
   it("404 + zero writes for a well-shaped but unregistered machine", async () => {
     await fresh();
-    const res = await createLoopReq({ machineId: "m-ffffffffffffffff" });
+    const res = await createLoopReq({ machineId: "m-ffffffffffffffff", taskFile: "/home/dev/TASK.md" });
     await expectJsonError(res, 404, { error: "not found" });
     expect(await snapshotLoops(db)).toEqual([]);
   });
@@ -309,6 +337,7 @@ describe("POST /api/loops", () => {
     const bad = [
       { machineId: "m-UPPERCASED789AB" }, // not m-<16 lowercase hex>
       { machineId: "" },
+      { machineId: MACHINE_ID }, // Phase 4: taskFile is application-layer required
       { machineId: MACHINE_ID, name: "" },
       { machineId: MACHINE_ID, name: "a\0b" },
       { machineId: MACHINE_ID, workdir: "\0" },
@@ -327,6 +356,7 @@ describe("POST /api/loops", () => {
     await seedMachine(db, MACHINE_ID);
     const res = await createLoopReq({
       machineId: MACHINE_ID,
+      taskFile: "/home/dev/TASK.md",
       workflow: "return true",
       model: "claude-opus",
       agent: "codex",
@@ -344,7 +374,7 @@ describe("POST /api/loops", () => {
   it("413 over the shared 2 MiB body cap", async () => {
     await fresh();
     await seedMachine(db, MACHINE_ID);
-    const res = await createLoopReq({ machineId: MACHINE_ID, name: "x".repeat(2 * 1024 * 1024) });
+    const res = await createLoopReq({ machineId: MACHINE_ID, taskFile: "/t", name: "x".repeat(2 * 1024 * 1024) });
     await expectJsonError(res, 413, { error: "request body too large" });
     expect(await snapshotLoops(db)).toEqual([]);
   });
@@ -353,10 +383,10 @@ describe("POST /api/loops", () => {
     await fresh();
     await seedMachine(db, MACHINE_ID);
     const bad = [
-      { machineId: MACHINE_ID, cron: "not a cron" },
-      { machineId: MACHINE_ID, cron: "@daily" }, // macros rejected
-      { machineId: MACHINE_ID, cron: "0 10 * * * *" }, // six segments rejected
-      { machineId: MACHINE_ID, cron: "61 10 * * *" }, // out-of-range minute
+      { machineId: MACHINE_ID, taskFile: "/t", cron: "not a cron" },
+      { machineId: MACHINE_ID, taskFile: "/t", cron: "@daily" }, // macros rejected
+      { machineId: MACHINE_ID, taskFile: "/t", cron: "0 10 * * * *" }, // six segments rejected
+      { machineId: MACHINE_ID, taskFile: "/t", cron: "61 10 * * *" }, // out-of-range minute
     ];
     for (const body of bad) {
       await expectJsonError(await createLoopReq(body), 400, { error: "invalid request" });
@@ -370,12 +400,12 @@ describe("POST /api/loops", () => {
     // Timezone-only creation must not bypass validation: a manual-only loop
     // still persists its timezone, so an invalid one is rejected up front.
     await expectJsonError(
-      await createLoopReq({ machineId: MACHINE_ID, timezone: "Not/AZone" }),
+      await createLoopReq({ machineId: MACHINE_ID, taskFile: "/t", timezone: "Not/AZone" }),
       400,
       { error: "invalid request" },
     );
     await expectJsonError(
-      await createLoopReq({ machineId: MACHINE_ID, cron: "0 10 * * *", timezone: "Not/AZone" }),
+      await createLoopReq({ machineId: MACHINE_ID, taskFile: "/t", cron: "0 10 * * *", timezone: "Not/AZone" }),
       400,
       { error: "invalid request" },
     );
@@ -385,7 +415,7 @@ describe("POST /api/loops", () => {
   it("201 for timezone-only creation — timezone persisted, cron stays null", async () => {
     await fresh();
     await seedMachine(db, MACHINE_ID);
-    const res = await createLoopReq({ machineId: MACHINE_ID, timezone: "Asia/Shanghai" });
+    const res = await createLoopReq({ machineId: MACHINE_ID, taskFile: "/t", timezone: "Asia/Shanghai" });
     expect(res.status).toBe(201);
     const parsed = createLoopResponseSchema.parse(await res.json());
     expect(parsed.loop).toMatchObject({ cron: null, timezone: "Asia/Shanghai", nextFireAt: null });
@@ -399,6 +429,7 @@ describe("POST /api/loops", () => {
     await seedMachine(db, MACHINE_ID);
     const res = await createLoopReq({
       machineId: MACHINE_ID,
+      taskFile: "/t",
       cron: "  0   10  * *  * ", // whitespace normalizes
       timezone: "UTC",
     });
@@ -477,7 +508,9 @@ describe("POST /api/runs/:id/cancel", () => {
     const machineId = await seedMachineForToken(db, TOKEN);
     await seedLoop(db, { id: "loop-1" });
     await seedRun(db, { id: "run-1", machineId });
-    const runToken = pollResponseSchema.parse(await (await pollReq()).json()).deliveries[0]!.runToken;
+    const runToken = pollResponseSchema.parse(
+      await (await pollReq({ capabilities: ["terminal-journal-v1"] })).json(),
+    ).deliveries[0]!.runToken;
 
     const res = await cancelReq("run-1"); // NO body at all — normalizes to {}
     expect(res.status).toBe(200);
@@ -616,6 +649,12 @@ describe("GET observation surface", () => {
         cron: null,
         timezone: "UTC",
         nextFireAt: null,
+        goal: null,
+        completedAt: null,
+        completionReason: null,
+        taskFileSyncedAt: null,
+        taskFileSyncAttemptedAt: null,
+        taskFileSyncError: null,
         lastRun: {
           id: "run-1",
           loopId: "loop-1",
@@ -727,9 +766,9 @@ describe("unified error surface", () => {
         },
       },
       admin,
+      createLifecycleAdmin({ db, clock }),
+      createScheduleAdmin({ db, clock }),
       ownerControl,
-      db,
-      clock,
     );
     const res = await sabotaged.request("/api/machine/poll", {
       method: "POST",
@@ -742,5 +781,209 @@ describe("unified error surface", () => {
     expect(text).not.toContain("hunter2");
     expect(text).not.toContain("pg connection");
     expect(text).not.toContain("at ");
+  });
+});
+
+describe("the taxonomy pin (review STD-5) — the adapter's full (status, code) set, fake-driven", () => {
+  // 413 stays pinned by the 2 MiB body-cap tests above (route-independent
+  // middleware); every OTHER (status, code) pair the adapter can emit is
+  // driven below through fully fake narrow interfaces and pinned as a
+  // literal set — a new code or a drifting status turns THIS test red.
+  const PINNED = [
+    "200:-",
+    "201:-",
+    "202:-",
+    "400:-",
+    "401:-",
+    `401:${RUN_CAPABILITY_INVALID_CODE}`,
+    "404:-",
+    "409:-",
+    `409:${LOOP_COMPLETED_CODE}`,
+    `409:${LOOP_NOT_COMPLETED_CODE}`,
+    "500:-",
+  ];
+
+  it("every route branch emits exactly the pinned set", async () => {
+    let coordinatorMode = "ok";
+    let adminRuns: unknown = [];
+    let adminCreated = true;
+    let ownerMode = "canceled";
+    let lifecycleResult: Record<string, unknown> = { found: true, kind: "changed", loop: { id: "loop-1" } };
+    let lifecycleThrow: Error | null = null;
+    let scheduleResult: Record<string, unknown> = { found: true, changed: true, loop: { id: "loop-1" } };
+    let scheduleThrow: Error | null = null;
+
+    const coordinator = {
+      poll: async () => {
+        if (coordinatorMode === "bad-credential") throw new InvalidMachineCredentialError();
+        if (coordinatorMode === "bad-capabilities") throw new CapabilityDeclarationInvalidError();
+        if (coordinatorMode === "boom") throw new Error("boom");
+        return { runs: [] };
+      },
+      report: async () => {
+        if (coordinatorMode === "denied") throw new RunCapabilityInvalidError("stale_phase");
+        return { ok: true as const };
+      },
+      enqueueExecRun: async () => {
+        if (coordinatorMode === "enqueued") return { enqueued: true as const, runId: "run-1", supersededRunIds: [] };
+        if (coordinatorMode === "loop_not_found") return { enqueued: false as const, reason: "loop_not_found" as const };
+        if (coordinatorMode === "loop_completed") return { enqueued: false as const, reason: "loop_completed" as const };
+        return { enqueued: false as const, reason: "running_exists" as const };
+      },
+    } as unknown as RunCoordinator;
+    const admin = {
+      listMachines: async () => [],
+      listLoops: async () => [],
+      listRuns: async () => adminRuns as never,
+      getLoopSummary: async () => ({ id: "loop-1" }) as never,
+      createLoop: async () =>
+        adminCreated
+          ? ({ created: true, row: { enabled: false, cron: null }, loop: { id: "loop-1" } } as never)
+          : ({ created: false, reason: "machine_not_found" } as never),
+    } as unknown as LoopAdmin;
+    const ownerControl = {
+      cancelRun: async () =>
+        ownerMode === "canceled"
+          ? ({ canceled: true } as never)
+          : ownerMode === "not_found"
+            ? ({ canceled: false, reason: "not_found" } as never)
+            : ({ canceled: false, reason: "not_cancelable" } as never),
+    } as unknown as OwnerControl;
+    const lifecycle = {
+      updateGoal: async () => {
+        if (lifecycleThrow) throw lifecycleThrow;
+        return lifecycleResult as never;
+      },
+      updateTaskFile: async () => {
+        if (lifecycleThrow) throw lifecycleThrow;
+        return lifecycleResult as never;
+      },
+      reopenLoop: async () => {
+        if (lifecycleThrow) throw lifecycleThrow;
+        return lifecycleResult as never;
+      },
+    } as unknown as LifecycleAdmin;
+    const schedule: ScheduleAdmin = {
+      updateSchedule: async () => {
+        if (scheduleThrow) throw scheduleThrow;
+        return scheduleResult as never;
+      },
+    };
+
+    const fake = createServerApp(coordinator, admin, lifecycle, schedule, ownerControl);
+    const observed = new Set<string>();
+    const record = async (res: Response): Promise<void> => {
+      const body = (await res.json()) as { code?: string };
+      observed.add(`${res.status}:${body.code ?? "-"}`);
+    };
+    const json = (body: unknown) => ({
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const bearer = (token: string, body: unknown) => ({
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+    });
+
+    // poll: 401 no bearer / 400 malformed JSON / 400 DTO / 401 credential /
+    // 400 capabilities / 500 sabotage / 200 ok
+    await record(await fake.request("/api/machine/poll", { method: "POST", ...json({}) }));
+    await record(await fake.request("/api/machine/poll", { method: "POST", headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" }, body: "{" }));
+    await record(await fake.request("/api/machine/poll", { method: "POST", ...bearer(TOKEN, { capabilities: "x" }) }));
+    coordinatorMode = "bad-credential";
+    await record(await fake.request("/api/machine/poll", { method: "POST", ...bearer(TOKEN, {}) }));
+    coordinatorMode = "bad-capabilities";
+    await record(await fake.request("/api/machine/poll", { method: "POST", ...bearer(TOKEN, {}) }));
+    coordinatorMode = "boom";
+    const boom = await fake.request("/api/machine/poll", { method: "POST", ...bearer(TOKEN, {}) });
+    expect(boom.status).toBe(500);
+    observed.add("500:-");
+    coordinatorMode = "ok";
+
+    // report: 401 coded denial / 200 ok
+    coordinatorMode = "denied";
+    await record(await fake.request("/api/machine/report", { method: "POST", ...bearer("rk_x", { ok: true }) }));
+    coordinatorMode = "ok";
+    await record(await fake.request("/api/machine/report", { method: "POST", ...bearer("rk_x", { ok: true }) }));
+
+    // runs list: 404 unknown loop / 200 list
+    adminRuns = undefined;
+    await record(await fake.request("/api/loops/nope/runs"));
+    adminRuns = [];
+    await record(await fake.request("/api/loops/loop-1/runs"));
+
+    // create: 404 unknown machine / 201 created
+    adminCreated = false;
+    await record(await fake.request("/api/loops", { method: "POST", ...json({ machineId: MACHINE_ID }) }));
+    adminCreated = true;
+    await record(await fake.request("/api/loops", { method: "POST", ...json({ machineId: MACHINE_ID }) }));
+
+    // run now: 404 / 409 loop_completed / 200 running_exists / 202 enqueued
+    for (const mode of ["loop_not_found", "loop_completed", "running_exists", "enqueued"]) {
+      coordinatorMode = mode;
+      await record(await fake.request("/api/loops/loop-1/run", { method: "POST", ...json({}) }));
+    }
+    coordinatorMode = "ok";
+
+    // cancel: 200 canceled / 404 not_found / 200 not_cancelable
+    for (const mode of ["canceled", "not_found", "not_cancelable"]) {
+      ownerMode = mode;
+      await record(await fake.request("/api/runs/run-1/cancel", { method: "POST", ...json({}) }));
+    }
+
+    // schedule: 404 / 409 loop_completed / 200 changed / 200 noop / 400 validation / 409 exhausted
+    scheduleResult = { found: false };
+    await record(await fake.request("/api/loops/loop-1/schedule", { method: "PATCH", ...json({ cron: "0 1 * * *" }) }));
+    scheduleResult = { found: true, conflict: "loop_completed", changed: false, loop: { id: "loop-1" } };
+    await record(await fake.request("/api/loops/loop-1/schedule", { method: "PATCH", ...json({ enabled: true }) }));
+    scheduleResult = { found: true, changed: true, loop: { id: "loop-1" } };
+    await record(await fake.request("/api/loops/loop-1/schedule", { method: "PATCH", ...json({ cron: "0 1 * * *" }) }));
+    scheduleResult = { found: true, changed: false, loop: { id: "loop-1" } };
+    await record(await fake.request("/api/loops/loop-1/schedule", { method: "PATCH", ...json({ cron: "0 1 * * *" }) }));
+    scheduleThrow = new ScheduleValidationError("cron", "bad cron");
+    await record(await fake.request("/api/loops/loop-1/schedule", { method: "PATCH", ...json({ cron: "x" }) }));
+    scheduleThrow = new ScheduleRevisionExhaustedError("loop-1");
+    await record(await fake.request("/api/loops/loop-1/schedule", { method: "PATCH", ...json({ cron: "0 1 * * *" }) }));
+    scheduleThrow = null;
+
+    // goal: 404 / 409 loop_completed / 409 invalid_loop_state / 409 revision / 200 changed
+    lifecycleResult = { found: false };
+    await record(await fake.request("/api/loops/loop-1/goal", { method: "PATCH", ...json({ goal: "g" }) }));
+    for (const reason of ["loop_completed", "invalid_loop_state", "goal_revision_exhausted"]) {
+      lifecycleResult = { found: true, kind: "rejected", reason };
+      await record(await fake.request("/api/loops/loop-1/goal", { method: "PATCH", ...json({ goal: "g" }) }));
+    }
+    lifecycleResult = { found: true, kind: "changed", loop: { id: "loop-1" } };
+    await record(await fake.request("/api/loops/loop-1/goal", { method: "PATCH", ...json({ goal: "g" }) }));
+
+    // task-file: 400 cap / 404 / 409 conflict / 200 changed
+    await record(await fake.request("/api/loops/loop-1/task-file", { method: "PATCH", ...json({ taskFile: "/" + "x".repeat(4097) }) }));
+    lifecycleResult = { found: false };
+    await record(await fake.request("/api/loops/loop-1/task-file", { method: "PATCH", ...json({ taskFile: "/a.md" }) }));
+    lifecycleResult = { found: true, kind: "conflict", reason: "run_in_progress" };
+    await record(await fake.request("/api/loops/loop-1/task-file", { method: "PATCH", ...json({ taskFile: "/a.md" }) }));
+    lifecycleResult = { found: true, kind: "changed", loop: { id: "loop-1" } };
+    await record(await fake.request("/api/loops/loop-1/task-file", { method: "PATCH", ...json({ taskFile: "/a.md" }) }));
+
+    // reopen: 404 / 409 loop_not_completed / 409 state conflict / 200 changed
+    lifecycleResult = { found: false };
+    await record(await fake.request("/api/loops/loop-1/reopen", { method: "POST", ...json({}) }));
+    lifecycleResult = { found: true, kind: "rejected", reason: "loop_not_completed" };
+    await record(await fake.request("/api/loops/loop-1/reopen", { method: "POST", ...json({}) }));
+    lifecycleResult = { found: true, kind: "rejected", reason: "invalid_loop_state" };
+    await record(await fake.request("/api/loops/loop-1/reopen", { method: "POST", ...json({}) }));
+    lifecycleResult = { found: true, kind: "changed", loop: { id: "loop-1" } };
+    await record(await fake.request("/api/loops/loop-1/reopen", { method: "POST", ...json({}) }));
+
+    // unknown route → 404
+    await record(await fake.request("/nope"));
+
+    expect([...observed].sort()).toEqual([...PINNED].sort());
+  });
+
+  it("the pinned codes are exactly the protocol's three additive codes", () => {
+    expect([RUN_CAPABILITY_INVALID_CODE, LOOP_COMPLETED_CODE, LOOP_NOT_COMPLETED_CODE].sort()).toEqual(
+      ["loop_completed", "loop_not_completed", "run_capability_invalid"],
+    );
   });
 });

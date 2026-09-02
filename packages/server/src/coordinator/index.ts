@@ -30,21 +30,36 @@
  */
 import { randomBytes, randomUUID } from "node:crypto";
 
-import { isDeviceTokenShape, type Delivery, type PollRequest, type ReportRequest } from "@loopzhb/protocol";
+import {
+  hasTerminalJournalV1,
+  isDeviceTokenShape,
+  TERMINAL_JOURNAL_V1_CAPABILITY,
+  type Delivery,
+  type PollRequest,
+  type PollResponse,
+  type ReportRequest,
+} from "@loopzhb/protocol";
 import { machineIdFromToken, sha256 } from "@loopzhb/protocol/node";
 
 import { buildDelivery } from "../gateway/delivery.js";
 import { resolveLiveLease } from "../store/leases.js";
-import { applyMachinePollContact, getMachine, registerMachineOnPoll } from "../store/machines.js";
+import {
+  applyMachinePollContact,
+  capabilitySnapshotFromPoll,
+  getMachine,
+  registerMachineOnPoll,
+} from "../store/machines.js";
 import { executeReportTx, type ReportTxResult } from "../store/report.js";
 import {
   applyRunProgress,
   claimRunWithLeaseTx,
+  ClaimRefusedError,
   enqueueExecRunTx,
   getLoop,
   pendingExecRunsForMachine,
   type EnqueueExecRunResult,
   type RunStoreDeps,
+  type RunStoreHooks,
 } from "../store/runs.js";
 import { InvalidMachineCredentialError, RunCapabilityInvalidError } from "./errors.js";
 
@@ -62,10 +77,10 @@ export type ExecTrigger =
       scheduleRevision: number;
     };
 
-export interface CoordinatorHooks {
+export interface CoordinatorHooks extends RunStoreHooks {
   /** Runs after the loop lookup, BEFORE the enqueue write transaction opens —
    *  lets a test commit a competing claim on the (then-idle) single pglite
-   *  connection, proving the in-transaction re-check skips/rolls back. */
+   *  connection, proving the store's authoritative resolve/CAS skips or retries. */
   beforeEnqueueTx?(loopId: string): void | Promise<void>;
   /** Runs after the loop lookup, BEFORE the candidate's claim transaction —
    *  lets a test commit a competing claim so the in-poll claim loses the race
@@ -140,10 +155,19 @@ export function createRunCoordinator(deps: RunCoordinatorDependencies) {
     /**
      * The daemon's heartbeat + run claim (plan §2).
      *
-     * Order matters: cheap shape filter → derived-id + full-hash verification
-     * (self-registering on first contact) → heartbeat/identity write (OUTSIDE
-     * any claim transaction — confirmed contact survives a lost claim race) →
-     * progress heartbeats → capacity gate → the per-candidate atomic claims.
+     * Order matters: cheap shape filter → capability resource policy (Phase 4:
+     * an illegal declaration rejects the WHOLE poll with a 400 BEFORE any
+     * heartbeat/snapshot/claim write — ADR-009 修订 2026-09-01 决策 1) →
+     * derived-id + full-hash verification (self-registering on first contact)
+     * → heartbeat/identity/capability-snapshot write (OUTSIDE any claim
+     * transaction — confirmed contact survives a lost claim race) → progress
+     * heartbeats → capability gate → capacity gate → the per-candidate atomic
+     * claims.
+     *
+     * Phase 4 claim gating (ADR-009 决策 7): a machine whose capability
+     * snapshot lacks `terminal-journal-v1` claims NOTHING; when claimable
+     * pending runs exist the response carries
+     * `requiredCapabilities: ["terminal-journal-v1"]` (never on an idle poll).
      * `progress` is LIVE since Phase 2 (the sweep's liveness evidence; it must
      * land BEFORE the gate — busy is exactly when heartbeats matter most);
      * `wait` stays parse-only. `availableSlots` (Phase 2) is a cooperative
@@ -153,8 +177,11 @@ export function createRunCoordinator(deps: RunCoordinatorDependencies) {
      * InvalidMachineCredentialError on any credential failure; the HTTP
      * adapter maps that to the unified 401.
      */
-    async poll(deviceToken: string, body: PollRequest): Promise<{ deliveries: Delivery[] }> {
+    async poll(deviceToken: string, body: PollRequest): Promise<PollResponse> {
       if (!isDeviceTokenShape(deviceToken)) throw new InvalidMachineCredentialError();
+      // Resource policy FIRST (after the cheap shape filter, before ANY
+      // write): an illegal declaration is a 400 for the whole poll.
+      const capabilities = capabilitySnapshotFromPoll(body.capabilities);
       const machineId = machineIdFromToken(deviceToken);
       const tokenHash = sha256(deviceToken);
 
@@ -164,9 +191,9 @@ export function createRunCoordinator(deps: RunCoordinatorDependencies) {
         // truncation collision must not hand one machine's authority to a
         // different token (reference audit H-01).
         if (machine.tokenHash !== tokenHash) throw new InvalidMachineCredentialError();
-        machine = await applyMachinePollContact(deps, machine, body);
+        machine = await applyMachinePollContact(deps, machine, body, capabilities);
       } else {
-        machine = await registerMachineOnPoll(deps, { machineId, tokenHash, identity: body });
+        machine = await registerMachineOnPoll(deps, { machineId, tokenHash, identity: body, capabilities });
       }
 
       if (body.progress !== undefined && body.progress.length > 0) {
@@ -174,21 +201,42 @@ export function createRunCoordinator(deps: RunCoordinatorDependencies) {
       }
       if (body.availableSlots === 0) return { deliveries: [] }; // busy: skip the claim scan
 
+      const candidates = await pendingExecRunsForMachine(deps.db, machineId);
+
+      // Capability gate (Phase 4): without terminal-journal-v1 the machine
+      // cannot receive new runs. The upgrade hint rides ONLY when claimable
+      // work exists — an idle poll stays hint-free.
+      if (!hasTerminalJournalV1(machine.capabilities)) {
+        if (candidates.length === 0) return { deliveries: [] };
+        return { deliveries: [], requiredCapabilities: [TERMINAL_JOURNAL_V1_CAPABILITY] };
+      }
+
       const deliveries: Delivery[] = [];
       // NO limit on the candidate scan (A-05): a LIMIT would impersonate
       // concurrency control — the availableSlots break below is the gate.
-      for (const candidate of await pendingExecRunsForMachine(deps.db, machineId)) {
+      for (const candidate of candidates) {
         const loop = await getLoop(deps.db, candidate.loopId);
         if (!loop) continue; // undeliverable: stays pending, never fails the batch
+        if (loop.completedAt !== null) continue; // Completed loops never claim (scan-side hint)
         await deps.hooks?.beforeClaimTx?.(candidate.id);
-        const claimed = await claimRunWithLeaseTx(deps, {
-          runId: candidate.id,
-          loopId: loop.id,
-          machineId,
-          role: candidate.role,
-        });
+        let claimed;
+        try {
+          claimed = await claimRunWithLeaseTx(deps, {
+            runId: candidate.id,
+            loopId: loop.id,
+            machineId,
+            role: candidate.role,
+          });
+        } catch (err) {
+          // The authoritative loop resolve refused the claim (loop deleted or
+          // Completed between scan and claim) — skip this candidate, keep polling.
+          if (err instanceof ClaimRefusedError) continue;
+          throw err;
+        }
         if (!claimed) continue; // race loser — another poll owns this run now
-        deliveries.push(buildDelivery({ loop, run: claimed.run, roots: machine.roots ?? [], runToken: claimed.runToken }));
+        deliveries.push(
+          buildDelivery({ loop: claimed.loop, run: claimed.run, roots: machine.roots ?? [], runToken: claimed.runToken }),
+        );
         // Capacity 1 stops AFTER a success only — a guard loss above must
         // never end the poll, or a lost race would starve this cycle.
         if (body.availableSlots === 1) break;

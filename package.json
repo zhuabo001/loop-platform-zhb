@@ -12,6 +12,7 @@
     "start": "pnpm --filter @loopzhb/server start",
     "test": "pnpm -r test",
     "test:phase2:e2e": "pnpm build && LOOPZHB_REAL_CLAUDE_E2E=1 pnpm --filter @loopzhb/server test src/real-claude-e2e.test.ts",
+    "test:phase4:batch2:e2e": "pnpm build && LOOPZHB_REAL_CLAUDE_E2E=1 pnpm --filter @loopzhb/server test src/phase4-batch2-real-claude-e2e.test.ts",
     "typecheck": "pnpm -r typecheck"
   }
 }

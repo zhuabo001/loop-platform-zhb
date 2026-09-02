@@ -15,16 +15,19 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "pnpm --filter @loopzhb/protocol build && pnpm build:wrapper && tsc -p tsconfig.build.json && pnpm check:wrapper",
+    "build:wrapper": "node scripts/build-wrapper.mjs",
+    "check:wrapper": "node scripts/build-wrapper.mjs --check",
     "start": "node --enable-source-maps dist/cli.js",
-    "typecheck": "pnpm --filter @loopzhb/protocol build && tsc --noEmit",
-    "test": "pnpm --filter @loopzhb/protocol build && vitest run"
+    "typecheck": "pnpm --filter @loopzhb/protocol build && pnpm build:wrapper && tsc --noEmit",
+    "test": "pnpm --filter @loopzhb/protocol build && pnpm build:wrapper && pnpm check:wrapper && vitest run"
   },
   "dependencies": {
     "@loopzhb/protocol": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^25.9.3",
+    "esbuild": "0.28.1",
     "typescript": "^6.0.3",
     "vitest": "^4.1.9"
   }

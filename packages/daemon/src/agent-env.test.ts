@@ -5,7 +5,15 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { buildAgentEnv, buildProbeEnv, redactSecrets } from "./agent-env.js";
+import {
+  buildAgentEnv,
+  buildProbeEnv,
+  collectSecretValues,
+  isProviderEnvKey,
+  isSecretKey,
+  redactSecrets,
+} from "./agent-env.js";
+import { resolveClaudeProviderEnv } from "./claude-provider-env.js";
 
 describe("buildAgentEnv — whitelist", () => {
   it("E1: forwards system vars PATH/HOME/LANG/TMPDIR", () => {
@@ -161,6 +169,162 @@ describe("secretValues and redactSecrets", () => {
     for (const sensitive of [credential, runToken, serverUrl]) {
       expect(Object.values(env)).not.toContain(sensitive);
     }
+  });
+});
+
+describe("collectSecretValues — the single classifier (review STD-3)", () => {
+  it("every sensitive key family is collected, empties dropped", () => {
+    const source: NodeJS.ProcessEnv = {
+      HTTP_PROXY: "http://u:p@proxy:8080",
+      http_proxy: "http://proxy:8080",
+      HTTPS_PROXY: "https://u:p@proxy:8443",
+      https_proxy: "https://proxy:8443",
+      NO_PROXY: "localhost",
+      no_proxy: "localhost",
+      ALL_PROXY: "socks5://u:p@proxy:1080",
+      all_proxy: "socks5://proxy:1080",
+      ANTHROPIC_API_KEY: "sk-ant-key",
+      ANTHROPIC_AUTH_TOKEN: "auth-token",
+      ANTHROPIC_BASE_URL: "https://api.anthropic.com",
+      CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
+    };
+    const values = collectSecretValues(source);
+    for (const value of Object.values(source)) expect(values).toContain(value);
+  });
+
+  it("non-secret keys are never collected", () => {
+    for (const key of ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "CLAUDE_CONFIG_DIR", "SSL_CERT_FILE"]) {
+      expect(isSecretKey(key)).toBe(false);
+    }
+    expect(collectSecretValues({ PATH: "/usr/bin", HOME: "/home/x", LANG: "C" })).toEqual([]);
+  });
+
+  it("empty-string secrets never participate", () => {
+    expect(collectSecretValues({ ANTHROPIC_API_KEY: "", HTTPS_PROXY: "" })).toEqual([]);
+  });
+
+  it("is the exact source buildAgentEnv draws from — drift detector", () => {
+    const source: NodeJS.ProcessEnv = {
+      PATH: "/usr/bin",
+      HOME: "/home/x",
+      ANTHROPIC_API_KEY: "sk-ant-key",
+      CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
+      HTTPS_PROXY: "https://u:p@proxy:8443",
+      NO_PROXY: "localhost",
+      EDITOR: "vim",
+    };
+    expect(buildAgentEnv(source).secretValues).toEqual(collectSecretValues(source));
+  });
+});
+
+describe("isProviderEnvKey — the bootstrap/forwarding drift detector (plan §5.2)", () => {
+  // One representative per classification-relevant family. The drift
+  // detector's job: isProviderEnvKey (what the startup bootstrap may extract
+  // from user settings), the buildAgentEnv allow-list, and isSecretKey can
+  // NEVER silently disagree.
+  const PROVIDER_SECRET_KEYS = [
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_MODEL",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+  ];
+  const PROVIDER_PLAIN_KEYS = ["SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS"];
+  const SYSTEM_ONLY_KEYS = ["PATH", "HOME", "LANG", "TMPDIR", "CLAUDE_CONFIG_DIR", "LC_ALL", "LC_CTYPE"];
+  const REFUSED_KEYS = [
+    "LOOPZHB_SERVER_URL",
+    "LOOPZHB_MACHINE_CREDENTIAL",
+    "GITHUB_TOKEN",
+    "AWS_ACCESS_KEY_ID",
+    "GOOGLE_API_KEY",
+    "OPENAI_API_KEY",
+    "EDITOR",
+    "RUN_TOKEN",
+  ];
+
+  it("every settings-extractable key is forwarded by buildAgentEnv — and vice versa over the samples", () => {
+    for (const key of [...PROVIDER_SECRET_KEYS, ...PROVIDER_PLAIN_KEYS]) {
+      expect(isProviderEnvKey(key)).toBe(true);
+      expect(buildAgentEnv({ [key]: "v" }).env[key]).toBe("v");
+    }
+    // Forwarded but NEVER settings-extractable: system + locale keys.
+    for (const key of SYSTEM_ONLY_KEYS) {
+      expect(isProviderEnvKey(key)).toBe(false);
+      expect(buildAgentEnv({ [key]: "v" }).env[key]).toBe("v");
+    }
+    // Neither forwarded nor extractable.
+    for (const key of REFUSED_KEYS) {
+      expect(isProviderEnvKey(key)).toBe(false);
+      expect(buildAgentEnv({ [key]: "v" }).env).toEqual({});
+    }
+  });
+
+  it("every settings-extractable SECRET key is collected; TLS cert paths stay non-secret", () => {
+    for (const key of PROVIDER_SECRET_KEYS) {
+      expect(isSecretKey(key)).toBe(true);
+      expect(collectSecretValues({ [key]: `value-of-${key}` })).toContain(`value-of-${key}`);
+    }
+    for (const key of PROVIDER_PLAIN_KEYS) {
+      expect(isProviderEnvKey(key)).toBe(true);
+      expect(isSecretKey(key)).toBe(false);
+    }
+  });
+
+  it("bootstrap-injected provider values still flow through buildAgentEnv into secretValues", () => {
+    // The full startup path: settings fixture → resolveClaudeProviderEnv →
+    // buildAgentEnv. A settings-derived token MUST land in secretValues (the
+    // redaction needles), an unknown settings key must NEVER reach the child.
+    const settingsToken = "sk-ant-settings-derived-secret";
+    const resolved = resolveClaudeProviderEnv(
+      { PATH: "/usr/bin", CLAUDE_CONFIG_DIR: "/fixture" },
+      {
+        readSettingsFile: () =>
+          JSON.stringify({
+            env: {
+              ANTHROPIC_API_KEY: settingsToken,
+              ANTHROPIC_BASE_URL: "https://settings-provider.example",
+              GITHUB_TOKEN: "ghp-settings-never",
+            },
+          }),
+      },
+    );
+    const { env, secretValues } = buildAgentEnv(resolved);
+    expect(env.ANTHROPIC_API_KEY).toBe(settingsToken);
+    expect(secretValues).toContain(settingsToken);
+    expect(secretValues).toContain("https://settings-provider.example");
+    expect(env.GITHUB_TOKEN).toBeUndefined();
+    expect(Object.values(env)).not.toContain("ghp-settings-never");
+  });
+
+  it("the startup probe env strips bootstrap-injected provider credentials (E23 extended)", () => {
+    const resolved = resolveClaudeProviderEnv(
+      { PATH: "/usr/bin", HOME: "/home/x", CLAUDE_CONFIG_DIR: "/fixture" },
+      {
+        readSettingsFile: () =>
+          JSON.stringify({
+            env: {
+              ANTHROPIC_API_KEY: "sk-ant-probe-must-not-see",
+              CLAUDE_CODE_OAUTH_TOKEN: "oauth-probe-must-not-see",
+              HTTPS_PROXY: "https://u:p@proxy:8443",
+              SSL_CERT_FILE: "/etc/ssl/cert.pem",
+            },
+          }),
+      },
+    );
+    expect(buildProbeEnv(resolved)).toEqual({
+      PATH: "/usr/bin",
+      HOME: "/home/x",
+      CLAUDE_CONFIG_DIR: "/fixture",
+      SSL_CERT_FILE: "/etc/ssl/cert.pem",
+    });
   });
 });
 
