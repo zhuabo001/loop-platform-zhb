@@ -111,8 +111,11 @@ export interface ScheduleStateMachineDeps {
 /**
  * Updates a Loop's schedule configuration.
  *
- * This is the ONLY entry point for schedule-related writes. All validation,
- * normalization, and state transitions happen in one atomic transaction.
+ * This is the ONLY entry point for schedule-related writes. Each attempt
+ * resolves and validates one authoritative Loop snapshot, then applies an
+ * effective transition in a short `id + revision` CAS transaction. A guard
+ * loss rolls that attempt back and triggers one bounded fresh re-resolve;
+ * no-op/conflict outcomes verify the same revision before returning.
  *
  * @param deps - Database and clock dependencies
  * @param loopId - Loop identifier
