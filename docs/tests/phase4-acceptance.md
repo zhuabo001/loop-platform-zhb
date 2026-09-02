@@ -35,7 +35,7 @@
 | 最终 Report 事务 / Finish / Reopen | `store/report.test.ts`、`loop-lifecycle/*`、`schedule/state-machine.test.ts` | v1 分支表（failure/invalid/普通/finish/迟到冻结/wake）、stale_goal、finish 取消 pending 保留 running、Reopen 旧代际撤销、Completed 调度守卫、**revision OCC guard（SPEC-3）** |
 | **竞态闭环 R1–R5**（review 修复新增） | `packages/server/src/loop-lifecycle/ops.race.test.ts`（5） | retarget/claim 双向真交错（含 claim resolve 后 retarget → claim CAS 重试并只交付新路径）、同时间戳双事务、reopen/retarget 竞争 |
 | **并发矩阵 C1–C8** | `packages/server/src/phase4-concurrency.test.ts`（8） | 见下节（**C8** 为 HTTP 级 retarget/claim 真交错） |
-| **Completed 守卫 G1–G7** | `packages/server/src/phase4-completed-guards.test.ts`（7） | finish 取消 pending 保留 running、顺序 Completed 拒绝，以及 **Finish 在 manual/scheduled resolve-write 窗口提交**时 revision CAS 重解析为 `loop_completed`（无完成后 pending/旧 watermark）、Paused 手动 Run Now 允许、Completed schedule enable 冲突 |
+| **Completed/调度守卫 G1–G10** | `packages/server/src/phase4-completed-guards.test.ts`（10） | finish 取消 pending 保留 running、顺序 Completed 拒绝；**Finish 在 manual/scheduled resolve-write 窗口提交**时 CAS 重解析为 `loop_completed`；反向 Finish→Run Now 因 finisher 仍 running 而稳定 `running_exists`、零写；**schedule PATCH ↔ scheduled callback 双向**均证明旧 revision CAS 零行并从新代际重解析，watermark 不受陈旧写污染 |
 | **确定性 Batch 2 E2E** | `packages/server/src/phase4-batch2-e2e.test.ts`（1） | 见下节（含 **SIGTERM 后 control root 消失**，STD-4 端到端证据） |
 | HTTP 窄接口与 taxonomy | `packages/server/src/http/app.test.ts`（41，含 taxonomy 钉死 2） | createServerApp 只装配窄接口（review STD-2）；fake 驱动的 (status, code) 全集钉死（STD-5） |
 | 既有全链路与故障注入 | `daemon-e2e.test.ts`（2）、`fault-injection.test.ts`（T4/T5/T6/delivery-loss）、`restart-e2e.test.ts`、`roundrobin-liveness.test.ts`、`start.test.ts` | 全 HTTP 用户链、at-most-once、sweep reclaim/wake reconcile、cancel/report（T6，v1 body）、跨重启 lease 存活 |
@@ -80,7 +80,7 @@
 $ pnpm test            # 全仓（protocol + daemon + server）
 packages/protocol: Test Files  11 passed (11)         Tests  174 passed (174)
 packages/daemon:   Test Files  19 passed | 1 skipped  Tests  425 passed | 3 skipped (428)
-packages/server:   Test Files  43 passed | 2 skipped  Tests  553 passed | 2 skipped (555)
+packages/server:   Test Files  43 passed | 2 skipped  Tests  556 passed | 2 skipped (558)
 
 $ pnpm typecheck       # Done（protocol / daemon / server 全部通过）
 $ pnpm build           # Done
