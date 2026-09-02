@@ -27,13 +27,11 @@
  *  G10 PATCH resolves first, then callback commits: the stale PATCH CAS is
  *      zero-row and a fresh update preserves the committed generation.
  */
-import { and, eq, sql } from "drizzle-orm";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { sha256 } from "@loopzhb/protocol/node";
 
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "./db/index.js";
-import { loops } from "./db/schema.js";
 import { createRunCoordinator, type RunCoordinator } from "./coordinator/index.js";
 import { updateSchedule } from "./schedule/state-machine.js";
 import { FINISH_CANCELED_MESSAGE } from "./store/report.js";
@@ -371,15 +369,18 @@ describe("G9 — Finish vs manual Run Now, reverse direction: the competing Run 
     // unreachable direction explicitly instead of manufacturing an invalid
     // state that the public state machine cannot produce.
     const [finishSnapshot] = await snapshotLoops(db);
-    const enqueued = await coordinator.enqueueExecRun("loop-1");
-    expect(enqueued).toEqual({ enqueued: false, reason: "running_exists" });
-    const [afterRefusal] = await snapshotLoops(db);
-    expect(afterRefusal!.revision).toBe(finishSnapshot!.revision);
-    expect(await snapshotRuns(db)).toEqual([
-      expect.objectContaining({ id: "run-finisher", phase: "running" }),
-    ]);
-
-    const ack = await coordinator.report("rk_reverse_finish", {
+    let hookCalls = 0;
+    let runNowResult: Awaited<ReturnType<RunCoordinator["enqueueExecRun"]>> | undefined;
+    const finishFirst = createRunCoordinator({
+      ...testDeps(db, clock),
+      hooks: {
+        afterReportResolve: async () => {
+          hookCalls += 1;
+          runNowResult = await coordinator.enqueueExecRun("loop-1");
+        },
+      },
+    });
+    const ack = await finishFirst.report("rk_reverse_finish", {
       ok: true,
       outcome: "exec",
       durationMs: 1,
@@ -388,8 +389,11 @@ describe("G9 — Finish vs manual Run Now, reverse direction: the competing Run 
     });
 
     expect(ack).toMatchObject({ ok: true });
+    expect(hookCalls).toBe(1);
+    expect(runNowResult).toEqual({ enqueued: false, reason: "running_exists" });
     const [completed] = await snapshotLoops(db);
     expect(completed).toMatchObject({ completedAt: expect.any(String), completionReason: "finish won" });
+    expect(completed!.revision).toBe(finishSnapshot!.revision + 1);
     expect(await snapshotRuns(db)).toEqual([
       expect.objectContaining({ id: "run-finisher", phase: "done", outcome: "exec" }),
     ]);
@@ -408,30 +412,30 @@ describe("G10 — schedule PATCH vs scheduled callback, reverse window: PATCH re
     });
 
     const [patchSnapshot] = await snapshotLoops(db);
-    const callback = await coordinator.enqueueExecRun("loop-1", {
-      kind: "scheduled",
-      scheduledFor: "2026-07-28T00:00:00.000Z",
-      scheduleRevision: 0,
-    });
-    expect(callback).toMatchObject({ enqueued: true });
-
-    // This is updateSchedule's exact id+observed-revision guard. The real
-    // callback bumped the unified revision, so the PATCH planned from the
-    // frozen snapshot cannot overwrite its watermark/config state.
-    const stalePatchCas = await db
-      .update(loops)
-      .set({
-        cron: "0 12 * * *",
-        scheduleRevision: patchSnapshot!.scheduleRevision + 1,
-        lastScheduledAt: null,
-        revision: sql`${loops.revision} + 1`,
-      })
-      .where(and(eq(loops.id, "loop-1"), eq(loops.revision, patchSnapshot!.revision)))
-      .returning({ id: loops.id });
-    expect(stalePatchCas).toEqual([]);
-
-    const retried = await updateSchedule({ db, clock }, "loop-1", { cron: "0 12 * * *" });
+    let hookCalls = 0;
+    let callback: Awaited<ReturnType<RunCoordinator["enqueueExecRun"]>> | undefined;
+    const retried = await updateSchedule(
+      {
+        db,
+        clock,
+        hooks: {
+          afterScheduleLoopResolve: async () => {
+            hookCalls += 1;
+            if (hookCalls > 1) return;
+            callback = await coordinator.enqueueExecRun("loop-1", {
+              kind: "scheduled",
+              scheduledFor: "2026-07-28T00:00:00.000Z",
+              scheduleRevision: 0,
+            });
+            expect(callback).toMatchObject({ enqueued: true });
+          },
+        },
+      },
+      "loop-1",
+      { cron: "0 12 * * *" },
+    );
     expect(retried).toMatchObject({ found: true, changed: true });
+    expect(hookCalls).toBe(2);
     const [updated] = await snapshotLoops(db);
     expect(updated).toMatchObject({
       cron: "0 12 * * *",
@@ -440,7 +444,7 @@ describe("G10 — schedule PATCH vs scheduled callback, reverse window: PATCH re
       revision: patchSnapshot!.revision + 2,
     });
     expect(await snapshotRuns(db)).toEqual([
-      expect.objectContaining({ id: callback.enqueued ? callback.runId : "", phase: "pending" }),
+      expect.objectContaining({ id: callback?.enqueued ? callback.runId : "", phase: "pending" }),
     ]);
   });
 });

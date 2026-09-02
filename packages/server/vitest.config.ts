@@ -11,5 +11,10 @@ export default defineConfig({
     // 10s default hookTimeout was the actual flake source under WASM
     // contention (spec-track P2, Batch 3 review).
     hookTimeout: 60_000,
+    // Bound concurrent WASM Postgres boots. Unbounded file-level workers can
+    // exhaust the host and turn unrelated 1–2s tests into deterministic
+    // 20–60s timeouts; two workers keep the complete gate representative and
+    // reproducible without weakening any per-test timeout.
+    maxWorkers: 2,
   },
 });

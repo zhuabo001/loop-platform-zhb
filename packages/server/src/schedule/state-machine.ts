@@ -60,7 +60,7 @@ export class ScheduleRevisionExhaustedError extends Error {
 }
 
 /** The guarded schedule write observed zero rows — a competitor committed
- *  between the in-transaction read and the write (review SPEC-3: this write
+ *  between the authoritative resolve and the write (review SPEC-3: this write
  *  previously had NO guard at all). Rolls back; the shared retry re-runs
  *  once on fresh state. */
 class ScheduleGuardLostError extends Error {
@@ -100,6 +100,12 @@ export type UpdateScheduleResult =
 export interface ScheduleStateMachineDeps {
   db: Db;
   clock: Clock;
+  /** TEST-ONLY committed-interleaving seam. The resolved row is protected by
+   *  the same revision CAS as production, so a competitor committed here
+   *  must make this attempt lose and trigger the bounded fresh re-resolve. */
+  hooks?: {
+    afterScheduleLoopResolve?(loopId: string): void | Promise<void>;
+  };
 }
 
 /**
@@ -131,55 +137,74 @@ async function updateScheduleOnce(
   loopId: string,
   patch: SchedulePatch,
 ): Promise<UpdateScheduleResult> {
+  // Resolve before the short write transaction, matching claim/enqueue's OCC
+  // discipline. The id+revision CAS below makes every decision from this row
+  // conditional on it remaining authoritative.
+  const [currentLoop] = await deps.db.select().from(loops).where(eq(loops.id, loopId)).limit(1);
+
+  if (!currentLoop) {
+    return { found: false };
+  }
+  await deps.hooks?.afterScheduleLoopResolve?.(loopId);
+
+  // A zero-write outcome still needs a linearization point: verify the
+  // observed revision immediately before returning. If a competitor changed
+  // the row after resolve, retry and reclassify against the fresh state.
+  const verifyUnchanged = async (): Promise<void> => {
+    const [sameRevision] = await deps.db
+      .select({ id: loops.id })
+      .from(loops)
+      .where(and(eq(loops.id, loopId), eq(loops.revision, currentLoop.revision)))
+      .limit(1);
+    if (!sameRevision) throw new ScheduleGuardLostError(loopId);
+  };
+
+  // Phase 4 Completed guard: only Reopen may re-enable a Completed loop.
+  if (currentLoop.completedAt !== null && patch.enabled === true) {
+    await verifyUnchanged();
+    return { found: true, conflict: "loop_completed", changed: false, loop: currentLoop };
+  }
+
+  // 2. Validate raw values before semantic no-op comparison, then normalize
+  // through the shared time-semantics entry point so field limits and syntax
+  // have one owner.
+  const normalizedPatch = normalizeAndValidatePatch(currentLoop, patch);
+
+  // 3. The pure core decides: noop (zero writes), exhausted (zero writes +
+  // stable signal), or the revision/activation/watermark patch.
+  const nowIso = deps.clock.now().toISOString();
+  const transition = planScheduleTransition(currentLoop, normalizedPatch, nowIso);
+  if (transition.kind === "noop") {
+    await verifyUnchanged();
+    return { found: true, changed: false, loop: currentLoop };
+  }
+  if (transition.kind === "schedule_revision_exhausted") {
+    await verifyUnchanged();
+    throw new ScheduleRevisionExhaustedError(loopId);
+  }
+
+  // 4. Validate final configuration (cron and timezone semantics)
+  const finalCron = normalizedPatch.cron !== undefined ? normalizedPatch.cron : currentLoop.cron;
+  const finalTimezone = normalizedPatch.timezone !== undefined ? normalizedPatch.timezone : currentLoop.timezone;
+
+  // Always validate cron and timezone together when either changes OR when timezone changes for manual-only
+  // This prevents manual-only loops from persisting invalid timezones
+  if (finalCron !== null) {
+    // Scheduled loop: validate both cron and timezone
+    validateSchedule(finalCron, finalTimezone);
+  } else if (normalizedPatch.timezone !== undefined) {
+    // Manual-only loop with timezone change: validate timezone alone
+    // We validate with a dummy cron to check timezone validity
+    validateSchedule("0 0 * * *", finalTimezone);
+  }
+
+  // 5. Apply the core-computed patch in a short write transaction — guarded
+  // on the revision the authoritative resolve observed (review SPEC-3): any
+  // competing loops write (retarget, finish, callback watermark, claim bump,
+  // …) committed between resolve and here loses the guard, and the shared
+  // retry re-plans from the fresh row. The bump keeps the unified invariant:
+  // EVERY loops write increments it.
   return deps.db.transaction(async (tx) => {
-    // 1. Re-read the Loop within the transaction
-    const [currentLoop] = await tx.select().from(loops).where(eq(loops.id, loopId)).limit(1);
-
-    if (!currentLoop) {
-      return { found: false };
-    }
-
-    // Phase 4 Completed guard: only Reopen may re-enable a Completed loop.
-    if (currentLoop.completedAt !== null && patch.enabled === true) {
-      return { found: true, conflict: "loop_completed", changed: false, loop: currentLoop };
-    }
-
-    // 2. Validate raw values before semantic no-op comparison, then normalize
-    // through the shared time-semantics entry point so field limits and syntax
-    // have one owner.
-    const normalizedPatch = normalizeAndValidatePatch(currentLoop, patch);
-
-    // 3. The pure core decides: noop (zero writes), exhausted (zero writes +
-    // stable signal), or the revision/activation/watermark patch.
-    const nowIso = deps.clock.now().toISOString();
-    const transition = planScheduleTransition(currentLoop, normalizedPatch, nowIso);
-    if (transition.kind === "noop") {
-      return { found: true, changed: false, loop: currentLoop };
-    }
-    if (transition.kind === "schedule_revision_exhausted") {
-      throw new ScheduleRevisionExhaustedError(loopId);
-    }
-
-    // 4. Validate final configuration (cron and timezone semantics)
-    const finalCron = normalizedPatch.cron !== undefined ? normalizedPatch.cron : currentLoop.cron;
-    const finalTimezone = normalizedPatch.timezone !== undefined ? normalizedPatch.timezone : currentLoop.timezone;
-
-    // Always validate cron and timezone together when either changes OR when timezone changes for manual-only
-    // This prevents manual-only loops from persisting invalid timezones
-    if (finalCron !== null) {
-      // Scheduled loop: validate both cron and timezone
-      validateSchedule(finalCron, finalTimezone);
-    } else if (normalizedPatch.timezone !== undefined) {
-      // Manual-only loop with timezone change: validate timezone alone
-      // We validate with a dummy cron to check timezone validity
-      validateSchedule("0 0 * * *", finalTimezone);
-    }
-
-    // 5. Apply the core-computed patch — guarded on the revision this
-    // transaction's read observed (review SPEC-3): any competing loops write
-    // (retarget, finish, claim bump, …) committed between the read and here
-    // loses the guard, and the shared retry re-plans from the fresh row. The
-    // bump keeps the unified invariant: EVERY loops write increments it.
     const [updatedLoop] = await tx
       .update(loops)
       .set({ ...transition.writes, revision: sql`${loops.revision} + 1` })
