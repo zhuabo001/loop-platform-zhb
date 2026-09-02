@@ -216,13 +216,21 @@ export function createClaudeRunner(deps: ClaudeRunnerDeps): AgentRunner {
             prevState: delivery.prevState,
           });
           // The ONLY journal injections (ADR-009 修订 8): the wrapper's PATH
-          // prefix and the outbox location — never a credential or URL.
+          // prefix, the daemon's canonical Node directory immediately after
+          // it, and the outbox location — never a credential or URL. Binding
+          // env(1)'s `node` lookup prevents an operator PATH entry from
+          // selecting a different architecture/runtime than the daemon.
           childEnv = {
             ...env,
-            PATH: `${deps.controlRoot.wrapperDir}${path.delimiter}${env["PATH"] ?? ""}`,
+            PATH: [deps.controlRoot.wrapperDir, deps.controlRoot.nodeDir, env["PATH"] ?? ""]
+              .filter((entry) => entry !== "")
+              .join(path.delimiter),
             [JOURNAL_OUTBOX_ENV]: runControl.outboxDir,
           };
-          journal = { readOnly: [deps.controlRoot.rootDir, runControl.contextDir], writable: [runControl.outboxDir] };
+          journal = {
+            readOnly: [deps.controlRoot.rootDir, runControl.contextDir, deps.controlRoot.nodePath],
+            writable: [runControl.outboxDir],
+          };
           taskOverride = buildV1Prompt({
             goal: delivery.loop.goal ?? null,
             taskFilePath: taskFile.canonicalPath,

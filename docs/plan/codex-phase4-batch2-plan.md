@@ -1,6 +1,6 @@
 # Phase 4 Batch 2 开发计划：Task File、State 与 Finish 全链路
 
-- 状态：确定性验收完成（第三轮三轨复审 PASS，Issues #39–#47 已关闭；真实 Claude 门 #38 待执行）
+- 状态：确定性验收完成（第三轮三轨复审 PASS，Issues #39–#47 已关闭；wrapper capability 修复 #49 进行中并阻塞真实 Claude 门 #38）
 - 基线：`main@6af3b29`
 - 目标分支：`feat/phase4-batch2-dev`
 - 长期决策：修订 ADR-009
@@ -29,8 +29,8 @@ Daemon 启动时创建私有 0700 控制根目录和静态 `loopzhb` wrapper；w
 
 - `context/prev-state.json`：只读、紧凑 JSON，内容为 Delivery `prevState`。
 - `outbox/`：Journal 唯一可写目录。
-- Agent PATH 首位指向静态 wrapper，并只注入非秘密的 Journal 目录位置。
-- sandbox 只读开放 wrapper/runtime/context，只写开放 outbox。
+- Agent PATH 前两项固定为静态 wrapper 目录与 Daemon 自身 canonical Node 目录，并只注入非秘密的 Journal 目录位置。
+- wrapper 是从单一业务实现构建的自包含胶囊，不在 sandbox 内回读 Daemon 安装目录；sandbox 对 runtime 只读开放 exact canonical Node 文件，另开放 wrapper/context，只写开放 outbox。
 
 `loopzhb` 严格支持：
 

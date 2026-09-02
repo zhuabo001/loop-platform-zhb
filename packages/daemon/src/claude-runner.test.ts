@@ -637,17 +637,22 @@ describe("V1–V4: v1 spawn shape — prompt, sandbox, journal env", () => {
     expect(sidecar.prompt).toContain("loopzhb finish --reason"); // Closed Loop
     expect(sidecar.argv[1]).toBe(sidecar.prompt);
 
-    // The sandbox profile: control root (wrapper) + context read-only, the
-    // outbox as the ONLY extra writable directory.
+    // The sandbox profile: control root (wrapper), context and the daemon's
+    // exact Node executable read-only; outbox is the ONLY extra writable dir.
     const outbox = sidecar.env.LOOPZHB_JOURNAL_OUTBOX!;
     const settings = sidecarSettings();
     expect(settings.filesystem.allowRead).toContain(controlRoot.rootDir);
     expect(settings.filesystem.allowRead).toContain(path.join(path.dirname(outbox), "context"));
+    expect(settings.filesystem.allowRead).toContain(controlRoot.nodePath);
     expect(settings.filesystem.allowWrite).toContain(outbox);
     expect(settings.filesystem.allowWrite).not.toContain(controlRoot.rootDir);
+    expect(settings.filesystem.allowWrite).not.toContain(controlRoot.nodePath);
 
-    // The journal env: wrapper PATH prefix + outbox location — and nothing else.
-    expect(sidecar.env.PATH!.startsWith(`${controlRoot.wrapperDir}:`)).toBe(true);
+    // PATH binds env(1)'s node lookup to the runtime that started the daemon.
+    expect(sidecar.env.PATH!.split(path.delimiter).slice(0, 2)).toEqual([
+      controlRoot.wrapperDir,
+      controlRoot.nodeDir,
+    ]);
     expect(outbox.startsWith(`${controlRoot.rootDir}/`)).toBe(true);
     expect(sidecar.env.LOOPZHB_MACHINE_CREDENTIAL).toBeNull();
     expect(sidecar.env.GITHUB_TOKEN).toBeNull();
@@ -680,6 +685,7 @@ describe("V1–V4: v1 spawn shape — prompt, sandbox, journal env", () => {
     expect(sidecar.env.PATH!.startsWith(`${controlRoot.wrapperDir}:`)).toBe(false);
     expect(sidecar.prompt).toBe("fake-claude://ok");
     expect(sidecarSettings().filesystem.allowRead).not.toContain(controlRoot.rootDir);
+    expect(sidecarSettings().filesystem.allowRead).not.toContain(controlRoot.nodePath);
   });
 });
 

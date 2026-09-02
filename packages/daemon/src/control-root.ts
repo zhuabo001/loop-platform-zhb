@@ -2,8 +2,8 @@
  * The daemon's private control root (Phase 4 Batch 2, plan §2.1, ADR-009
  * 修订 8): minted ONCE per daemon start as an unpredictable mkdtemp
  * directory (0700), holding the static `loopzhb` wrapper the agent's PATH
- * points at. The wrapper is read-only (0500), its content is fixed for the
- * install (the only interpolated value is the daemon's own module URL) and
+ * points at. The wrapper is a build-generated, self-contained read-only
+ * capsule (0500): it has no runtime import back into the daemon install and
  * carries NO Server URL, Machine Credential or Run Credential. Per-run
  * control directories live under this root (run-control.ts).
  *
@@ -11,13 +11,19 @@
  * the composition root releases it on startup failure and at shutdown —
  * fail-closed, like the per-run release below it.
  */
+import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-import { WRAPPER_PACKAGE_JSON, wrapperScriptSource } from "./wrapper-main.js";
+import { WRAPPER_BUNDLE_FILE, WRAPPER_BUNDLE_SHA256 } from "./wrapper-artifact.generated.js";
 
 export const WRAPPER_COMMAND = "loopzhb";
 const CONTROL_ROOT_PREFIX = "loopzhb-control-";
+const WRAPPER_PACKAGE_JSON = '{"type":"module"}\n';
+// Resolves to packages/daemon/dist from both src/control-root.ts under
+// Vitest and dist/control-root.js in production.
+const WRAPPER_BUNDLE_PATH = fileURLToPath(new URL(`../dist/${WRAPPER_BUNDLE_FILE}`, import.meta.url));
 
 export interface ControlRoot {
   /** The 0700 mkdtemp root — parent of every per-run control directory. */
@@ -26,6 +32,10 @@ export interface ControlRoot {
   wrapperDir: string;
   /** `wrapperDir/loopzhb` — the static 0500 executable. */
   wrapperPath: string;
+  /** Canonical executable of the Node process that started this daemon. */
+  nodePath: string;
+  /** Directory placed immediately after wrapperDir in the child PATH. */
+  nodeDir: string;
   /** The canonicalized base the root was minted under — release re-verifies
    *  the root's identity against it before deleting anything. */
   baseDir: string;
@@ -33,13 +43,21 @@ export interface ControlRoot {
 
 type ControlRootIo = Pick<
   typeof fs,
-  "mkdir" | "realpath" | "mkdtemp" | "chmod" | "writeFile" | "rm"
+  "mkdir" | "realpath" | "mkdtemp" | "chmod" | "readFile" | "writeFile" | "rm"
 >;
 
 export async function createControlRoot(baseDir: string, io: ControlRootIo = fs): Promise<ControlRoot> {
   if (!path.isAbsolute(baseDir)) {
     throw new Error(`control root base must be an absolute path: ${JSON.stringify(baseDir)}`);
   }
+  // Fail startup before minting any directory when the generated install
+  // artifact is absent, corrupt, or stale relative to its build digest.
+  const bundle = await io.readFile(WRAPPER_BUNDLE_PATH);
+  const actualDigest = createHash("sha256").update(bundle).digest("hex");
+  if (!/^[a-f0-9]{64}$/.test(WRAPPER_BUNDLE_SHA256) || WRAPPER_BUNDLE_SHA256 !== actualDigest) {
+    throw new Error("loopzhb wrapper bundle is invalid or stale — rebuild @loopzhb/daemon");
+  }
+  const nodePath = await io.realpath(process.execPath);
   await io.mkdir(baseDir, { recursive: true });
   const base = await io.realpath(baseDir);
   let rootDir: string | undefined;
@@ -49,14 +67,11 @@ export async function createControlRoot(baseDir: string, io: ControlRootIo = fs)
     const wrapperDir = path.join(rootDir, "bin");
     await io.mkdir(wrapperDir);
     await io.chmod(wrapperDir, 0o700);
-    // The wrapper re-enters THIS build's wrapper-main module (dist in
-    // production): the script is static per install and carries no secret.
-    const wrapperMainUrl = new URL("./wrapper-main.js", import.meta.url).href;
     const wrapperPath = path.join(wrapperDir, WRAPPER_COMMAND);
-    await io.writeFile(wrapperPath, wrapperScriptSource(wrapperMainUrl), { mode: 0o500 });
+    await io.writeFile(wrapperPath, bundle, { mode: 0o500 });
     await io.chmod(wrapperPath, 0o500);
     await io.writeFile(path.join(wrapperDir, "package.json"), WRAPPER_PACKAGE_JSON, { mode: 0o400 });
-    return { rootDir, wrapperDir, wrapperPath, baseDir: base };
+    return { rootDir, wrapperDir, wrapperPath, nodePath, nodeDir: path.dirname(nodePath), baseDir: base };
   } catch (err) {
     // Construction owns the directory as soon as mkdtemp returns. Any later
     // chmod/mkdir/write failure must not transfer a half-built root to the

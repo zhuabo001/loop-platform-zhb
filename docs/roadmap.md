@@ -182,7 +182,7 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
   - Daemon：0700 控制根 + 静态无 secret `loopzhb` wrapper（严格 report/finish 文法、`open(wx,0600)` 单条 journal、双层脱敏）；每 Run 控制目录（只读 prev-state + outbox）；Task File 解析/jail/漂移重验/Run 后同步快照；v1 prompt 由 Daemon 构建（v0 golden 字节不变）。
   - Server：capability 快照与门控（`terminal-journal-v1`）、claim 事务权威 Loop 快照 mint v1 Lease、最终 Report 单事务分支表（stale_goal/迟到冻结/wake finish）、Finish 取消 pending 保留 running、Reopen 旧代际撤销、Completed 全部守卫（claim/cron/catch-up/Run Now/schedule enable/goal）。
   - 首轮/第二轮 code review 发现已全部修复；第三轮 Standards/Spec/Adversarial 确定性三轨 **PASS**，Issues #39–#47 已核销关闭。修复含 `loops.revision` OCC additive 列、双向真实交错、no-follow 有界读取、encoding-aware 秘密边界、control/scratch root 生命周期与 HTTP 窄接口收口；全量确定性质量门全绿。
-  - **唯一收口阻塞**：[Issue #38](https://github.com/zhuabo001/loop-platform-zhb/issues/38) 真实 Claude E2E 门实机执行（需明确接受模型费用并记录固定 commit/hash/version/命令/结果）。
+  - **当前收口阻塞**：[Issue #49](https://github.com/zhuabo001/loop-platform-zhb/issues/49) 自包含 wrapper/固定 Node capability 修复与真实 smoke；其后解除 [Issue #38](https://github.com/zhuabo001/loop-platform-zhb/issues/38) 阻塞并执行真实 Claude E2E 门（需有效认证、明确接受模型费用并记录固定 commit/hash/version/命令/结果）。
 - **Batch 3 — 最小 Dashboard 与阶段收口：未开始**（scope 见 `docs/plan/codex-phase4-dev-roadmap.md`）。
 
 ## Phase 5 — 存储与协作（第 9–14 周）

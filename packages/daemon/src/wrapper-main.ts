@@ -198,18 +198,3 @@ export async function runLoopzhbWrapper(argv: string[], env: NodeJS.ProcessEnv, 
     return 2;
   }
 }
-
-/** The static executable's content: secret-free by construction (the only
- *  interpolated value is the daemon's own module URL, never a credential).
- *  A sibling package.json marks the extensionless wrapper as ESM. */
-export function wrapperScriptSource(wrapperMainUrl: string): string {
-  return `#!/usr/bin/env node
-// loopzhb terminal-command wrapper — static, read-only, secret-free
-// (Phase 4 Batch 2, ADR-009 修订 8). Regenerated per daemon start.
-import { runLoopzhbWrapper } from ${JSON.stringify(wrapperMainUrl)};
-process.exitCode = await runLoopzhbWrapper(process.argv.slice(2), process.env, process.cwd());
-`;
-}
-
-/** Marks the extensionless wrapper as an ES module for the spawned node. */
-export const WRAPPER_PACKAGE_JSON = '{"type":"module"}\n';
