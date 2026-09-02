@@ -384,7 +384,11 @@ describe("bootstrapServer", () => {
       updatedAt: "2026-07-01T00:00:00.000Z",
     });
     expect(await first.coordinator.enqueueExecRun("loop-1")).toMatchObject({ enqueued: true });
-    const claimed = pollResponseSchema.parse(await (await poll(first.app, "dk_boot_machine")).json());
+    // The claim poll declares terminal-journal-v1 — Phase 4 Batch 2 gates the
+    // claim on the capability snapshot.
+    const claimed = pollResponseSchema.parse(
+      await (await poll(first.app, "dk_boot_machine", { capabilities: ["terminal-journal-v1"] })).json(),
+    );
     expect(claimed.deliveries).toHaveLength(1);
     const runToken = claimed.deliveries[0]!.runToken;
     await closeDb(first.handle);
@@ -396,7 +400,11 @@ describe("bootstrapServer", () => {
     const report = await second.app.request("/api/machine/report", {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${runToken}` },
-      body: JSON.stringify({ ok: true, message: "across the restart" }),
+      body: JSON.stringify({
+        ok: true,
+        terminal: { kind: "report", status: "resolved", message: "across the restart" },
+        taskFileSyncError: "missing",
+      }),
     });
     expect(report.status).toBe(200);
     expect(await report.json()).toEqual({ ok: true });
@@ -429,7 +437,7 @@ describe("bootstrapServer", () => {
     const createRes = await b.app.request("/api/loops", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ machineId, cron: "0 10 * * *", timezone: "UTC" }),
+      body: JSON.stringify({ machineId, taskFile: "/srv/TASK.md", cron: "0 10 * * *", timezone: "UTC" }),
     });
     expect(createRes.status).toBe(201);
     const { loop } = (await createRes.json()) as any;

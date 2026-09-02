@@ -17,7 +17,9 @@ import { loops, runs } from "../db/schema.js";
 import { FakeClock, seedMachine, seedMachineForToken, seedLoop, snapshotRuns, testDeps } from "../testkit/index.js";
 import { createRunCoordinator, type RunCoordinator } from "../coordinator/index.js";
 import { createLoopAdmin, newUuidLoopId } from "../admin/index.js";
+import { createLifecycleAdmin } from "../loop-lifecycle/admin.js";
 import { createOwnerControl } from "../owner/index.js";
+import { createScheduleAdmin } from "../schedule/index.js";
 import { createScheduler, type Scheduler } from "../scheduler/index.js";
 import { createServerApp } from "../http/app.js";
 
@@ -92,7 +94,14 @@ describe("F-group: Integration and production wiring", () => {
       cronFactory: cronFactory as any,
     });
 
-    app = createServerApp(coordinator, admin, ownerControl, db, clock, (loop) => scheduler.reconcile(loop));
+    app = createServerApp(
+      coordinator,
+      admin,
+      createLifecycleAdmin({ db, clock }),
+      createScheduleAdmin({ db, clock }),
+      ownerControl,
+      (loop) => scheduler.reconcile(loop),
+    );
   });
 
   describe("HTTP PATCH /schedule", () => {
@@ -185,9 +194,9 @@ describe("F-group: Integration and production wiring", () => {
       const retryableApp = createServerApp(
         coordinator,
         failingReadAdmin,
+        createLifecycleAdmin({ db, clock }),
+        createScheduleAdmin({ db, clock }),
         createOwnerControl({ db, clock }),
-        db,
-        clock,
         (loop) => scheduler.reconcile(loop),
       );
       const request = {
@@ -356,6 +365,7 @@ describe("F-group: Integration and production wiring", () => {
         platform: "darwin",
         arch: "arm64",
         version: "0.0.0-test",
+        capabilities: ["terminal-journal-v1"],
       });
       expect(pollResult.deliveries).toHaveLength(1);
       expect(pollResult.deliveries[0]!.runId).toBe(allRuns[3]!.id);
@@ -487,7 +497,7 @@ describe("F-group: Integration and production wiring", () => {
       const tick2 = cronFactory.triggerAll();
 
       // The machine polls and claims run-1 WHILE tick 2 is parked
-      const pollResult = await gatedCoordinator.poll(TOKEN, { host: "test-host" });
+      const pollResult = await gatedCoordinator.poll(TOKEN, { host: "test-host", capabilities: ["terminal-journal-v1"] });
       expect(pollResult.deliveries).toHaveLength(1);
       expect(pollResult.deliveries[0]!.runId).toBe("run-1");
 
@@ -518,7 +528,7 @@ describe("F-group: Integration and production wiring", () => {
       const res = await app.request("/api/loops", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ machineId: WIRE_MACHINE_ID, cron: "* * * * *", timezone: "UTC" }),
+        body: JSON.stringify({ machineId: WIRE_MACHINE_ID, taskFile: "/srv/TASK.md", cron: "* * * * *", timezone: "UTC" }),
       });
 
       expect(res.status).toBe(201);
@@ -543,9 +553,9 @@ describe("F-group: Integration and production wiring", () => {
         const failingApp = createServerApp(
           coordinator,
           createLoopAdmin({ db, clock, newLoopId: newUuidLoopId }),
+          createLifecycleAdmin({ db, clock }),
+          createScheduleAdmin({ db, clock }),
           createOwnerControl({ db, clock }),
-          db,
-          clock,
           () => {
             throw new Error("injected reconcile failure");
           },
@@ -554,7 +564,7 @@ describe("F-group: Integration and production wiring", () => {
         const res = await failingApp.request("/api/loops", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ machineId: WIRE_MACHINE_ID, cron: "0 10 * * *", timezone: "UTC" }),
+          body: JSON.stringify({ machineId: WIRE_MACHINE_ID, taskFile: "/srv/TASK.md", cron: "0 10 * * *", timezone: "UTC" }),
         });
 
         // The committed create still succeeds — the seam error is classified,

@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
-import { readFileSync, realpathSync } from "node:fs";
+import { readFileSync, realpathSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -76,9 +76,11 @@ describe("production Runner seam (I6, inverted in batch 3)", () => {
     // touching the jail (a stub that throws on any use proves it).
     const jail: WorkdirJail = {
       daemonRoots: ["/"],
+      scratchRoot: "/tmp/unused-test-scratch",
       resolve: () => Promise.reject(new Error("jail must not be used for an unsupported agent")),
       revalidate: () => Promise.reject(new Error("jail must not be used for an unsupported agent")),
       release: () => Promise.reject(new Error("jail must not be used for an unsupported agent")),
+      dispose: () => Promise.resolve(),
     };
     const runner = productionRunnerFactory({ jail, claudeBin: "claude", timeoutMs: 1000, envSource: {} });
     const delivery = {
@@ -121,6 +123,53 @@ describe("prepareDaemon — the batch-3 composition root", () => {
         {},
       ),
     ).rejects.toThrow(ClaudeProbeError);
+  });
+
+  it("a startup failure releases the minted control root (review STD-4)", async () => {
+    let minted: string | null = null;
+    let scratchRoot: string | null = null;
+    await expect(
+      prepareDaemon(
+        { ...baseConfig, allowedRoots: [realpathSync(tmpdir())], claudeBin: path.join(tmpdir(), "no-such-claude") },
+        {},
+        {
+          onControlRoot: (root) => {
+            minted = root.rootDir;
+          },
+          onJail: (jail) => {
+            scratchRoot = jail.scratchRoot;
+          },
+        },
+      ),
+    ).rejects.toThrow(ClaudeProbeError);
+    expect(minted).not.toBeNull();
+    expect(existsSync(minted!)).toBe(false); // no loopzhb-control-* residue
+    expect(scratchRoot).not.toBeNull();
+    expect(existsSync(scratchRoot!)).toBe(false); // no loopzhb-runs-* residue
+  });
+
+  it("an observer throw releases both per-start roots", async () => {
+    let controlRoot: string | null = null;
+    let scratchRoot: string | null = null;
+    await expect(
+      prepareDaemon(
+        { ...baseConfig, allowedRoots: [realpathSync(tmpdir())], claudeBin: FIXTURE },
+        { PATH: `${path.dirname(process.execPath)}:${process.env.PATH ?? ""}` },
+        {
+          onJail: (jail) => {
+            scratchRoot = jail.scratchRoot;
+          },
+          onControlRoot: (root) => {
+            controlRoot = root.rootDir;
+            throw new Error("observer failed");
+          },
+        },
+      ),
+    ).rejects.toThrow("observer failed");
+    expect(controlRoot).not.toBeNull();
+    expect(scratchRoot).not.toBeNull();
+    expect(existsSync(controlRoot!)).toBe(false);
+    expect(existsSync(scratchRoot!)).toBe(false);
   });
 
   it("bad isolation roots still reject before the probe (fail-closed ordering)", async () => {

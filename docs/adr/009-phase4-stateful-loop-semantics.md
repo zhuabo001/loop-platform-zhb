@@ -116,6 +116,37 @@ Batch 1 交付以上全部契约的 schema、migration、wire 形状与纯领域
 
 ## 修订记录
 
+### 2026-09-01：Batch 2 接线裁决固化
+
+Batch 2 把本 ADR 的纯领域/write-plan 接到事务适配层（决策 8 的预定工作）。在不改变任何已裁决语义的前提下，固化接线期确认的十处裁决：
+
+1. **Capability 资源策略的位置与写放大。** Poll capability 声明的持久化前限制（原始数组 ≤32 项、每项匹配 `^[a-z0-9][a-z0-9._-]{0,63}$`、违规整次 Poll 400）是 server 侧策略，落 `store/machines.ts` 纯函数并在 coordinator 的 Poll 流水线中于任何 heartbeat/snapshot/claim 写入之前执行——credential 失败（401）仍先于 capability 拒绝（400），未认证请求不做资源校验。快照持久化语义不变（完整替换、缺失写 null、空数组写 `[]`、未知名保留），但按值等价的快照不重复落盘：能力快照视同 identity 字段搭 `applyMachinePollContact` 的同一 UPDATE，无变化时 idle Poll 保持只读热路径。
+2. **迟到普通 v1 成功 Report 的冻结分支。** 普通 report（非 finish）抵达时已合法 Completed 的 Loop：Run 自身照常记 `done/exec/<status>` 并保存 message 与本次 Run state，但 Loop 全部字段零写入（state 不晋升、Task File 不同步、updatedAt 不动）。该分支在 terminal/state/sync policy 全部通过且快照合法之后才判定；finish 抵达时已 Completed 仍走 `already_completed`（决策 4 顺序不变）。
+3. **v1 Lease 的 Loop 缺失。** claim 后 Loop 被删除（cascade 删 Run 是既有约定，但孤儿 Lease 防御层仍在）时，v1 Report 收口为稳定 `invalid_loop_state` Run failure 并消费 Lease——与损坏快照同族，不发明新分类。
+4. **合法 Finish 的附带写集与调度信号。** 合法 Finish 在同一事务内：将同 Loop 的其他 pending Run 标为 `canceled/skipped`（保留 running Run），删除本 Lease。事务提交后必须 reconcile Scheduler；该需求通过 Report 内部结果的显式字段传回 HTTP 适配层（wire response 只序列化原有 Report ack，内部 Loop 行不得泄露），由适配层复用既有 schedule-commit seam。非法/stale Finish 不产生调度信号。
+5. **Reopen 的旧代际撤销。** Reopen 事务在 planReopen 计算成功后：把该 Loop 遗留的 pending/running Run 置 `canceled`（沿用 cancel 语义，不写 outcome），删除该 Loop 的全部残余 Lease（active 与 terminal-grace 一视同仁），再写入 completion 清除 + enabled=true + schedule revision+1 + 清 watermark + 有 cron 时以事务时间建立新 activation。提交后 reconcile Scheduler；完成期间的 occurrence 不补跑（activation 边界与 revision guard 共同保证）。
+6. **管理路由的稳定 HTTP 映射（不新增 code）。** 决策 10 的两个 code 之外：goal/task-file 的值域违规 → 400；goal/schedule/reopen 的 revision 耗尽 → 普通 409（无 code）；Task File 重定向遇 running Run → 普通 409；管理路由读到损坏快照（`invalid_loop_state`）→ 普通 409。这些映射固定后即为契约，未来不得静默改码。
+7. **Claim 事务的权威快照。** claim 事务在 `pending → running` 条件更新成功后于同一事务重读 Loop 行：Loop 缺失、Loop 已合法 Completed、或 goal/role 等授权输入与该快照矛盾时不 mint Lease（Run 回滚回 pending，候选扫描继续）。Lease 的 `terminalProtocolVersion=1`、`goalRevision=currentLoop.goalRevision`、`canFinish=role==='exec' && goal!=null` 全部由该快照计算；Delivery（含 `terminalProtocol:1` 与当前 goal）也由该快照构建——candidate 扫描时的 Loop 副本只是提示。Task File 为空的旧 Loop 不在 claim 处拦截：新 Daemon 领取后本地以前置失败收口（计划 §2.3）。
+8. **Daemon Journal 的秘密边界。** 控制根目录（0700，每启动一次 mkdtemp）、静态 `loopzhb` wrapper（0500，内容不含任何 secret）与每 Run 控制目录（0700：`context/prev-state.json` 只读紧凑 JSON、`outbox/` 唯一可写）构成唯一本地命令通道。Agent env 只注入 wrapper 的 PATH 前缀与 outbox 位置（`LOOPZHB_JOURNAL_OUTBOX`）；Machine Credential、Run Credential、Server URL 不进入 env/prompt/wrapper/Journal/控制文件。wrapper 从继承的 provider/proxy 环境变量（ANTHROPIC_*、CLAUDE_CODE_OAUTH_TOKEN、代理变量）派生脱敏 needle，在落盘前脱敏 message/reason；Daemon 读取 Journal 记录后用完整 `redactSecrets` 再脱敏一次（双层）。state 任何 key/value 命中已知 provider/proxy secret → 写无敏感 invalid marker 并令 Run 失败，不静默改写结构化 state。
+9. **Daemon 本地 Journal/Task File 的稳定失败分类。** 均为 content-free 稳定字符串，经 `ok=false` Report 上报：Journal 侧 `journal_missing`（零记录）/`journal_multiple`（多记录或 symlink）/`journal_corrupt`（损坏 JSON）/`journal_invalid`（invalid marker 或 policy 非法）/`journal_io`（读取或清理失败）；Task File 前置（不启动 Claude）沿用 sync 分类 `missing`/`unreadable`/`outside_jail`/`changed` 加 `task_file_not_configured`（旧 Loop 未补齐）；Claude 非零退出/超时/signal/stream 失败永远优先，Journal 内容被忽略。这些分类是 daemon-local 的 error 文本，不进入 wire schema。
+10. **v1 prompt 由 Daemon 构建。** Server 的 `buildExecTask`（Phase 3 原文）对 v0 Delivery 保持不变；v1 Delivery 的 `task` 字段仍是既有文本（向后兼容旧 reader），但新 Daemon 对 `terminalProtocol:1` 的 Run 忽略它，本地用权威输入组装 prompt：Goal line（最高优先级）、Task File 规范绝对路径（只给路径不注入全文，`## Spec` 权威/`## Current understanding` 基线/`## Timeline` 与 `prev-state.json` 不可信）、恰好一次 `loopzhb report|finish` 的收口指令；Open Loop 不展示 finish 示例，Closed Loop 提醒只有真实证据满足 Goal 才可 Finish。
+
+### 2026-09-01（二）：首轮 Code Review 修复裁决固化
+
+Batch 2 首轮 code review（FAIL）后，固化修复期确认的四处裁决——它们全部不改变已裁决语义，只改变实现纪律：
+
+1. **`loops.revision` 统一乐观并发令牌（OCC）。** `updatedAt` 不能担任并发 guard：毫秒时钟下先提交者与陈旧事务可共享同一值，陈旧写会静默命中（review SPEC-3）。新增 additive 列 `loops.revision`（int、默认 0，ADR-003 只增不删纪律）：**每一次** loops 行写必须 `revision = revision + 1`；每一个基于 loop 快照做决策的写事务必须 `WHERE id = ? AND revision = <observed>` guard；guard 丢零行 → 回滚 → 有界 re-resolve 一次 → 再丢为稳定 500（RaceLost）。写方审计单：updateGoal/updateTaskFile/reopenLoop、最终 Report 的 Loop 写、claim（flip 即 bump——这是 retarget/claim 竞态 SPEC-1 的闭环机制：claim 先于 retarget 提交时 retarget 的 guard 必丢，re-resolve 见到 running Run → 409；反之 claim 读到新 taskFile，Delivery 恒属新路径）、调度水位写、updateSchedule（本次补齐此前缺失的 guard）。`updatedAt` 降级为纯展示字段；`goalRevision`/`scheduleRevision` 保留各自业务语义（lease 的 stale_goal 判定仍用 goalRevision）。单连接 PGlite 无法观测锁，故弃行锁方案；OCC 的确定性交错证明由 resolve/write 之间的 TEST-ONLY hook（`LifecycleOpsHooks.afterResolve`）承载。
+2. **Daemon 的 no-follow 有界 fd 读取纪律。** 凡读取 agent 可影响的文件（Journal record、Task File 同步、wrapper 的 `--message-file`/`--state-file`），一律经 `bounded-read.ts` 的 `readRegularFileNoFollow`：`O_NOFOLLOW` 打开一次（终组件换链得 ELOOP）、同一 fd 上 fstat 验 regular+尺寸上限（先验尺寸再分配，超限含稀疏文件立即失败，review ADV-4 的 OOM 面关闭）、固定 `maxBytes+1` 缓冲有界读、返回 dev/ino 供调用方做 check/use 一致性复验。残余（明示）：中间目录组件在 realpath 与 open 之间被换链超出 Node 跨平台能力，Task File 以读后 realpath 复验收窄该窗口；Windows 无 `O_NOFOLLOW` 时退化为 dev/ino 比对（本仓 CI 为 POSIX）。Journal record 上限定为 2×64 KiB=128 KiB（合法 record 上界 ≈90 KB：64 KiB state + message/reason 最坏转义），超限为新的 daemon-local 稳定分类 `journal_too_large`；outbox 目录项数量帽 16（归入 `journal_multiple`）。
+3. **Journal 第二层秘密边界扩展至 state。** wrapper 落盘前的 state 扫描（任何 key/value 命中已知 secret → 无用户值 invalid marker）不是可信边界：agent 对 outbox 有直接写权限，可绕过 wrapper 直写 record（review ADV-1）。collector 因此对 canonical state 复跑同一共享扫描（`secret-scan.ts`，needle 集 = agent env 全量 secret + runToken），命中即 `journal_invalid` fail-closed——绝不脱敏后静默入库（静默改写等于发明 agent 未报告的 state）。同时 secret key 分类收敛为 `agent-env.ts` 单一导出（`isSecretKey`/`collectSecretValues`），wrapper 不再字面复制（review STD-3）。
+4. **per-start control root 的全生命周期。** `createControlRoot` 增补 `releaseControlRoot`（fail-closed：父目录/前缀身份校验先行，symlink/非目录置换 throw 不删，ENOENT 幂等）；composition root 在 startup failure（probe 失败等）与 runtime 关闭（SIGTERM/异常）两条路径都释放（review STD-4）——不再遗留 `loopzhb-control-*` 与 wrapper 元数据。
+
+### 2026-09-02：第二轮 Code Review 修复裁决固化
+
+1. **决策快照与写入必须由同一 Loop revision 证明。** claim、manual enqueue 与 scheduled watermark 在写事务外解析 Loop 快照，写事务内以 `id + revision` CAS 获得该快照对应的写权限；CAS 丢失时整笔 Run/Lease/watermark 事务回滚并完整重解析一次。manual enqueue 即使不修改 Loop 业务字段，也以 revision bump 封住 Finish 后插入 pending 的窗口；scheduled enqueue 的 watermark 与 Run 写共享同一事务。
+2. **秘密边界复用同一个 protected-form matcher。** message/reason 的 redaction 与 state/Task File 的 fail-closed 扫描共享 raw、JSON escape、Base64/Base64URL、hex、二次编码、percent 与分隔符拆分形态定义。state/Task File 命中后拒绝，不对待持久化数据做静默改写。
+3. **Journal 条目上限约束枚举本身。** collector 通过流式目录 handle 逐项读取，第 17 项立即返回 `journal_multiple` 并关闭 handle；不得先全量分配文件名再检查上限。
+4. **所有 per-start 临时根都有 owner-level 生命周期。** control root 在 `mkdtemp` 后任一步构造失败即自清理；observer 也位于 startup 保护区。Workdir jail 暴露身份校验、幂等的 owner-level `dispose()`，composition root 在 startup failure 和 runtime shutdown 同时回收 control/scratch 两类根。
+
 ### 2026-08-31：实现期裁决固化
 
 在不改变任何已裁决语义的前提下，固化实现期确认的八处裁决：

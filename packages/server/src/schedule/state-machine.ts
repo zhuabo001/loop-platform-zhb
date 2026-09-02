@@ -33,11 +33,12 @@
  * the D9 equivalence tests).
  */
 
-import { eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 
 import type { Db } from "../db/index.js";
 import type { Loop } from "../db/schema.js";
 import { loops } from "../db/schema.js";
+import { withGuardRetry } from "../store/guard-retry.js";
 import type { Clock } from "../time.js";
 import { validateSchedule } from "./time-semantics.js";
 import { planScheduleTransition, type ScheduleTransitionPatch } from "./transition.js";
@@ -58,11 +59,38 @@ export class ScheduleRevisionExhaustedError extends Error {
   }
 }
 
+/** The guarded schedule write observed zero rows — a competitor committed
+ *  between the in-transaction read and the write (review SPEC-3: this write
+ *  previously had NO guard at all). Rolls back; the shared retry re-runs
+ *  once on fresh state. */
+class ScheduleGuardLostError extends Error {
+  constructor(readonly loopId: string) {
+    super(`schedule guard lost for loop ${loopId}`);
+    this.name = "ScheduleGuardLostError";
+  }
+}
+
+/** The schedule guard lost AGAIN on the single bounded re-resolve — surfaces
+ *  as a retryable 500; no partial state was ever committed. */
+export class ScheduleRaceLostError extends Error {
+  constructor(readonly loopId: string) {
+    super(`schedule guard did not settle for loop ${loopId}`);
+    this.name = "ScheduleRaceLostError";
+  }
+}
+
 /**
- * Result of a schedule update attempt.
+ * Result of a schedule update attempt. The `conflict: "loop_completed"`
+ * variant is the Phase 4 guard: a Completed loop's cron/timezone stay
+ * editable (it remains paused either way), but re-enabling it is refused —
+ * only Reopen restores scheduling (ADR-009 决策 10: mapped to 409
+ * `loop_completed` at the route). It carries `changed: false` and the
+ * untouched row so callers that only narrow on found/changed keep compiling
+ * and behave exactly like a no-op; the route checks `conflict` FIRST.
  */
 export type UpdateScheduleResult =
   | { found: false }
+  | { found: true; conflict: "loop_completed"; changed: false; loop: Loop }
   | { found: true; changed: false; loop: Loop }
   | { found: true; changed: true; loop: Loop };
 
@@ -91,12 +119,29 @@ export async function updateSchedule(
   loopId: string,
   patch: SchedulePatch,
 ): Promise<UpdateScheduleResult> {
+  return withGuardRetry(
+    () => updateScheduleOnce(deps, loopId, patch),
+    (err) => err instanceof ScheduleGuardLostError,
+    (err) => new ScheduleRaceLostError((err as ScheduleGuardLostError).loopId),
+  );
+}
+
+async function updateScheduleOnce(
+  deps: ScheduleStateMachineDeps,
+  loopId: string,
+  patch: SchedulePatch,
+): Promise<UpdateScheduleResult> {
   return deps.db.transaction(async (tx) => {
     // 1. Re-read the Loop within the transaction
     const [currentLoop] = await tx.select().from(loops).where(eq(loops.id, loopId)).limit(1);
 
     if (!currentLoop) {
       return { found: false };
+    }
+
+    // Phase 4 Completed guard: only Reopen may re-enable a Completed loop.
+    if (currentLoop.completedAt !== null && patch.enabled === true) {
+      return { found: true, conflict: "loop_completed", changed: false, loop: currentLoop };
     }
 
     // 2. Validate raw values before semantic no-op comparison, then normalize
@@ -130,11 +175,19 @@ export async function updateSchedule(
       validateSchedule("0 0 * * *", finalTimezone);
     }
 
-    // 5. Apply the core-computed patch.
-    const [updatedLoop] = await tx.update(loops).set(transition.writes).where(eq(loops.id, loopId)).returning();
+    // 5. Apply the core-computed patch — guarded on the revision this
+    // transaction's read observed (review SPEC-3): any competing loops write
+    // (retarget, finish, claim bump, …) committed between the read and here
+    // loses the guard, and the shared retry re-plans from the fresh row. The
+    // bump keeps the unified invariant: EVERY loops write increments it.
+    const [updatedLoop] = await tx
+      .update(loops)
+      .set({ ...transition.writes, revision: sql`${loops.revision} + 1` })
+      .where(and(eq(loops.id, loopId), eq(loops.revision, currentLoop.revision)))
+      .returning();
 
     if (!updatedLoop) {
-      throw new Error(`Loop ${loopId} disappeared during transaction`);
+      throw new ScheduleGuardLostError(loopId);
     }
 
     return { found: true, changed: true, loop: updatedLoop };

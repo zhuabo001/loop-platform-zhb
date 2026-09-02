@@ -38,6 +38,7 @@ const loopBase: Loop = {
   completionReason: null,
   taskFileSyncAttemptedAt: null,
   taskFileSyncError: null,
+  revision: 0,
   createdAt: "2026-07-01T00:00:00.000Z",
   updatedAt: "2026-07-01T00:00:00.000Z",
 };
@@ -134,13 +135,26 @@ describe("buildDelivery", () => {
         model: null,
         allowControl: true,
         agent: "claude-code",
+        goal: null,
       },
       prevState: null,
       roots: ["/home/dev"],
       systemPrompt: "",
       task: buildExecTask(loopBase),
+      terminalProtocol: 1,
     });
     expect(deliverySchema.parse(delivery)).toEqual(delivery);
+  });
+
+  it("carries the loop's CURRENT goal from the claim-time snapshot (Phase 4 v1)", () => {
+    const delivery = buildDelivery({
+      loop: { ...loopBase, goal: "close the onboarding gap" },
+      run: runBase,
+      roots: [],
+      runToken: "rk_x",
+    });
+    expect(delivery.loop.goal).toBe("close the onboarding gap");
+    expect(delivery.terminalProtocol).toBe(1);
   });
 
   it("carries the loop's workflow cursor as prevState (opaque passthrough)", () => {

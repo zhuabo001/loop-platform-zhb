@@ -30,13 +30,18 @@
  * (Single-connection PGlite serializes the window away — the CAS never loses
  * here; the real interleaving proof stays with Phase 6.)
  */
-import { and, eq } from "drizzle-orm";
+import { and, eq, ne, sql } from "drizzle-orm";
 
 import type { ReportRequest } from "@loopzhb/protocol";
 
 import { ReportRaceLostError, RunCapabilityInvalidError } from "../coordinator/errors.js";
 import type { Db } from "../db/index.js";
-import { runLeases, runs, type NewRun, type Run } from "../db/schema.js";
+import { loops, runLeases, runs, type Loop, type NewLoop, type NewRun, type Run } from "../db/schema.js";
+import {
+  planReportWrites,
+  type LeaseAuthSnapshot,
+  type ReportWritePlan,
+} from "../loop-lifecycle/index.js";
 import { isLeaseDead } from "./leases.js";
 import type { Clock } from "../time.js";
 
@@ -54,7 +59,18 @@ export const SESSION_ID_CAP = 200;
  *  generic reclaim reason). */
 export const GENERIC_RUN_ERROR = "run failed on machine";
 
-export type ReportTxResult = { ok: true } | { ok: true; reconciled: true };
+/** Stable terminal message for a pending run canceled by a sibling run's
+ *  legal Finish (ADR-009 修订 2026-09-01 决策 4). */
+export const FINISH_CANCELED_MESSAGE = "canceled: the loop's goal was completed by a sibling run";
+
+/**
+ * The report transaction's result. `reconciled` marks the ONE wake-report for
+ * a swept (terminal-grace) run; `schedulerReconcile` carries the post-commit
+ * authoritative loop row of a LEGAL FINISH so the HTTP adapter can reconcile
+ * the Scheduler through its seam (ADR-009 修订 2026-09-01 决策 4) — it is
+ * INTERNAL ONLY and must never be serialized onto the wire.
+ */
+export type ReportTxResult = { ok: true; reconciled?: true; schedulerReconcile?: Loop };
 
 type ReportTxOutcome =
   | { kind: "ok"; result: ReportTxResult }
@@ -179,16 +195,19 @@ async function runReportTx(
     // ONE clock snapshot for the whole transaction: the expiry re-check and
     // the transition stamp must agree.
     const now = clock.now();
-    // Read the lease and Run in ONE statement. Under Postgres READ COMMITTED,
-    // separate SELECTs may observe `active lease` before a sweep and `error
-    // run` after it, manufacture a false stale-phase 401, and lose an
-    // unconsumed report. A joined snapshot makes every branch-table decision
-    // coherent; all subsequent writes retain their conditional guards.
+    const nowIso = now.toISOString();
+    // Read the lease, Run AND Loop in ONE coherent snapshot. Under Postgres
+    // READ COMMITTED, separate SELECTs may observe `active lease` before a
+    // sweep and `error run` after it, manufacture a false stale-phase 401,
+    // and lose an unconsumed report; the v1 branch table additionally plans
+    // Loop writes from this snapshot and must never mix rows from different
+    // instants. All subsequent writes retain their conditional guards.
     const state = (
       await tx
-        .select({ lease: runLeases, run: runs })
+        .select({ lease: runLeases, run: runs, loop: loops })
         .from(runLeases)
         .leftJoin(runs, eq(runs.id, runLeases.runId))
+        .leftJoin(loops, eq(loops.id, runLeases.loopId))
         .where(eq(runLeases.tokenHash, input.tokenHash))
     )[0];
     if (!state) return { kind: "denied", reason: "consumed_or_revoked" };
@@ -236,23 +255,92 @@ async function runReportTx(
     }
 
     // CAS over the whole write window (ADR-001:36 / ADR-003:80 — review #3):
-    // the terminal UPDATE re-guards on the phase we validated, and BOTH writes
-    // verify their affected row count. On real multi-connection Postgres a
-    // competing report/cancel/sweep that committed in between turns a guard
-    // to 0 rows → ReportCasLostError → the transaction rolls back and the
-    // BOUNDED re-resolve (module header) re-runs the branch table on the
-    // winner's committed state. (On single-connection pglite the guards are
-    // structural depth; the real contention proof stays with Phase 6.)
-    const updated = await tx
-      .update(runs)
-      .set(buildReportWriteSet(input.body, run, now.toISOString()))
-      .where(and(eq(runs.id, run.id), eq(runs.phase, run.phase)))
-      .returning({ id: runs.id });
-    if (updated.length !== 1) throw new ReportCasLostError(run.id);
-    // Fault-injection seam (between the two writes — see the jsdoc above).
+    // every guarded write re-checks the state this snapshot validated and
+    // verifies its affected row count; zero rows → ReportCasLostError →
+    // rollback → the BOUNDED re-resolve (module header) re-runs the branch
+    // table on the winner's committed state.
+    const writeRun = async (runWrites: Partial<NewRun>): Promise<void> => {
+      const updated = await tx
+        .update(runs)
+        .set(runWrites)
+        .where(and(eq(runs.id, run.id), eq(runs.phase, run.phase)))
+        .returning({ id: runs.id });
+      if (updated.length !== 1) throw new ReportCasLostError(run.id);
+    };
+
+    /** Guarded Loop write (v1 only): CAS on the snapshot's `revision` — the
+     *  unified monotonic OCC token EVERY loops write increments (review
+     *  SPEC-3, ADR-009 修订 2026-09-01). A loop write that committed between
+     *  the snapshot and here — INCLUDING a same-millisecond one the old
+     *  updatedAt guard could not see — is a CAS loss, so the whole plan
+     *  re-resolves against the fresh row instead of writing a patch computed
+     *  from stale inputs. The pure kernel stays revision-agnostic; the bump
+     *  is appended here. Returns the authoritative new row. */
+    const writeLoop = async (loopWrites: Partial<NewLoop>, loop: Loop): Promise<Loop> => {
+      const updated = await tx
+        .update(loops)
+        .set({ ...loopWrites, revision: sql`${loops.revision} + 1` })
+        .where(and(eq(loops.id, loop.id), eq(loops.revision, loop.revision)))
+        .returning();
+      if (updated.length !== 1) throw new ReportCasLostError(run.id);
+      return updated[0]!;
+    };
+
+    // ---- v0 lease: Phase 3 semantics, byte-identical to the pre-Phase-4 path ----
+    if (lease.terminalProtocolVersion === 0) {
+      await writeRun(buildReportWriteSet(input.body, run, nowIso));
+      // Fault-injection seam (between the two writes — see the jsdoc above).
+      await input.insideTxHook?.(run.id);
+      await deleteObservedLease();
+      return { kind: "ok", result: reconcile ? { ok: true as const, reconciled: true as const } : { ok: true as const } };
+    }
+
+    // ---- v1 lease: the ADR-009 决策 8 branch table, planned by the PURE
+    // kernel (loop-lifecycle) and executed here with guarded writes ----
+    const leaseAuth: LeaseAuthSnapshot = {
+      role: lease.role,
+      canFinish: lease.canFinish,
+      goalRevision: lease.goalRevision,
+      terminalProtocolVersion: lease.terminalProtocolVersion,
+    };
+    // A missing loop behind a live v1 lease is orphan-grade damage: fail
+    // closed into the SAME stable classification as a corrupt snapshot
+    // (ADR-009 修订 2026-09-01 决策 3) — zero Loop writes, lease consumed.
+    const plan: ReportWritePlan = state.loop
+      ? planReportWrites({ loop: state.loop, lease: leaseAuth, run, body: input.body, nowIso })
+      : {
+          kind: "loop_state_invalid",
+          runWrites: buildReportWriteSet({ ok: false, error: "invalid_loop_state" }, run, nowIso),
+          loopWrites: null,
+          deleteLease: true,
+        };
+
+    await writeRun(plan.runWrites);
+
+    let schedulerReconcile: Loop | undefined;
+    if (plan.kind === "v1_success" || plan.kind === "v1_finish") {
+      const updatedLoop = await writeLoop(plan.loopWrites, state.loop!);
+      if (plan.kind === "v1_finish") {
+        // A legal finish retires the loop's OTHER pending runs in the same
+        // transaction (running runs are preserved — their late reports freeze
+        // the loop, ADR-009 修订 2026-09-01 决策 2). Pending runs hold no
+        // leases, so there is nothing else to clean.
+        await tx
+          .update(runs)
+          .set({ phase: "canceled", outcome: "skipped", message: FINISH_CANCELED_MESSAGE, ts: nowIso })
+          .where(and(eq(runs.loopId, updatedLoop.id), eq(runs.phase, "pending"), ne(runs.id, run.id)));
+        // The HTTP adapter reconciles the Scheduler post-commit through its
+        // seam; the wire response never carries this row.
+        schedulerReconcile = updatedLoop;
+      }
+    }
+
+    // Fault-injection seam (between the run write and the lease delete).
     await input.insideTxHook?.(run.id);
     await deleteObservedLease();
-    return { kind: "ok", result: reconcile ? { ok: true as const, reconciled: true as const } : { ok: true as const } };
+    const result: ReportTxResult = reconcile ? { ok: true, reconciled: true } : { ok: true };
+    if (schedulerReconcile !== undefined) result.schedulerReconcile = schedulerReconcile;
+    return { kind: "ok", result };
   });
   if (outcome.kind === "denied") throw new RunCapabilityInvalidError(outcome.reason);
   return outcome.result;

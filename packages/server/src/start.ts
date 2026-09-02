@@ -22,7 +22,9 @@ import { createRunCoordinator, mintRunCredential, newUuidRunId, type Coordinator
 import { loadServerConfig, unauthenticatedExposureWarning, type ServerConfig } from "./config.js";
 import { closeDb, openMigratedDb, type DbHandle } from "./db/index.js";
 import { createServerApp } from "./http/app.js";
+import { createLifecycleAdmin, type LifecycleOpsHooks } from "./loop-lifecycle/admin.js";
 import { createOwnerControl } from "./owner/index.js";
+import { createScheduleAdmin } from "./schedule/index.js";
 import { createScheduler, type CronFactory, type Scheduler } from "./scheduler/index.js";
 import { productionCronFactory } from "./scheduler/croner-factory.js";
 import { armInactivitySweep, createInactivitySweep, type InactivitySweep } from "./sweep/index.js";
@@ -55,6 +57,10 @@ export interface BootstrapOverrides {
    *  catch-up enqueue mid-flight to race stopAndDrain). Production passes no
    *  overrides, so no hooks are ever installed outside tests. */
   coordinatorHooks?: CoordinatorHooks;
+  /** TEST-ONLY interleaving hook forwarded to the lifecycle ops through the
+   *  LifecycleAdmin (review SPEC-1: C8 commits a real claim between the
+   *  retarget's resolve and its guarded write). */
+  lifecycleHooks?: LifecycleOpsHooks;
 }
 
 /**
@@ -86,6 +92,8 @@ export async function bootstrapServer(
       hooks: overrides.coordinatorHooks,
     });
     const admin = createLoopAdmin({ db: handle.db, clock, newLoopId: newUuidLoopId });
+    const lifecycle = createLifecycleAdmin({ db: handle.db, clock, hooks: overrides.lifecycleHooks });
+    const schedule = createScheduleAdmin({ db: handle.db, clock });
     const ownerControl = createOwnerControl({ db: handle.db, clock });
     const sweep = createInactivitySweep({ db: handle.db, clock });
     const scheduler = createScheduler({
@@ -95,7 +103,7 @@ export async function bootstrapServer(
       cronFactory,
     });
     return {
-      app: createServerApp(coordinator, admin, ownerControl, handle.db, clock, (loop) =>
+      app: createServerApp(coordinator, admin, lifecycle, schedule, ownerControl, (loop) =>
         scheduler.reconcile(loop),
       ),
       coordinator,

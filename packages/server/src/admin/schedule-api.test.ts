@@ -44,6 +44,7 @@ describe("A-group: schedule API surface", () => {
     test("A1: creates manual-only loop by default", async () => {
       const req: CreateLoopRequest = {
         machineId,
+        taskFile: "/srv/TASK.md",
         name: "manual-loop",
       };
 
@@ -62,6 +63,7 @@ describe("A-group: schedule API surface", () => {
     test("A2: creates scheduled loop with cron", async () => {
       const req: CreateLoopRequest = {
         machineId,
+        taskFile: "/srv/TASK.md",
         name: "scheduled-loop",
         cron: "0 9 * * 1-5",
       };
@@ -81,6 +83,7 @@ describe("A-group: schedule API surface", () => {
     test("A3: creates scheduled loop with custom timezone", async () => {
       const req: CreateLoopRequest = {
         machineId,
+        taskFile: "/srv/TASK.md",
         name: "tz-loop",
         cron: "30 14 * * *",
         timezone: "Asia/Shanghai",
@@ -104,6 +107,7 @@ describe("A-group: schedule API surface", () => {
     beforeEach(async () => {
       const result = await admin.createLoop({
         machineId,
+        taskFile: "/srv/TASK.md",
         name: "test-loop",
       });
       if (!result.created) throw new Error("Failed to create loop");

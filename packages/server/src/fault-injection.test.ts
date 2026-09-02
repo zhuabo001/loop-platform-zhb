@@ -46,7 +46,9 @@ import { createRunCoordinator } from "./coordinator/index.js";
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "./db/index.js";
 import { runLeases } from "./db/schema.js";
 import { createServerApp } from "./http/app.js";
+import { createLifecycleAdmin } from "./loop-lifecycle/admin.js";
 import { createOwnerControl } from "./owner/index.js";
+import { createScheduleAdmin } from "./schedule/index.js";
 import { RECLAIM_RUN_ERROR } from "./store/runs.js";
 import { createInactivitySweep, type InactivitySweep } from "./sweep/index.js";
 import { FakeClock, makeTestFactories } from "./testkit/index.js";
@@ -81,7 +83,13 @@ async function bootFake(dataDir?: string): Promise<FakeBoot> {
   const sweep = createInactivitySweep({ db: handle.db, clock, log: (line) => sweepLogs.push(line) });
   const ownerControl = createOwnerControl({ db: handle.db, clock });
   return {
-    app: createServerApp(coordinator, admin, ownerControl, handle.db, clock),
+    app: createServerApp(
+      coordinator,
+      admin,
+      createLifecycleAdmin({ db: handle.db, clock }),
+      createScheduleAdmin({ db: handle.db, clock }),
+      ownerControl,
+    ),
     db: handle.db,
     handle,
     clock,
@@ -162,7 +170,7 @@ function createDaemon(
   const runtime = createDaemonRuntime({
     client,
     runner: countingRunner,
-    identity: { host: "fault-host", platform: "test", arch: "test", version: "0.1.0" },
+    identity: { host: "fault-host", platform: "test", arch: "test", version: "0.1.0", capabilities: ["terminal-journal-v1"] },
     pollMs: 3000,
     machineCredential: TOKEN,
   });
@@ -179,7 +187,7 @@ async function createLoopAndTrigger(app: FakeBoot["app"]): Promise<{ loopId: str
   const createRes = await app.request("/api/loops", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ machineId: machineIdFromToken(TOKEN), name: "fault-loop", workdir: "/srv/project" }),
+    body: JSON.stringify({ machineId: machineIdFromToken(TOKEN), name: "fault-loop", workdir: "/srv/project", taskFile: "/srv/project/TASK.md" }),
   });
   expect(createRes.status).toBe(201);
   const { loop } = createLoopResponseSchema.parse(await createRes.json());
@@ -218,7 +226,11 @@ describe("T5 — the sleeping daemon's late report reconciles the sweep's misjud
     // The laptop wakes; the daemon reports the REAL success with the original
     // credential and sees the report confirmed. (poll+dispatch: the claiming
     // pollOnce returned long ago — the settle seam joins the pipeline.)
-    gate.release({ ok: true, message: "slept through the sweep, finished fine" });
+    gate.release({
+      ok: true,
+      terminal: { kind: "report", status: "resolved", message: "slept through the sweep, finished fine" },
+      taskFileSyncError: "missing",
+    });
     await claimPromise;
     await daemon.executionSettled();
     expect(daemon.pendingCount()).toBe(0);
@@ -272,7 +284,11 @@ describe("T6 — a canceled run's late report is intercepted", () => {
     // The runner finishes with a SUCCESS and the daemon reports it: the coded
     // 401 is the terminal confirmation — the pending report is cleared, never
     // retried forever.
-    gate.release({ ok: true, message: "finished after the cancel" });
+    gate.release({
+      ok: true,
+      terminal: { kind: "report", status: "resolved", message: "finished after the cancel" },
+      taskFileSyncError: "missing",
+    });
     await claimPromise;
     await daemon.executionSettled();
     expect(daemon.pendingCount()).toBe(0);
@@ -296,11 +312,13 @@ describe("delivery response lost — the orphaned run converges to an observable
     const { loopId, runId } = await createLoopAndTrigger(b.app);
 
     // A RAW poll completes the claim server-side; the daemon never processes
-    // the response (dropped Delivery — the credential is lost with it).
+    // the response (dropped Delivery — the credential is lost with it). The
+    // capability declaration rides along: an absent one would RESET the
+    // machine's snapshot to null and gate the claim (Phase 4 semantics).
     const rawClaim = await b.app.request("/api/machine/poll", {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${TOKEN}` },
-      body: JSON.stringify({}),
+      body: JSON.stringify({ capabilities: ["terminal-journal-v1"] }),
     });
     expect(rawClaim.status).toBe(200);
     expect(pollResponseSchema.parse(await rawClaim.json()).deliveries).toHaveLength(1);
@@ -366,7 +384,11 @@ describe("T4 — a server restart never loses an in-flight run", () => {
 
     // The runner finishes; the daemon reports to server B with the ORIGINAL
     // credential and is confirmed.
-    gate.release({ ok: true, message: "across the restart" });
+    gate.release({
+      ok: true,
+      terminal: { kind: "report", status: "resolved", message: "across the restart" },
+      taskFileSyncError: "missing",
+    });
     await claimPromise;
     await daemon.executionSettled();
     expect(daemon.pendingCount()).toBe(0);

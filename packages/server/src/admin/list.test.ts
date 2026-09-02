@@ -119,7 +119,7 @@ describe("listLoops", () => {
   it("pins the full LoopSummary nullability on a freshly created loop", async () => {
     await fresh();
     await seedMachineRow("m-0123456789abcdef", "mbp");
-    const created = await admin.createLoop({ machineId: "m-0123456789abcdef" });
+    const created = await admin.createLoop({ machineId: "m-0123456789abcdef", taskFile: "/home/dev/TASK.md" });
     expect(created.created).toBe(true);
     const list = await admin.listLoops();
     expect(list).toHaveLength(1);
@@ -128,7 +128,7 @@ describe("listLoops", () => {
       machineId: "m-0123456789abcdef",
       name: null,
       workdir: null,
-      taskFile: null,
+      taskFile: "/home/dev/TASK.md",
       agent: "claude-code",
       allowControl: true,
       enabled: true,
@@ -138,8 +138,13 @@ describe("listLoops", () => {
       cron: null,
       timezone: "UTC",
       nextFireAt: null,
-      // Phase 4 fields (goal/completion/sync) are NOT emitted while dormant
-      // The raw-key absence is pinned in phase4-dormant.test.ts.
+      // Phase 4 fields are always emitted explicitly (Batch 2 opened them).
+      goal: null,
+      completedAt: null,
+      completionReason: null,
+      taskFileSyncedAt: null,
+      taskFileSyncAttemptedAt: null,
+      taskFileSyncError: null,
     });
   });
 
@@ -221,21 +226,12 @@ describe("listRuns", () => {
 describe("observation projections stay in lockstep with the wire DTOs", () => {
   it("every projected column set equals its summary DTO's key set (default-exclude for new columns)", () => {
     expect(Object.keys(machineSummaryColumns).sort()).toEqual(Object.keys(machineSummarySchema.shape).sort());
-    // lastRun and nextFireAt are computed fields with no backing columns. The
-    // Phase 4 loop fields are DECLARED in the DTO but deferred while Batch 1
-    // keeps them dormant (ADR-009 决策 11) — Batch 2 re-opts them
-    // into the projection by deleting this set.
-    const DORMANT_PHASE4_LOOP_FIELDS = [
-      "completedAt",
-      "completionReason",
-      "goal",
-      "taskFileSyncAttemptedAt",
-      "taskFileSyncError",
-      "taskFileSyncedAt",
-    ];
+    // lastRun and nextFireAt are computed fields with no backing columns.
+    // Batch 2 opted the Phase 4 loop fields into the projection (ADR-009
+    // 决策 11's dormancy ended), so the lockstep is again exact.
     expect(Object.keys(loopSummaryColumns).sort()).toEqual(
       Object.keys(loopSummarySchema.shape)
-        .filter((k) => k !== "lastRun" && k !== "nextFireAt" && !DORMANT_PHASE4_LOOP_FIELDS.includes(k))
+        .filter((k) => k !== "lastRun" && k !== "nextFireAt")
         .sort(),
     );
     expect(Object.keys(runSummaryColumns).sort()).toEqual(Object.keys(runSummarySchema.shape).sort());

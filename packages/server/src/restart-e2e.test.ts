@@ -110,7 +110,7 @@ function makeDaemon(rs: RunningServer, runner?: AgentRunner) {
   return createDaemonRuntime({
     client,
     runner: runner ?? createFakeRunner(),
-    identity: { host: "e2e-host", platform: "test", arch: "test", version: "0.1.0" },
+    identity: { host: "e2e-host", platform: "test", arch: "test", version: "0.1.0", capabilities: ["terminal-journal-v1"] },
     pollMs: 3000,
     machineCredential: TOKEN,
   });
@@ -120,7 +120,7 @@ async function createScheduledLoop(rs: RunningServer, cron: string): Promise<str
   const res = await fetch(`${rs.baseUrl}/api/loops`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ machineId: MACHINE_ID, name: "e2e-loop", cron, timezone: "UTC" }),
+    body: JSON.stringify({ machineId: MACHINE_ID, name: "e2e-loop", cron, timezone: "UTC", taskFile: "/srv/e2e/TASK.md" }),
   });
   expect(res.status).toBe(201);
   const { loop } = createLoopResponseSchema.parse(await res.json());
@@ -329,7 +329,7 @@ describe("E-group: file-backed DB + real HTTP restart E2E", () => {
     const claimRes = await fetch(`${first.baseUrl}/api/machine/poll`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${TOKEN}` },
-      body: JSON.stringify({ host: "e2e-host", platform: "test", arch: "test", version: "0.1.0" }),
+      body: JSON.stringify({ host: "e2e-host", platform: "test", arch: "test", version: "0.1.0", capabilities: ["terminal-journal-v1"] }),
     });
     expect(claimRes.status).toBe(200);
     const claimed = (await claimRes.json()) as any;

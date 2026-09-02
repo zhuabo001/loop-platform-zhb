@@ -48,13 +48,11 @@ function isAllowed(key: string): boolean {
 
 /** Which FORWARDED values are credentials: non-empty ANTHROPIC_* and the
  *  OAuth token are obvious; proxy URLs can embed userinfo. PATH/HOME/LANG
- *  are never secrets. */
-function isSecretKey(key: string): boolean {
+ *  are never secrets. Exported as the SINGLE secret-key classification —
+ *  every env-derived needle collection (agent env, wrapper, journal) must
+ *  draw from here (review STD-3). */
+export function isSecretKey(key: string): boolean {
   return key.startsWith("ANTHROPIC_") || key === "CLAUDE_CODE_OAUTH_TOKEN" || PROXY_NAMES.has(key);
-}
-
-function isSecret(key: string, value: string): boolean {
-  return value !== "" && isSecretKey(key);
 }
 
 /** Longest-first, deduped, empties dropped — replacing a short secret before
@@ -63,15 +61,27 @@ function normalizeSecrets(values: string[]): string[] {
   return [...new Set(values)].filter((value) => value !== "").sort((a, b) => b.length - a.length);
 }
 
+/** The daemon's env-derived secret collection (review STD-3): the single
+ *  source buildAgentEnv's secretValues AND the wrapper's redaction needles
+ *  both draw from. Every secret-keyed variable is also allow-listed, so the
+ *  collection is identical whether taken over the raw source env or the
+ *  already-filtered agent env. */
+export function collectSecretValues(source: NodeJS.ProcessEnv): string[] {
+  const secrets: string[] = [];
+  for (const [key, value] of Object.entries(source)) {
+    if (value === undefined || value === "") continue;
+    if (isSecretKey(key)) secrets.push(value);
+  }
+  return normalizeSecrets(secrets);
+}
+
 export function buildAgentEnv(source: NodeJS.ProcessEnv): AgentEnv {
   const env: Record<string, string> = {};
-  const secrets: string[] = [];
   for (const [key, value] of Object.entries(source)) {
     if (value === undefined || !isAllowed(key)) continue;
     env[key] = value;
-    if (isSecret(key, value)) secrets.push(value);
   }
-  return { env, secretValues: normalizeSecrets(secrets) };
+  return { env, secretValues: collectSecretValues(source) };
 }
 
 /** Startup capability probes need PATH/config/TLS compatibility, but never
@@ -215,8 +225,7 @@ function redactTolerant(
  *  All forms are normalized together (longest-first, deduped, empties
  *  dropped). Caller contract: redact BEFORE serializing structured fields,
  *  and raw child env/stdout never enters logs unscrubbed. */
-export function redactSecrets(text: string, secretValues: string[]): string {
-  const secrets = normalizeSecrets(secretValues);
+function redactNormalizedSecrets(text: string, secrets: string[]): string {
   if (secrets.length === 0 || text === "") return text;
 
   const exactForms = new Set<string>();
@@ -258,4 +267,21 @@ export function redactSecrets(text: string, secretValues: string[]): string {
     out = redactTolerant(out, [...new Set(tolerantCS)], [...new Set(tolerantCI)], marker);
   }
   return out;
+}
+
+export function redactSecrets(text: string, secretValues: string[]): string {
+  return redactNormalizedSecrets(text, normalizeSecrets(secretValues));
+}
+
+/** Compile the exact same raw/derived/separator-tolerant forms used by
+ * redaction into a read-only predicate. State and Task File boundaries use
+ * this matcher to fail closed instead of rewriting persisted user data. */
+export function createProtectedSecretMatcher(secretValues: readonly string[]): (text: string) => boolean {
+  const secrets = normalizeSecrets([...secretValues]);
+  if (secrets.length === 0) return () => false;
+  return (text: string): boolean => text !== "" && redactNormalizedSecrets(text, secrets) !== text;
+}
+
+export function containsProtectedSecretForm(text: string, secretValues: readonly string[]): boolean {
+  return createProtectedSecretMatcher(secretValues)(text);
 }

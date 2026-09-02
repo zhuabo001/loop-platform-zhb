@@ -5,7 +5,7 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { buildAgentEnv, buildProbeEnv, redactSecrets } from "./agent-env.js";
+import { buildAgentEnv, buildProbeEnv, collectSecretValues, isSecretKey, redactSecrets } from "./agent-env.js";
 
 describe("buildAgentEnv — whitelist", () => {
   it("E1: forwards system vars PATH/HOME/LANG/TMPDIR", () => {
@@ -161,6 +161,51 @@ describe("secretValues and redactSecrets", () => {
     for (const sensitive of [credential, runToken, serverUrl]) {
       expect(Object.values(env)).not.toContain(sensitive);
     }
+  });
+});
+
+describe("collectSecretValues — the single classifier (review STD-3)", () => {
+  it("every sensitive key family is collected, empties dropped", () => {
+    const source: NodeJS.ProcessEnv = {
+      HTTP_PROXY: "http://u:p@proxy:8080",
+      http_proxy: "http://proxy:8080",
+      HTTPS_PROXY: "https://u:p@proxy:8443",
+      https_proxy: "https://proxy:8443",
+      NO_PROXY: "localhost",
+      no_proxy: "localhost",
+      ALL_PROXY: "socks5://u:p@proxy:1080",
+      all_proxy: "socks5://proxy:1080",
+      ANTHROPIC_API_KEY: "sk-ant-key",
+      ANTHROPIC_AUTH_TOKEN: "auth-token",
+      ANTHROPIC_BASE_URL: "https://api.anthropic.com",
+      CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
+    };
+    const values = collectSecretValues(source);
+    for (const value of Object.values(source)) expect(values).toContain(value);
+  });
+
+  it("non-secret keys are never collected", () => {
+    for (const key of ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "CLAUDE_CONFIG_DIR", "SSL_CERT_FILE"]) {
+      expect(isSecretKey(key)).toBe(false);
+    }
+    expect(collectSecretValues({ PATH: "/usr/bin", HOME: "/home/x", LANG: "C" })).toEqual([]);
+  });
+
+  it("empty-string secrets never participate", () => {
+    expect(collectSecretValues({ ANTHROPIC_API_KEY: "", HTTPS_PROXY: "" })).toEqual([]);
+  });
+
+  it("is the exact source buildAgentEnv draws from — drift detector", () => {
+    const source: NodeJS.ProcessEnv = {
+      PATH: "/usr/bin",
+      HOME: "/home/x",
+      ANTHROPIC_API_KEY: "sk-ant-key",
+      CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
+      HTTPS_PROXY: "https://u:p@proxy:8443",
+      NO_PROXY: "localhost",
+      EDITOR: "vim",
+    };
+    expect(buildAgentEnv(source).secretValues).toEqual(collectSecretValues(source));
   });
 });
 
