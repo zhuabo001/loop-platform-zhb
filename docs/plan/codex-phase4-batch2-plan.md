@@ -1,6 +1,6 @@
 # Phase 4 Batch 2 开发计划：Task File、State 与 Finish 全链路
 
-- 状态：待最终验收（第二轮审查修复已实现；仍需完成提交后复审与真实 Claude 门 #38）
+- 状态：确定性验收完成（第三轮三轨复审 PASS，Issues #39–#47 已关闭；真实 Claude 门 #38 待执行）
 - 基线：`main@6af3b29`
 - 目标分支：`feat/phase4-batch2-dev`
 - 长期决策：修订 ADR-009

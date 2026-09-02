@@ -111,6 +111,7 @@ $ git diff --check main  # 无输出（clean）；基线 6af3b29
 按 `AGENTS.md` 文档分层：本节只保留蒸馏结论与指针。
 
 - 本批新增：[Issue #38](https://github.com/zhuabo001/loop-platform-zhb/issues/38)（真实 Claude 门执行与证据记录，phase-4）。
+- 首轮/第二轮复审 Issues #39–#47 已在第三轮 Standards/Spec/Adversarial 确定性三轨 PASS 后核销关闭；审计记录见 `docs/handoff/codex-handoff-phase4-batch2-code-review.md` 的“第三轮审查与核销”。
 - 既有 Batch 1 复审 Issue 的状态提示（**未改动其状态，留待下一轮复审核销**）：
   - #36（finish 可选 message 绕过 terminal policy）：Batch 2 的 `planReportWrites` 单一穷尽 variant pass 已对 finish 的 `reason` 与可选 `message` 一并执行 policy（`packages/server/src/loop-lifecycle/index.ts` finish 分支），daemon 侧 `collectJournal` 同口径复验。
   - #33（state 的 stack-safe wire 与 PG 可写域）：Batch 2 terminal-policy 固定 64 KiB compact + PG 可写域 + canonical clone；phase4-live L7 固定 20k 深 state 稳定 400 且 Lease 不消费。
@@ -118,4 +119,4 @@ $ git diff --check main  # 无输出（clean）；基线 6af3b29
 
 ## 结论
 
-Phase 4 Batch 2 的确定性验收目标及第二轮审查反例均有对应测试，确定性质量门全绿（修订记录见 ADR-009 2026-09-01（二）与 2026-09-02）。Batch 2 当前仍为**待最终验收**：提交后复审核销 Issues #39–#47，并完成真实 Claude 门 Issue #38（固定 commit/hash/version/命令/结果）后方可收口。
+Phase 4 Batch 2 的确定性验收目标及第二轮审查反例均有对应测试，确定性质量门全绿，第三轮三轨复审 PASS，Issues #39–#47 已核销关闭（修订记录见 ADR-009 2026-09-01（二）与 2026-09-02）。Batch 2 当前为**确定性验收完成、真实 Claude 门待执行**；仅 Issue #38（固定 commit/hash/version/命令/结果）完成后方可宣告最终收口。
