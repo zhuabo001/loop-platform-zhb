@@ -55,9 +55,11 @@ export async function prepareClaudeRunTemp(io: RunTempIo = fs): Promise<Prepared
   return { tmpRoot, baseDir };
 }
 
-/** Fail-closed release: pure path-identity checks BEFORE touching the
- *  filesystem, then refuse a swapped (symlink / non-directory) root —
- *  never follow it. */
+/** Fail-closed release, same discipline as run-control's: pure
+ *  path-identity checks BEFORE touching the filesystem, refuse a swapped
+ *  (symlink / non-directory) root — never follow it — and NO force flag:
+ *  an already-missing root (an agent could have deleted it) is a release
+ *  failure, not silent success. */
 export async function releaseClaudeRunTemp(prepared: PreparedRunTemp): Promise<void> {
   if (
     path.dirname(prepared.tmpRoot) !== prepared.baseDir ||
@@ -69,5 +71,5 @@ export async function releaseClaudeRunTemp(prepared: PreparedRunTemp): Promise<v
   if (stat.isSymbolicLink() || !stat.isDirectory()) {
     throw new Error(`run temp root was replaced before release: ${prepared.tmpRoot}`);
   }
-  await fs.rm(prepared.tmpRoot, { recursive: true, force: true });
+  await fs.rm(prepared.tmpRoot, { recursive: true });
 }

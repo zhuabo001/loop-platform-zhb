@@ -49,7 +49,7 @@ import path from "node:path";
 import { collectSecretValues, redactSecrets } from "../dist/agent-env.js";
 import { resolveClaudeProviderEnv } from "../dist/claude-provider-env.js";
 import { createClaudeRunner } from "../dist/claude-runner.js";
-import { createControlRoot, releaseControlRoot } from "../dist/control-root.js";
+import { buildWrapperLauncher, createControlRoot, releaseControlRoot } from "../dist/control-root.js";
 import { createWorkdirJail } from "../dist/jail.js";
 import { probeClaudeBinary } from "../dist/probe-claude.js";
 import { spawnWithTimeout } from "../dist/subprocess.js";
@@ -85,22 +85,15 @@ async function readLedger(evidenceDir) {
   }
 }
 
-/** The variant-C/D launcher (macOS-26 corrected form): a tiny ESM file whose
- *  shebang names the CANONICAL Node binary directly and carries
- *  `--openssl-config=<readonly cfg>` as the kernel's single shebang argument
- *  (no spaces tolerated — paths are daemon-generated and verified here), then
- *  imports the digest-verified bundle. A `#!/bin/sh` script does NOT work:
- *  the seatbelt profile denyReads `/`, which blocks the script interpreter
- *  `/bin/sh` → `/private/var/select/sh` (observed in variant C attempt 1);
- *  a direct Mach-O interpreter needs only execute permission. */
-function buildLauncher(nodePath, configPath) {
-  for (const p of [nodePath, configPath]) {
-    if (typeof p !== "string" || !path.isAbsolute(p) || /[\s"'\\]/.test(p)) {
-      throw new Error("launcher paths must be absolute and free of whitespace/quotes (single kernel shebang argument)");
-    }
-  }
-  return `#!${nodePath} --openssl-config=${configPath}\nimport "./loopzhb-bundle.mjs";\n`;
-}
+/** The variant-C/D launcher is the PRODUCTION buildWrapperLauncher output —
+ *  no local copy (the first copy already drifted once: a wrong bundle
+ *  basename would have made the launcher import a nonexistent file). The
+ *  macOS-26 form it encodes: a two-line ESM file whose shebang names the
+ *  CANONICAL Node binary directly with `--openssl-config=<readonly cfg>` as
+ *  the kernel's single shebang argument; a `#!/bin/sh` script does NOT work
+ *  (the seatbelt profile denyReads `/`, blocking the script interpreter
+ *  `/bin/sh` → `/private/var/select/sh`; a direct Mach-O interpreter needs
+ *  only execute permission). */
 
 /** Extract the observable Bash traffic from the captured stream-json. */
 function analyzeStream(stdoutText) {
@@ -254,7 +247,7 @@ async function main() {
     await fs.chmod(configPath, 0o400);
     // The minted entry is 0500 — replace, don't overwrite.
     await fs.rm(controlRoot.wrapperPath);
-    await fs.writeFile(controlRoot.wrapperPath, buildLauncher(controlRoot.nodePath, configPath), {
+    await fs.writeFile(controlRoot.wrapperPath, buildWrapperLauncher(controlRoot.nodePath, configPath), {
       mode: 0o500,
     });
     await fs.chmod(controlRoot.wrapperPath, 0o500);
@@ -329,6 +322,8 @@ async function main() {
   let wrapperIntact = null;
   try {
     report = await runner.run(delivery, {
+      // No external abort — the 180s per-call cap governs; this controller's
+      // signal is deliberately never fired.
       signal: new AbortController().signal,
       onProgress: () => {},
     });
@@ -342,11 +337,15 @@ async function main() {
         wrapperIntact = false;
       }
     }
-    await releaseControlRoot(controlRoot).catch(() => {});
-    await jail.dispose().catch(() => {});
-    if (runTmpRoot !== null) await fs.rm(runTmpRoot, { recursive: true, force: true }).catch(() => {});
-    await fs.rm(scratchBase, { recursive: true, force: true }).catch(() => {});
-    await fs.rm(controlBase, { recursive: true, force: true }).catch(() => {});
+    // Evidence capture outranks cleanup, but a release failure is still
+    // reported (never silently swallowed) — the fail-closed audit trail
+    // holds in the diagnostic driver too.
+    const release = (label, p) => p.catch((err) => console.error(`release ${label} failed: ${err?.message ?? err}`));
+    await release("controlRoot", releaseControlRoot(controlRoot));
+    await release("jail", jail.dispose());
+    if (runTmpRoot !== null) await release("runTmpRoot", fs.rm(runTmpRoot, { recursive: true, force: true }));
+    await release("scratchBase", fs.rm(scratchBase, { recursive: true, force: true }));
+    await release("controlBase", fs.rm(controlBase, { recursive: true, force: true }));
   }
   const durationMs = Date.now() - startedAt;
 
