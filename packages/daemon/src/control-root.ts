@@ -98,11 +98,15 @@ export async function createControlRoot(baseDir: string, io: ControlRootIo = fs)
   }
   const nodePath = await io.realpath(process.execPath);
   // The launcher's empty OpenSSL config would silently REPLACE a custom one
-  // (FIPS or site policy) the daemon's own Node was started with — refuse
-  // and surface a separate compatibility decision instead (plan §3.6).
-  if (process.env.OPENSSL_CONF !== undefined && process.env.OPENSSL_CONF !== "") {
+  // (FIPS or site policy) the daemon's own Node was started with — via the
+  // OPENSSL_CONF env var OR a --openssl-config exec arg. Refuse and surface
+  // a separate compatibility decision instead (plan §3.6).
+  if (
+    (process.env.OPENSSL_CONF !== undefined && process.env.OPENSSL_CONF !== "") ||
+    process.execArgv.some((arg) => arg.startsWith("--openssl-config"))
+  ) {
     throw new Error(
-      "daemon runs under a custom OpenSSL configuration (OPENSSL_CONF is set); the wrapper launcher would silently override it — refusing, this combination needs a separate compatibility decision",
+      "daemon runs under a custom OpenSSL configuration (OPENSSL_CONF/--openssl-config); the wrapper launcher would silently override it — refusing, this combination needs a separate compatibility decision",
     );
   }
   await io.mkdir(baseDir, { recursive: true });

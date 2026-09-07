@@ -550,6 +550,8 @@ describe("A13–A14: timeout and abort", () => {
     const report = await pending;
     expect(report.ok).toBe(false);
     expect(report.error).toContain("aborted");
+    // The per-Run temp root is released on the abort path too (Issue #50).
+    expect(existsSync(readSidecar().env.CLAUDE_CODE_TMPDIR!)).toBe(false);
   });
 });
 
@@ -620,6 +622,25 @@ describe("A23–A26: the per-Run Claude temp root (Issue #50)", () => {
     await expect(run(makeDelivery({ task: "fake-claude://self-swap-runtemp" }))).rejects.toThrow(
       /replaced before release/,
     );
+  });
+
+  it("A27: a spawn error still releases the per-Run temp root", async () => {
+    // The spawnImpl seam captures the runner-minted temp root from the child
+    // env at spawn-attempt time, then lets the REAL spawn fail (ENOENT).
+    let mintedTmp: string | null = null;
+    const { spawnWithTimeout } = await import("./subprocess.js");
+    const { run } = makeRunner({
+      claudeBin: path.join(base, "no-such-claude"),
+      spawnImpl: (options) => {
+        mintedTmp = options.env.CLAUDE_CODE_TMPDIR ?? null;
+        return spawnWithTimeout(options);
+      },
+    });
+    const report = await run(makeDelivery());
+    expect(report.ok).toBe(false);
+    expect(report.error).toContain("failed to spawn claude");
+    expect(mintedTmp).toMatch(/^\/private\/tmp\/lzc-/);
+    expect(existsSync(mintedTmp!)).toBe(false); // released despite the spawn error
   });
 });
 

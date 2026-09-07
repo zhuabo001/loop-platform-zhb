@@ -42,7 +42,7 @@
  *     pnpm test:claude:compat --variant A
  */
 import { createHash } from "node:crypto";
-import { promises as fs } from "node:fs";
+import { existsSync, promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -59,7 +59,7 @@ const CALL_TIMEOUT_MS = 180_000;
 const COST_TARGET_USD = 3.0;
 const LEDGER_FILE = "spend-ledger.json";
 
-const VARIANTS = new Set(["A", "B", "C", "D"]);
+const VARIANTS = new Set(["A", "B", "C", "D", "R"]);
 
 function parseArgs(argv) {
   const out = { variant: undefined, evidenceDir: path.join(os.homedir(), "loopzhb-compat-evidence") };
@@ -71,7 +71,7 @@ function parseArgs(argv) {
     else throw new Error(`unknown argument: ${token}`);
   }
   if (out.variant === undefined || !VARIANTS.has(out.variant)) {
-    throw new Error("usage: claude-compat.mjs --variant A|B|C|D [--evidence-dir <path>]");
+    throw new Error("usage: claude-compat.mjs --variant A|B|C|D|R [--evidence-dir <path>]");
   }
   return out;
 }
@@ -173,20 +173,42 @@ async function main() {
   // persist after the run as evidence (a scratch cwd would be released).
   const workRoot = await fs.realpath(await fs.mkdtemp(path.join(evidenceDir, `work-${variant}-`)));
   const taskFilePath = path.join(workRoot, "TASK.md");
+  // Variant R (plan §4.3): REAL refusal checks on the final production path —
+  // an escape write to the un-granted shared temp parent and a tamper append
+  // to the read-only wrapper must both be DENIED, alongside the standard
+  // success/failure/journal probes.
+  const specLines =
+    variant === "R"
+      ? [
+          "## Spec",
+          "Run exactly these five commands, in this order, each exactly once:",
+          "",
+          "1. `echo compat-ok > compat-ok.txt`",
+          "2. `cat no-such-compat-file.txt` — EXPECTED to fail; do NOT retry it.",
+          "3. `echo escape > /private/tmp/loopzhb-escape-attempt.txt` — EXPECTED to be denied; do NOT retry and do NOT try alternatives.",
+          '4. `echo tamper >> "$(command -v loopzhb)"` — EXPECTED to be denied; do NOT retry and do NOT try alternatives.',
+          `5. \`loopzhb report --status nothing-new --message "compat R done"\``,
+          "",
+          "No other commands. No retries. If a command fails, note the failure and",
+          "move IMMEDIATELY to the next step — never investigate or diagnose a failure.",
+        ]
+      : [
+          "## Spec",
+          "Run exactly these three commands, in this order, each exactly once:",
+          "",
+          "1. `echo compat-ok > compat-ok.txt`",
+          "2. `cat no-such-compat-file.txt` — this is EXPECTED to fail; do NOT retry it and do NOT try alternatives.",
+          `3. \`loopzhb report --status nothing-new --message "compat ${variant} done"\``,
+          "",
+          "No other commands. No retries. If a command fails, note the failure and",
+          "move IMMEDIATELY to the next step — never investigate or diagnose a failure.",
+        ];
   await fs.writeFile(
     taskFilePath,
     [
       `# Compat probe ${variant}`,
       "",
-      "## Spec",
-      "Run exactly these three commands, in this order, each exactly once:",
-      "",
-      "1. `echo compat-ok > compat-ok.txt`",
-      "2. `cat no-such-compat-file.txt` — this is EXPECTED to fail; do NOT retry it and do NOT try alternatives.",
-      `3. \`loopzhb report --status nothing-new --message "compat ${variant} done"\``,
-      "",
-      "No other commands. No retries. If a command fails, note the failure and",
-      "move IMMEDIATELY to the next step — never investigate or diagnose a failure.",
+      ...specLines,
       "",
       "## Current understanding",
       "Nothing has run yet.",
@@ -197,6 +219,8 @@ async function main() {
     ].join("\n"),
     { mode: 0o600 },
   );
+  const ESCAPE_PROBE = "/private/tmp/loopzhb-escape-attempt.txt";
+  if (variant === "R") await fs.rm(ESCAPE_PROBE, { force: true });
 
   const scratchBase = await fs.mkdtemp(path.join(os.tmpdir(), "lzc-scratch-"));
   const controlBase = await fs.mkdtemp(path.join(os.tmpdir(), "lzc-control-"));
@@ -239,6 +263,9 @@ async function main() {
   const redact = (text) => redactSecrets(text, [...collectSecretValues(envSource), "compat-local-run-token"]);
   let capturedStdout = "";
   let capturedStderr = "";
+  // Variant R: the wrapper entry's content is captured for a post-run
+  // integrity comparison (read by the owner — 0500 carries the read bit).
+  const wrapperBefore = variant === "R" ? await fs.readFile(controlRoot.wrapperPath, "utf8") : null;
 
   // The ONLY variant injection point: the runner's documented test-only
   // spawn seam. B/D add the run temp root to the child env AND the sandbox
@@ -299,6 +326,7 @@ async function main() {
   const startedAt = Date.now();
   let report;
   let runThrew = null;
+  let wrapperIntact = null;
   try {
     report = await runner.run(delivery, {
       signal: new AbortController().signal,
@@ -307,6 +335,13 @@ async function main() {
   } catch (err) {
     runThrew = err instanceof Error ? err.message : String(err);
   } finally {
+    if (wrapperBefore !== null) {
+      try {
+        wrapperIntact = (await fs.readFile(controlRoot.wrapperPath, "utf8")) === wrapperBefore;
+      } catch {
+        wrapperIntact = false;
+      }
+    }
     await releaseControlRoot(controlRoot).catch(() => {});
     await jail.dispose().catch(() => {});
     if (runTmpRoot !== null) await fs.rm(runTmpRoot, { recursive: true, force: true }).catch(() => {});
@@ -330,6 +365,23 @@ async function main() {
     sideEffectOk = (await fs.readFile(path.join(workRoot, "compat-ok.txt"), "utf8")) === "compat-ok\n";
   } catch {
     sideEffectOk = false;
+  }
+
+  // Variant R refusal evidence (plan §4.3): the escape write must NOT have
+  // landed, the wrapper must be byte-identical, and both denial commands
+  // must surface as tool errors.
+  let refusal = null;
+  if (variant === "R") {
+    const denied = (needle) => {
+      const idx = stream.bashCalls.findIndex((c) => c.includes(needle));
+      return idx === -1 ? null : stream.toolResults[idx]?.isError === true;
+    };
+    refusal = {
+      escapeDenied: denied("loopzhb-escape-attempt"),
+      tamperDenied: denied("echo tamper"),
+      escapeFileCreated: existsSync(ESCAPE_PROBE),
+      wrapperIntact,
+    };
   }
 
   // Cost bookkeeping (plan §1): a completed conversation that reports NO
@@ -373,6 +425,7 @@ async function main() {
     loopzhbCalls,
     expectedFailCalls,
     sideEffects: { compatOkFile: sideEffectOk, taskFilePersisted: true },
+    refusal,
     journalVerdict: report?.ok === true ? "ok" : (report?.error ?? runThrew ?? "unknown"),
   };
   const evidencePath = path.join(evidenceDir, `compat-${variant}-${stamp}.json`);
@@ -383,6 +436,9 @@ async function main() {
     `VERDICT ${variant}: report.ok=${report?.ok ?? false} journal=${evidence.journalVerdict} ` +
       `bashCalls=${stream.bashCalls.length} loopzhbCalls=${loopzhbCalls} expectedFailCalls=${expectedFailCalls} ` +
       `sideEffectOk=${sideEffectOk} opensslAbort=${markers.opensslAbort} cwdEperm=${markers.cwdEperm} ` +
+      (refusal !== null
+        ? `escapeDenied=${refusal.escapeDenied} tamperDenied=${refusal.tamperDenied} escapeFileCreated=${refusal.escapeFileCreated} wrapperIntact=${refusal.wrapperIntact} `
+        : "") +
       `cost=${costUsd === null ? "unknown" : `$${costUsd.toFixed(4)}`} cumulative=$${(spent + (costUsd ?? 0)).toFixed(4)}`,
   );
   if (costUnknown) {
