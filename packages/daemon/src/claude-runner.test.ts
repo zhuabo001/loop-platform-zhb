@@ -16,7 +16,7 @@
  *    run (the success report is discarded);
  *  - spawn-time revalidation failure means NO spawn and a failed run.
  */
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -641,6 +641,36 @@ describe("A23–A26: the per-Run Claude temp root (Issue #50)", () => {
     expect(report.error).toContain("failed to spawn claude");
     expect(mintedTmp).toMatch(/^\/private\/tmp\/lzc-/);
     expect(existsSync(mintedTmp!)).toBe(false); // released despite the spawn error
+  });
+
+  it("A28: a run-temp-release failure never masks a ProcessControlError in flight", async () => {
+    // Swap the minted temp root for a symlink (release must refuse), THEN
+    // fail process control: the fatal signal must survive, with the release
+    // failure riding in the message (review round-2 P1 extended to the new
+    // resource, spec §4.6 error-priority matrix).
+    const runner = createClaudeRunner({
+      jail,
+      claudeBin: FIXTURE,
+      timeoutMs: 10_000,
+      envSource: ENV_SOURCE,
+      controlRoot,
+      spawnImpl: (options) => {
+        const tmp = options.env.CLAUDE_CODE_TMPDIR!;
+        rmSync(tmp, { recursive: true, force: true });
+        symlinkSync("/", tmp, "dir");
+        return Promise.reject(new ProcessControlError("process control failed: kill EPERM"));
+      },
+    });
+    const err = await runner
+      .run(makeDelivery(), { signal: new AbortController().signal, onProgress: () => {} })
+      .then(
+        () => null,
+        (e: unknown) => e,
+      );
+    expect(err).toBeInstanceOf(ProcessControlError);
+    expect((err as Error).message).toContain("EPERM");
+    expect((err as Error).message).toContain("release also failed");
+    expect((err as Error).message).toContain("replaced before release");
   });
 });
 

@@ -352,7 +352,7 @@ export function createClaudeRunner(deps: ClaudeRunnerDeps): AgentRunner {
         if (releaseFailure !== null) {
           if (controlErr !== null) {
             const detail = releaseFailure instanceof Error ? releaseFailure.message : String(releaseFailure);
-            throw new ProcessControlError(`${controlErr.message} (scratch release also failed: ${detail})`, {
+            throw new ProcessControlError(`${controlErr.message} (cleanup release also failed: ${detail})`, {
               cause: controlErr,
             });
           }
