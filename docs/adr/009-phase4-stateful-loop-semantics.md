@@ -154,6 +154,11 @@ Batch 2 首轮 code review（FAIL）后，固化修复期确认的四处裁决�
 3. **Node runtime 是最小只读 capability。** `createControlRoot` canonicalize `process.execPath`；v1 child PATH 固定以 `wrapperDir → dirname(process.execPath)` 开头，使 `#!/usr/bin/env node` 不再接受运营方 PATH 中的其他架构/runtime。sandbox `allowRead` 只增加 exact canonical Node 文件，不开放整个 Node bin、Daemon 安装目录或 bundle 源目录。
 4. **验收分层。** 确定性 capsule 必须以 agent 同形的 `loopzhb` shebang/PATH 入口启动，并在只允许 control root、exact Node 与 outbox 的文件权限下写出唯一合法记录；之后仍须依次通过单命令真实 Claude smoke 与 Issue #38 的两 Run 全链路门。真实门的认证/费用/监听环境问题只能记录为阻塞，不能用 fake/capsule 结果替代。
 
+### 2026-09-07：Issue #50 wrapper 形态与每 Run 临时根裁决
+
+1. **wrapper 入口改为薄 launcher + 摘要校验 bundle（修订 2026-09-02（二）第 1/3 条的形态）。** `loopzhb` 不再直接是 bundle：入口是 0500 的两行 ESM launcher——shebang 直接命名 daemon canonical Node 并以内核单参数携带 `--openssl-config=<0400 空配置>`，随后 `import "./loopzhb-wrapper.mjs"`（0400，构建期摘要校验语义不变）。动机（ADR-006 同日修订）：seatbelt `denyRead ["/"]` 下 Node 读系统 OpenSSL 配置即崩；`#!/bin/sh` 形态不可用（macOS 26 经 `/private/var/select/sh` 解析解释器，读被拒），直接 Mach-O 解释器只需执行位。OpenSSL 覆盖只作用于 wrapper 进程，不进入 Claude 环境、不动用户配置；daemon 自身带定制 OpenSSL 配置（`OPENSSL_CONF`/`--openssl-config`）时启动期拒绝静默覆盖。秘密边界不变：launcher 只含固定路径，无 credential。
+2. **每 Run Claude 临时根。** runner 在用户环境过滤之后内部铸发每 Run 私有 canonical 临时根（0700），自设 `CLAUDE_CODE_TMPDIR` 并把该根精确加入 sandbox profile 读写（不授权共享 UID 临时目录）；用户环境/settings 中的同名变量既不能覆盖 runner 生成值也不能扩大 profile。回收沿用 fail-closed 纪律且永不掩盖 `ProcessControlError`（同 ADR-006 决策 11）。修订 8 的其余不变量（每 Run 控制目录、outbox 唯一可写、PATH 前缀）不变。
+
 ### 2026-08-31：实现期裁决固化
 
 在不改变任何已裁决语义的前提下，固化实现期确认的八处裁决：

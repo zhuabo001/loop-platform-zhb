@@ -92,12 +92,20 @@ $ git diff --check main  # 无输出（clean）；基线 6af3b29
 
 （server 侧 2 个 skipped 文件为 opt-in 真实 Claude 门 `real-claude-e2e.test.ts` 与 `phase4-batch2-real-claude-e2e.test.ts`，非本批引入的回归；daemon 3 个 skipped 为既有用例。）
 
-## 真实 Claude 门（待执行 — Issue #38）
+## 真实 Claude 门（已通过 — Issue #38，2026-09-07）
 
-`packages/server/src/phase4-batch2-real-claude-e2e.test.ts` + 根脚本 `pnpm test:phase4:batch2:e2e` 已落地：Run 1 读 Task File 并 `loopzhb report --state '{"step":1}'`，Run 2 读 `prev-state.json` 并 `loopzhb finish`；断言 Completed、调度停用、Run Now/schedule enable 409、日志无 secret、进程组关闭、SIGTERM exit 0，且仅在 daemon 生产 probe 的 sha256 匹配 `LOOPZHB_EXPECTED_CLAUDE_SHA256` 批准值后才触发真实 Run。
+`packages/server/src/phase4-batch2-real-claude-e2e.test.ts` + 根脚本 `pnpm test:phase4:batch2:e2e`：Run 1 读 Task File 并 `loopzhb report --state '{"step":1}'`，Run 2 读 `prev-state.json` 并 `loopzhb finish`；断言 Completed、调度停用、Run Now/schedule enable 409、日志无 secret、进程组关闭、SIGTERM exit 0，且仅在 daemon 生产 probe 的 sha256 匹配 `LOOPZHB_EXPECTED_CLAUDE_SHA256` 批准值后才触发真实 Run。
 
-- 默认跳过行为已验证（无 env 时 1 skipped）；脚本与类型随全量门通过。
-- **真实执行待进行**：需在允许监听 127.0.0.1 且明确接受模型费用的环境运行 `LOOPZHB_EXPECTED_CLAUDE_SHA256=<approved-sha256> pnpm test:phase4:batch2:e2e`，并把固定提交、命令、hash、Claude version 与结果追加到本节。跟踪：[Issue #38](https://github.com/zhuabo001/loop-platform-zhb/issues/38)。Batch 3 在此脚本上追加 Dashboard 与重启断言。
+**2026-09-07 真实执行结果（通过）**：
+
+- 修复提交：`39627f9` + 审查跟进 `4112aa2`（分支 `feat/phase4-batch2-dev`）。
+- Claude：`/opt/homebrew/Caskroom/claude-code/2.1.236/claude`，version 2.1.236，sha256 `6bc4ba992d2786cbf0237c4453ca53c1fdf0c3b3d83ffa0025c0d8190ed27848`（生产 probe 实测钉住并与批准值一致）。
+- Node：`/usr/local/bin/node` v22.17.0（arm64）；macOS 26.6.2（25G83）。
+- 命令：`LOOPZHB_EXPECTED_CLAUDE_SHA256=6bc4…7848 pnpm test:phase4:batch2:e2e`。
+- 结果：**1 passed（46.99s）**——两 Run 链（report+state → prev-state 晋升 → finish → Completed）全绿，日志 sticky 脱敏扫描（含 provider bootstrap 收敛的全部 settings 凭据）零命中，全部观测进程组关闭。
+- 前置：Issue #50 沙箱兼容性修复（wrapper launcher + 每 Run `CLAUDE_CODE_TMPDIR`）。A/B/C/D 实验矩阵（7 次真实调用）与 3 次独立生产 smoke + 1 次真实拒绝检查（逃逸写/篡改 wrapper 均被拒）的脱敏证据在仓库外 `~/loopzhb-compat-evidence/`；诊断入口为 `pnpm test:claude:compat`（opt-in）。
+
+历史记录：本节此前为「待执行」；#50（2026-09-02 登记的 2.1.236 沙箱双重缺陷）阻塞至本次修复。
 
 ## 显式边界核对（相对基线 `6af3b29` 的变更面）
 
@@ -119,4 +127,4 @@ $ git diff --check main  # 无输出（clean）；基线 6af3b29
 
 ## 结论
 
-Phase 4 Batch 2 的确定性验收目标及第二轮审查反例均有对应测试，确定性质量门全绿，第三轮三轨复审 PASS，Issues #39–#47 已核销关闭（修订记录见 ADR-009 2026-09-01（二）与 2026-09-02）。Batch 2 当前为**确定性验收完成、真实 Claude 门待执行**；仅 Issue #38（固定 commit/hash/version/命令/结果）完成后方可宣告最终收口。
+Phase 4 Batch 2 的确定性验收目标及第二轮审查反例均有对应测试，确定性质量门全绿，第三轮三轨复审 PASS，Issues #39–#47 已核销关闭（修订记录见 ADR-009 2026-09-01（二）与 2026-09-02）。**真实 Claude 门已于 2026-09-07 通过**（见上节；Issue #50 沙箱兼容性修复为其前置，#38/#49/#50 随之核销）。Batch 3 在真实门脚本上追加 Dashboard 与重启断言。
