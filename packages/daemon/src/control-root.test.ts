@@ -5,7 +5,7 @@
  * compact prev-state.json and the outbox — plus fail-closed release.
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { promises as fs } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -42,15 +42,26 @@ describe("createControlRoot", () => {
     expect(path.basename(first.wrapperPath)).toBe("loopzhb");
   });
 
-  it("the wrapper content is static, ESM-marked and secret-free", async () => {
-    const { wrapperDir, wrapperPath } = await createControlRoot(base);
+  it("the wrapper is a fixed launcher around the digest-verified bundle — all secret-free", async () => {
+    const { wrapperDir, wrapperPath, bundlePath, opensslConfigPath, nodePath } = await createControlRoot(base);
     const second = await createControlRoot(base);
-    const script = readFileSync(wrapperPath, "utf8");
-    expect(script).toContain("#!/usr/bin/env node");
-    expect(script).toContain("runLoopzhbWrapper");
-    expect(readFileSync(second.wrapperPath)).toEqual(readFileSync(wrapperPath));
-    expect(script).not.toContain("file://");
-    expect(script).not.toContain(realpathSync(path.join(import.meta.dirname, "..")));
+    // The launcher: canonical-Node shebang carrying the wrapper-only OpenSSL
+    // config as the kernel's single argument, then the bundle import.
+    const launcher = readFileSync(wrapperPath, "utf8");
+    expect(launcher).toBe(`#!${nodePath} --openssl-config=${opensslConfigPath}\nimport "./loopzhb-wrapper.mjs";\n`);
+    // The bundle keeps the executable header and the wrapper logic; identical
+    // bytes across roots (only the launcher's baked paths differ per start).
+    const bundle = readFileSync(bundlePath, "utf8");
+    expect(bundle).toContain("#!/usr/bin/env node");
+    expect(bundle).toContain("runLoopzhbWrapper");
+    expect(readFileSync(second.bundlePath)).toEqual(readFileSync(bundlePath));
+    expect(bundle).not.toContain("file://");
+    expect(bundle).not.toContain(realpathSync(path.join(import.meta.dirname, "..")));
+    // Modes: launcher 0500, bundle and config 0400.
+    expect(modeOf(wrapperPath)).toBe(0o500);
+    expect(modeOf(bundlePath)).toBe(0o400);
+    expect(modeOf(opensslConfigPath)).toBe(0o400);
+    expect(readFileSync(opensslConfigPath, "utf8")).toBe("");
     // ESM marker sibling (the extensionless wrapper must parse as ESM).
     expect(readFileSync(path.join(wrapperDir, "package.json"), "utf8")).toBe('{"type":"module"}\n');
     // Runtime credentials are never interpolated into the static capsule.
@@ -59,6 +70,62 @@ describe("createControlRoot", () => {
       const content = readFileSync(path.join(wrapperDir, name), "utf8");
       for (const secret of runtimeOnlySecrets) expect(content).not.toContain(secret);
     }
+  });
+
+  it("the launcher passes arguments with spaces, quotes and dollars through verbatim — no shell re-evaluation", async () => {
+    const controlRoot = await createControlRoot(base);
+    const control = await prepareRunControl({ controlRoot, runId: "args", prevState: null });
+    const tricky = 'a $HOME `whoami` "quoted" tail';
+    const result = spawnSync(controlRoot.wrapperPath, ["report", "--status", "nothing-new", "--message", tricky], {
+      env: { ...process.env, PATH: [controlRoot.wrapperDir, controlRoot.nodeDir].join(path.delimiter), [JOURNAL_OUTBOX_ENV]: control.outboxDir },
+      encoding: "utf8",
+    });
+    expect(result.status, result.stderr).toBe(0);
+    const records = readdirSync(control.outboxDir);
+    expect(records).toHaveLength(1);
+    expect(JSON.parse(readFileSync(path.join(control.outboxDir, records[0]!), "utf8"))).toEqual({
+      kind: "report",
+      status: "nothing-new",
+      message: tricky,
+    });
+  });
+
+  it("a wrong node earlier in PATH is never picked — the launcher execs the canonical daemon Node", async () => {
+    const controlRoot = await createControlRoot(base);
+    const control = await prepareRunControl({ controlRoot, runId: "wrong-node", prevState: null });
+    const decoyDir = path.join(base, "decoy-bin");
+    mkdirSync(decoyDir);
+    const marker = path.join(base, "decoy-ran");
+    writeFileSync(path.join(decoyDir, "node"), `#!/bin/sh\necho decoy > ${marker}\nexit 42\n`, { mode: 0o755 });
+    const result = spawnSync(controlRoot.wrapperPath, ["report", "--status", "nothing-new"], {
+      env: {
+        ...process.env,
+        PATH: [controlRoot.wrapperDir, decoyDir, controlRoot.nodeDir].join(path.delimiter),
+        [JOURNAL_OUTBOX_ENV]: control.outboxDir,
+      },
+      encoding: "utf8",
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(existsSync(marker)).toBe(false);
+    expect(readdirSync(control.outboxDir)).toHaveLength(1);
+  });
+
+  it("refuses to start when the daemon itself runs under a custom OpenSSL configuration", async () => {
+    process.env.OPENSSL_CONF = "/etc/site-openssl.cnf";
+    try {
+      await expect(createControlRoot(base)).rejects.toThrow(/custom OpenSSL configuration/);
+    } finally {
+      delete process.env.OPENSSL_CONF;
+    }
+  });
+
+  it("buildWrapperLauncher rejects non-absolute or whitespace/quote-bearing paths", async () => {
+    const { buildWrapperLauncher } = await import("./control-root.js");
+    const good = await createControlRoot(base);
+    expect(() => buildWrapperLauncher(good.nodePath, good.opensslConfigPath)).not.toThrow();
+    expect(() => buildWrapperLauncher("relative/node", good.opensslConfigPath)).toThrow(/absolute/);
+    expect(() => buildWrapperLauncher(good.nodePath, "/tmp/has space/openssl.cnf")).toThrow(/whitespace/);
+    expect(() => buildWrapperLauncher('/tmp/evil"quote/node', good.opensslConfigPath)).toThrow(/whitespace/);
   });
 
   it("executes as a self-contained capsule without read access to the daemon install", async () => {
@@ -109,22 +176,30 @@ describe("createControlRoot", () => {
     expect(existsSync(controlBase)).toBe(false);
   });
 
-  it.each(["wrapper", "package"] as const)("cleans the minted root when the %s write fails", async (failure) => {
-    let minted = "";
-    await expect(
-      createControlRoot(base, {
-        ...fs,
-        writeFile: async (file, data, options) => {
-          minted = path.dirname(path.dirname(String(file)));
-          const isPackage = String(file).endsWith("package.json");
-          if ((failure === "package") === isPackage) throw new Error(`injected ${failure} write failure`);
-          return fs.writeFile(file, data, options);
-        },
-      }),
-    ).rejects.toThrow(`injected ${failure} write failure`);
-    expect(minted).not.toBe("");
-    expect(existsSync(minted)).toBe(false);
-  });
+  it.each(["bundle", "config", "wrapper", "package"] as const)(
+    "cleans the minted root when the %s write fails",
+    async (failure) => {
+      let minted = "";
+      const match: Record<string, RegExp> = {
+        bundle: /loopzhb-wrapper\.mjs$/,
+        config: /openssl\.cnf$/,
+        wrapper: /bin\/loopzhb$/,
+        package: /package\.json$/,
+      };
+      await expect(
+        createControlRoot(base, {
+          ...fs,
+          writeFile: async (file, data, options) => {
+            minted = path.dirname(path.dirname(String(file)));
+            if (match[failure]!.test(String(file))) throw new Error(`injected ${failure} write failure`);
+            return fs.writeFile(file, data, options);
+          },
+        }),
+      ).rejects.toThrow(`injected ${failure} write failure`);
+      expect(minted).not.toBe("");
+      expect(existsSync(minted)).toBe(false);
+    },
+  );
 });
 
 describe("releaseControlRoot — the per-start lifecycle (review STD-4)", () => {

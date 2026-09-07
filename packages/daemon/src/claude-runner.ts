@@ -27,6 +27,11 @@
  *  - child-controlled progress text is discarded in favor of fixed semantic
  *    labels; terminal child text (finalText, error narrative, session id) is
  *    redacted with env secrets AND the run token before report/runtime;
+ *  - every run mints a private per-Run Claude temp root (run-temp.ts, Issue
+ *    #50): the runner itself sets CLAUDE_CODE_TMPDIR after user-env
+ *    filtering and grants exactly that root in the profile, so the CLI's
+ *    per-command `cwd-*` directories live INSIDE the sandbox contract —
+ *    Bash exit status stays accurate and wrapper Node can start;
  *  - jail.revalidate re-checks the resolution immediately before spawn —
  *    a drifted cwd/root/scratch means NO spawn (S1–S10); the irreducible
  *    revalidate→execve residue is bounded by the fail-closed OS sandbox
@@ -51,6 +56,7 @@ import type { ResolvedWorkdir, WorkdirJail } from "./jail.js";
 import { collectJournal } from "./journal.js";
 import { sameClaudeBinary, statClaudeBinary, type ClaudeBinaryIdentity } from "./probe-claude.js";
 import { prepareRunControl, releaseRunControl, type PreparedRunControl } from "./run-control.js";
+import { prepareClaudeRunTemp, releaseClaudeRunTemp, type PreparedRunTemp } from "./run-temp.js";
 import type { AgentRunner, RunnerContext, RunnerReport } from "./runner.js";
 import { ERROR_CAP } from "./runtime.js";
 import type { ProcessGroupLifecycleEvent, SpawnResult } from "./subprocess.js";
@@ -94,13 +100,17 @@ export interface ClaudeRunnerDeps {
  *  exact duplicates collapse. For a terminal-protocol v1 run the journal
  *  directories join the profile (plan §2.1): the control root (wrapper) and
  *  the run's context dir read-only, the outbox as the ONE extra writable
- *  directory. */
+ *  directory. The per-Run Claude temp root (run-temp.ts, Issue #50) joins
+ *  BOTH lists — the CLI's sandboxed Bash reads AND writes its per-command
+ *  `cwd-*` directories there. */
 export function buildSandboxSettings(
   resolved: ResolvedWorkdir,
   journal?: { readOnly: string[]; writable: string[] },
+  runTempRoot?: string,
 ): Record<string, unknown> {
-  const allowRead = [...new Set([...resolved.effectiveRoots, resolved.cwd, ...(journal?.readOnly ?? [])])];
-  const allowWrite = [...new Set([...resolved.effectiveRoots, resolved.cwd, ...(journal?.writable ?? [])])];
+  const runTemp = runTempRoot !== undefined ? [runTempRoot] : [];
+  const allowRead = [...new Set([...resolved.effectiveRoots, resolved.cwd, ...(journal?.readOnly ?? []), ...runTemp])];
+  const allowWrite = [...new Set([...resolved.effectiveRoots, resolved.cwd, ...(journal?.writable ?? []), ...runTemp])];
   return {
     sandbox: {
       enabled: true,
@@ -190,15 +200,22 @@ export function createClaudeRunner(deps: ClaudeRunnerDeps): AgentRunner {
       const isV1 = delivery.terminalProtocol === 1;
       let controlErr: ProcessControlError | null = null;
       let runControl: PreparedRunControl | null = null;
+      let runTemp: PreparedRunTemp | null = null;
       let taskFile: ResolvedTaskFile | null = null;
       try {
+        // Issue #50 (sandbox-compat plan §3): every run — v0 and v1 — gets a
+        // private, profile-covered Claude temp root, minted AFTER the user
+        // env was filtered and exported by the runner ITSELF
+        // (CLAUDE_CODE_TMPDIR): a user/settings value can neither override
+        // it nor widen the profile.
+        runTemp = await prepareClaudeRunTemp();
         // Phase 4 Batch 2 (plan §2.1/§2.2): a v1 run gets its control
         // directory, journal environment, task-file preflight and daemon-
         // built prompt BEFORE the spawn checks. Every preflight failure
         // closes the run WITHOUT spawning (v0 skips all of it unchanged).
         let journal: { readOnly: string[]; writable: string[] } | undefined;
         let taskOverride: string | undefined;
-        let childEnv = env;
+        let childEnv: Record<string, string> = { ...env, CLAUDE_CODE_TMPDIR: runTemp.tmpRoot };
         if (isV1) {
           if (deps.controlRoot === undefined) {
             return { ok: false, error: "terminal-protocol v1 run refused: this daemon has no control root" };
@@ -225,8 +242,9 @@ export function createClaudeRunner(deps: ClaudeRunnerDeps): AgentRunner {
           // it, and the outbox location — never a credential or URL. Binding
           // env(1)'s `node` lookup prevents an operator PATH entry from
           // selecting a different architecture/runtime than the daemon.
+          // (CLAUDE_CODE_TMPDIR rides the base childEnv above.)
           childEnv = {
-            ...env,
+            ...childEnv,
             PATH: [deps.controlRoot.wrapperDir, deps.controlRoot.nodeDir, env["PATH"] ?? ""]
               .filter((entry) => entry !== "")
               .join(path.delimiter),
@@ -242,7 +260,7 @@ export function createClaudeRunner(deps: ClaudeRunnerDeps): AgentRunner {
             prevStatePath: runControl.prevStatePath,
           });
         }
-        const settingsJson = JSON.stringify(buildSandboxSettings(resolved, journal));
+        const settingsJson = JSON.stringify(buildSandboxSettings(resolved, journal, runTemp.tmpRoot));
         // The spawn-time re-check (plan §2.2): any drift since resolve means
         // NO spawn — the JailError/TaskFileDriftError propagates and fails
         // the run.
@@ -303,9 +321,10 @@ export function createClaudeRunner(deps: ClaudeRunnerDeps): AgentRunner {
         if (err instanceof ProcessControlError) controlErr = err;
         throw err;
       } finally {
-        // Cleanup is fail-closed and UNCONDITIONAL for BOTH the run control
-        // dir and the jail scratch: if either release throws, the run fails
-        // (a computed report — success included — is discarded).
+        // Cleanup is fail-closed and UNCONDITIONAL for the run control
+        // dir, the per-Run Claude temp root AND the jail scratch: if any
+        // release throws, the run fails (a computed report — success
+        // included — is discarded).
         // EXCEPTION (round-2 review P1): a ProcessControlError in flight must
         // NEVER be masked by a release failure — a runaway child outranks
         // broken cleanup, and the runtime escalates on exactly that type. The
@@ -316,6 +335,13 @@ export function createClaudeRunner(deps: ClaudeRunnerDeps): AgentRunner {
             await releaseRunControl(runControl.controlDir);
           } catch (controlReleaseErr) {
             releaseFailure = controlReleaseErr;
+          }
+        }
+        if (runTemp !== null) {
+          try {
+            await releaseClaudeRunTemp(runTemp);
+          } catch (tempReleaseErr) {
+            releaseFailure ??= tempReleaseErr;
           }
         }
         try {

@@ -253,7 +253,13 @@ describe("A1–A3: the fixed argv and the dynamic sandbox settings", () => {
     const { run } = makeRunner();
     await run(makeDelivery());
 
-    const argv = readSidecar().argv;
+    const sidecar = readSidecar();
+    const argv = sidecar.argv;
+    // The runner-minted per-Run Claude temp root (Issue #50): exported to the
+    // child as CLAUDE_CODE_TMPDIR and granted read+write in the profile.
+    const runTemp = sidecar.env.CLAUDE_CODE_TMPDIR;
+    expect(runTemp).toMatch(/^\/private\/tmp\/lzc-/);
+    expect(existsSync(runTemp!)).toBe(false); // released after the run
     const settings = JSON.parse(argv[argv.indexOf("--settings") + 1]!) as Record<string, unknown>;
     expect(settings).toEqual({
       sandbox: {
@@ -265,8 +271,8 @@ describe("A1–A3: the fixed argv and the dynamic sandbox settings", () => {
         filesystem: {
           disabled: false,
           denyRead: ["/"],
-          allowRead: [realpathSync(root), realpathSync(workdir)],
-          allowWrite: [realpathSync(root), realpathSync(workdir)],
+          allowRead: [realpathSync(root), realpathSync(workdir), runTemp],
+          allowWrite: [realpathSync(root), realpathSync(workdir), runTemp],
         },
         network: { strictAllowlist: true, allowedDomains: [] },
       },
@@ -297,10 +303,12 @@ describe("A1–A3: the fixed argv and the dynamic sandbox settings", () => {
     d.loop = { ...d.loop, workdir: root };
     await run(d);
 
-    const argv = JSON.parse(readFileSync(path.join(root, SIDECAR), "utf8")).argv as string[];
+    const sidecar = JSON.parse(readFileSync(path.join(root, SIDECAR), "utf8"));
+    const argv = sidecar.argv as string[];
+    const runTemp = sidecar.env.CLAUDE_CODE_TMPDIR as string;
     const settings = JSON.parse(argv[argv.indexOf("--settings") + 1]!);
-    expect(settings.sandbox.filesystem.allowRead).toEqual([realpathSync(root)]);
-    expect(settings.sandbox.filesystem.allowWrite).toEqual([realpathSync(root)]);
+    expect(settings.sandbox.filesystem.allowRead).toEqual([realpathSync(root), runTemp]);
+    expect(settings.sandbox.filesystem.allowWrite).toEqual([realpathSync(root), runTemp]);
   });
 });
 
@@ -570,6 +578,51 @@ describe("A15–A16: the scratch lifecycle", () => {
   });
 });
 
+describe("A23–A26: the per-Run Claude temp root (Issue #50)", () => {
+  it("A23: runner-minted per Run, granted in the profile, released after success — a user-supplied value can neither override nor widen", async () => {
+    const envSource = { ...ENV_SOURCE, CLAUDE_CODE_TMPDIR: "/tmp/loopzhb-user-supplied-evil" };
+    const { run } = makeRunner({ envSource });
+
+    await run(makeDelivery());
+    const first = readSidecar();
+    const firstTmp = first.env.CLAUDE_CODE_TMPDIR!;
+    expect(firstTmp).toMatch(/^\/private\/tmp\/lzc-/);
+    const firstSettings = JSON.parse(first.argv[first.argv.indexOf("--settings") + 1]!);
+    expect(firstSettings.sandbox.filesystem.allowRead).toContain(firstTmp);
+    expect(firstSettings.sandbox.filesystem.allowWrite).toContain(firstTmp);
+    expect(JSON.stringify(firstSettings)).not.toContain("loopzhb-user-supplied-evil");
+    expect(existsSync(firstTmp)).toBe(false); // released
+
+    rmSync(path.join(workdir, SIDECAR));
+    await run(makeDelivery({ runId: "run-2" }));
+    const secondTmp = readSidecar().env.CLAUDE_CODE_TMPDIR!;
+    expect(secondTmp).toMatch(/^\/private\/tmp\/lzc-/);
+    expect(secondTmp).not.toBe(firstTmp); // fresh per Run
+    expect(existsSync(secondTmp)).toBe(false);
+  });
+
+  it("A24: released after a FAILED run (non-zero exit)", async () => {
+    const { run } = makeRunner();
+    const report = await run(makeDelivery({ task: "fake-claude://exit3" }));
+    expect(report.ok).toBe(false);
+    expect(existsSync(readSidecar().env.CLAUDE_CODE_TMPDIR!)).toBe(false);
+  });
+
+  it("A25: released after a timeout kill", async () => {
+    const { run } = makeRunner({ timeoutMs: 300 });
+    const report = await run(makeDelivery({ task: "fake-claude://hang" }));
+    expect(report.error).toContain("timed out");
+    expect(existsSync(readSidecar().env.CLAUDE_CODE_TMPDIR!)).toBe(false);
+  });
+
+  it("A26: a failed run-temp release FAILS the run — the success report is discarded", async () => {
+    const { run } = makeRunner();
+    await expect(run(makeDelivery({ task: "fake-claude://self-swap-runtemp" }))).rejects.toThrow(
+      /replaced before release/,
+    );
+  });
+});
+
 describe("A22: a scratch-release failure never masks a process-control failure (review round-2 P1)", () => {
   it("the ProcessControlError survives a throwing release — the fatal signal reaches the runtime", async () => {
     const resolution: ResolvedWorkdir = { cwd: workdir, effectiveRoots: [realpathSync(root)], scratchDir: null };
@@ -726,6 +779,9 @@ describe("V1–V4: v1 spawn shape — prompt, sandbox, journal env", () => {
     expect(settings.filesystem.allowWrite).toContain(outbox);
     expect(settings.filesystem.allowWrite).not.toContain(controlRoot.rootDir);
     expect(settings.filesystem.allowWrite).not.toContain(controlRoot.nodePath);
+    // The per-Run Claude temp root joins BOTH lists (Issue #50).
+    expect(settings.filesystem.allowRead).toContain(sidecar.env.CLAUDE_CODE_TMPDIR);
+    expect(settings.filesystem.allowWrite).toContain(sidecar.env.CLAUDE_CODE_TMPDIR);
 
     // PATH binds env(1)'s node lookup to the runtime that started the daemon.
     expect(sidecar.env.PATH!.split(path.delimiter).slice(0, 2)).toEqual([

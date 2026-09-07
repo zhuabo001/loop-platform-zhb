@@ -25,6 +25,8 @@
  *   hang             write the sidecar, then hang forever (timeout/abort pins)
  *   self-swap-scratch replace our OWN cwd with a symlink mid-run (release
  *                    fail-closed pin — the post-run release must refuse it)
+ *   self-swap-runtemp replace the runner-minted CLAUDE_CODE_TMPDIR root with
+ *                    a symlink mid-run (run-temp release fail-closed pin)
  *   session-conflict init session_id ≠ result session_id (identity pin)
  *   secret-session   success result whose session_id embeds $ANTHROPIC_API_KEY
  *   probe            handled by the probe pins: `--version` / `--help` output
@@ -106,6 +108,7 @@ writeFileSync(
       HOME: process.env.HOME ?? null,
       ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY ?? null,
       CLAUDE_CODE_OAUTH_TOKEN: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? null,
+      CLAUDE_CODE_TMPDIR: process.env.CLAUDE_CODE_TMPDIR ?? null,
       LOOPZHB_MACHINE_CREDENTIAL: process.env.LOOPZHB_MACHINE_CREDENTIAL ?? null,
       GITHUB_TOKEN: process.env.GITHUB_TOKEN ?? null,
       LOOPZHB_JOURNAL_OUTBOX: process.env.LOOPZHB_JOURNAL_OUTBOX ?? null,
@@ -285,6 +288,21 @@ switch (scenario) {
     line({ type: "result", subtype: "success", is_error: false, result: "swapped", session_id: "fake-sess-1" });
     rmSync(cwd, { recursive: true, force: true });
     symlinkSync("/", cwd, "dir");
+    break;
+  }
+  case "self-swap-runtemp": {
+    // Same swap, one directory up the stack: the run SUCCEEDS, but the
+    // runner-minted CLAUDE_CODE_TMPDIR root is now a symlink — the
+    // fail-closed run-temp release must refuse and fail the run.
+    const tmpRoot = process.env.CLAUDE_CODE_TMPDIR;
+    if (!tmpRoot) {
+      process.stderr.write("self-swap-runtemp: CLAUDE_CODE_TMPDIR missing\n");
+      process.exitCode = 65;
+      break;
+    }
+    line({ type: "result", subtype: "success", is_error: false, result: "swapped", session_id: "fake-sess-1" });
+    rmSync(tmpRoot, { recursive: true, force: true });
+    symlinkSync("/", tmpRoot, "dir");
     break;
   }
   default:
