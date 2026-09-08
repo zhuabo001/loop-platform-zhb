@@ -111,6 +111,14 @@ $ git diff --check main  # 无输出（clean）；基线 6af3b29
 
 第二轮整改补充：两个账本现共享锁，并在每次调用前同时检查未完成、未知费用及格式损坏；旧诊断未知费用未核销前，显式设置 P/R 预算也不能启动调用。新增确定性入口反例覆盖跨账本双向阻断/并发、setup 与预留失败的资源回收、300 字符之后的 cwd/OpenSSL 错误检测。上述反例使用 fake CLI 和文件系统故障注入，不替代真实 R 隔离证据。
 
+**2026-09-08 最终真实 R 验收**：固定 HEAD `4ba3ea6f85b8c922b6aae18dcad59f6efc3dd83a`、Claude Code `2.1.236`、SHA-256 `6bc4ba992d2786cbf0237c4453ca53c1fdf0c3b3d83ffa0025c0d8190ed27848`、Node `v22.17.0`。旧 A/B 超时的实际费用无法恢复；保留原账本备份及 SHA-256 审计，以诊断阶段剩余预算 `$2.361416` 保守计提，使诊断账本恰好耗尽 `$3`，不声称该计提是实际账单。真实验收使用独立 `$1` 总预算：
+
+- 首次 R（`compat-R-2026-09-08T15-00-02-465Z.json`）29.9s、`$0.144288`：六项 OS 拒绝及完整性均通过，但 Claude 追加 marker 检查 Bash，严格协议以 exit 1 拒绝；没有把隔离子项通过误报为整体通过。
+- 将“marker 由 host 校验、禁止未编号检查”固定到任务/system prompt 后，以全新 Run 复验。`compat-R-2026-09-08T15-02-36-530Z.json`：17.1s、`$0.107987`、**exit 0 / verdict.ok=true**。Task File 首读一次；9 条编号命令各一次且顺序精确（总 Bash 10）；成功/故意失败状态正确；唯一 `loopzhb report` 成功、Journal 合法；无 cwd EPERM/OpenSSL abort；另一 Run temp 直接读写、根内 symlink 读写、wrapper 与 OpenSSL 配置篡改六项均 `attempted=true`、`outcome=denied`、目标完整；run temp 回收且 `cleanupFailures=[]`。
+- 两次真实 R 合计 `$0.252275`，低于 `$1` 验收预算。证据扫描未发现 credential/run credential 明文。生产 runner/profile 未因复验放宽；首轮额外命令只促成测试提示约束提交 `4ba3ea6`。
+
+至此 #50 的两类阻塞、确定性反例、独立三轨整改核销、真实隔离 R 及既有完整 Batch 2 E2E 证据齐备。结论仍限定为“固定 2.1.236/hash 在旧 profile 下不兼容、在修复 profile 下通过”，不推导版本回归。
+
 ## 显式边界核对（相对基线 `6af3b29` 的变更面）
 
 - DB migration：Batch 2 开发期保持「无 migration」边界；**首轮 review 修复引入 1 个 additive 列** `loops.revision`（`drizzle/0004_icy_black_crow.sql`，ADR-003 只增不删纪律；`db:check` = generate 后无 diff）。复用 Batch 1 已落库字段，无其他 schema 变化。
@@ -131,4 +139,4 @@ $ git diff --check main  # 无输出（clean）；基线 6af3b29
 
 ## 结论
 
-Phase 4 Batch 2 的确定性验收目标及第二轮审查反例均有对应测试，Issues #39–#47 已核销关闭。**真实 Claude 业务门已于 2026-09-07 通过**，#38/#49 保持核销；#50 的诊断与拒绝验收在 2026-09-08 独立复审后重新进入核销流程，不能据此把 Claude Code 2.1.236 认定为版本根因。Batch 3 在真实门脚本上追加 Dashboard 与重启断言。
+Phase 4 Batch 2 的确定性验收目标及第二轮审查反例均有对应测试，Issues #39–#47 已核销关闭。**真实 Claude 业务门已于 2026-09-07 通过**，#38/#49 保持核销；#50 的三轨整改及最终真实 R 已于 2026-09-08 完成核销。该事实不能用于把 Claude Code 2.1.236 认定为版本根因。Batch 3 在真实门脚本上追加 Dashboard 与重启断言。

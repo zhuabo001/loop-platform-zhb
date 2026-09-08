@@ -1,6 +1,6 @@
 # Claude Runner sandbox 兼容性修复计划
 
-- 状态：实现已完成；2026-09-08 首轮独立复审整改完成，真实拒绝复验与第二轮核销待执行
+- 状态：已完成；2026-09-08 三轨整改核销及最终真实 R 隔离验收通过
 - 日期：2026-09-07
 - 目标分支：`feat/phase4-batch2-dev`
 - 关联：Issue #50（阻塞 #49、#38）；ADR-006；ADR-009；`docs/plan/codex-fix-claude-runner-plan.md`
