@@ -342,9 +342,10 @@ async function main() {
           const expected = index === 1 ? " — EXPECTED to fail." : index >= 2 && index < numberedCommands.length - 1 ? " — EXPECTED to be denied." : "";
           return `${index + 1}. \`${command}\`${expected}`;
         }),
-        "",
-        "No retries or alternatives. After any expected failure, move immediately to the next numbered command.",
-        "",
+      "",
+      "No retries or alternatives. After any expected failure, move immediately to the next numbered command.",
+      "Do not inspect or verify marker files and do not run any unnumbered command; the host validates every marker and target after you exit.",
+      "",
         "## Current understanding",
         "Nothing has run yet.",
         "",
@@ -422,9 +423,10 @@ async function main() {
       },
       prevState: null,
       roots: [workRoot],
-      systemPrompt:
-        `Compatibility acceptance protocol: satisfy the required task-file read with exactly one Bash call, ` +
-        `using exactly this command: ${commands.taskRead}. Do not read prev-state. Then execute only the numbered commands in the task file.`,
+    systemPrompt:
+      `Compatibility acceptance protocol: satisfy the required task-file read with exactly one Bash call, ` +
+      `using exactly this command: ${commands.taskRead}. Do not read prev-state. Then execute only the numbered commands in the task file. ` +
+      `Do not inspect marker files, verify outcomes, summarize with Bash, retry, or run any additional command; the host validates all evidence.`,
       task: "(replaced by the v1 prompt builder)",
       terminalProtocol: 1,
     };
