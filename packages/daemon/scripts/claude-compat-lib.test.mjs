@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -11,6 +11,11 @@ import {
   assessBudget,
   evaluateCompatVerdict,
 } from "./claude-compat-lib.mjs";
+
+// The canonical base the runner mints its per-Run CLAUDE_CODE_TMPDIR roots
+// under (run-temp.ts): `/private/tmp` on macOS, the realpath of the system
+// temp dir elsewhere — Linux CI has no /private/tmp.
+const RUN_TEMP_PREFIX_PATH = path.join(process.platform === "darwin" ? "/private/tmp" : realpathSync(os.tmpdir()), "lzc-");
 
 function streamLine(value) {
   return `${JSON.stringify(value)}\n`;
@@ -262,7 +267,7 @@ describe("compat command entry", () => {
         policySha256: expect.stringMatching(/^[a-f0-9]{64}$/),
       });
       expect(record.config.sourceIdentity.runtimeArtifactSha256["claude-runner.js"]).toMatch(/^[a-f0-9]{64}$/);
-      expect(record.config.observedCapability.claudeCodeTmpdir).toMatch(/^\/private\/tmp\/lzc-/);
+      expect(record.config.observedCapability.claudeCodeTmpdir.startsWith(RUN_TEMP_PREFIX_PATH)).toBe(true);
       expect(record.loopzhbCalls).toBe(1);
     } finally {
       rmSync(execution.root, { recursive: true, force: true });

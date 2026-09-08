@@ -35,6 +35,10 @@ import { ProcessControlError } from "./subprocess.js";
 
 const FIXTURE = fileURLToPath(new URL("../test-fixtures/fake-claude.mjs", import.meta.url));
 const SIDECAR = ".fake-claude-session.json";
+// The canonical base the runner mints its per-Run CLAUDE_CODE_TMPDIR roots
+// under (run-temp.ts): `/private/tmp` on macOS, the realpath of the system
+// temp dir elsewhere — Linux CI has no /private/tmp.
+const RUN_TEMP_PREFIX_PATH = path.join(process.platform === "darwin" ? "/private/tmp" : realpathSync(tmpdir()), "lzc-");
 
 const ENV_SOURCE: NodeJS.ProcessEnv = {
   PATH: `${path.dirname(process.execPath)}:${process.env.PATH ?? ""}`,
@@ -258,7 +262,7 @@ describe("A1–A3: the fixed argv and the dynamic sandbox settings", () => {
     // The runner-minted per-Run Claude temp root (Issue #50): exported to the
     // child as CLAUDE_CODE_TMPDIR and granted read+write in the profile.
     const runTemp = sidecar.env.CLAUDE_CODE_TMPDIR;
-    expect(runTemp).toMatch(/^\/private\/tmp\/lzc-/);
+    expect(runTemp!.startsWith(RUN_TEMP_PREFIX_PATH)).toBe(true);
     expect(existsSync(runTemp!)).toBe(false); // released after the run
     const settings = JSON.parse(argv[argv.indexOf("--settings") + 1]!) as Record<string, unknown>;
     expect(settings).toEqual({
@@ -588,7 +592,7 @@ describe("A23–A26: the per-Run Claude temp root (Issue #50)", () => {
     await run(makeDelivery());
     const first = readSidecar();
     const firstTmp = first.env.CLAUDE_CODE_TMPDIR!;
-    expect(firstTmp).toMatch(/^\/private\/tmp\/lzc-/);
+    expect(firstTmp.startsWith(RUN_TEMP_PREFIX_PATH)).toBe(true);
     const firstSettings = JSON.parse(first.argv[first.argv.indexOf("--settings") + 1]!);
     expect(firstSettings.sandbox.filesystem.allowRead).toContain(firstTmp);
     expect(firstSettings.sandbox.filesystem.allowWrite).toContain(firstTmp);
@@ -598,7 +602,7 @@ describe("A23–A26: the per-Run Claude temp root (Issue #50)", () => {
     rmSync(path.join(workdir, SIDECAR));
     await run(makeDelivery({ runId: "run-2" }));
     const secondTmp = readSidecar().env.CLAUDE_CODE_TMPDIR!;
-    expect(secondTmp).toMatch(/^\/private\/tmp\/lzc-/);
+    expect(secondTmp.startsWith(RUN_TEMP_PREFIX_PATH)).toBe(true);
     expect(secondTmp).not.toBe(firstTmp); // fresh per Run
     expect(existsSync(secondTmp)).toBe(false);
   });
@@ -639,7 +643,7 @@ describe("A23–A26: the per-Run Claude temp root (Issue #50)", () => {
     const report = await run(makeDelivery());
     expect(report.ok).toBe(false);
     expect(report.error).toContain("failed to spawn claude");
-    expect(mintedTmp).toMatch(/^\/private\/tmp\/lzc-/);
+    expect(mintedTmp!.startsWith(RUN_TEMP_PREFIX_PATH)).toBe(true);
     expect(existsSync(mintedTmp!)).toBe(false); // released despite the spawn error
   });
 

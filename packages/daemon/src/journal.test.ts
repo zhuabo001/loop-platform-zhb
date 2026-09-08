@@ -5,7 +5,7 @@
  * re-validation against the protocol's single source, and the daemon-side
  * second redaction layer on message/reason.
  */
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, truncateSync, writeFileSync, promises as fs } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, truncateSync, writeFileSync, promises as fs } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -243,10 +243,15 @@ describe("the bounded read (review ADV-4)", () => {
 
   it("an inode swap between the listing lstat and the record read is journal_multiple", async () => {
     writeRecord("x.json", '{"kind":"report","status":"nothing-new"}');
+    // The replacement must already exist when the swap happens: creating it
+    // AFTER unlinking the record can reuse the freed inode number (Linux
+    // does), and the dev/ino guard would then see no swap at all.
+    const replacement = path.join(base, "replacement.json");
+    writeFileSync(replacement, '{"kind":"report","status":"nothing-new"}');
     const result = await collectJournal(outbox, SECRETS, {
       open: async (p, flags, mode) => {
         rmSync(p);
-        writeFileSync(p, '{"kind":"report","status":"nothing-new"}'); // same content, NEW inode
+        renameSync(replacement, p); // same content, NEW inode
         return fs.open(p, flags as never, mode as never);
       },
     });
