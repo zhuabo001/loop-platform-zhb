@@ -160,6 +160,8 @@ Batch 2 首轮 code review（FAIL）后，固化修复期确认的四处裁决�
 2. **每 Run Claude 临时根。** runner 在用户环境过滤之后内部铸发每 Run 私有 canonical 临时根（0700），自设 `CLAUDE_CODE_TMPDIR` 并把该根精确加入 sandbox profile 读写（不授权共享 UID 临时目录）；用户环境/settings 中的同名变量既不能覆盖 runner 生成值也不能扩大 profile。回收沿用 fail-closed 纪律且永不掩盖 `ProcessControlError`（同 ADR-006 决策 11）。修订 8 的其余不变量（每 Run 控制目录、outbox 唯一可写、PATH 前缀）不变。
 3. **证据边界（2026-09-08 修订）。** “本机固定 2.1.236/hash 在旧 profile 下复现、相同二进制在新 profile 下通过”是兼容性结论，不是版本因果结论。诊断四象限必须冻结旧/新能力并记录实际 child profile；生产验证另用 P/R，且 verdict 必须核对 tool ID、Task File 首读与命令顺序、命令状态、副作用、唯一 terminal、同 shell attempt/denied 证据、拒绝目标完整性与资源回收。费用未知会由固定持久账本阻断后续付费调用，账本 reservation 必须跨进程原子化。
 
+   第二轮复审补充：错误检测基于完整 tool-result，仅证据展示可截断，tool-use 命令文本不参与 marker 判定。诊断与验收账本共享排他锁及未完成/未知费用/损坏状态门；独立预算只隔离次数、时间和金额计算，不隔离未决费用。compat harness 的资源所有权从首次临时能力分配开始，覆盖 setup、预算预留、runner 和失败退出，避免启动拒绝及锁异常绕过清理。
+
 ### 2026-08-31：实现期裁决固化
 
 在不改变任何已裁决语义的前提下，固化实现期确认的八处裁决：

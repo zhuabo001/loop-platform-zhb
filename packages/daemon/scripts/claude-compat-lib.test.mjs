@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -17,6 +17,19 @@ function streamLine(value) {
 }
 
 describe("compat stream evidence", () => {
+  it("detects full text-block results without treating command text as an error", () => {
+    const commandOnly = streamLine({ type: "assistant", message: { content: [
+      { type: "tool_use", name: "Bash", id: "probe", input: { command: 'echo "OpenSSL configuration error"' } },
+    ] } });
+    expect(analyzeStream(commandOnly).markers.opensslAbort).toBe(false);
+    const result = streamLine({ type: "user", message: { content: [
+      { type: "tool_result", tool_use_id: "probe", is_error: true, content: [
+        { type: "text", text: "x".repeat(1000) },
+        { type: "text", text: "OpenSSL configuration error" },
+      ] },
+    ] } });
+    expect(analyzeStream(commandOnly + result).markers.opensslAbort).toBe(true);
+  });
   it("pairs tool results by tool_use_id and counts only an exact terminal command", () => {
     const stdout =
       streamLine({
@@ -175,12 +188,12 @@ describe("compat command entry", () => {
   const fixture = path.resolve(import.meta.dirname, "../test-fixtures/fake-claude.mjs");
   const fixtureSha = createHash("sha256").update(readFileSync(fixture)).digest("hex");
 
-  function run(variant, prepare, envOverrides = {}) {
+  function run(variant, prepare, envOverrides = {}, nodeArgs = []) {
     const root = mkdtempSync(path.join(os.tmpdir(), "loopzhb-compat-entry-"));
     const evidence = path.join(root, "evidence");
     const ledgerDir = path.join(root, "loopzhb-compat-evidence");
     prepare?.({ evidence, ledgerDir, root });
-    const result = spawnSync(process.execPath, [script, "--variant", variant, "--evidence-dir", evidence], {
+    const result = spawnSync(process.execPath, [...nodeArgs, script, "--variant", variant, "--evidence-dir", evidence], {
       env: {
         PATH: process.env.PATH,
         HOME: root,
@@ -188,6 +201,7 @@ describe("compat command entry", () => {
         LOOPZHB_CLAUDE_BIN: fixture,
         LOOPZHB_EXPECTED_CLAUDE_SHA256: fixtureSha,
         LOOPZHB_COMPAT_ACCEPTANCE_BUDGET_USD: "1",
+        COMPAT_TEST_MINTED_LOG: path.join(root, "minted.txt"),
         ...envOverrides,
       },
       encoding: "utf8",
@@ -196,8 +210,8 @@ describe("compat command entry", () => {
     return { root, evidence, ledgerDir, result };
   }
 
-  function startRun(root, evidence, configName) {
-    const child = spawn(process.execPath, [script, "--variant", "P", "--evidence-dir", evidence], {
+  function startRun(root, evidence, configName, variant = "P") {
+    const child = spawn(process.execPath, [script, "--variant", variant, "--evidence-dir", evidence], {
       env: {
         PATH: process.env.PATH,
         HOME: root,
@@ -254,6 +268,43 @@ describe("compat command entry", () => {
       rmSync(execution.root, { recursive: true, force: true });
     }
   });
+
+  it.each([["long-cwd", "cwdEperm"], ["long-openssl", "opensslAbort"]])(
+    "rejects %s errors beyond the displayed tool preview", (config, marker) => {
+      const execution = run("P", undefined, { CLAUDE_CONFIG_DIR: path.join(os.tmpdir(), config) });
+      try {
+        expect(execution.result.status).toBe(1);
+        const file = readdirSync(execution.evidence).find((name) => /^compat-P-.+\.json$/.test(name));
+        const record = JSON.parse(readFileSync(path.join(execution.evidence, file), "utf8"));
+        expect(record.report.ok).toBe(true);
+        expect(record.markers[marker]).toBe(true);
+        expect(record.verdict.ok).toBe(false);
+        expect(record.bashCalls.every((call) => (call.result?.preview.length ?? 0) <= 300)).toBe(true);
+      } finally {
+        rmSync(execution.root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each(["reservation-lock", "reservation-write", "refusal-setup", "startup-guard"])(
+    "releases every temporary capability after %s fails", (fault) => {
+      const execution = run("R", undefined, {
+        COMPAT_TEST_FAULT: fault,
+        ...(fault === "startup-guard" ? { NODE_OPTIONS: "--openssl_config=/dev/null" } : {}),
+      }, ["--import", path.resolve(import.meta.dirname, "../test-fixtures/compat-fs-faults.mjs")]);
+      const minted = readFileSync(path.join(execution.root, "minted.txt"), "utf8").trim().split("\n");
+      try {
+        expect(execution.result.status).toBe(2);
+        expect(minted.length).toBeGreaterThan(0);
+        expect(minted.filter(existsSync)).toEqual([]);
+        expect(readdirSync(execution.ledgerDir).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+        expect(readdirSync(execution.evidence).some((name) => name.startsWith("compat-R-"))).toBe(false);
+      } finally {
+        for (const directory of minted) rmSync(directory, { recursive: true, force: true });
+        rmSync(execution.root, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("requires an explicit independent budget before a P/R acceptance call", () => {
     const execution = run("P", undefined, { LOOPZHB_COMPAT_ACCEPTANCE_BUDGET_USD: undefined });
@@ -337,21 +388,43 @@ describe("compat command entry", () => {
     }
   });
 
-  it("allows only one concurrent acceptance call and preserves its ledger row", async () => {
+  it.each([
+    ["P", "spend-ledger.json", "cost-unknown"],
+    ["R", "spend-ledger.json", "started"],
+    ["A", "acceptance-spend-ledger.json", "cost-unknown"],
+    ["D", "acceptance-spend-ledger.json", "started"],
+    ["P", "spend-ledger.json", "corrupt"],
+    ["A", "acceptance-spend-ledger.json", "corrupt"],
+  ])("blocks %s when the other ledger %s is %s", (variant, file, status) => {
+    const execution = run(variant, ({ ledgerDir }) => {
+      mkdirSync(ledgerDir, { recursive: true });
+      writeFileSync(path.join(ledgerDir, file), status === "corrupt" ? "broken json" :
+        JSON.stringify([{ variant: "A", runId: "unresolved", at: new Date().toISOString(), usd: null, status }]));
+    });
+    try {
+      expect(execution.result.status).toBe(status === "corrupt" ? 2 : 3);
+      expect(readdirSync(execution.evidence)).toEqual([]);
+      expect(readdirSync(execution.ledgerDir)).toEqual([file]);
+    } finally {
+      rmSync(execution.root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([["P", "P"], ["P", "D"], ["D", "P"]])("serializes concurrent %s and %s calls across both budgets", async (firstVariant, secondVariant) => {
     const root = mkdtempSync(path.join(os.tmpdir(), "loopzhb-compat-concurrent-"));
-    const ledgerPath = path.join(root, "loopzhb-compat-evidence", "acceptance-spend-ledger.json");
-    const first = startRun(root, path.join(root, "evidence-one"), "slow-compat");
+    const ledgerPath = path.join(root, "loopzhb-compat-evidence", firstVariant === "D" ? "spend-ledger.json" : "acceptance-spend-ledger.json");
+    const first = startRun(root, path.join(root, "evidence-one"), "slow-compat", firstVariant);
     try {
       await waitForStartedLedger(ledgerPath);
-      const second = startRun(root, path.join(root, "evidence-two"), "normal-compat");
+      const second = startRun(root, path.join(root, "evidence-two"), "normal-compat", secondVariant);
       const [firstResult, secondResult] = await Promise.all([first.done, second.done]);
       expect(firstResult.status, firstResult.stderr).toBe(0);
       expect(secondResult.status).toBe(3);
       expect(secondResult.stderr).toContain("unfinished call");
       const rows = JSON.parse(readFileSync(ledgerPath, "utf8"));
       expect(rows).toHaveLength(1);
-      expect(rows[0]).toMatchObject({ variant: "P", status: "complete", usd: 0.001 });
-      expect(readdirSync(path.join(root, "evidence-two")).some((name) => /^compat-P-.+\.json$/.test(name))).toBe(false);
+      expect(rows[0]).toMatchObject({ variant: firstVariant, status: "complete", usd: 0.001 });
+      expect(readdirSync(path.join(root, "evidence-two"))).toEqual([]);
     } finally {
       if (first.child.exitCode === null) first.child.kill("SIGKILL");
       rmSync(root, { recursive: true, force: true });

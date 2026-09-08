@@ -25,12 +25,21 @@ export function isTerminalCommand(command) {
   return /^\s*loopzhb\s+(?:report|finish)(?:\s|$)/.test(command);
 }
 
+export function detectCompatMarkers(text) {
+  return {
+    opensslAbort: /OpenSSL configuration error|Abort trap|(?:^|\s)exit(?:ed)?(?: code)? 134(?:\s|$)/im.test(text),
+    cwdEperm: /operation not permitted[^\n]*cwd-|cwd-[^\n]*operation not permitted/i.test(text),
+    anyEperm: /operation not permitted|EPERM/i.test(text),
+  };
+}
+
 /** Pair Bash calls/results by Claude's tool-use identity. Event order is not
  * a reliable join key: tool results can be grouped or arrive out of order. */
 export function analyzeStream(stdoutText) {
   const calls = [];
   const resultById = new Map();
   let terminal = null;
+  const markers = detectCompatMarkers("");
   for (const line of stdoutText.split("\n")) {
     if (line.trim() === "") continue;
     let event;
@@ -48,9 +57,14 @@ export function analyzeStream(stdoutText) {
     } else if (event.type === "user") {
       for (const block of event.message?.content ?? []) {
         if (block?.type === "tool_result") {
+          const text = resultText(block.content);
+          // Detect on complete results before generating bounded previews.
+          // Keep only booleans, never an additional raw transcript copy.
+          const detected = detectCompatMarkers(text);
+          for (const key of Object.keys(markers)) markers[key] ||= detected[key];
           resultById.set(String(block.tool_use_id ?? ""), {
             isError: block.is_error === true,
-            preview: resultText(block.content).slice(0, 300),
+            preview: text.slice(0, 300),
           });
         }
       }
@@ -59,7 +73,7 @@ export function analyzeStream(stdoutText) {
     }
   }
   const joined = calls.map((call) => ({ ...call, result: resultById.get(call.id) ?? null }));
-  return { calls: joined, terminalCalls: joined.filter((call) => isTerminalCommand(call.command)), terminal };
+  return { calls: joined, terminalCalls: joined.filter((call) => isTerminalCommand(call.command)), terminal, markers };
 }
 
 function exactCalls(stream, command) {

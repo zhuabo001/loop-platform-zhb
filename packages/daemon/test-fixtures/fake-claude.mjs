@@ -169,12 +169,15 @@ if (isV1) {
           writeJournal({ kind: "report", status: "nothing-new", message: "fake compat" });
           isError = false;
         }
-        // Refusal commands are deliberately reported as allowed. The compat
-        // driver's black-box test proves this cannot yield exit 0 merely
-        // because the journal/report succeeded.
+        const longError = process.env.CLAUDE_CONFIG_DIR?.endsWith("long-cwd")
+          ? "zsh:1: operation not permitted: /tmp/claude-501/cwd-probe"
+          : process.env.CLAUDE_CONFIG_DIR?.endsWith("long-openssl") ? "OpenSSL configuration error" : null;
+        // Preserve a long tool error even when the overall Claude result and
+        // journal succeed: the compat gate must inspect beyond its preview.
         line({
           type: "user",
-          message: { content: [{ type: "tool_result", tool_use_id: id, is_error: isError, content: isError ? "expected failure" : "ok" }] },
+          message: { content: [{ type: "tool_result", tool_use_id: id, is_error: isError,
+            content: isError ? longError === null ? "expected failure" : `${"x".repeat(301)}\n${longError}` : "ok" }] },
         });
       }
       successResult({ total_cost_usd: 0.001 });

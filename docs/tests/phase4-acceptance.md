@@ -109,6 +109,8 @@ $ git diff --check main  # 无输出（clean）；基线 6af3b29
 
 **2026-09-08 独立复审整改状态**：上述 E2E 成功事实未被推翻，但 #50 的验收闭环被撤回。`pnpm test:claude:compat` 已恢复冻结旧/新能力的 A/B/C/D 四象限，并新增最终生产 P 与拒绝 R；R 现在覆盖另一 Run temp 直接及 symlink 读写、wrapper 和 OpenSSL 配置篡改，每项用同 shell attempt/denied marker 排除 Claude 权限层预拒绝，任何命令状态/顺序、目标完整性、唯一 terminal、副作用或清理失败都会使入口非零退出。旧诊断账本已超过 8 次且含未知费用，按固定持久账本门禁禁止继续诊断；P/R 使用独立账本、原子 reservation，最多 4 次且必须显式设置 `LOOPZHB_COMPAT_ACCEPTANCE_BUDGET_USD`。本轮用户选择暂不批准新验收费用，因此真实 R 未运行；待预算裁决后复验，再由第二轮独立复审核销。
 
+第二轮整改补充：两个账本现共享锁，并在每次调用前同时检查未完成、未知费用及格式损坏；旧诊断未知费用未核销前，显式设置 P/R 预算也不能启动调用。新增确定性入口反例覆盖跨账本双向阻断/并发、setup 与预留失败的资源回收、300 字符之后的 cwd/OpenSSL 错误检测。上述反例使用 fake CLI 和文件系统故障注入，不替代真实 R 隔离证据。
+
 ## 显式边界核对（相对基线 `6af3b29` 的变更面）
 
 - DB migration：Batch 2 开发期保持「无 migration」边界；**首轮 review 修复引入 1 个 additive 列** `loops.revision`（`drizzle/0004_icy_black_crow.sql`，ADR-003 只增不删纪律；`db:check` = generate 后无 diff）。复用 Batch 1 已落库字段，无其他 schema 变化。
