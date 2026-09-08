@@ -156,8 +156,9 @@ Batch 2 首轮 code review（FAIL）后，固化修复期确认的四处裁决�
 
 ### 2026-09-07：Issue #50 wrapper 形态与每 Run 临时根裁决
 
-1. **wrapper 入口改为薄 launcher + 摘要校验 bundle（修订 2026-09-02（二）第 1/3 条的形态）。** `loopzhb` 不再直接是 bundle：入口是 0500 的两行 ESM launcher——shebang 直接命名 daemon canonical Node 并以内核单参数携带 `--openssl-config=<0400 空配置>`，随后 `import "./loopzhb-wrapper.mjs"`（0400，构建期摘要校验语义不变）。动机（ADR-006 同日修订）：seatbelt `denyRead ["/"]` 下 Node 读系统 OpenSSL 配置即崩；`#!/bin/sh` 形态不可用（macOS 26 经 `/private/var/select/sh` 解析解释器，读被拒），直接 Mach-O 解释器只需执行位。OpenSSL 覆盖只作用于 wrapper 进程，不进入 Claude 环境、不动用户配置；daemon 自身带定制 OpenSSL 配置（`OPENSSL_CONF`/`--openssl-config`）时启动期拒绝静默覆盖。秘密边界不变：launcher 只含固定路径，无 credential。
+1. **wrapper 入口改为薄 launcher + 摘要校验 bundle（修订 2026-09-02（二）第 1/3 条的形态）。** `loopzhb` 不再直接是 bundle：入口是 0500 的两行 ESM launcher——shebang 直接命名 daemon canonical Node 并以内核单参数携带 `--openssl-config=<0400 空配置>`，随后 `import "./loopzhb-wrapper.mjs"`（0400，构建期摘要校验语义不变）。动机（ADR-006 同日修订）：seatbelt `denyRead ["/"]` 下 Node 读系统 OpenSSL 配置即崩；`#!/bin/sh` 形态不可用（macOS 26 经 `/private/var/select/sh` 解析解释器，读被拒），直接 Mach-O 解释器只需执行位。OpenSSL 覆盖只作用于 wrapper 进程，不进入 Claude 环境、不动用户配置；daemon 自身带定制 OpenSSL 配置或 FIPS 模式时启动期拒绝静默覆盖，检查 `OPENSSL_CONF`、进程 argv 及 `NODE_OPTIONS` 中的 `--openssl-config`/`--enable-fips`/`--force-fips`。秘密边界不变：launcher 只含固定路径，无 credential。
 2. **每 Run Claude 临时根。** runner 在用户环境过滤之后内部铸发每 Run 私有 canonical 临时根（0700），自设 `CLAUDE_CODE_TMPDIR` 并把该根精确加入 sandbox profile 读写（不授权共享 UID 临时目录）；用户环境/settings 中的同名变量既不能覆盖 runner 生成值也不能扩大 profile。回收沿用 fail-closed 纪律且永不掩盖 `ProcessControlError`（同 ADR-006 决策 11）。修订 8 的其余不变量（每 Run 控制目录、outbox 唯一可写、PATH 前缀）不变。
+3. **证据边界（2026-09-08 修订）。** “本机固定 2.1.236/hash 在旧 profile 下复现、相同二进制在新 profile 下通过”是兼容性结论，不是版本因果结论。诊断四象限必须冻结旧/新能力并记录实际 child profile；生产验证另用 P/R，且 verdict 必须核对 tool ID、命令状态、副作用、唯一 terminal、拒绝结果、目标完整性与资源回收。费用未知会持久阻断后续付费调用。
 
 ### 2026-08-31：实现期裁决固化
 

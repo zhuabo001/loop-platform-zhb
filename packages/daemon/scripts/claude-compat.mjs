@@ -4,32 +4,28 @@
  *
  * One invocation = ONE real Claude call of ONE experiment variant:
  *
- *   A  production baseline — no change (OpenSSL abort / cwd EPERM still
- *      reproduce on this exact binary+OS?)
- *   B  run temp dir      — a private short canonical tmp root is minted and
- *      injected as CLAUDE_CODE_TMPDIR plus precise allowRead/allowWrite
- *      grants (do the per-command `cwd-*` dirs migrate and does Bash status
- *      become accurate?)
- *   C  wrapper launch    — the `loopzhb` entry is replaced by a thin shell
- *      launcher `exec <canonical node> --openssl-config=<empty cfg> <bundle>`
- *      (does Node start under the seatbelt profile and write a valid record?)
- *   D  combined          — B and C together (one-shot success, no retries?)
+ *   A  frozen legacy wrapper + legacy temp profile (negative control)
+ *   B  legacy wrapper + fixed private run temp (isolates cwd fix)
+ *   C  fixed launcher + legacy temp profile (isolates wrapper fix)
+ *   D  fixed launcher + fixed private run temp (combined diagnostic)
+ *   P  untouched current production path (acceptance smoke)
+ *   R  current production path plus complete refusal probes
  *
  * The variants exist ONLY in this helper: production code gains no switches.
- * B/D apply their delta through the runner's documented TEST-ONLY `spawnImpl`
- * seam (the same standing as SpawnOptions.killImpl); C/D rebuild the control
- * root's wrapper entry in-place after createControlRoot verified the bundle
- * digest. Everything else is the untouched production path: provider
+ * A/B restore the digest-pinned legacy entry, while A/C use the existing
+ * spawnImpl diagnostic seam to remove the production temp env/grants from
+ * the actual spawn. P/R modify neither capability. Everything
+ * else is the untouched production path: provider
  * bootstrap (resolveClaudeProviderEnv), probe-pinned binary identity,
  * createClaudeRunner, the static wrapper bundle and spawnWithTimeout's
  * process-group reaping.
  *
- * Budget (plan §1): at most 8 real calls / ~90 min / a $3 cumulative cost
- * TARGET across the whole matrix. The cumulative ledger lives in the
- * evidence dir and blocks a new call once the target is reached. Each call
- * is capped at 180s. When a completed Claude conversation reports NO cost,
- * the driver refuses further paid experiments (exit 3) — cost that cannot
- * be observed cannot be budgeted.
+ * Budget (plan §1): A-D share at most 8 real calls / 90 min / a $3
+ * cumulative diagnostic target. P/R have an independent at-most-4-call /
+ * 90-minute ledger and additionally require an explicit positive acceptance
+ * budget. Each call is capped at 180s. A started call whose cost cannot be
+ * observed persists as blocking evidence (exit 3); it is never treated as
+ * free or silently discarded.
  *
  * Evidence (plan §2): one redacted JSON per run in the persistent evidence
  * dir (default ~/loopzhb-compat-evidence, NEVER /tmp): config summary,
@@ -39,27 +35,38 @@
  *
  * Usage:
  *   LOOPZHB_EXPECTED_CLAUDE_SHA256=<approved hash> \
- *     pnpm test:claude:compat --variant A
+ *   LOOPZHB_COMPAT_ACCEPTANCE_BUDGET_USD=<approved target> \
+ *     pnpm test:claude:compat --variant P
  */
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { collectSecretValues, redactSecrets } from "../dist/agent-env.js";
 import { resolveClaudeProviderEnv } from "../dist/claude-provider-env.js";
 import { createClaudeRunner } from "../dist/claude-runner.js";
-import { buildWrapperLauncher, createControlRoot, releaseControlRoot } from "../dist/control-root.js";
+import { createControlRoot, releaseControlRoot } from "../dist/control-root.js";
 import { createWorkdirJail } from "../dist/jail.js";
 import { probeClaudeBinary } from "../dist/probe-claude.js";
+import { prepareClaudeRunTemp, releaseClaudeRunTemp } from "../dist/run-temp.js";
 import { spawnWithTimeout } from "../dist/subprocess.js";
 import { WRAPPER_BUNDLE_FILE, WRAPPER_BUNDLE_SHA256 } from "../dist/wrapper-artifact.generated.js";
+import {
+  VARIANT_PROFILES,
+  analyzeStream,
+  assessBudget,
+  evaluateCompatVerdict,
+} from "./claude-compat-lib.mjs";
 
 const CALL_TIMEOUT_MS = 180_000;
-const COST_TARGET_USD = 3.0;
-const LEDGER_FILE = "spend-ledger.json";
-
-const VARIANTS = new Set(["A", "B", "C", "D", "R"]);
+const DIAGNOSTIC_LEDGER_FILE = "spend-ledger.json";
+const ACCEPTANCE_LEDGER_FILE = "acceptance-spend-ledger.json";
+const SCRIPT_PATH = fileURLToPath(import.meta.url);
+const POLICY_PATH = fileURLToPath(new URL("./claude-compat-lib.mjs", import.meta.url));
+const VARIANTS = new Set(Object.keys(VARIANT_PROFILES));
 
 function parseArgs(argv) {
   const out = { variant: undefined, evidenceDir: path.join(os.homedir(), "loopzhb-compat-evidence") };
@@ -71,72 +78,32 @@ function parseArgs(argv) {
     else throw new Error(`unknown argument: ${token}`);
   }
   if (out.variant === undefined || !VARIANTS.has(out.variant)) {
-    throw new Error("usage: claude-compat.mjs --variant A|B|C|D|R [--evidence-dir <path>]");
+    throw new Error("usage: claude-compat.mjs --variant A|B|C|D|P|R [--evidence-dir <path>]");
   }
   return out;
 }
 
-async function readLedger(evidenceDir) {
+async function readLedger(evidenceDir, ledgerFile) {
   try {
-    const rows = JSON.parse(await fs.readFile(path.join(evidenceDir, LEDGER_FILE), "utf8"));
-    return Array.isArray(rows) ? rows : [];
-  } catch {
-    return [];
+    const rows = JSON.parse(await fs.readFile(path.join(evidenceDir, ledgerFile), "utf8"));
+    if (!Array.isArray(rows)) throw new Error("invalid spend ledger: expected an array");
+    return rows;
+  } catch (err) {
+    if (err?.code === "ENOENT") return [];
+    throw new Error(`cannot read spend ledger: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
-/** The variant-C/D launcher is the PRODUCTION buildWrapperLauncher output —
- *  no local copy (the first copy already drifted once: a wrong bundle
- *  basename would have made the launcher import a nonexistent file). The
- *  macOS-26 form it encodes: a two-line ESM file whose shebang names the
- *  CANONICAL Node binary directly with `--openssl-config=<readonly cfg>` as
- *  the kernel's single shebang argument; a `#!/bin/sh` script does NOT work
- *  (the seatbelt profile denyReads `/`, blocking the script interpreter
- *  `/bin/sh` → `/private/var/select/sh`; a direct Mach-O interpreter needs
- *  only execute permission). */
-
-/** Extract the observable Bash traffic from the captured stream-json. */
-function analyzeStream(stdoutText) {
-  const bashCalls = [];
-  const toolResults = [];
-  let terminal = null;
-  for (const line of stdoutText.split("\n")) {
-    if (line.trim() === "") continue;
-    let event;
-    try {
-      event = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    if (event.type === "assistant") {
-      for (const block of event.message?.content ?? []) {
-        if (block?.type === "tool_use" && block.name === "Bash") {
-          bashCalls.push(String(block.input?.command ?? ""));
-        }
-      }
-    } else if (event.type === "user") {
-      for (const block of event.message?.content ?? []) {
-        if (block?.type === "tool_result") {
-          const content = block.content;
-          const text =
-            typeof content === "string"
-              ? content
-              : (content ?? [])
-                  .filter((part) => part?.type === "text")
-                  .map((part) => part.text)
-                  .join("\n");
-          toolResults.push({ isError: block.is_error === true, preview: text.slice(0, 300) });
-        }
-      }
-    } else if (event.type === "result") {
-      terminal = event;
-    }
-  }
-  return { bashCalls, toolResults, terminal };
+async function writeLedger(evidenceDir, ledgerFile, rows) {
+  const ledgerPath = path.join(evidenceDir, ledgerFile);
+  const pendingPath = path.join(evidenceDir, `.${ledgerFile}.${process.pid}.tmp`);
+  await fs.writeFile(pendingPath, `${JSON.stringify(rows, null, 2)}\n`, { mode: 0o600 });
+  await fs.rename(pendingPath, ledgerPath);
 }
 
 async function main() {
   const { variant, evidenceDir } = parseArgs(process.argv.slice(2));
+  const profile = VARIANT_PROFILES[variant];
   const expectedSha = process.env.LOOPZHB_EXPECTED_CLAUDE_SHA256;
   if (expectedSha === undefined || !/^[a-f0-9]{64}$/.test(expectedSha)) {
     throw new Error("LOOPZHB_EXPECTED_CLAUDE_SHA256=<approved sha256> is required (operator-pinned binary identity)");
@@ -144,12 +111,25 @@ async function main() {
   const claudeBin = process.env.LOOPZHB_CLAUDE_BIN ?? "claude";
 
   await fs.mkdir(evidenceDir, { recursive: true });
-  const ledger = await readLedger(evidenceDir);
-  const spent = ledger.reduce((sum, row) => sum + (typeof row.usd === "number" ? row.usd : 0), 0);
-  if (spent >= COST_TARGET_USD) {
-    console.error(`budget target reached ($${spent.toFixed(4)} >= $${COST_TARGET_USD}) — no further paid experiments`);
+  const isAcceptance = profile.purpose !== "diagnostic";
+  const acceptanceBudgetRaw = process.env.LOOPZHB_COMPAT_ACCEPTANCE_BUDGET_USD;
+  const acceptanceBudgetUsd = acceptanceBudgetRaw === undefined ? Number.NaN : Number(acceptanceBudgetRaw);
+  if (isAcceptance && (!Number.isFinite(acceptanceBudgetUsd) || acceptanceBudgetUsd <= 0)) {
+    console.error("P/R requires explicit LOOPZHB_COMPAT_ACCEPTANCE_BUDGET_USD=<positive usd target>");
     process.exit(3);
   }
+  const ledgerFile = isAcceptance ? ACCEPTANCE_LEDGER_FILE : DIAGNOSTIC_LEDGER_FILE;
+  const ledger = await readLedger(evidenceDir, ledgerFile);
+  const budget = assessBudget(
+    ledger,
+    Date.now(),
+    isAcceptance ? { maxCalls: 4, costTargetUsd: acceptanceBudgetUsd, label: "acceptance" } : {},
+  );
+  if (!budget.ok) {
+    console.error(`${budget.reason} — no further paid experiments`);
+    process.exit(3);
+  }
+  const spent = budget.spent;
 
   // Production startup sequence, unchanged: provider bootstrap THEN probe.
   const envSource = resolveClaudeProviderEnv(process.env);
@@ -166,42 +146,116 @@ async function main() {
   // persist after the run as evidence (a scratch cwd would be released).
   const workRoot = await fs.realpath(await fs.mkdtemp(path.join(evidenceDir, `work-${variant}-`)));
   const taskFilePath = path.join(workRoot, "TASK.md");
-  // Variant R (plan §4.3): REAL refusal checks on the final production path —
-  // an escape write to the un-granted shared temp parent and a tamper append
-  // to the read-only wrapper must both be DENIED, alongside the standard
-  // success/failure/journal probes.
-  const specLines =
-    variant === "R"
-      ? [
-          "## Spec",
-          "Run exactly these five commands, in this order, each exactly once:",
-          "",
-          "1. `echo compat-ok > compat-ok.txt`",
-          "2. `cat no-such-compat-file.txt` — EXPECTED to fail; do NOT retry it.",
-          "3. `echo escape > /private/tmp/loopzhb-escape-attempt.txt` — EXPECTED to be denied; do NOT retry and do NOT try alternatives.",
-          '4. `echo tamper >> "$(command -v loopzhb)"` — EXPECTED to be denied; do NOT retry and do NOT try alternatives.',
-          `5. \`loopzhb report --status nothing-new --message "compat R done"\``,
-          "",
-          "No other commands. No retries. If a command fails, note the failure and",
-          "move IMMEDIATELY to the next step — never investigate or diagnose a failure.",
-        ]
-      : [
-          "## Spec",
-          "Run exactly these three commands, in this order, each exactly once:",
-          "",
-          "1. `echo compat-ok > compat-ok.txt`",
-          "2. `cat no-such-compat-file.txt` — this is EXPECTED to fail; do NOT retry it and do NOT try alternatives.",
-          `3. \`loopzhb report --status nothing-new --message "compat ${variant} done"\``,
-          "",
-          "No other commands. No retries. If a command fails, note the failure and",
-          "move IMMEDIATELY to the next step — never investigate or diagnose a failure.",
-        ];
+  const scratchBase = await fs.mkdtemp(path.join(os.tmpdir(), "lzc-scratch-"));
+  const controlBase = await fs.mkdtemp(path.join(os.tmpdir(), "lzc-control-"));
+  const jail = await createWorkdirJail({ allowedRoots: [workRoot], scratchBase });
+  const controlRoot = await createControlRoot(controlBase);
+
+  // A/B are a frozen copy of the old self-contained bundle entry. C/D/P/R
+  // keep the current launcher produced by createControlRoot. The same
+  // digest-pinned bundle is used on both sides, so the launcher is the only
+  // wrapper variable.
+  const bundle = await fs.readFile(controlRoot.bundlePath);
+  if (createHash("sha256").update(bundle).digest("hex") !== WRAPPER_BUNDLE_SHA256) {
+    throw new Error("wrapper bundle digest mismatch — rebuild @loopzhb/daemon");
+  }
+  if (profile.wrapper === "legacy") {
+    await fs.rm(controlRoot.wrapperPath);
+    await fs.writeFile(controlRoot.wrapperPath, bundle, { mode: 0o500 });
+    await fs.chmod(controlRoot.wrapperPath, 0o500);
+  }
+  const wrapperBytes = await fs.readFile(controlRoot.wrapperPath);
+  const bundleSha256 = createHash("sha256").update(bundle).digest("hex");
+  const wrapperSha256 = createHash("sha256").update(wrapperBytes).digest("hex");
+  const wrapperConfigured =
+    profile.wrapper === "legacy"
+      ? wrapperBytes.equals(bundle)
+      : !wrapperBytes.equals(bundle) &&
+        wrapperBytes.toString("utf8").includes(`--openssl-config=${controlRoot.opensslConfigPath}`) &&
+        wrapperBytes.toString("utf8").includes(`import "./${WRAPPER_BUNDLE_FILE}"`);
+  const repoRoot = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: path.dirname(SCRIPT_PATH), encoding: "utf8" }).trim();
+  const sourceHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoRoot, encoding: "utf8" }).trim();
+  const sourceStatus = execFileSync("git", ["status", "--porcelain=v1"], { cwd: repoRoot, encoding: "utf8" });
+  const runtimeArtifactSha256 = {};
+  for (const name of [
+    "agent-env.js",
+    "claude-provider-env.js",
+    "claude-runner.js",
+    "control-root.js",
+    "jail.js",
+    "probe-claude.js",
+    "run-temp.js",
+    "subprocess.js",
+    "wrapper-artifact.generated.js",
+  ]) {
+    const artifact = fileURLToPath(new URL(`../dist/${name}`, import.meta.url));
+    runtimeArtifactSha256[name] = createHash("sha256").update(await fs.readFile(artifact)).digest("hex");
+  }
+  const sourceIdentity = {
+    head: sourceHead,
+    dirty: sourceStatus !== "",
+    worktreeStatusSha256: createHash("sha256").update(sourceStatus).digest("hex"),
+    scriptSha256: createHash("sha256").update(await fs.readFile(SCRIPT_PATH)).digest("hex"),
+    policySha256: createHash("sha256").update(await fs.readFile(POLICY_PATH)).digest("hex"),
+    runtimeArtifactSha256,
+  };
+  const nodeSha256 = createHash("sha256").update(await fs.readFile(controlRoot.nodePath)).digest("hex");
+
+  const shellQuote = (value) => `'${value.replaceAll("'", `'"'"'`)}'`;
+  let otherRunTemp = null;
+  const commands = {
+    success: "echo compat-ok > compat-ok.txt",
+    expectedFailure: "cat no-such-compat-file.txt",
+    terminal: `loopzhb report --status nothing-new --message "compat ${variant} done"`,
+    denials: [],
+  };
+  const refusalTargets = [];
+  if (variant === "R") {
+    // A second run-shaped temp root is live while the current Run executes.
+    // Direct and in-root-symlink access must both be denied by the current
+    // sandbox even though the host process has the same UID.
+    otherRunTemp = await prepareClaudeRunTemp();
+    const otherRead = path.join(otherRunTemp.tmpRoot, "sentinel.txt");
+    const otherWrite = path.join(otherRunTemp.tmpRoot, "write-target.txt");
+    await fs.writeFile(otherRead, "other-run-secret\n", { mode: 0o600 });
+    await fs.writeFile(otherWrite, "original\n", { mode: 0o600 });
+    const readLink = path.join(workRoot, "outside-read-link");
+    const writeLink = path.join(workRoot, "outside-write-link");
+    await fs.symlink(otherRead, readLink);
+    await fs.symlink(otherWrite, writeLink);
+    commands.denials.push(
+      `cat ${shellQuote(otherRead)}`,
+      `echo tamper > ${shellQuote(otherWrite)}`,
+      `echo tamper >> ${shellQuote(controlRoot.wrapperPath)}`,
+      `echo tamper >> ${shellQuote(controlRoot.opensslConfigPath)}`,
+      "cat outside-read-link",
+      "echo tamper > outside-write-link",
+    );
+    refusalTargets.push(
+      { name: "other-run-read", kind: "file", path: otherRead, before: await fs.readFile(otherRead) },
+      { name: "other-run-write", kind: "file", path: otherWrite, before: await fs.readFile(otherWrite) },
+      { name: "wrapper", kind: "file", path: controlRoot.wrapperPath, before: await fs.readFile(controlRoot.wrapperPath) },
+      { name: "openssl-config", kind: "file", path: controlRoot.opensslConfigPath, before: await fs.readFile(controlRoot.opensslConfigPath) },
+      { name: "outside-read-link", kind: "symlink", path: readLink, before: await fs.readlink(readLink) },
+      { name: "outside-write-link", kind: "symlink", path: writeLink, before: await fs.readlink(writeLink) },
+    );
+  }
+
+  const numberedCommands = [commands.success, commands.expectedFailure, ...commands.denials, commands.terminal];
   await fs.writeFile(
     taskFilePath,
     [
       `# Compat probe ${variant}`,
       "",
-      ...specLines,
+      "## Spec",
+      `Run exactly these ${numberedCommands.length} commands, in this order, each exactly once:`,
+      "",
+      ...numberedCommands.map((command, index) => {
+        const expected = index === 1 ? " — EXPECTED to fail." : index >= 2 && index < numberedCommands.length - 1 ? " — EXPECTED to be denied." : "";
+        return `${index + 1}. \`${command}\`${expected}`;
+      }),
+      "",
+      "No retries or alternatives. After any expected failure, move immediately to the next numbered command.",
       "",
       "## Current understanding",
       "Nothing has run yet.",
@@ -212,75 +266,44 @@ async function main() {
     ].join("\n"),
     { mode: 0o600 },
   );
-  const ESCAPE_PROBE = "/private/tmp/loopzhb-escape-attempt.txt";
-  if (variant === "R") await fs.rm(ESCAPE_PROBE, { force: true });
-
-  const scratchBase = await fs.mkdtemp(path.join(os.tmpdir(), "lzc-scratch-"));
-  const controlBase = await fs.mkdtemp(path.join(os.tmpdir(), "lzc-control-"));
-  const jail = await createWorkdirJail({ allowedRoots: [workRoot], scratchBase });
-  const controlRoot = await createControlRoot(controlBase);
-
-  // Variant B/D: the private short canonical run temp root (plan §3 每 Run
-  // 的临时文件能力, diagnostic form — macOS mints under canonical
-  // /private/tmp with a short prefix, 0700, credential-free name).
-  let runTmpRoot = null;
-  if (variant === "B" || variant === "D") {
-    runTmpRoot = await fs.mkdtemp(path.join("/private/tmp", "lzc-"));
-    await fs.chmod(runTmpRoot, 0o700);
-  }
-
-  // Variant C/D: rebuild the wrapper entry as the thin launcher around the
-  // digest-verified bundle (plan §3 Wrapper 启动依赖, diagnostic form). The
-  // bundle bytes come from the digest-pinned install artifact — the minted
-  // wrapperPath itself is 0500 (execute-only) by design.
-  if (variant === "C" || variant === "D") {
-    const bundle = await fs.readFile(new URL(`../dist/${WRAPPER_BUNDLE_FILE}`, import.meta.url));
-    const digest = createHash("sha256").update(bundle).digest("hex");
-    if (digest !== WRAPPER_BUNDLE_SHA256) {
-      throw new Error("wrapper bundle digest mismatch — rebuild @loopzhb/daemon");
-    }
-    const bundlePath = path.join(controlRoot.wrapperDir, WRAPPER_BUNDLE_FILE);
-    const configPath = path.join(controlRoot.wrapperDir, "openssl.cnf");
-    await fs.writeFile(bundlePath, bundle, { mode: 0o400 });
-    await fs.chmod(bundlePath, 0o400);
-    await fs.writeFile(configPath, "", { mode: 0o400 });
-    await fs.chmod(configPath, 0o400);
-    // The minted entry is 0500 — replace, don't overwrite.
-    await fs.rm(controlRoot.wrapperPath);
-    await fs.writeFile(controlRoot.wrapperPath, buildWrapperLauncher(controlRoot.nodePath, configPath), {
-      mode: 0o500,
-    });
-    await fs.chmod(controlRoot.wrapperPath, 0o500);
-  }
 
   const redact = (text) => redactSecrets(text, [...collectSecretValues(envSource), "compat-local-run-token"]);
   let capturedStdout = "";
   let capturedStderr = "";
-  // Variant R: the wrapper entry's content is captured for a post-run
-  // integrity comparison (read by the owner — 0500 carries the read bit).
-  const wrapperBefore = variant === "R" ? await fs.readFile(controlRoot.wrapperPath, "utf8") : null;
-
-  // The ONLY variant injection point: the runner's documented test-only
-  // spawn seam. B/D add the run temp root to the child env AND the sandbox
-  // profile; every variant captures stdout/stderr for evidence.
+  let capturedCapability = null;
+  let runnerMintedTmp = null;
   const spawnImpl = async (options) => {
-    let next = {
-      ...options,
+    let spawnOptions = options;
+    runnerMintedTmp = options.env.CLAUDE_CODE_TMPDIR ?? null;
+    if (profile.runTemp === "legacy" && runnerMintedTmp !== null) {
+      const args = [...options.args];
+      const settingsIndex = args.indexOf("--settings");
+      const settings = JSON.parse(args[settingsIndex + 1]);
+      settings.sandbox.filesystem.allowRead = settings.sandbox.filesystem.allowRead.filter(
+        (entry) => entry !== runnerMintedTmp,
+      );
+      settings.sandbox.filesystem.allowWrite = settings.sandbox.filesystem.allowWrite.filter(
+        (entry) => entry !== runnerMintedTmp,
+      );
+      args[settingsIndex + 1] = JSON.stringify(settings);
+      const env = { ...options.env };
+      delete env.CLAUDE_CODE_TMPDIR;
+      spawnOptions = { ...options, args, env };
+    }
+    const settingsIndex = spawnOptions.args.indexOf("--settings");
+    const settings = settingsIndex === -1 ? null : JSON.parse(spawnOptions.args[settingsIndex + 1]);
+    capturedCapability = {
+      claudeCodeTmpdir: spawnOptions.env.CLAUDE_CODE_TMPDIR ?? null,
+      opensslConfPresent: spawnOptions.env.OPENSSL_CONF !== undefined,
+      filesystem: settings?.sandbox?.filesystem ?? null,
+    };
+    const result = await spawnWithTimeout({
+      ...spawnOptions,
       onStdout: (chunk) => {
         capturedStdout += chunk;
         options.onStdout(chunk);
       },
-    };
-    if (runTmpRoot !== null) {
-      const args = [...next.args];
-      const flagIndex = args.indexOf("--settings");
-      const settings = JSON.parse(args[flagIndex + 1]);
-      settings.sandbox.filesystem.allowRead.push(runTmpRoot);
-      settings.sandbox.filesystem.allowWrite.push(runTmpRoot);
-      args[flagIndex + 1] = JSON.stringify(settings);
-      next = { ...next, args, env: { ...next.env, CLAUDE_CODE_TMPDIR: runTmpRoot } };
-    }
-    const result = await spawnWithTimeout(next);
+    });
     capturedStderr = result.stderr;
     return result;
   };
@@ -317,9 +340,12 @@ async function main() {
   };
 
   const startedAt = Date.now();
+  const callRow = { variant, runId, at: new Date(startedAt).toISOString(), usd: null, status: "started" };
+  await writeLedger(evidenceDir, ledgerFile, [...ledger, callRow]);
   let report;
   let runThrew = null;
-  let wrapperIntact = null;
+  const cleanupFailures = [];
+  let refusal = null;
   try {
     report = await runner.run(delivery, {
       // No external abort — the 180s per-call cap governs; this controller's
@@ -330,20 +356,34 @@ async function main() {
   } catch (err) {
     runThrew = err instanceof Error ? err.message : String(err);
   } finally {
-    if (wrapperBefore !== null) {
-      try {
-        wrapperIntact = (await fs.readFile(controlRoot.wrapperPath, "utf8")) === wrapperBefore;
-      } catch {
-        wrapperIntact = false;
+    if (variant === "R") {
+      const targets = [];
+      for (const target of refusalTargets) {
+        let intact = false;
+        try {
+          intact =
+            target.kind === "symlink"
+              ? (await fs.readlink(target.path)) === target.before
+              : (await fs.readFile(target.path)).equals(target.before);
+        } catch {
+          intact = false;
+        }
+        targets.push({ name: target.name, intact });
       }
+      refusal = { targets, allTargetsIntact: targets.every((target) => target.intact) };
     }
-    // Evidence capture outranks cleanup, but a release failure is still
-    // reported (never silently swallowed) — the fail-closed audit trail
-    // holds in the diagnostic driver too.
-    const release = (label, p) => p.catch((err) => console.error(`release ${label} failed: ${err?.message ?? err}`));
+    const release = async (label, promise) => {
+      try {
+        await promise;
+      } catch (err) {
+        const detail = `${label}: ${err instanceof Error ? err.message : String(err)}`;
+        cleanupFailures.push(detail);
+        console.error(`release failed: ${detail}`);
+      }
+    };
     await release("controlRoot", releaseControlRoot(controlRoot));
     await release("jail", jail.dispose());
-    if (runTmpRoot !== null) await release("runTmpRoot", fs.rm(runTmpRoot, { recursive: true, force: true }));
+    if (otherRunTemp !== null) await release("otherRunTemp", releaseClaudeRunTemp(otherRunTemp));
     await release("scratchBase", fs.rm(scratchBase, { recursive: true, force: true }));
     await release("controlBase", fs.rm(controlBase, { recursive: true, force: true }));
   }
@@ -356,8 +396,8 @@ async function main() {
     cwdEperm: /operation not permitted[^\n]*cwd-|cwd-[^\n]*operation not permitted/i.test(combined),
     anyEperm: /operation not permitted|EPERM/i.test(combined),
   };
-  const loopzhbCalls = stream.bashCalls.filter((c) => c.includes("loopzhb")).length;
-  const expectedFailCalls = stream.bashCalls.filter((c) => c.includes("no-such-compat-file")).length;
+  const loopzhbCalls = stream.terminalCalls.length;
+  const expectedFailCalls = stream.calls.filter((call) => call.command.trim() === commands.expectedFailure).length;
 
   let sideEffectOk = null;
   try {
@@ -366,33 +406,59 @@ async function main() {
     sideEffectOk = false;
   }
 
-  // Variant R refusal evidence (plan §4.3): the escape write must NOT have
-  // landed, the wrapper must be byte-identical, and both denial commands
-  // must surface as tool errors.
-  let refusal = null;
-  if (variant === "R") {
-    const denied = (needle) => {
-      const idx = stream.bashCalls.findIndex((c) => c.includes(needle));
-      return idx === -1 ? null : stream.toolResults[idx]?.isError === true;
-    };
-    refusal = {
-      escapeDenied: denied("loopzhb-escape-attempt"),
-      tamperDenied: denied("echo tamper"),
-      escapeFileCreated: existsSync(ESCAPE_PROBE),
-      wrapperIntact,
-    };
-  }
-
-  // Cost bookkeeping (plan §1): a completed conversation that reports NO
-  // cost blocks further paid experiments. A run that never reached the API
-  // (no terminal event at all) could not have incurred model cost.
+  // A started call is billable even if it times out before a terminal event.
+  // Unknown cost is persisted and blocks every subsequent invocation.
   const costUsd = report?.cost?.usd ?? stream.terminal?.total_cost_usd ?? null;
-  const costUnknown = stream.terminal !== null && costUsd === null;
-  await fs.writeFile(
-    path.join(evidenceDir, LEDGER_FILE),
-    `${JSON.stringify([...ledger, { variant, runId, at: new Date().toISOString(), usd: costUsd }], null, 2)}\n`,
-    { mode: 0o600 },
-  );
+  const costUnknown = costUsd === null;
+  const completedRow = { ...callRow, usd: costUsd, status: costUnknown ? "cost-unknown" : "complete" };
+  await writeLedger(evidenceDir, ledgerFile, [...ledger, completedRow]);
+
+  const tmpRoot = capturedCapability?.claudeCodeTmpdir ?? null;
+  const runTempConfigured =
+    profile.runTemp === "legacy"
+      ? tmpRoot === null &&
+        (runnerMintedTmp === null ||
+          (capturedCapability?.filesystem?.allowRead?.includes(runnerMintedTmp) !== true &&
+            capturedCapability?.filesystem?.allowWrite?.includes(runnerMintedTmp) !== true))
+      : typeof tmpRoot === "string" &&
+        capturedCapability?.filesystem?.allowRead?.includes(tmpRoot) === true &&
+        capturedCapability?.filesystem?.allowWrite?.includes(tmpRoot) === true;
+  const runTempReleased = runnerMintedTmp === null || !existsSync(runnerMintedTmp);
+  const strictVerdict = evaluateCompatVerdict({
+    variant,
+    reportOk: report?.ok === true,
+    stream,
+    markers,
+    sideEffectOk,
+    commands,
+    refusal,
+  });
+  if (!runTempConfigured) strictVerdict.failures.push("run-temp profile did not match the selected variant");
+  if (!runTempReleased) strictVerdict.failures.push("runner temp root was not released");
+  if (!wrapperConfigured) strictVerdict.failures.push("wrapper profile did not match the selected variant");
+  strictVerdict.failures.push(...cleanupFailures.map((failure) => `cleanup failed: ${failure}`));
+  strictVerdict.ok = strictVerdict.failures.length === 0;
+
+  const diagnosticExpected =
+    variant === "A"
+      ? !report?.ok && markers.cwdEperm && markers.opensslAbort
+      : variant === "B"
+        ? !report?.ok && !markers.cwdEperm && markers.opensslAbort
+        : variant === "C"
+          ? !report?.ok && markers.cwdEperm && !markers.opensslAbort
+          : strictVerdict.ok;
+  const matrixFailures = [];
+  if (!runTempConfigured) matrixFailures.push("run-temp profile did not match the selected variant");
+  if (!runTempReleased) matrixFailures.push("runner temp root was not released");
+  if (!wrapperConfigured) matrixFailures.push("wrapper profile did not match the selected variant");
+  matrixFailures.push(...cleanupFailures.map((failure) => `cleanup failed: ${failure}`));
+  const isNegativeControl = variant === "A" || variant === "B" || variant === "C";
+  const verdict = isNegativeControl
+    ? {
+        ok: diagnosticExpected && matrixFailures.length === 0,
+        failures: [...matrixFailures, ...(diagnosticExpected ? [] : ["diagnostic signature did not match the selected variant"])],
+      }
+    : strictVerdict;
 
   const evidence = {
     variant,
@@ -404,27 +470,34 @@ async function main() {
       claudeSha256: probe.binary.sha256,
       nodePath: controlRoot.nodePath,
       nodeVersion: process.version,
+      nodeSha256,
       platform: `${os.type()} ${os.release()} ${os.arch()}`,
-      variantChanges:
-        variant === "A"
-          ? "none (production baseline)"
-          : variant === "B"
-            ? "CLAUDE_CODE_TMPDIR=private canonical tmp root + precise allowRead/allowWrite grant"
-            : variant === "C"
-              ? "loopzhb entry = thin shell launcher: exec <canonical node> --openssl-config=<empty cfg> <bundle>"
-              : "B and C combined",
+      profile,
+      sourceIdentity,
+      observedCapability: capturedCapability,
+      bundleSha256,
+      wrapperSha256,
+      wrapperConfigured,
+      runTempConfigured,
+      runTempReleased,
     },
     report: report ?? null,
     runThrew,
     durationMs,
     costUsd,
-    bashCalls: stream.bashCalls.map(redact),
-    toolResults: stream.toolResults.map((r) => ({ isError: r.isError, preview: redact(r.preview) })),
+    budget: { kind: isAcceptance ? "acceptance" : "diagnostic", ledgerFile, targetUsd: isAcceptance ? acceptanceBudgetUsd : 3 },
+    bashCalls: stream.calls.map((call) => ({
+      id: call.id,
+      command: redact(call.command),
+      result: call.result === null ? null : { isError: call.result.isError, preview: redact(call.result.preview) },
+    })),
     markers,
     loopzhbCalls,
     expectedFailCalls,
     sideEffects: { compatOkFile: sideEffectOk, taskFilePersisted: true },
     refusal,
+    cleanupFailures,
+    verdict,
     journalVerdict: report?.ok === true ? "ok" : (report?.error ?? runThrew ?? "unknown"),
   };
   const evidencePath = path.join(evidenceDir, `compat-${variant}-${stamp}.json`);
@@ -433,18 +506,19 @@ async function main() {
   console.log(`variant ${variant} done in ${(durationMs / 1000).toFixed(1)}s — evidence: ${evidencePath}`);
   console.log(
     `VERDICT ${variant}: report.ok=${report?.ok ?? false} journal=${evidence.journalVerdict} ` +
-      `bashCalls=${stream.bashCalls.length} loopzhbCalls=${loopzhbCalls} expectedFailCalls=${expectedFailCalls} ` +
+      `ok=${verdict.ok} bashCalls=${stream.calls.length} loopzhbCalls=${loopzhbCalls} expectedFailCalls=${expectedFailCalls} ` +
       `sideEffectOk=${sideEffectOk} opensslAbort=${markers.opensslAbort} cwdEperm=${markers.cwdEperm} ` +
       (refusal !== null
-        ? `escapeDenied=${refusal.escapeDenied} tamperDenied=${refusal.tamperDenied} escapeFileCreated=${refusal.escapeFileCreated} wrapperIntact=${refusal.wrapperIntact} `
+        ? `refusalIntact=${refusal.allTargetsIntact} `
         : "") +
       `cost=${costUsd === null ? "unknown" : `$${costUsd.toFixed(4)}`} cumulative=$${(spent + (costUsd ?? 0)).toFixed(4)}`,
   );
   if (costUnknown) {
-    console.error("cost unavailable for a completed conversation — stopping paid experiments (plan §1)");
+    console.error("cost unavailable after a started call — ledger is permanently blocked pending operator reconciliation (plan §1)");
     process.exit(3);
   }
-  process.exit(report?.ok === true ? 0 : 1);
+  if (!verdict.ok) console.error(`acceptance failed: ${verdict.failures.join("; ")}`);
+  process.exit(verdict.ok ? 0 : 1);
 }
 
 main().catch((err) => {

@@ -103,9 +103,11 @@ $ git diff --check main  # 无输出（clean）；基线 6af3b29
 - Node：`/usr/local/bin/node` v22.17.0（arm64）；macOS 26.6.2（25G83）。
 - 命令：`LOOPZHB_EXPECTED_CLAUDE_SHA256=6bc4…7848 pnpm test:phase4:batch2:e2e`。
 - 结果：**1 passed（46.99s）**——两 Run 链（report+state → prev-state 晋升 → finish → Completed）全绿，日志 sticky 脱敏扫描（含 provider bootstrap 收敛的全部 settings 凭据）零命中，全部观测进程组关闭。
-- 前置：Issue #50 沙箱兼容性修复（wrapper launcher + 每 Run `CLAUDE_CODE_TMPDIR`）。A/B/C/D 实验矩阵（7 次真实调用）与 3 次独立生产 smoke + 1 次真实拒绝检查（逃逸写/篡改 wrapper 均被拒）的脱敏证据在仓库外 `~/loopzhb-compat-evidence/`；诊断入口为 `pnpm test:claude:compat`（opt-in）。
+- 前置：Issue #50 沙箱兼容性修复（wrapper launcher + 每 Run `CLAUDE_CODE_TMPDIR`）。同一固定 Claude 二进制上的 3 次生产 smoke 成功；历史拒绝检查只证明共享 tmp 写与 wrapper 篡改被拒。A/B/C/D 历史证据含两个未知费用调用，已知费用约 `$0.40`，不能表述为总费用。脱敏证据在仓库外 `~/loopzhb-compat-evidence/`。
 
 历史记录：本节此前为「待执行」；#50（2026-09-02 登记的 2.1.236 沙箱双重缺陷）阻塞至本次修复。
+
+**2026-09-08 独立复审整改状态**：上述 E2E 成功事实未被推翻，但 #50 的验收闭环被撤回。`pnpm test:claude:compat` 已恢复冻结旧/新能力的 A/B/C/D 四象限，并新增最终生产 P 与拒绝 R；R 现在覆盖另一 Run temp 直接及 symlink 读写、wrapper 和 OpenSSL 配置篡改，任何命令状态、目标完整性、唯一 terminal、副作用或清理失败都会使入口非零退出。旧诊断账本已超过 8 次且含未知费用，按新门禁禁止继续诊断；P/R 使用独立账本，但必须显式设置 `LOOPZHB_COMPAT_ACCEPTANCE_BUDGET_USD`。本轮用户选择暂不批准新验收费用，因此真实 R 未运行；待预算裁决后复验，再由第二轮独立复审核销。
 
 ## 显式边界核对（相对基线 `6af3b29` 的变更面）
 
@@ -127,4 +129,4 @@ $ git diff --check main  # 无输出（clean）；基线 6af3b29
 
 ## 结论
 
-Phase 4 Batch 2 的确定性验收目标及第二轮审查反例均有对应测试，确定性质量门全绿，第三轮三轨复审 PASS，Issues #39–#47 已核销关闭（修订记录见 ADR-009 2026-09-01（二）与 2026-09-02）。**真实 Claude 门已于 2026-09-07 通过**（见上节；Issue #50 沙箱兼容性修复为其前置，#38/#49/#50 随之核销）。Batch 3 在真实门脚本上追加 Dashboard 与重启断言。
+Phase 4 Batch 2 的确定性验收目标及第二轮审查反例均有对应测试，Issues #39–#47 已核销关闭。**真实 Claude 业务门已于 2026-09-07 通过**，#38/#49 保持核销；#50 的诊断与拒绝验收在 2026-09-08 独立复审后重新进入核销流程，不能据此把 Claude Code 2.1.236 认定为版本根因。Batch 3 在真实门脚本上追加 Dashboard 与重启断言。

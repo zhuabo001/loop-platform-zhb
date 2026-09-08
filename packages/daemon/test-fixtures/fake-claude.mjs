@@ -130,6 +130,35 @@ const successResult = (overrides = {}) =>
   line({ type: "result", subtype: "success", is_error: false, result: "fake final text", session_id: "fake-sess-1", ...overrides });
 
 if (isV1) {
+  const compatTaskPath = path.join(process.cwd(), "TASK.md");
+  if (existsSync(compatTaskPath)) {
+    const compatTask = readFileSync(compatTaskPath, "utf8");
+    if (compatTask.startsWith("# Compat probe ")) {
+      const commands = compatTask
+        .split("\n")
+        .map((text) => /^\d+\. `(.+)`(?: — .+)?$/.exec(text)?.[1] ?? null)
+        .filter((command) => command !== null);
+      for (const [index, command] of commands.entries()) {
+        const id = `compat-tool-${index}`;
+        line({ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", id, input: { command } }] } });
+        let isError = command === "cat no-such-compat-file.txt";
+        if (command === "echo compat-ok > compat-ok.txt") writeFileSync(path.join(process.cwd(), "compat-ok.txt"), "compat-ok\n");
+        if (/^loopzhb report\s/.test(command)) {
+          writeJournal({ kind: "report", status: "nothing-new", message: "fake compat" });
+          isError = false;
+        }
+        // Refusal commands are deliberately reported as allowed. The compat
+        // driver's black-box test proves this cannot yield exit 0 merely
+        // because the journal/report succeeded.
+        line({
+          type: "user",
+          message: { content: [{ type: "tool_result", tool_use_id: id, is_error: isError, content: isError ? "expected failure" : "ok" }] },
+        });
+      }
+      successResult({ total_cost_usd: 0.001 });
+      process.exit();
+    }
+  }
   switch (scenario) {
     case "journal-none":
       successResult();

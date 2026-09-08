@@ -119,6 +119,36 @@ describe("createControlRoot", () => {
     }
   });
 
+  it("refuses a custom OpenSSL configuration supplied through NODE_OPTIONS in a real Node process", () => {
+    const moduleUrl = new URL("../dist/control-root.js", import.meta.url).href;
+    const childBase = path.join(base, "node-options");
+    const program = [
+      `import { createControlRoot } from ${JSON.stringify(moduleUrl)};`,
+      `await createControlRoot(${JSON.stringify(childBase)});`,
+    ].join("\n");
+    const result = spawnSync(process.execPath, ["--input-type=module", "-e", program], {
+      env: { ...process.env, OPENSSL_CONF: "", NODE_OPTIONS: "--openssl-config=/dev/null" },
+      encoding: "utf8",
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("custom OpenSSL configuration");
+    expect(existsSync(childBase)).toBe(false);
+  });
+
+  it.each(["--enable-fips", "--force-fips", "'--openssl-config' '/etc/site openssl.cnf'"])(
+    "recognizes the NODE_OPTIONS OpenSSL/FIPS form %s",
+    async (nodeOptions) => {
+      const original = process.env.NODE_OPTIONS;
+      process.env.NODE_OPTIONS = nodeOptions;
+      try {
+        await expect(createControlRoot(base)).rejects.toThrow(/custom OpenSSL configuration or FIPS mode/);
+      } finally {
+        if (original === undefined) delete process.env.NODE_OPTIONS;
+        else process.env.NODE_OPTIONS = original;
+      }
+    },
+  );
+
   it("buildWrapperLauncher rejects non-absolute or whitespace/quote-bearing paths", async () => {
     const { buildWrapperLauncher } = await import("./control-root.js");
     const good = await createControlRoot(base);

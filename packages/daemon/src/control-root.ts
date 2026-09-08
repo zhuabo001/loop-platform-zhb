@@ -42,6 +42,7 @@ const WRAPPER_PACKAGE_JSON = '{"type":"module"}\n';
 // Vitest and dist/control-root.js in production.
 const WRAPPER_BUNDLE_PATH = fileURLToPath(new URL(`../dist/${WRAPPER_BUNDLE_FILE}`, import.meta.url));
 const OPENSSL_CONFIG_FILE = "openssl.cnf";
+const OPENSSL_NODE_FLAGS = ["--openssl-config", "--enable-fips", "--force-fips"] as const;
 
 export interface ControlRoot {
   /** The 0700 mkdtemp root — parent of every per-run control directory. */
@@ -85,6 +86,18 @@ export function buildWrapperLauncher(nodePath: string, configPath: string): stri
   return `#!${nodePath} --openssl-config=${configPath}\nimport "./${WRAPPER_BUNDLE_FILE}";\n`;
 }
 
+function hasOpenSslNodeFlag(args: readonly string[]): boolean {
+  return args.some((arg) => OPENSSL_NODE_FLAGS.some((flag) => arg === flag || arg.startsWith(`${flag}=`)));
+}
+
+function nodeOptionsHasOpenSslFlag(nodeOptions: string | undefined): boolean {
+  if (nodeOptions === undefined || nodeOptions.trim() === "") return false;
+  return OPENSSL_NODE_FLAGS.some((flag) => {
+    const escaped = flag.replaceAll("-", "\\-");
+    return new RegExp(`(?:^|[\\s"'])${escaped}(?:=|[\\s"']|$)`).test(nodeOptions);
+  });
+}
+
 export async function createControlRoot(baseDir: string, io: ControlRootIo = fs): Promise<ControlRoot> {
   if (!path.isAbsolute(baseDir)) {
     throw new Error(`control root base must be an absolute path: ${JSON.stringify(baseDir)}`);
@@ -99,14 +112,18 @@ export async function createControlRoot(baseDir: string, io: ControlRootIo = fs)
   const nodePath = await io.realpath(process.execPath);
   // The launcher's empty OpenSSL config would silently REPLACE a custom one
   // (FIPS or site policy) the daemon's own Node was started with — via the
-  // OPENSSL_CONF env var OR a --openssl-config exec arg. Refuse and surface
-  // a separate compatibility decision instead (plan §3.6).
+  // OPENSSL_CONF or any Node startup channel that selects an OpenSSL config /
+  // FIPS mode. NODE_OPTIONS is parsed by Node before user code and those
+  // flags are deliberately absent from process.execArgv, so it must be
+  // inspected separately. Refuse and surface a separate compatibility
+  // decision instead (plan §3.6).
   if (
     (process.env.OPENSSL_CONF !== undefined && process.env.OPENSSL_CONF !== "") ||
-    process.execArgv.some((arg) => arg.startsWith("--openssl-config"))
+    hasOpenSslNodeFlag(process.execArgv) ||
+    nodeOptionsHasOpenSslFlag(process.env.NODE_OPTIONS)
   ) {
     throw new Error(
-      "daemon runs under a custom OpenSSL configuration (OPENSSL_CONF/--openssl-config); the wrapper launcher would silently override it — refusing, this combination needs a separate compatibility decision",
+      "daemon runs under a custom OpenSSL configuration or FIPS mode (OPENSSL_CONF/NODE_OPTIONS/Node argv); the wrapper launcher would silently override it — refusing, this combination needs a separate compatibility decision",
     );
   }
   await io.mkdir(baseDir, { recursive: true });
