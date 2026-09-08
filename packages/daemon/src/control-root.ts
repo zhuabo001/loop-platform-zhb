@@ -12,8 +12,9 @@
  * the composition root releases it on startup failure and at shutdown —
  * fail-closed, like the per-run release below it.
  *
- * Launcher form (Issue #50, sandbox-compat plan §3, validated by the
- * variant-C/D experiment matrix on Claude Code 2.1.236 / macOS 26): the
+ * Launcher form (Issue #50, sandbox-compat plan §3, supported by the fixed
+ * 2.1.236/macOS 26 production smoke; the isolated historical C candidate
+ * itself did not pass): the
  * entry is a two-line ESM file whose shebang names the daemon's CANONICAL
  * Node directly — never env(1)/PATH — and passes `--openssl-config=<the
  * read-only empty config>` as the kernel's single shebang argument, so the
@@ -24,7 +25,7 @@
  * a direct Mach-O interpreter needs only execute permission. The OpenSSL
  * override applies ONLY to the wrapper process; it never enters Claude's
  * environment and never touches user configuration. If the daemon itself
- * runs under a custom OpenSSL configuration (OPENSSL_CONF set), startup
+ * runs under a custom OpenSSL configuration/provider or FIPS mode, startup
  * REFUSES to silently override it — that combination needs a separate
  * compatibility decision.
  */
@@ -42,7 +43,13 @@ const WRAPPER_PACKAGE_JSON = '{"type":"module"}\n';
 // Vitest and dist/control-root.js in production.
 const WRAPPER_BUNDLE_PATH = fileURLToPath(new URL(`../dist/${WRAPPER_BUNDLE_FILE}`, import.meta.url));
 const OPENSSL_CONFIG_FILE = "openssl.cnf";
-const OPENSSL_NODE_FLAGS = ["--openssl-config", "--enable-fips", "--force-fips"] as const;
+const OPENSSL_NODE_FLAGS = [
+  "--openssl-config",
+  "--openssl-shared-config",
+  "--openssl-legacy-provider",
+  "--enable-fips",
+  "--force-fips",
+] as const;
 
 export interface ControlRoot {
   /** The 0700 mkdtemp root — parent of every per-run control directory. */
@@ -87,14 +94,18 @@ export function buildWrapperLauncher(nodePath: string, configPath: string): stri
 }
 
 function hasOpenSslNodeFlag(args: readonly string[]): boolean {
-  return args.some((arg) => OPENSSL_NODE_FLAGS.some((flag) => arg === flag || arg.startsWith(`${flag}=`)));
+  return args.some((arg) => {
+    const normalized = arg.replaceAll("_", "-");
+    return OPENSSL_NODE_FLAGS.some((flag) => normalized === flag || normalized.startsWith(`${flag}=`));
+  });
 }
 
 function nodeOptionsHasOpenSslFlag(nodeOptions: string | undefined): boolean {
   if (nodeOptions === undefined || nodeOptions.trim() === "") return false;
+  const normalized = nodeOptions.replaceAll("_", "-");
   return OPENSSL_NODE_FLAGS.some((flag) => {
     const escaped = flag.replaceAll("-", "\\-");
-    return new RegExp(`(?:^|[\\s"'])${escaped}(?:=|[\\s"']|$)`).test(nodeOptions);
+    return new RegExp(`(?:^|[\\s"'])${escaped}(?:=|[\\s"']|$)`).test(normalized);
   });
 }
 
@@ -112,8 +123,8 @@ export async function createControlRoot(baseDir: string, io: ControlRootIo = fs)
   const nodePath = await io.realpath(process.execPath);
   // The launcher's empty OpenSSL config would silently REPLACE a custom one
   // (FIPS or site policy) the daemon's own Node was started with — via the
-  // OPENSSL_CONF or any Node startup channel that selects an OpenSSL config /
-  // FIPS mode. NODE_OPTIONS is parsed by Node before user code and those
+  // OPENSSL_CONF or any Node startup channel that selects an OpenSSL config,
+  // provider, or FIPS mode. NODE_OPTIONS is parsed by Node before user code and those
   // flags are deliberately absent from process.execArgv, so it must be
   // inspected separately. Refuse and surface a separate compatibility
   // decision instead (plan §3.6).
@@ -123,7 +134,7 @@ export async function createControlRoot(baseDir: string, io: ControlRootIo = fs)
     nodeOptionsHasOpenSslFlag(process.env.NODE_OPTIONS)
   ) {
     throw new Error(
-      "daemon runs under a custom OpenSSL configuration or FIPS mode (OPENSSL_CONF/NODE_OPTIONS/Node argv); the wrapper launcher would silently override it — refusing, this combination needs a separate compatibility decision",
+      "daemon runs under a custom OpenSSL configuration/provider or FIPS mode (OPENSSL_CONF/NODE_OPTIONS/Node argv); the wrapper launcher would silently override it — refusing, this combination needs a separate compatibility decision",
     );
   }
   await io.mkdir(baseDir, { recursive: true });

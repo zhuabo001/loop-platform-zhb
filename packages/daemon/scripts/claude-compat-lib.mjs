@@ -71,10 +71,12 @@ function exactCalls(stream, command) {
  * assessed separately by the driver. */
 export function evaluateCompatVerdict({ variant, reportOk, stream, markers, sideEffectOk, commands, refusal }) {
   const failures = [];
+  const taskRead = exactCalls(stream, commands.taskRead);
   const success = exactCalls(stream, commands.success);
   const expectedFailure = exactCalls(stream, commands.expectedFailure);
   const terminal = exactCalls(stream, commands.terminal);
   const expectedCommands = new Set([
+    commands.taskRead.trim(),
     commands.success.trim(),
     commands.expectedFailure.trim(),
     commands.terminal.trim(),
@@ -85,6 +87,8 @@ export function evaluateCompatVerdict({ variant, reportOk, stream, markers, side
   if (!reportOk) failures.push("runner report was not ok");
   if (markers.opensslAbort) failures.push("OpenSSL abort marker present");
   if (markers.cwdEperm) failures.push("cwd EPERM marker present");
+  if (taskRead.length !== 1) failures.push(`task-file read command count was ${taskRead.length}, expected 1`);
+  else if (taskRead[0].result?.isError !== false) failures.push("task-file read command did not succeed");
   if (success.length !== 1) failures.push(`success command count was ${success.length}, expected 1`);
   else if (success[0].result?.isError !== false) failures.push("success command did not succeed");
   if (!sideEffectOk) failures.push("success side effect missing");
@@ -98,9 +102,21 @@ export function evaluateCompatVerdict({ variant, reportOk, stream, markers, side
   for (const denial of commands.denials ?? []) {
     const matches = exactCalls(stream, denial);
     if (matches.length !== 1) failures.push(`denial command count was ${matches.length}, expected 1: ${denial}`);
-    else if (matches[0].result?.isError !== true) failures.push(`denial command did not fail: ${denial}`);
+    else if (matches[0].result?.isError !== false) failures.push(`refusal probe shell did not complete: ${denial}`);
   }
-  if (variant === "R" && refusal?.allTargetsIntact !== true) failures.push("refusal target changed");
+  const expectedSequence = [commands.taskRead, commands.success, commands.expectedFailure, ...(commands.denials ?? []), commands.terminal];
+  const actualSequence = stream.calls.map((call) => call.command.trim());
+  if (
+    actualSequence.length !== expectedSequence.length ||
+    expectedSequence.some((command, index) => actualSequence[index] !== command.trim())
+  ) {
+    failures.push("Bash command sequence did not match the acceptance protocol");
+  }
+  if (variant === "R") {
+    if (refusal?.allProbesAttempted !== true) failures.push("refusal probe did not reach the shell attempt");
+    if (refusal?.allProbesDenied !== true) failures.push("refusal probe did not take the denied branch");
+    if (refusal?.allTargetsIntact !== true) failures.push("refusal target changed");
+  }
   return { ok: failures.length === 0, failures };
 }
 

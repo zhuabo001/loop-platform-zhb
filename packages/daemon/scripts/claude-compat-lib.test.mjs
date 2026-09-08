@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -52,6 +52,7 @@ describe("compat stream evidence", () => {
 
   it("fails a production verdict when an asserted side effect or refusal is missing", () => {
     const commands = {
+      taskRead: "cat '/work/TASK.md'",
       success: "echo compat-ok > compat-ok.txt",
       expectedFailure: "cat no-such-compat-file.txt",
       terminal: 'loopzhb report --status nothing-new --message "compat R done"',
@@ -59,6 +60,7 @@ describe("compat stream evidence", () => {
     };
     const stream = {
       calls: [
+        { id: "r", command: commands.taskRead, result: { isError: false, preview: "task" } },
         { id: "s", command: commands.success, result: { isError: false, preview: "" } },
         { id: "f", command: commands.expectedFailure, result: { isError: true, preview: "missing" } },
         { id: "d", command: commands.denials[0], result: { isError: false, preview: "wrongly allowed" } },
@@ -74,11 +76,16 @@ describe("compat stream evidence", () => {
       markers: { opensslAbort: false, cwdEperm: false },
       sideEffectOk: false,
       commands,
-      refusal: { allTargetsIntact: false },
+      refusal: { allProbesAttempted: false, allProbesDenied: false, allTargetsIntact: false },
     });
     expect(verdict.ok).toBe(false);
     expect(verdict.failures).toEqual(
-      expect.arrayContaining(["success side effect missing", expect.stringContaining("denial command did not fail"), "refusal target changed"]),
+      expect.arrayContaining([
+        "success side effect missing",
+        "refusal probe did not reach the shell attempt",
+        "refusal probe did not take the denied branch",
+        "refusal target changed",
+      ]),
     );
   });
 
@@ -94,7 +101,7 @@ describe("compat stream evidence", () => {
       stream: { calls, terminalCalls: calls, terminal: { type: "result" } },
       markers: { opensslAbort: false, cwdEperm: false },
       sideEffectOk: true,
-      commands: { success: "success", expectedFailure: "failure", terminal, denials: [] },
+      commands: { taskRead: "cat '/work/TASK.md'", success: "success", expectedFailure: "failure", terminal, denials: [] },
       refusal: null,
     });
     expect(verdict.ok).toBe(false);
@@ -103,12 +110,14 @@ describe("compat stream evidence", () => {
 
   it("rejects an otherwise successful run that executes an extra Bash command", () => {
     const commands = {
+      taskRead: "cat '/work/TASK.md'",
       success: "echo compat-ok > compat-ok.txt",
       expectedFailure: "cat no-such-compat-file.txt",
       terminal: 'loopzhb report --status nothing-new --message "compat P done"',
       denials: [],
     };
     const calls = [
+      { id: "r", command: commands.taskRead, result: { isError: false, preview: "task" } },
       { id: "s", command: commands.success, result: { isError: false, preview: "" } },
       { id: "f", command: commands.expectedFailure, result: { isError: true, preview: "missing" } },
       { id: "x", command: "pwd", result: { isError: false, preview: "/work" } },
@@ -117,7 +126,7 @@ describe("compat stream evidence", () => {
     const verdict = evaluateCompatVerdict({
       variant: "P",
       reportOk: true,
-      stream: { calls, terminalCalls: [calls[3]], terminal: { type: "result" } },
+      stream: { calls, terminalCalls: [calls[4]], terminal: { type: "result" } },
       markers: { opensslAbort: false, cwdEperm: false },
       sideEffectOk: true,
       commands,
@@ -169,7 +178,8 @@ describe("compat command entry", () => {
   function run(variant, prepare, envOverrides = {}) {
     const root = mkdtempSync(path.join(os.tmpdir(), "loopzhb-compat-entry-"));
     const evidence = path.join(root, "evidence");
-    prepare?.(evidence);
+    const ledgerDir = path.join(root, "loopzhb-compat-evidence");
+    prepare?.({ evidence, ledgerDir, root });
     const result = spawnSync(process.execPath, [script, "--variant", variant, "--evidence-dir", evidence], {
       env: {
         PATH: process.env.PATH,
@@ -183,14 +193,49 @@ describe("compat command entry", () => {
       encoding: "utf8",
       timeout: 30_000,
     });
-    return { root, evidence, result };
+    return { root, evidence, ledgerDir, result };
+  }
+
+  function startRun(root, evidence, configName) {
+    const child = spawn(process.execPath, [script, "--variant", "P", "--evidence-dir", evidence], {
+      env: {
+        PATH: process.env.PATH,
+        HOME: root,
+        CLAUDE_CONFIG_DIR: path.join(root, configName),
+        LOOPZHB_CLAUDE_BIN: fixture,
+        LOOPZHB_EXPECTED_CLAUDE_SHA256: fixtureSha,
+        LOOPZHB_COMPAT_ACCEPTANCE_BUDGET_USD: "1",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk) => (stdout += chunk));
+    child.stderr.setEncoding("utf8").on("data", (chunk) => (stderr += chunk));
+    const done = new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (status) => resolve({ status, stdout, stderr }));
+    });
+    return { child, done };
+  }
+
+  async function waitForStartedLedger(ledgerPath) {
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      try {
+        const rows = JSON.parse(readFileSync(ledgerPath, "utf8"));
+        if (rows.some((row) => row.status === "started")) return;
+      } catch {}
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error("timed out waiting for started ledger reservation");
   }
 
   it("returns success for a complete production smoke and persists source/capability evidence", () => {
     const execution = run("P");
     try {
       expect(execution.result.status, execution.result.stderr).toBe(0);
-      const evidenceName = readFileSync(path.join(execution.evidence, "acceptance-spend-ledger.json"), "utf8");
+      const evidenceName = readFileSync(path.join(execution.ledgerDir, "acceptance-spend-ledger.json"), "utf8");
       expect(evidenceName).toContain('"status": "complete"');
       const files = readdirSync(execution.evidence);
       const record = JSON.parse(readFileSync(path.join(execution.evidence, files.find((name) => /^compat-P-.+\.json$/.test(name))), "utf8"));
@@ -222,10 +267,28 @@ describe("compat command entry", () => {
   });
 
   it("returns failure when refusal commands are reported as allowed despite an ok runner report", () => {
-    const execution = run("R");
+    const execution = run("R", undefined, { CLAUDE_CONFIG_DIR: path.join(os.tmpdir(), "allow-refusals") });
     try {
       expect(execution.result.status).toBe(1);
-      expect(execution.result.stderr).toContain("denial command did not fail");
+      expect(execution.result.stderr).toContain("refusal probe did not reach the shell attempt");
+    } finally {
+      rmSync(execution.root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns success when every refusal reaches the shell, takes the denied branch, and leaves targets intact", () => {
+    const execution = run("R");
+    try {
+      expect(execution.result.status, execution.result.stderr).toBe(0);
+      const file = readdirSync(execution.evidence).find((name) => /^compat-R-.+\.json$/.test(name));
+      const record = JSON.parse(readFileSync(path.join(execution.evidence, file), "utf8"));
+      expect(record.markers.opensslAbort).toBe(false);
+      expect(record.refusal).toMatchObject({
+        allProbesAttempted: true,
+        allProbesDenied: true,
+        allTargetsIntact: true,
+      });
+      expect(record.verdict).toEqual({ ok: true, failures: [] });
     } finally {
       rmSync(execution.root, { recursive: true, force: true });
     }
@@ -257,19 +320,41 @@ describe("compat command entry", () => {
   });
 
   it("blocks before probing when an earlier call has unknown cost", () => {
-    const execution = run("P", (evidence) => {
-      mkdirSync(evidence, { recursive: true });
+    const execution = run("P", ({ ledgerDir }) => {
+      mkdirSync(ledgerDir, { recursive: true });
       writeFileSync(
-        path.join(evidence, "acceptance-spend-ledger.json"),
+        path.join(ledgerDir, "acceptance-spend-ledger.json"),
         JSON.stringify([{ variant: "A", runId: "old", at: new Date().toISOString(), usd: null, status: "cost-unknown" }]),
       );
     });
     try {
       expect(execution.result.status).toBe(3);
       expect(execution.result.stderr).toContain("unknown cost");
-      expect(readdirSync(execution.evidence)).toEqual(["acceptance-spend-ledger.json"]);
+      expect(readdirSync(execution.evidence)).toEqual([]);
+      expect(readdirSync(execution.ledgerDir)).toEqual(["acceptance-spend-ledger.json"]);
     } finally {
       rmSync(execution.root, { recursive: true, force: true });
+    }
+  });
+
+  it("allows only one concurrent acceptance call and preserves its ledger row", async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "loopzhb-compat-concurrent-"));
+    const ledgerPath = path.join(root, "loopzhb-compat-evidence", "acceptance-spend-ledger.json");
+    const first = startRun(root, path.join(root, "evidence-one"), "slow-compat");
+    try {
+      await waitForStartedLedger(ledgerPath);
+      const second = startRun(root, path.join(root, "evidence-two"), "normal-compat");
+      const [firstResult, secondResult] = await Promise.all([first.done, second.done]);
+      expect(firstResult.status, firstResult.stderr).toBe(0);
+      expect(secondResult.status).toBe(3);
+      expect(secondResult.stderr).toContain("unfinished call");
+      const rows = JSON.parse(readFileSync(ledgerPath, "utf8"));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ variant: "P", status: "complete", usd: 0.001 });
+      expect(readdirSync(path.join(root, "evidence-two")).some((name) => /^compat-P-.+\.json$/.test(name))).toBe(false);
+    } finally {
+      if (first.child.exitCode === null) first.child.kill("SIGKILL");
+      rmSync(root, { recursive: true, force: true });
     }
   });
 });

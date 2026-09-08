@@ -17,7 +17,7 @@
 
 第一阶段最多 **8 次真实 Claude 调用、90 分钟诊断时间，累计模型费用目标不超过 3 美元**。每次调用限时 180 秒；已知累计费用达到目标后不再启动下一次。费用通常在调用结束后才完整可见，因此不宣称这是严格账单上限。费用不可获取时停止继续付费实验。完整验收另计，沿用既有超时，不自动循环重跑。
 
-2026-09-08 复审补充：A–D 使用诊断账本；最终生产 P 与拒绝 R 使用独立验收账本，最多 4 次、90 分钟，并且必须由操作者显式设置 `LOOPZHB_COMPAT_ACCEPTANCE_BUDGET_USD` 正数目标。任一账本出现 started 未完成、费用未知、格式损坏、次数/时间/费用到限，后续调用均 fail-closed；更换 evidence 目录不能作为绕过既有未知费用的核销证据。
+2026-09-08 复审补充：A–D 使用诊断账本；最终生产 P 与拒绝 R 使用独立验收账本，最多 4 次、90 分钟，并且必须由操作者显式设置 `LOOPZHB_COMPAT_ACCEPTANCE_BUDGET_USD` 正数目标。账本固定在用户持久目录，不随 `--evidence-dir` 改变；检查与 `started` 预留受进程间排他锁保护，完成时按 `runId` 更新最新账本。任一账本出现 started 未完成、费用未知、格式损坏、次数/时间/费用到限，后续调用均 fail-closed；更换 evidence 目录不能作为绕过既有未知费用的核销证据。
 
 ## 2. 第一阶段：建立复现与验证修复假设
 
@@ -101,7 +101,7 @@ import "./<已校验 bundle>";
 
 1. 成功 Bash 得到成功结果；故意失败的 Bash 保留失败结果。
 2. 无 OpenSSL abort、无 cwd EPERM；三次独立最小 Journal smoke 均只调用一次 terminal 命令，恰好一条合法记录，Claude result 和进程退出均成功。
-3. 现有根外 symlink 读写拒绝测试继续通过；增加真实尝试访问另一 Run 临时目录的拒绝检查，以及修改只读 wrapper/配置的拒绝检查。
+3. 现有根外 symlink 读写拒绝测试继续通过；增加真实尝试访问另一 Run 临时目录的拒绝检查，以及修改只读 wrapper/配置的拒绝检查。每项在同一个 shell 中先写根内 attempt marker，再执行访问并写 allowed/denied completion marker；由 attempt、denied 分支、tool result 与目标完整性共同证明命令进入 shell 后被 OS sandbox 拒绝，Claude 权限层预执行拒绝不能算通过。
 4. 脱敏检查和进程组回收通过。
 
 定向测试通过后执行一次完整 `pnpm test`、`pnpm typecheck`、`pnpm build`，再进行三轨审查。修复审查问题后复验受影响项，最后执行 `pnpm test:phase4:batch2:e2e`：验证 Task File、state、下一 Run 的 prev-state、Finish、Completed、调度停止和进程回收。

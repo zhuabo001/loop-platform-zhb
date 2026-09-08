@@ -134,6 +134,19 @@ if (isV1) {
   if (existsSync(compatTaskPath)) {
     const compatTask = readFileSync(compatTaskPath, "utf8");
     if (compatTask.startsWith("# Compat probe ")) {
+      if (process.env.CLAUDE_CONFIG_DIR?.endsWith("slow-compat")) {
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
+      }
+      const quotedTaskPath = `'${compatTaskPath.replaceAll("'", `'"'"'`)}'`;
+      const taskReadCommand = `cat ${quotedTaskPath}`;
+      line({
+        type: "assistant",
+        message: { content: [{ type: "tool_use", name: "Bash", id: "compat-tool-task", input: { command: taskReadCommand } }] },
+      });
+      line({
+        type: "user",
+        message: { content: [{ type: "tool_result", tool_use_id: "compat-tool-task", is_error: false, content: compatTask }] },
+      });
       const commands = compatTask
         .split("\n")
         .map((text) => /^\d+\. `(.+)`(?: — .+)?$/.exec(text)?.[1] ?? null)
@@ -143,6 +156,15 @@ if (isV1) {
         line({ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", id, input: { command } }] } });
         let isError = command === "cat no-such-compat-file.txt";
         if (command === "echo compat-ok > compat-ok.txt") writeFileSync(path.join(process.cwd(), "compat-ok.txt"), "compat-ok\n");
+        if (!process.env.CLAUDE_CONFIG_DIR?.endsWith("allow-refusals") && command.startsWith("printf attempted > ")) {
+          const match = /^printf attempted > '([^']+)' && .* && printf allowed > '([^']+)' \|\| printf denied > '([^']+)'$/.exec(
+            command,
+          );
+          if (match !== null && match[2] === match[3]) {
+            writeFileSync(match[1], "attempted");
+            writeFileSync(match[3], "denied");
+          }
+        }
         if (/^loopzhb report\s/.test(command)) {
           writeJournal({ kind: "report", status: "nothing-new", message: "fake compat" });
           isError = false;

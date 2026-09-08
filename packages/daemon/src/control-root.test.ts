@@ -135,13 +135,50 @@ describe("createControlRoot", () => {
     expect(existsSync(childBase)).toBe(false);
   });
 
-  it.each(["--enable-fips", "--force-fips", "'--openssl-config' '/etc/site openssl.cnf'"])(
+  it.each([
+    { channel: "NODE_OPTIONS", option: "--openssl_config=/dev/null" },
+    { channel: "argv", option: "--openssl_config=/dev/null" },
+  ])("refuses Node's underscore OpenSSL alias supplied through $channel", ({ channel, option }) => {
+    const moduleUrl = new URL("../dist/control-root.js", import.meta.url).href;
+    const childBase = path.join(base, `underscore-${channel}`);
+    const program = [
+      `import { createControlRoot } from ${JSON.stringify(moduleUrl)};`,
+      `await createControlRoot(${JSON.stringify(childBase)});`,
+    ].join("\n");
+    const result = spawnSync(
+      process.execPath,
+      [...(channel === "argv" ? [option] : []), "--input-type=module", "-e", program],
+      {
+        env: {
+          ...process.env,
+          OPENSSL_CONF: "",
+          NODE_OPTIONS: channel === "NODE_OPTIONS" ? option : "",
+        },
+        encoding: "utf8",
+      },
+    );
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("custom OpenSSL configuration");
+    expect(existsSync(childBase)).toBe(false);
+  });
+
+  it.each([
+    "--enable-fips",
+    "--force-fips",
+    "--openssl-shared-config",
+    "--openssl-legacy-provider",
+    "--enable_fips",
+    "--force_fips",
+    "--openssl_shared_config",
+    "--openssl_legacy_provider",
+    "'--openssl-config' '/etc/site openssl.cnf'",
+  ])(
     "recognizes the NODE_OPTIONS OpenSSL/FIPS form %s",
     async (nodeOptions) => {
       const original = process.env.NODE_OPTIONS;
       process.env.NODE_OPTIONS = nodeOptions;
       try {
-        await expect(createControlRoot(base)).rejects.toThrow(/custom OpenSSL configuration or FIPS mode/);
+        await expect(createControlRoot(base)).rejects.toThrow(/custom OpenSSL configuration\/provider or FIPS mode/);
       } finally {
         if (original === undefined) delete process.env.NODE_OPTIONS;
         else process.env.NODE_OPTIONS = original;

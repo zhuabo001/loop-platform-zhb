@@ -107,7 +107,7 @@ $ git diff --check main  # 无输出（clean）；基线 6af3b29
 
 历史记录：本节此前为「待执行」；#50（2026-09-02 登记的 2.1.236 沙箱双重缺陷）阻塞至本次修复。
 
-**2026-09-08 独立复审整改状态**：上述 E2E 成功事实未被推翻，但 #50 的验收闭环被撤回。`pnpm test:claude:compat` 已恢复冻结旧/新能力的 A/B/C/D 四象限，并新增最终生产 P 与拒绝 R；R 现在覆盖另一 Run temp 直接及 symlink 读写、wrapper 和 OpenSSL 配置篡改，任何命令状态、目标完整性、唯一 terminal、副作用或清理失败都会使入口非零退出。旧诊断账本已超过 8 次且含未知费用，按新门禁禁止继续诊断；P/R 使用独立账本，但必须显式设置 `LOOPZHB_COMPAT_ACCEPTANCE_BUDGET_USD`。本轮用户选择暂不批准新验收费用，因此真实 R 未运行；待预算裁决后复验，再由第二轮独立复审核销。
+**2026-09-08 独立复审整改状态**：上述 E2E 成功事实未被推翻，但 #50 的验收闭环被撤回。`pnpm test:claude:compat` 已恢复冻结旧/新能力的 A/B/C/D 四象限，并新增最终生产 P 与拒绝 R；R 现在覆盖另一 Run temp 直接及 symlink 读写、wrapper 和 OpenSSL 配置篡改，每项用同 shell attempt/denied marker 排除 Claude 权限层预拒绝，任何命令状态/顺序、目标完整性、唯一 terminal、副作用或清理失败都会使入口非零退出。旧诊断账本已超过 8 次且含未知费用，按固定持久账本门禁禁止继续诊断；P/R 使用独立账本、原子 reservation，最多 4 次且必须显式设置 `LOOPZHB_COMPAT_ACCEPTANCE_BUDGET_USD`。本轮用户选择暂不批准新验收费用，因此真实 R 未运行；待预算裁决后复验，再由第二轮独立复审核销。
 
 ## 显式边界核对（相对基线 `6af3b29` 的变更面）
 

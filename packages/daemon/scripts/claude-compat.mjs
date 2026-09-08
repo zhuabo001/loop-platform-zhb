@@ -23,9 +23,11 @@
  * Budget (plan §1): A-D share at most 8 real calls / 90 min / a $3
  * cumulative diagnostic target. P/R have an independent at-most-4-call /
  * 90-minute ledger and additionally require an explicit positive acceptance
- * budget. Each call is capped at 180s. A started call whose cost cannot be
- * observed persists as blocking evidence (exit 3); it is never treated as
- * free or silently discarded.
+ * budget. The ledgers stay at ~/loopzhb-compat-evidence even when evidence
+ * output is redirected, and cross-process reservations are serialized.
+ * Each call is capped at 180s. A started call whose cost cannot be observed
+ * persists as blocking evidence (exit 3); it is never treated as free or
+ * silently discarded.
  *
  * Evidence (plan §2): one redacted JSON per run in the persistent evidence
  * dir (default ~/loopzhb-compat-evidence, NEVER /tmp): config summary,
@@ -64,6 +66,7 @@ import {
 const CALL_TIMEOUT_MS = 180_000;
 const DIAGNOSTIC_LEDGER_FILE = "spend-ledger.json";
 const ACCEPTANCE_LEDGER_FILE = "acceptance-spend-ledger.json";
+const LEDGER_HOME_DIR = "loopzhb-compat-evidence";
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const POLICY_PATH = fileURLToPath(new URL("./claude-compat-lib.mjs", import.meta.url));
 const VARIANTS = new Set(Object.keys(VARIANT_PROFILES));
@@ -83,9 +86,9 @@ function parseArgs(argv) {
   return out;
 }
 
-async function readLedger(evidenceDir, ledgerFile) {
+async function readLedger(ledgerDir, ledgerFile) {
   try {
-    const rows = JSON.parse(await fs.readFile(path.join(evidenceDir, ledgerFile), "utf8"));
+    const rows = JSON.parse(await fs.readFile(path.join(ledgerDir, ledgerFile), "utf8"));
     if (!Array.isArray(rows)) throw new Error("invalid spend ledger: expected an array");
     return rows;
   } catch (err) {
@@ -94,11 +97,33 @@ async function readLedger(evidenceDir, ledgerFile) {
   }
 }
 
-async function writeLedger(evidenceDir, ledgerFile, rows) {
-  const ledgerPath = path.join(evidenceDir, ledgerFile);
-  const pendingPath = path.join(evidenceDir, `.${ledgerFile}.${process.pid}.tmp`);
+async function writeLedger(ledgerDir, ledgerFile, rows) {
+  const ledgerPath = path.join(ledgerDir, ledgerFile);
+  const pendingPath = path.join(ledgerDir, `.${ledgerFile}.${process.pid}.tmp`);
   await fs.writeFile(pendingPath, `${JSON.stringify(rows, null, 2)}\n`, { mode: 0o600 });
   await fs.rename(pendingPath, ledgerPath);
+}
+
+async function withLedgerLock(ledgerDir, ledgerFile, operation) {
+  const lockPath = path.join(ledgerDir, `.${ledgerFile}.lock`);
+  let handle;
+  try {
+    handle = await fs.open(lockPath, "wx", 0o600);
+    await handle.writeFile(`${JSON.stringify({ pid: process.pid, at: new Date().toISOString() })}\n`);
+  } catch (err) {
+    await handle?.close().catch(() => {});
+    if (err?.code === "EEXIST") {
+      throw new Error(`spend ledger is locked: ${lockPath} (inspect the ledger before removing a stale lock)`);
+    }
+    await fs.rm(lockPath, { force: true }).catch(() => {});
+    throw err;
+  }
+  try {
+    return await operation();
+  } finally {
+    await handle.close();
+    await fs.rm(lockPath);
+  }
 }
 
 async function main() {
@@ -119,17 +144,20 @@ async function main() {
     process.exit(3);
   }
   const ledgerFile = isAcceptance ? ACCEPTANCE_LEDGER_FILE : DIAGNOSTIC_LEDGER_FILE;
-  const ledger = await readLedger(evidenceDir, ledgerFile);
-  const budget = assessBudget(
-    ledger,
-    Date.now(),
-    isAcceptance ? { maxCalls: 4, costTargetUsd: acceptanceBudgetUsd, label: "acceptance" } : {},
+  // Evidence output may be redirected, but the cost gate cannot: otherwise
+  // a fresh --evidence-dir would erase unknown-cost and call-count history.
+  const ledgerDir = path.join(os.homedir(), LEDGER_HOME_DIR);
+  await fs.mkdir(ledgerDir, { recursive: true, mode: 0o700 });
+  const budgetLimits = isAcceptance
+    ? { maxCalls: 4, costTargetUsd: acceptanceBudgetUsd, label: "acceptance" }
+    : {};
+  const initialBudget = await withLedgerLock(ledgerDir, ledgerFile, async () =>
+    assessBudget(await readLedger(ledgerDir, ledgerFile), Date.now(), budgetLimits),
   );
-  if (!budget.ok) {
-    console.error(`${budget.reason} — no further paid experiments`);
+  if (!initialBudget.ok) {
+    console.error(`${initialBudget.reason} — no further paid experiments`);
     process.exit(3);
   }
-  const spent = budget.spent;
 
   // Production startup sequence, unchanged: provider bootstrap THEN probe.
   const envSource = resolveClaudeProviderEnv(process.env);
@@ -204,12 +232,14 @@ async function main() {
   const shellQuote = (value) => `'${value.replaceAll("'", `'"'"'`)}'`;
   let otherRunTemp = null;
   const commands = {
+    taskRead: `cat ${shellQuote(taskFilePath)}`,
     success: "echo compat-ok > compat-ok.txt",
     expectedFailure: "cat no-such-compat-file.txt",
     terminal: `loopzhb report --status nothing-new --message "compat ${variant} done"`,
     denials: [],
   };
   const refusalTargets = [];
+  const refusalProbes = [];
   if (variant === "R") {
     // A second run-shaped temp root is live while the current Run executes.
     // Direct and in-root-symlink access must both be denied by the current
@@ -223,14 +253,26 @@ async function main() {
     const writeLink = path.join(workRoot, "outside-write-link");
     await fs.symlink(otherRead, readLink);
     await fs.symlink(otherWrite, writeLink);
-    commands.denials.push(
-      `cat ${shellQuote(otherRead)}`,
-      `echo tamper > ${shellQuote(otherWrite)}`,
-      `echo tamper >> ${shellQuote(controlRoot.wrapperPath)}`,
-      `echo tamper >> ${shellQuote(controlRoot.opensslConfigPath)}`,
-      "cat outside-read-link",
-      "echo tamper > outside-write-link",
-    );
+    const denialAttempts = [
+      ["other-run-read", `cat ${shellQuote(otherRead)}`],
+      ["other-run-write", `echo tamper > ${shellQuote(otherWrite)}`],
+      ["wrapper", `echo tamper >> ${shellQuote(controlRoot.wrapperPath)}`],
+      ["openssl-config", `echo tamper >> ${shellQuote(controlRoot.opensslConfigPath)}`],
+      ["outside-read-link", "cat outside-read-link"],
+      ["outside-write-link", "echo tamper > outside-write-link"],
+    ];
+    for (const [name, attempt] of denialAttempts) {
+      const markerPath = path.join(workRoot, `refusal-${name}-attempted.txt`);
+      const completionPath = path.join(workRoot, `refusal-${name}-complete.txt`);
+      // One shell proves the OS attempt was reached. A Claude permission-layer
+      // pre-rejection creates neither marker; an OS denial creates both an
+      // attempted marker and the literal denied completion branch.
+      const command =
+        `printf attempted > ${shellQuote(markerPath)} && ${attempt} && ` +
+        `printf allowed > ${shellQuote(completionPath)} || printf denied > ${shellQuote(completionPath)}`;
+      commands.denials.push(command);
+      refusalProbes.push({ name, command, markerPath, completionPath });
+    }
     refusalTargets.push(
       { name: "other-run-read", kind: "file", path: otherRead, before: await fs.readFile(otherRead) },
       { name: "other-run-write", kind: "file", path: otherWrite, before: await fs.readFile(otherWrite) },
@@ -334,17 +376,52 @@ async function main() {
     },
     prevState: null,
     roots: [workRoot],
-    systemPrompt: "",
+    systemPrompt:
+      `Compatibility acceptance protocol: satisfy the required task-file read with exactly one Bash call, ` +
+      `using exactly this command: ${commands.taskRead}. Do not read prev-state. Then execute only the numbered commands in the task file.`,
     task: "(replaced by the v1 prompt builder)",
     terminalProtocol: 1,
   };
 
+  const cleanupFailures = [];
+  const release = async (label, promise) => {
+    try {
+      await promise;
+    } catch (err) {
+      const detail = `${label}: ${err instanceof Error ? err.message : String(err)}`;
+      cleanupFailures.push(detail);
+      console.error(`release failed: ${detail}`);
+    }
+  };
+  const cleanupHarness = async () => {
+    await release("controlRoot", releaseControlRoot(controlRoot));
+    await release("jail", jail.dispose());
+    if (otherRunTemp !== null) await release("otherRunTemp", releaseClaudeRunTemp(otherRunTemp));
+    await release("scratchBase", fs.rm(scratchBase, { recursive: true, force: true }));
+    await release("controlBase", fs.rm(controlBase, { recursive: true, force: true }));
+  };
+
   const startedAt = Date.now();
   const callRow = { variant, runId, at: new Date(startedAt).toISOString(), usd: null, status: "started" };
-  await writeLedger(evidenceDir, ledgerFile, [...ledger, callRow]);
+  const reservation = await withLedgerLock(ledgerDir, ledgerFile, async () => {
+    const latestLedger = await readLedger(ledgerDir, ledgerFile);
+    const latestBudget = assessBudget(
+      latestLedger,
+      Date.now(),
+      budgetLimits,
+    );
+    if (!latestBudget.ok) return latestBudget;
+    await writeLedger(ledgerDir, ledgerFile, [...latestLedger, callRow]);
+    return latestBudget;
+  });
+  if (!reservation.ok) {
+    console.error(`${reservation.reason} — no further paid experiments`);
+    await cleanupHarness();
+    process.exit(3);
+  }
+  const spent = reservation.spent;
   let report;
   let runThrew = null;
-  const cleanupFailures = [];
   let refusal = null;
   try {
     report = await runner.run(delivery, {
@@ -370,29 +447,41 @@ async function main() {
         }
         targets.push({ name: target.name, intact });
       }
-      refusal = { targets, allTargetsIntact: targets.every((target) => target.intact) };
-    }
-    const release = async (label, promise) => {
-      try {
-        await promise;
-      } catch (err) {
-        const detail = `${label}: ${err instanceof Error ? err.message : String(err)}`;
-        cleanupFailures.push(detail);
-        console.error(`release failed: ${detail}`);
+      const probes = [];
+      for (const probe of refusalProbes) {
+        let attempted = false;
+        let outcome = null;
+        try {
+          attempted = (await fs.readFile(probe.markerPath, "utf8")) === "attempted";
+        } catch {}
+        try {
+          outcome = (await fs.readFile(probe.completionPath, "utf8")).trim();
+        } catch {}
+        probes.push({ name: probe.name, attempted, outcome });
       }
-    };
-    await release("controlRoot", releaseControlRoot(controlRoot));
-    await release("jail", jail.dispose());
-    if (otherRunTemp !== null) await release("otherRunTemp", releaseClaudeRunTemp(otherRunTemp));
-    await release("scratchBase", fs.rm(scratchBase, { recursive: true, force: true }));
-    await release("controlBase", fs.rm(controlBase, { recursive: true, force: true }));
+      refusal = {
+        targets,
+        probes,
+        allTargetsIntact: targets.every((target) => target.intact),
+        allProbesAttempted: probes.every((probe) => probe.attempted),
+        allProbesDenied: probes.every((probe) => probe.outcome === "denied"),
+      };
+    }
+    await cleanupHarness();
   }
   const durationMs = Date.now() - startedAt;
 
   const stream = analyzeStream(capturedStdout);
-  const combined = `${capturedStdout}\n${capturedStderr}`;
+  // Analyze diagnostic output, never tool-use command text: R intentionally
+  // names openssl.cnf in a refusal command, which is not an OpenSSL abort.
+  const combined = [
+    capturedStderr,
+    report?.error ?? "",
+    runThrew ?? "",
+    ...stream.calls.map((call) => call.result?.preview ?? ""),
+  ].join("\n");
   const markers = {
-    opensslAbort: /openssl|OPENSSL|Abort trap|exit 134/i.test(combined),
+    opensslAbort: /OpenSSL configuration error|Abort trap|(?:^|\s)exit(?:ed)?(?: code)? 134(?:\s|$)/im.test(combined),
     cwdEperm: /operation not permitted[^\n]*cwd-|cwd-[^\n]*operation not permitted/i.test(combined),
     anyEperm: /operation not permitted|EPERM/i.test(combined),
   };
@@ -411,7 +500,15 @@ async function main() {
   const costUsd = report?.cost?.usd ?? stream.terminal?.total_cost_usd ?? null;
   const costUnknown = costUsd === null;
   const completedRow = { ...callRow, usd: costUsd, status: costUnknown ? "cost-unknown" : "complete" };
-  await writeLedger(evidenceDir, ledgerFile, [...ledger, completedRow]);
+  await withLedgerLock(ledgerDir, ledgerFile, async () => {
+    const latestLedger = await readLedger(ledgerDir, ledgerFile);
+    const rowIndex = latestLedger.findIndex((row) => row.runId === runId);
+    if (rowIndex === -1 || latestLedger[rowIndex].status !== "started") {
+      throw new Error(`spend ledger lost active reservation ${runId}`);
+    }
+    latestLedger[rowIndex] = completedRow;
+    await writeLedger(ledgerDir, ledgerFile, latestLedger);
+  });
 
   const tmpRoot = capturedCapability?.claudeCodeTmpdir ?? null;
   const runTempConfigured =
@@ -485,7 +582,12 @@ async function main() {
     runThrew,
     durationMs,
     costUsd,
-    budget: { kind: isAcceptance ? "acceptance" : "diagnostic", ledgerFile, targetUsd: isAcceptance ? acceptanceBudgetUsd : 3 },
+    budget: {
+      kind: isAcceptance ? "acceptance" : "diagnostic",
+      ledgerFile,
+      ledgerDir,
+      targetUsd: isAcceptance ? acceptanceBudgetUsd : 3,
+    },
     bashCalls: stream.calls.map((call) => ({
       id: call.id,
       command: redact(call.command),
@@ -509,7 +611,7 @@ async function main() {
       `ok=${verdict.ok} bashCalls=${stream.calls.length} loopzhbCalls=${loopzhbCalls} expectedFailCalls=${expectedFailCalls} ` +
       `sideEffectOk=${sideEffectOk} opensslAbort=${markers.opensslAbort} cwdEperm=${markers.cwdEperm} ` +
       (refusal !== null
-        ? `refusalIntact=${refusal.allTargetsIntact} `
+        ? `refusalAttempted=${refusal.allProbesAttempted} refusalDenied=${refusal.allProbesDenied} refusalIntact=${refusal.allTargetsIntact} `
         : "") +
       `cost=${costUsd === null ? "unknown" : `$${costUsd.toFixed(4)}`} cumulative=$${(spent + (costUsd ?? 0)).toFixed(4)}`,
   );
