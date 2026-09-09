@@ -67,6 +67,28 @@ describe("createWorkdirJail — root canonicalization", () => {
   });
 });
 
+describe("dispose — per-start scratch-root ownership", () => {
+  it("removes an unused per-start root and is idempotent", async () => {
+    const root = path.join(base, "root");
+    mkdirSync(root);
+    const jail = await createWorkdirJail({ allowedRoots: [root], scratchBase: scratchBase() });
+    const scratchRoot = jail.scratchRoot;
+    await jail.dispose();
+    expect(existsSync(scratchRoot)).toBe(false);
+    await jail.dispose();
+  });
+
+  it("removes owned run scratch children that remain at owner shutdown", async () => {
+    const root = path.join(base, "root");
+    mkdirSync(root);
+    const jail = await createWorkdirJail({ allowedRoots: [root], scratchBase: scratchBase() });
+    const resolved = await jail.resolve({ workdir: null, serverRoots: [], loopId: "loop-1", runId: "run-1" });
+    expect(existsSync(resolved.cwd)).toBe(true);
+    await jail.dispose();
+    expect(existsSync(resolved.cwd)).toBe(false);
+  });
+});
+
 describe("resolve — daemon ∩ server root intersection", () => {
   let daemonA: string;
   let daemonAChild: string;

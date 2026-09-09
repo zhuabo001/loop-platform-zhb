@@ -173,6 +173,18 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
 |---|
 | 连续 run 能读到前次状态；closed 达标即停；Dashboard 只读 + 一个按钮，不做花活 |
 
+### 状态
+
+- **Batch 1 — Schema、Protocol 与领域基础：已完成**（2026-08-31，`main@6af3b29`，ADR-009）
+  - loops/runs/leases 的 Phase 4 字段与 CHECK、terminal command wire、goal/task-file/state 列、领域 planner 纯函数。
+  - 复审发现登记为 `phase-4` Issues #33/#36（核销状态以 Issue 为准）。
+- **Batch 2 — Task File、State 与 Finish 全链路：业务链路及 sandbox 兼容性核销完成**（2026-09-08，分支 `feat/phase4-batch2-dev`，ADR-006/ADR-009；证据 `docs/tests/phase4-acceptance.md`「真实 Claude 门」）
+  - Daemon：0700 控制根 + 静态无 secret `loopzhb` wrapper（严格 report/finish 文法、`open(wx,0600)` 单条 journal、双层脱敏）；每 Run 控制目录（只读 prev-state + outbox）；Task File 解析/jail/漂移重验/Run 后同步快照；v1 prompt 由 Daemon 构建（v0 golden 字节不变）。
+  - Server：capability 快照与门控（`terminal-journal-v1`）、claim 事务权威 Loop 快照 mint v1 Lease、最终 Report 单事务分支表（stale_goal/迟到冻结/wake finish）、Finish 取消 pending 保留 running、Reopen 旧代际撤销、Completed 全部守卫（claim/cron/catch-up/Run Now/schedule enable/goal）。
+  - 首轮/第二轮 code review 发现已全部修复；第三轮 Standards/Spec/Adversarial 确定性三轨 **PASS**，Issues #39–#47 已核销关闭。修复含 `loops.revision` OCC additive 列、双向真实交错、no-follow 有界读取、encoding-aware 秘密边界、control/scratch root 生命周期与 HTTP 窄接口收口；全量确定性质量门全绿。
+  - 2026-09-07 的固定二进制完整 `test:phase4:batch2:e2e`（1/1，46.99s）与三次生产 smoke 保持有效，#38/#49 已核销；#50 的三项复审 P2 已由独立 Standards/Spec 核销，2026-09-08 最终生产 R 在同一固定 Claude 2.1.236/hash 上通过另一 Run temp 直连及 symlink 读写、wrapper/OpenSSL 配置篡改拒绝检查，#50 核销证据完整。版本因果关系仍未被证明。
+- **Batch 3 — 最小 Dashboard 与阶段收口：未开始**（scope 见 `docs/plan/codex-phase4-dev-roadmap.md`）。
+
 ## Phase 5 — 存储与协作（第 9–14 周）
 
 按依赖顺序，每层独立可验：

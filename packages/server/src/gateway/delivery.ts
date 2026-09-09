@@ -40,7 +40,14 @@ export function buildExecTask(loop: Pick<Loop, "id" | "name" | "taskFile">): str
  *  cursor (opaque passthrough); `systemPrompt` is EXACTLY "" in Phase 1; the
  *  DTO `name` falls back to the loop id when no friendly name is set. The
  *  wire `loop.allowControl` carries the REAL loop config — it is not a grant
- *  (the lease's all-false caps are the effective authority, ADR-003). */
+ *  (the lease's all-false caps are the effective authority, ADR-003).
+ *
+ *  Phase 4 Batch 2 (ADR-009 决策 7): every new claim mints a v1 lease, so the
+ *  Delivery carries `terminalProtocol: 1` and the loop's CURRENT goal — both
+ *  from the claim transaction's authoritative loop snapshot. The `task` text
+ *  stays the Phase 3 template (v0 golden unchanged): a v1 daemon builds its
+ *  own prompt from the goal + task-file path + journal contract, and an old
+ *  daemon simply strips the unknown fields (tolerant reader, ADR-002). */
 export function buildDelivery(input: { loop: Loop; run: Run; roots: string[]; runToken: string }): Delivery {
   const { loop, run, roots, runToken } = input;
   return {
@@ -56,10 +63,12 @@ export function buildDelivery(input: { loop: Loop; run: Run; roots: string[]; ru
       model: loop.model ?? null,
       allowControl: loop.allowControl,
       agent: loop.agent,
+      goal: loop.goal ?? null,
     },
     prevState: loop.state ?? null,
     roots,
     systemPrompt: "",
     task: buildExecTask(loop),
+    terminalProtocol: 1,
   };
 }

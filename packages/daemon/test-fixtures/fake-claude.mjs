@@ -25,11 +25,37 @@
  *   hang             write the sidecar, then hang forever (timeout/abort pins)
  *   self-swap-scratch replace our OWN cwd with a symlink mid-run (release
  *                    fail-closed pin — the post-run release must refuse it)
+ *   self-swap-runtemp replace the runner-minted CLAUDE_CODE_TMPDIR root with
+ *                    a symlink mid-run (run-temp release fail-closed pin)
  *   session-conflict init session_id ≠ result session_id (identity pin)
  *   secret-session   success result whose session_id embeds $ANTHROPIC_API_KEY
  *   probe            handled by the probe pins: `--version` / `--help` output
+ *
+ * Phase 4 Batch 2 (terminal-protocol v1): a `-p` value NOT starting with
+ * `fake-claude://` is the daemon-built v1 prompt. The fixture then reads its
+ * scenario from `<cwd>/.fake-claude-v1-scenario` (default: `journal-none`),
+ * records the full prompt in the sidecar, and — per scenario — writes a
+ * journal record directly into $LOOPZHB_JOURNAL_OUTBOX (simulating the Bash
+ * child invoking the wrapper):
+ *   journal-none        no record; success result (→ journal_missing)
+ *   report-resolved     {"kind":"report","status":"resolved","message":"done"} + success
+ *   report-with-state   report/resolved + {"cursor":2} state + success
+ *   finish              {"kind":"finish","reason":"goal met"} + success
+ *   journal-two         two valid records + success (→ journal_multiple)
+ *   journal-symlink     a symlink entry in the outbox + success (→ journal_multiple)
+ *   journal-corrupt     one non-JSON record + success (→ journal_corrupt)
+ *   journal-invalid     {"kind":"invalid"} marker + success (→ journal_invalid)
+ *   journal-policy      report/new WITHOUT message + success (→ journal_invalid)
+ *   report-secret-text  report message embeds $ANTHROPIC_API_KEY (redaction pin)
+ *   journal-then-exit1  valid record, is_error terminal, exit 1 (claude failure wins)
+ *   report-delete-task  valid record, then <cwd>/TASK.md is deleted (sync → missing)
+ *   finish-observe-prev-state  reads the run's prev-state.json (derived as the
+ *                    sibling of $LOOPZHB_JOURNAL_OUTBOX) and embeds its raw
+ *                    content in the finish reason — the cross-run state
+ *                    promotion pin of the Batch-2 E2E
  */
-import { rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { existsSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 const argv = process.argv.slice(2);
@@ -65,25 +91,180 @@ if (argv.includes("--help")) {
 const taskIdx = argv.indexOf("-p");
 const task = taskIdx >= 0 ? (argv[taskIdx + 1] ?? "") : "";
 const PREFIX = "fake-claude://";
-const scenario = task.startsWith(PREFIX) ? task.slice(PREFIX.length) : "ok";
+const isV1 = !task.startsWith(PREFIX);
+let scenario = isV1 ? "journal-none" : task.slice(PREFIX.length);
+if (isV1) {
+  const scenarioFile = path.join(process.cwd(), ".fake-claude-v1-scenario");
+  if (existsSync(scenarioFile)) scenario = readFileSync(scenarioFile, "utf8").trim();
+}
 
 writeFileSync(
   path.join(process.cwd(), ".fake-claude-session.json"),
   JSON.stringify({
     argv,
+    prompt: task,
     env: {
       PATH: process.env.PATH ?? null,
       HOME: process.env.HOME ?? null,
       ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY ?? null,
       CLAUDE_CODE_OAUTH_TOKEN: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? null,
+      CLAUDE_CODE_TMPDIR: process.env.CLAUDE_CODE_TMPDIR ?? null,
       LOOPZHB_MACHINE_CREDENTIAL: process.env.LOOPZHB_MACHINE_CREDENTIAL ?? null,
       GITHUB_TOKEN: process.env.GITHUB_TOKEN ?? null,
+      LOOPZHB_JOURNAL_OUTBOX: process.env.LOOPZHB_JOURNAL_OUTBOX ?? null,
     },
   }),
 );
 
 const line = (obj) => process.stdout.write(JSON.stringify(obj) + "\n");
 const key = process.env.ANTHROPIC_API_KEY ?? "none";
+
+/** Write one journal record the way the wrapper would: random name, JSON. */
+const writeJournal = (record) => {
+  const outbox = process.env.LOOPZHB_JOURNAL_OUTBOX;
+  if (!outbox) throw new Error("v1 scenario without LOOPZHB_JOURNAL_OUTBOX");
+  writeFileSync(path.join(outbox, `${randomBytes(12).toString("hex")}.json`), JSON.stringify(record), { mode: 0o600 });
+};
+
+const successResult = (overrides = {}) =>
+  line({ type: "result", subtype: "success", is_error: false, result: "fake final text", session_id: "fake-sess-1", ...overrides });
+
+if (isV1) {
+  const compatTaskPath = path.join(process.cwd(), "TASK.md");
+  if (existsSync(compatTaskPath)) {
+    const compatTask = readFileSync(compatTaskPath, "utf8");
+    if (compatTask.startsWith("# Compat probe ")) {
+      if (process.env.CLAUDE_CONFIG_DIR?.endsWith("slow-compat")) {
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
+      }
+      const quotedTaskPath = `'${compatTaskPath.replaceAll("'", `'"'"'`)}'`;
+      const taskReadCommand = `cat ${quotedTaskPath}`;
+      line({
+        type: "assistant",
+        message: { content: [{ type: "tool_use", name: "Bash", id: "compat-tool-task", input: { command: taskReadCommand } }] },
+      });
+      line({
+        type: "user",
+        message: { content: [{ type: "tool_result", tool_use_id: "compat-tool-task", is_error: false, content: compatTask }] },
+      });
+      const commands = compatTask
+        .split("\n")
+        .map((text) => /^\d+\. `(.+)`(?: — .+)?$/.exec(text)?.[1] ?? null)
+        .filter((command) => command !== null);
+      for (const [index, command] of commands.entries()) {
+        const id = `compat-tool-${index}`;
+        line({ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", id, input: { command } }] } });
+        let isError = command === "cat no-such-compat-file.txt";
+        if (command === "echo compat-ok > compat-ok.txt") writeFileSync(path.join(process.cwd(), "compat-ok.txt"), "compat-ok\n");
+        if (!process.env.CLAUDE_CONFIG_DIR?.endsWith("allow-refusals") && command.startsWith("printf attempted > ")) {
+          const match = /^printf attempted > '([^']+)' && .* && printf allowed > '([^']+)' \|\| printf denied > '([^']+)'$/.exec(
+            command,
+          );
+          if (match !== null && match[2] === match[3]) {
+            writeFileSync(match[1], "attempted");
+            writeFileSync(match[3], "denied");
+          }
+        }
+        if (/^loopzhb report\s/.test(command)) {
+          writeJournal({ kind: "report", status: "nothing-new", message: "fake compat" });
+          isError = false;
+        }
+        const longError = process.env.CLAUDE_CONFIG_DIR?.endsWith("long-cwd")
+          ? "zsh:1: operation not permitted: /tmp/claude-501/cwd-probe"
+          : process.env.CLAUDE_CONFIG_DIR?.endsWith("long-openssl") ? "OpenSSL configuration error" : null;
+        // Preserve a long tool error even when the overall Claude result and
+        // journal succeed: the compat gate must inspect beyond its preview.
+        line({
+          type: "user",
+          message: { content: [{ type: "tool_result", tool_use_id: id, is_error: isError,
+            content: isError ? longError === null ? "expected failure" : `${"x".repeat(301)}\n${longError}` : "ok" }] },
+        });
+      }
+      successResult({ total_cost_usd: 0.001 });
+      process.exit();
+    }
+  }
+  switch (scenario) {
+    case "journal-none":
+      successResult();
+      break;
+    case "report-resolved":
+      writeJournal({ kind: "report", status: "resolved", message: "done" });
+      successResult();
+      break;
+    case "report-with-state":
+      writeJournal({ kind: "report", status: "resolved", message: "done", state: { cursor: 2 } });
+      successResult();
+      break;
+    case "finish":
+      writeJournal({ kind: "finish", reason: "goal met" });
+      successResult();
+      break;
+    case "journal-two":
+      writeJournal({ kind: "report", status: "resolved", message: "one" });
+      writeJournal({ kind: "report", status: "resolved", message: "two" });
+      successResult();
+      break;
+    case "journal-symlink": {
+      const outbox = process.env.LOOPZHB_JOURNAL_OUTBOX;
+      symlinkSync(path.join(outbox, "target.json"), path.join(outbox, "link.json"));
+      successResult();
+      break;
+    }
+    case "journal-corrupt": {
+      const outbox = process.env.LOOPZHB_JOURNAL_OUTBOX;
+      writeFileSync(path.join(outbox, `${randomBytes(12).toString("hex")}.json`), "this is not json{", { mode: 0o600 });
+      successResult();
+      break;
+    }
+    case "journal-invalid":
+      writeJournal({ kind: "invalid" });
+      successResult();
+      break;
+    case "journal-policy":
+      writeJournal({ kind: "report", status: "new" }); // new without message
+      successResult();
+      break;
+    case "report-secret-text":
+      writeJournal({ kind: "report", status: "resolved", message: `token is ${key}` });
+      successResult();
+      break;
+    case "journal-then-exit1":
+      writeJournal({ kind: "report", status: "resolved", message: "done" });
+      line({ type: "result", subtype: "error_during_execution", is_error: true, result: "blew up" });
+      process.exitCode = 1;
+      break;
+    case "report-delete-task":
+      // The sync-failure-never-rolls-back pin: a legal journal record, but
+      // the task file (conventionally <cwd>/TASK.md in the runner tests) is
+      // gone by the time the daemon re-reads it.
+      writeJournal({ kind: "report", status: "resolved", message: "done" });
+      rmSync(path.join(process.cwd(), "TASK.md"), { force: true });
+      successResult();
+      break;
+    case "finish-observe-prev-state": {
+      // The cross-run state pin: the run control dir holds context/ and
+      // outbox/ as siblings, so the prev-state path derives from the ONE
+      // journal env var. The observed content rides the finish reason —
+      // black-box observable on the server's run message.
+      const outbox = process.env.LOOPZHB_JOURNAL_OUTBOX;
+      const prevStatePath = path.join(path.dirname(outbox), "context", "prev-state.json");
+      let observed;
+      try {
+        observed = readFileSync(prevStatePath, "utf8");
+      } catch {
+        observed = "<unreadable>";
+      }
+      writeJournal({ kind: "finish", reason: `goal met; observed prev-state ${observed}` });
+      successResult();
+      break;
+    }
+    default:
+      process.stderr.write(`unknown v1 scenario: ${scenario}\n`);
+      process.exitCode = 64;
+  }
+  process.exit();
+}
 
 switch (scenario) {
   case "ok":
@@ -161,6 +342,21 @@ switch (scenario) {
     line({ type: "result", subtype: "success", is_error: false, result: "swapped", session_id: "fake-sess-1" });
     rmSync(cwd, { recursive: true, force: true });
     symlinkSync("/", cwd, "dir");
+    break;
+  }
+  case "self-swap-runtemp": {
+    // Same swap, one directory up the stack: the run SUCCEEDS, but the
+    // runner-minted CLAUDE_CODE_TMPDIR root is now a symlink — the
+    // fail-closed run-temp release must refuse and fail the run.
+    const tmpRoot = process.env.CLAUDE_CODE_TMPDIR;
+    if (!tmpRoot) {
+      process.stderr.write("self-swap-runtemp: CLAUDE_CODE_TMPDIR missing\n");
+      process.exitCode = 65;
+      break;
+    }
+    line({ type: "result", subtype: "success", is_error: false, result: "swapped", session_id: "fake-sess-1" });
+    rmSync(tmpRoot, { recursive: true, force: true });
+    symlinkSync("/", tmpRoot, "dir");
     break;
   }
   default:

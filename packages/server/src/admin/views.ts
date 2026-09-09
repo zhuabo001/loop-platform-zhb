@@ -37,6 +37,12 @@ export type LoopSummaryRow = Pick<
   | "updatedAt"
   | "cron"
   | "timezone"
+  | "goal"
+  | "completedAt"
+  | "completionReason"
+  | "taskFileSyncedAt"
+  | "taskFileSyncAttemptedAt"
+  | "taskFileSyncError"
 >;
 
 export type RunSummaryRow = Pick<
@@ -107,9 +113,14 @@ export function toLoopSummary(
     cron: row.cron ?? null,
     timezone: row.timezone,
     nextFireAt,
-    // Phase 4 observation fields (goal/completion/task-file sync) are NOT
-    // emitted while Batch 1 keeps them dormant (ADR-009 决策 11) — the
-    // response stays byte-identical to Phase 3.
+    // Phase 4 observation fields — always emitted explicitly (null when
+    // unset), per the additive wire DTO (ADR-009; Batch 2 opens them).
+    goal: row.goal ?? null,
+    completedAt: row.completedAt ?? null,
+    completionReason: row.completionReason ?? null,
+    taskFileSyncedAt: row.taskFileSyncedAt ?? null,
+    taskFileSyncAttemptedAt: row.taskFileSyncAttemptedAt ?? null,
+    taskFileSyncError: row.taskFileSyncError ?? null,
   };
 }
 

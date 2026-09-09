@@ -352,7 +352,7 @@ describe("transaction guards", () => {
     await seedRun(db, { id: "run-1", machineId, phase: "pending" });
 
     const before = await snapshotRuns(db);
-    await expect(coordinator.poll(TOKEN, {})).rejects.toThrow();
+    await expect(coordinator.poll(TOKEN, { capabilities: ["terminal-journal-v1"] })).rejects.toThrow();
     // Claim rolled back: the run is STILL pending (not running), no delivery.
     expect(await snapshotRuns(db)).toEqual(before);
     expect(await snapshotLeases(db)).toHaveLength(1); // only the pre-seeded one
@@ -361,7 +361,7 @@ describe("transaction guards", () => {
   it("delivery lost + machine vanished: claim → (response dropped) → reclaim → poll stays empty, exactly one wake-report", async () => {
     await fresh();
     await seedRun(db, { id: "run-1", machineId, phase: "pending" });
-    const first = await coordinator.poll(TOKEN, {});
+    const first = await coordinator.poll(TOKEN, { capabilities: ["terminal-journal-v1"] });
     expect(first.deliveries).toHaveLength(1);
     const droppedToken = first.deliveries[0]!.runToken; // "lost" — daemon never saw it
 
@@ -370,11 +370,15 @@ describe("transaction guards", () => {
     expect(await reclaim("run-1")).toBe("reclaimed");
 
     // Still no re-dispatch — the run left the surface at claim time.
-    const after = await coordinator.poll(TOKEN, {});
+    const after = await coordinator.poll(TOKEN, { capabilities: ["terminal-journal-v1"] });
     expect(after.deliveries).toEqual([]);
 
     // …and the run is reconcilable exactly once via the original credential.
-    const wake = await coordinator.report(droppedToken, { ok: true, message: "actually finished before dying" });
+    const wake = await coordinator.report(droppedToken, {
+      ok: true,
+      terminal: { kind: "report", status: "resolved", message: "actually finished before dying" },
+      taskFileSyncError: "missing",
+    });
     expect(wake).toEqual({ ok: true, reconciled: true });
     expect((await snapshotRuns(db))[0]).toMatchObject({ phase: "done", outcome: "exec", error: null });
   });

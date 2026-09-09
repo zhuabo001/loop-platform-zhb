@@ -74,7 +74,7 @@ describe("daemon E2E: the full HTTP user chain", () => {
     const runtime = createDaemonRuntime({
       client,
       runner: countingRunner,
-      identity: { host: "e2e-host", platform: "test", arch: "test", version: "0.1.0" },
+      identity: { host: "e2e-host", platform: "test", arch: "test", version: "0.1.0", capabilities: ["terminal-journal-v1"] },
       pollMs: 3000,
       machineCredential: TOKEN,
     });
@@ -185,14 +185,22 @@ describe("daemon E2E: the full HTTP user chain", () => {
           calls.push({
             runId: delivery.runId,
             release: () =>
-              resolve({ ok: true, outcome: "exec", message: `finished ${delivery.runId}`, durationMs: 0 }),
+              resolve({
+                ok: true,
+                outcome: "exec",
+                durationMs: 0,
+                // The claim mints a v1 lease (Phase 4): a legal success report
+                // carries the terminal command + exactly one sync result.
+                terminal: { kind: "report", status: "resolved", message: `finished ${delivery.runId}` },
+                taskFileSyncError: "missing",
+              }),
           });
         }),
     };
     const runtime = createDaemonRuntime({
       client,
       runner: gatedRunner,
-      identity: { host: "e2e-host", platform: "test", arch: "test", version: "0.1.0" },
+      identity: { host: "e2e-host", platform: "test", arch: "test", version: "0.1.0", capabilities: ["terminal-journal-v1"] },
       pollMs: 3000,
       machineCredential: TOKEN,
     });
@@ -208,7 +216,7 @@ describe("daemon E2E: the full HTTP user chain", () => {
       const createRes = await b.app.request("/api/loops", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ machineId, name, workdir: "/srv/project" }),
+        body: JSON.stringify({ machineId, name, workdir: "/srv/project", taskFile: "/srv/project/TASK.md" }),
       });
       expect(createRes.status).toBe(201);
       const { loop } = createLoopResponseSchema.parse(await createRes.json());

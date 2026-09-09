@@ -30,7 +30,9 @@ import { createLoopAdmin, newUuidLoopId } from "./admin/index.js";
 import { createRunCoordinator, mintRunCredential, newUuidRunId } from "./coordinator/index.js";
 import { closeDb, openMigratedDb, type DbHandle } from "./db/index.js";
 import { createServerApp } from "./http/app.js";
+import { createLifecycleAdmin } from "./loop-lifecycle/admin.js";
 import { createOwnerControl } from "./owner/index.js";
+import { createScheduleAdmin } from "./schedule/index.js";
 import { createInactivitySweep } from "./sweep/index.js";
 import { FakeClock, seedLease, seedLoop, seedRun, snapshotRuns } from "./testkit/index.js";
 
@@ -57,7 +59,13 @@ async function bootLiveness() {
   });
   const admin = createLoopAdmin({ db: handle.db, clock, newLoopId: newUuidLoopId });
   const ownerControl = createOwnerControl({ db: handle.db, clock });
-  const app = createServerApp(coordinator, admin, ownerControl, handle.db, clock);
+  const app = createServerApp(
+    coordinator,
+    admin,
+    createLifecycleAdmin({ db: handle.db, clock }),
+    createScheduleAdmin({ db: handle.db, clock }),
+    ownerControl,
+  );
   const sweep = createInactivitySweep({ db: handle.db, clock, log: () => {} });
   return { app, sweep, handle, clock };
 }
@@ -110,7 +118,7 @@ describe("Issue #12: cross-layer round-robin liveness", () => {
     const runtime = createDaemonRuntime({
       client: batchClient,
       runner: gated.runner,
-      identity: { host: "liveness-host", platform: "test", arch: "test", version: "0.1.0" },
+      identity: { host: "liveness-host", platform: "test", arch: "test", version: "0.1.0", capabilities: ["terminal-journal-v1"] },
       pollMs: 3000,
       machineCredential: TOKEN,
     });
@@ -125,7 +133,7 @@ describe("Issue #12: cross-layer round-robin liveness", () => {
       const createRes = await app.request("/api/loops", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ machineId, name: `liveness-loop-${i}`, workdir: "/srv/liveness" }),
+        body: JSON.stringify({ machineId, name: `liveness-loop-${i}`, workdir: "/srv/liveness", taskFile: "/srv/liveness/TASK.md" }),
       });
       expect(createRes.status).toBe(201);
       const { loop } = (await createRes.json()) as { loop: { id: string } };

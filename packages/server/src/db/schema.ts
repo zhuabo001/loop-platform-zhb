@@ -34,7 +34,7 @@ import {
   RUN_STATUSES,
   TASK_FILE_SYNC_ERRORS,
 } from "@loopzhb/protocol";
-import type { RunArtifact, TranscriptStep } from "@loopzhb/protocol";
+import type { JsonObject, RunArtifact, TranscriptStep } from "@loopzhb/protocol";
 
 // ---- shared storage shapes ----
 //
@@ -60,7 +60,10 @@ export interface RunUsage {
   attempts?: number;
 }
 
-/** This run's observation snapshot — numeric metrics plus scalar values. */
+/** This run's observation snapshot — numeric metrics plus scalar values.
+ *  Phase 4 Batch 2: a v1 run's persisted terminal state is an arbitrary
+ *  JsonObject (the column below is typed accordingly); RunState survives for
+ *  the pre-Phase-4 in-run-verb meaning. */
 export type RunState = Record<string, number | string>;
 
 /** Live "what's it doing" signal while running — pushed on the poll heartbeat
@@ -178,6 +181,15 @@ export const loops = pgTable(
     taskFileSyncError: text("task_file_sync_error", { enum: [...TASK_FILE_SYNC_ERRORS] }),
     createdAt: text("created_at").notNull(),
     updatedAt: text("updated_at").notNull(),
+    /** The unified optimistic-concurrency token (review SPEC-1/SPEC-3,
+     *  ADR-009 修订 2026-09-01): EVERY loops write increments it by one, and
+     *  every write transaction that decided from a loop snapshot guards on
+     *  the observed value (`WHERE id = ? AND revision = ?`) — zero rows means
+     *  a competitor committed, roll back and re-resolve once. Unlike
+     *  `updatedAt` (millisecond clock — a same-ms write leaves it unchanged)
+     *  this token cannot collide. `goalRevision`/`scheduleRevision` keep their
+     *  own business semantics and are untouched. */
+    revision: integer("revision").notNull().default(0),
   },
   (t) => [
     index("loops_machine_idx").on(t.machineId),
@@ -217,7 +229,9 @@ export const runs = pgTable(
     message: text("message"),
     durationMs: integer("duration_ms"),
     error: text("error"),
-    state: jsonb("state").$type<RunState>(),
+    /** Phase 4: a v1 run's terminal state snapshot is an arbitrary JsonObject
+     *  (validated + size-capped by terminal-policy before it can land here). */
+    state: jsonb("state").$type<JsonObject>(),
     /** Agent session id on the machine (locates the local transcript). */
     sessionId: text("session_id"),
     /** Agent's own USD estimate for the run. A real column (not JSON) so

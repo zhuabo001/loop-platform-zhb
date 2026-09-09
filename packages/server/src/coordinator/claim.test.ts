@@ -75,6 +75,14 @@ async function seedExec(id: string, overrides: Partial<NewRun> = {}): Promise<vo
   await seedRun(db, { ...overrides, id, machineId });
 }
 
+/** Phase 4: polls from a CAPABLE daemon (claims are gated on
+ *  terminal-journal-v1 — ADR-009 决策 7). Every claim test below polls
+ *  through this helper; the gating itself is pinned in the dedicated
+ *  capability describe block. */
+function capable(body: object = {}): { capabilities: string[] } & object {
+  return { capabilities: ["terminal-journal-v1"], ...body };
+}
+
 async function leaseRows() {
   return db.select().from(runLeases).orderBy(asc(runLeases.runId));
 }
@@ -84,7 +92,7 @@ describe("poll claim: T1 concurrent claim uniqueness", () => {
     await fresh();
     await seedExec("run-1");
 
-    const [a, b] = await Promise.all([coordinator.poll(TOKEN, {}), coordinator.poll(TOKEN, {})]);
+    const [a, b] = await Promise.all([coordinator.poll(TOKEN, capable()), coordinator.poll(TOKEN, capable())]);
     const deliveries = [...a.deliveries, ...b.deliveries];
     expect(deliveries).toHaveLength(1);
     expect(deliveries[0]!.runId).toBe("run-1");
@@ -108,7 +116,7 @@ describe("poll claim: T2 at-most-once (repeat poll / dropped first response)", (
     await fresh();
     await seedExec("run-1");
 
-    const first = await coordinator.poll(TOKEN, {});
+    const first = await coordinator.poll(TOKEN, capable());
     expect(first.deliveries).toHaveLength(1);
     const leaseAfterFirst = await leaseRows();
     const runAfterFirst = (await snapshotRuns(db))[0]!;
@@ -117,7 +125,7 @@ describe("poll claim: T2 at-most-once (repeat poll / dropped first response)", (
     // reached the daemon) must return EMPTY and change nothing.
     for (let i = 0; i < 3; i += 1) {
       clock.advance(11_000); // past the heartbeat window — poll is fully processed
-      const again = await coordinator.poll(TOKEN, {});
+      const again = await coordinator.poll(TOKEN, capable());
       expect(again.deliveries).toEqual([]);
     }
     expect(mintCount).toBe(1);
@@ -132,7 +140,7 @@ describe("poll claim: batch semantics (A-05)", () => {
     await seedExec("run-c", { ts: "2026-07-01T00:00:03.000Z" });
     await seedExec("run-b", { ts: "2026-07-01T00:00:01.000Z" });
     await seedExec("run-a", { ts: "2026-07-01T00:00:01.000Z" }); // ts tie → id ASC first
-    const { deliveries } = await coordinator.poll(TOKEN, {});
+    const { deliveries } = await coordinator.poll(TOKEN, capable());
     expect(deliveries.map((d) => d.runId)).toEqual(["run-a", "run-b", "run-c"]);
     expect((await snapshotRuns(db)).every((r) => r.phase === "running")).toBe(true);
     expect(await leaseRows()).toHaveLength(3);
@@ -146,7 +154,7 @@ describe("poll claim: batch semantics (A-05)", () => {
     await seedExec("run-no-loop", { loopId: "loop-gone" });
     await seedExec("run-ok");
 
-    const { deliveries } = await coordinator.poll(TOKEN, {});
+    const { deliveries } = await coordinator.poll(TOKEN, capable());
     expect(deliveries.map((d) => d.runId)).toEqual(["run-ok"]);
 
     // Skipped candidates stay pending (Phase 1 does NOT fail them — they are
@@ -163,7 +171,7 @@ describe("poll claim: batch semantics (A-05)", () => {
     await fresh();
     for (const id of ["run-1", "run-2", "run-3", "run-4"]) await seedExec(id);
 
-    const [a, b] = await Promise.all([coordinator.poll(TOKEN, {}), coordinator.poll(TOKEN, {})]);
+    const [a, b] = await Promise.all([coordinator.poll(TOKEN, capable()), coordinator.poll(TOKEN, capable())]);
     const ids = [...a.deliveries.map((d) => d.runId), ...b.deliveries.map((d) => d.runId)];
     expect(ids.sort()).toEqual(["run-1", "run-2", "run-3", "run-4"]);
     expect(new Set(ids).size).toBe(4);
@@ -195,7 +203,7 @@ describe("poll claim: lease mint policy (ADR-003, A-06)", () => {
     await fresh();
     await seedExec("run-1");
     // loop-1 has allowControl: true (seed default) — mint must NOT inherit it.
-    const { deliveries } = await coordinator.poll(TOKEN, {});
+    const { deliveries } = await coordinator.poll(TOKEN, capable());
     expect(deliveries[0]!.loop.allowControl).toBe(true); // real loop config on the wire
 
     const lease = (await leaseRows())[0]!;
@@ -220,7 +228,7 @@ describe("poll claim: lease mint policy (ADR-003, A-06)", () => {
     await fresh();
     await seedLoop(db, { id: "loop-2", allowControl: false });
     await seedExec("run-2", { loopId: "loop-2" });
-    const { deliveries } = await coordinator.poll(TOKEN, {});
+    const { deliveries } = await coordinator.poll(TOKEN, capable());
     expect(deliveries[0]!.loop.allowControl).toBe(false);
     expect((await leaseRows())[0]).toMatchObject({ allowControl: false, canFinish: false });
   });
@@ -233,7 +241,7 @@ describe("poll claim: delivery content", () => {
     await seedLoop(db, { id: "loop-2", name: null, workdir: null, taskFile: null, state: { cursor: 7 } });
     await seedExec("run-2", { loopId: "loop-2" });
 
-    const { deliveries } = await coordinator.poll(TOKEN, {});
+    const { deliveries } = await coordinator.poll(TOKEN, capable());
     expect(deliveries).toHaveLength(1);
     const d = deliveries[0]!;
     expect(d).toMatchObject({
@@ -259,7 +267,7 @@ describe("poll claim: delivery content", () => {
   it("delivers unrestricted roots as [] when the machine has no allowlist", async () => {
     await fresh();
     await seedExec("run-1");
-    const { deliveries } = await coordinator.poll(TOKEN, {});
+    const { deliveries } = await coordinator.poll(TOKEN, capable());
     expect(deliveries[0]!.roots).toEqual([]);
   });
 });
@@ -272,10 +280,10 @@ describe("poll claim: availableSlots capacity gating (Phase 2)", () => {
     await seedExec("run-running", { phase: "running" });
     const before = await snapshotRuns(db);
 
-    const { deliveries } = await coordinator.poll(TOKEN, {
+    const { deliveries } = await coordinator.poll(TOKEN, capable({
       availableSlots: 0,
       progress: [{ runId: "run-running", step: 2, label: "busy" }],
-    });
+    }));
     expect(deliveries).toEqual([]);
 
     // Only the running run's progress changed; every other row/column (ts
@@ -294,10 +302,10 @@ describe("poll claim: availableSlots capacity gating (Phase 2)", () => {
     await seedExec("run-2", { ts: "2026-07-01T00:00:02.000Z" });
     await seedExec("run-1", { ts: "2026-07-01T00:00:01.000Z" });
 
-    const first = await coordinator.poll(TOKEN, { availableSlots: 1 });
+    const first = await coordinator.poll(TOKEN, capable({ availableSlots: 1 }));
     expect(first.deliveries.map((d) => d.runId)).toEqual(["run-1"]);
 
-    const second = await coordinator.poll(TOKEN, { availableSlots: 1 });
+    const second = await coordinator.poll(TOKEN, capable({ availableSlots: 1 }));
     expect(second.deliveries.map((d) => d.runId)).toEqual(["run-2"]);
 
     expect((await snapshotRuns(db)).every((r) => r.phase === "running")).toBe(true);
@@ -329,19 +337,70 @@ describe("poll claim: availableSlots capacity gating (Phase 2)", () => {
       }),
     );
 
-    const { deliveries } = await hooked.poll(TOKEN, { availableSlots: 1 });
+    const { deliveries } = await hooked.poll(TOKEN, capable({ availableSlots: 1 }));
     // The guard loss on run-1 must NOT end the capacity-1 poll: run-2 is delivered.
     expect(raced).toBe(true);
     expect(deliveries.map((d) => d.runId)).toEqual(["run-2"]);
     expect(await leaseRows()).toHaveLength(2);
   });
 
-  it("keeps Phase 1 BATCH claim when availableSlots is absent (old-daemon regression pin)", async () => {
+  it("keeps BATCH claim when availableSlots is absent (capable daemon)", async () => {
     await fresh();
     await seedExec("run-1");
     await seedExec("run-2");
-    const { deliveries } = await coordinator.poll(TOKEN, {});
+    const { deliveries } = await coordinator.poll(TOKEN, capable());
     expect(deliveries.map((d) => d.runId)).toEqual(["run-1", "run-2"]);
     expect(await leaseRows()).toHaveLength(2);
+  });
+
+  it("an OLD daemon (no capability declaration) claims NOTHING and gets the upgrade hint — new-server/old-daemon compat (ADR-009 决策 7)", async () => {
+    await fresh();
+    await seedExec("run-1");
+    await seedExec("run-2");
+    const res = await coordinator.poll(TOKEN, {});
+    expect(res.deliveries).toEqual([]);
+    expect(res.requiredCapabilities).toEqual(["terminal-journal-v1"]);
+    // Nothing was claimed or minted; the runs stay pending for a capable poll.
+    expect((await snapshotRuns(db)).every((r) => r.phase === "pending")).toBe(true);
+    expect(await leaseRows()).toEqual([]);
+    expect(mintCount).toBe(0);
+    // Idle old daemon (a machine with NO pending work): the hint is never
+    // sent on an idle poll (ADR-009 决策 7).
+    await seedMachineForToken(db, OTHER_TOKEN);
+    const idle = await coordinator.poll(OTHER_TOKEN, {});
+    expect(idle.deliveries).toEqual([]);
+    expect(idle).not.toHaveProperty("requiredCapabilities");
+  });
+
+  it("an illegal capability declaration rejects the WHOLE poll with the resource-policy error BEFORE any write", async () => {
+    await fresh();
+    await seedExec("run-1");
+    const before = await snapshotRuns(db);
+    // 33 entries (over the 32 cap), and an illegal name — both reject.
+    for (const capabilities of [
+      Array.from({ length: 33 }, (_, i) => `cap-${i}`),
+      ["UPPERCASE"],
+      ["-leading-dash"],
+    ]) {
+      await expect(coordinator.poll(TOKEN, { capabilities })).rejects.toMatchObject({
+        name: "CapabilityDeclarationInvalidError",
+      });
+    }
+    // Zero writes: the run stays pending, no lease, and the machine's
+    // capability snapshot was never touched.
+    expect(await snapshotRuns(db)).toEqual(before);
+    expect(await leaseRows()).toEqual([]);
+  });
+
+  it("a capable poll persists the CURRENT capability snapshot (deduped + sorted); absent resets to null", async () => {
+    await fresh();
+    await coordinator.poll(TOKEN, { capabilities: ["zzz-future", "terminal-journal-v1", "zzz-future"] });
+    let machine = (await db.select().from(machines).where(eq(machines.id, machineId)))[0]!;
+    expect(machine.capabilities).toEqual(["terminal-journal-v1", "zzz-future"]);
+    // Absent on a later poll → the snapshot resets to null (complete-snapshot
+    // semantics, not accumulation).
+    await coordinator.poll(TOKEN, {});
+    machine = (await db.select().from(machines).where(eq(machines.id, machineId)))[0]!;
+    expect(machine.capabilities).toBeNull();
   });
 });

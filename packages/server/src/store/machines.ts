@@ -23,6 +23,8 @@
  */
 import { and, eq, sql } from "drizzle-orm";
 
+import { normalizeCapabilities } from "@loopzhb/protocol";
+
 import { InvalidMachineCredentialError } from "../coordinator/errors.js";
 import type { Db } from "../db/index.js";
 import { machines, type Machine, type NewMachine } from "../db/schema.js";
@@ -31,6 +33,47 @@ import type { Clock } from "../time.js";
 export interface MachineStoreDeps {
   db: Db;
   clock: Clock;
+}
+
+// ---- Phase 4 capability declaration resource policy (ADR-009 修订 2026-09-01 决策 1) ----
+
+/** At most 32 raw entries per declaration — a resource bound, not a semantic
+ *  rule (dedupe happens after acceptance). */
+export const CAPABILITY_MAX_ENTRIES = 32;
+/** Lowercase machine-safe names; unknown-but-legal names are preserved. */
+export const CAPABILITY_NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+
+/** Thrown by the poll pipeline when a capability declaration violates the
+ *  resource policy: the WHOLE poll is rejected with a 400 BEFORE any
+ *  heartbeat, snapshot or claim write. */
+export class CapabilityDeclarationInvalidError extends Error {
+  constructor() {
+    super("capability declaration rejected by the resource policy");
+    this.name = "CapabilityDeclarationInvalidError";
+  }
+}
+
+/**
+ * Validate + normalize a poll's capability declaration into the snapshot to
+ * persist (ADR-009 决策 7 + 修订决策 1). `undefined` (absent) is a LEGAL old
+ * daemon and snapshots to null — only a PRESENT array is resource-checked
+ * (entry count, per-entry name shape). Illegal input throws
+ * CapabilityDeclarationInvalidError; the caller maps it to a 400 for the
+ * whole poll.
+ */
+export function capabilitySnapshotFromPoll(raw: string[] | undefined): string[] | null {
+  if (raw === undefined) return null;
+  if (raw.length > CAPABILITY_MAX_ENTRIES || raw.some((name) => !CAPABILITY_NAME_RE.test(name))) {
+    throw new CapabilityDeclarationInvalidError();
+  }
+  return normalizeCapabilities(raw);
+}
+
+/** Value equality for the persisted snapshot — a snapshot that deep-equals
+ *  the stored one is a no-op write (keeps the idle poll's hot path read-only). */
+export function capabilitiesEqual(a: string[] | null, b: string[] | null): boolean {
+  if (a === null || b === null) return a === b;
+  return a.length === b.length && a.every((name, i) => name === b[i]);
 }
 
 /** How old the persisted watermark must be before a poll re-stamps it (A-13). */
@@ -113,7 +156,7 @@ export async function getMachine(db: Db, id: string): Promise<Machine | undefine
  */
 export async function registerMachineOnPoll(
   deps: MachineStoreDeps,
-  input: { machineId: string; tokenHash: string; identity: PollIdentity },
+  input: { machineId: string; tokenHash: string; identity: PollIdentity; capabilities: string[] | null },
 ): Promise<Machine> {
   const nowIso = deps.clock.now().toISOString();
   const hostname = cleanIdentityField(input.identity.host, CAP_HOSTNAME);
@@ -127,6 +170,7 @@ export async function registerMachineOnPoll(
     tokenHash: input.tokenHash,
     roots: null,
     lastSeen: nowIso,
+    capabilities: input.capabilities,
     createdAt: nowIso,
   };
   try {
@@ -181,9 +225,10 @@ export async function applyMachinePollContact(
   deps: MachineStoreDeps,
   machine: Machine,
   identity: PollIdentity,
+  capabilities: string[] | null = machine.capabilities,
 ): Promise<Machine> {
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    const result = await tryApplyContact(deps, machine, identity);
+    const result = await tryApplyContact(deps, machine, identity, capabilities);
     if (result !== "cas-lost") return result;
     // Lost the repair race: re-read the winner's row and re-decide (its value
     // is normally in the legal domain now, so the next attempt takes the
@@ -200,6 +245,7 @@ async function tryApplyContact(
   deps: MachineStoreDeps,
   machine: Machine,
   identity: PollIdentity,
+  capabilities: string[] | null,
 ): Promise<Machine | "cas-lost"> {
   const pollTime = deps.clock.now();
   const pollIso = pollTime.toISOString();
@@ -222,6 +268,11 @@ async function tryApplyContact(
   const version = cleanIdentityField(identity.version, CAP_VERSION);
   if (version !== undefined && version !== machine.daemonVersion) patch.daemonVersion = version;
   if (hostname !== undefined && machine.name.trim() === "") patch.name = hostname;
+
+  // Phase 4 capability snapshot: a COMPLETE replacement per poll (absent →
+  // null), riding the same single UPDATE as identity changes. A value-equal
+  // snapshot adds no write — the idle hot path stays read-only.
+  if (!capabilitiesEqual(capabilities, machine.capabilities)) patch.capabilities = capabilities;
 
   const identityChanged = Object.keys(patch).length > 0;
 

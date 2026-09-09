@@ -16,7 +16,7 @@
  *    run (the success report is discarded);
  *  - spawn-time revalidation failure means NO spawn and a failed run.
  */
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,15 +24,21 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { Delivery } from "@loopzhb/protocol";
 
+import { resolveClaudeProviderEnv } from "./claude-provider-env.js";
 import { createClaudeRunner, type ClaudeRunnerDeps } from "./claude-runner.js";
+import { createControlRoot, type ControlRoot } from "./control-root.js";
 import { JailError, createWorkdirJail, type ResolvedWorkdir, type WorkdirJail } from "./jail.js";
 import type { ClaudeBinaryIdentity } from "./probe-claude.js";
 import { statClaudeBinary } from "./probe-claude.js";
-import type { AgentRunner, RunnerContext, RunnerReport } from "./runner.js";
+import type { AgentRunner, RunnerReport } from "./runner.js";
 import { ProcessControlError } from "./subprocess.js";
 
 const FIXTURE = fileURLToPath(new URL("../test-fixtures/fake-claude.mjs", import.meta.url));
 const SIDECAR = ".fake-claude-session.json";
+// The canonical base the runner mints its per-Run CLAUDE_CODE_TMPDIR roots
+// under (run-temp.ts): `/private/tmp` on macOS, the realpath of the system
+// temp dir elsewhere — Linux CI has no /private/tmp.
+const RUN_TEMP_PREFIX_PATH = path.join(process.platform === "darwin" ? "/private/tmp" : realpathSync(tmpdir()), "lzc-");
 
 const ENV_SOURCE: NodeJS.ProcessEnv = {
   PATH: `${path.dirname(process.execPath)}:${process.env.PATH ?? ""}`,
@@ -46,6 +52,7 @@ let base: string;
 let root: string;
 let workdir: string;
 let jail: WorkdirJail;
+let controlRoot: ControlRoot;
 
 beforeEach(async () => {
   base = mkdtempSync(path.join(realpathSync(tmpdir()), "loopzhb-claude-test-"));
@@ -53,6 +60,7 @@ beforeEach(async () => {
   workdir = path.join(root, "work");
   mkdirSync(workdir, { recursive: true });
   jail = await createWorkdirJail({ allowedRoots: [root], scratchBase: path.join(base, "scratch") });
+  controlRoot = await createControlRoot(path.join(base, "control-base"));
 });
 
 afterEach(() => {
@@ -94,6 +102,7 @@ function makeRunner(depOverrides: Partial<ClaudeRunnerDeps> = {}): Harness {
     claudeBin: FIXTURE,
     timeoutMs: 10_000,
     envSource: ENV_SOURCE,
+    controlRoot,
     ...depOverrides,
   });
   return {
@@ -104,10 +113,11 @@ function makeRunner(depOverrides: Partial<ClaudeRunnerDeps> = {}): Harness {
   };
 }
 
-function readSidecar(): { argv: string[]; env: Record<string, string | null> } {
+function readSidecar(): { argv: string[]; env: Record<string, string | null>; prompt?: string } {
   return JSON.parse(readFileSync(path.join(workdir, SIDECAR), "utf8")) as {
     argv: string[];
     env: Record<string, string | null>;
+    prompt?: string;
   };
 }
 
@@ -153,6 +163,84 @@ describe("A1–A3: the fixed argv and the dynamic sandbox settings", () => {
     expect(events[1]).toEqual({ kind: "closed", pgid: events[0]!.pgid });
   });
 
+  it("A1c: settings sources stay DISABLED — the provider bootstrap never reopens them", async () => {
+    // The Issue #38 fix converges provider config into env vars; it must NOT
+    // relax the runtime isolation. The A1 golden pins the exact argv; this
+    // pin names the regression directly: --setting-sources is always the
+    // empty string, never user/project/local.
+    const configDir = path.join(base, "claude-config");
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(
+      path.join(configDir, "settings.json"),
+      JSON.stringify({ env: { ANTHROPIC_API_KEY: "sk-ant-a1c-settings" } }),
+    );
+    const envSource = resolveClaudeProviderEnv({ ...ENV_SOURCE, CLAUDE_CONFIG_DIR: configDir });
+    const { run } = makeRunner({ envSource });
+    const report = await run(makeDelivery());
+    expect(report.ok).toBe(true);
+
+    const argv = readSidecar().argv;
+    expect(argv[argv.indexOf("--setting-sources") + 1]).toBe("");
+    expect(argv).toContain("--safe-mode");
+    for (const forbidden of ["user", "project", "local"]) {
+      expect(argv[argv.indexOf("--setting-sources") + 1]).not.toBe(forbidden);
+    }
+    // No credential or settings JSON rides argv either (plan §2 boundary 5).
+    expect(argv.join("\n")).not.toContain("sk-ant-a1c-settings");
+  });
+
+  it("A1d: bootstrap-resolved provider env reaches the child — allowed settings fields in, refused fields out", async () => {
+    // The deterministic integration of plan §6 step 5: temp CLAUDE_CONFIG_DIR
+    // fixture → resolveClaudeProviderEnv → runner → fake-claude sidecar env.
+    const configDir = path.join(base, "claude-config");
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(
+      path.join(configDir, "settings.json"),
+      JSON.stringify({
+        env: {
+          ANTHROPIC_API_KEY: "sk-ant-a1d-settings-secret",
+          CLAUDE_CODE_OAUTH_TOKEN: "oauth-a1d-settings",
+          GITHUB_TOKEN: "ghp-a1d-settings-decoy",
+          LOOPZHB_SERVER_URL: "http://a1d-evil.example",
+        },
+      }),
+    );
+    const envSource = resolveClaudeProviderEnv({
+      PATH: ENV_SOURCE.PATH,
+      HOME: ENV_SOURCE.HOME,
+      CLAUDE_CONFIG_DIR: configDir,
+      LOOPZHB_MACHINE_CREDENTIAL: ENV_SOURCE.LOOPZHB_MACHINE_CREDENTIAL,
+    });
+    const { run } = makeRunner({ envSource });
+    const report = await run(makeDelivery());
+    expect(report.ok).toBe(true);
+
+    const sidecar = readSidecar();
+    expect(sidecar.env.ANTHROPIC_API_KEY).toBe("sk-ant-a1d-settings-secret");
+    expect(sidecar.env.CLAUDE_CODE_OAUTH_TOKEN).toBe("oauth-a1d-settings");
+    expect(sidecar.env.GITHUB_TOKEN).toBeNull();
+    expect(sidecar.env.LOOPZHB_MACHINE_CREDENTIAL).toBeNull();
+  });
+
+  it("A1e: a settings-derived secret is redacted out of report-bound child text", async () => {
+    // echo-secret embeds $ANTHROPIC_API_KEY in the terminal text: the value
+    // came from the settings fixture, NOT the launch env — proof that
+    // bootstrap-injected credentials are inside the secretValues net.
+    const settingsSecret = "sk-ant-a1e-settings-secret";
+    const configDir = path.join(base, "claude-config");
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(path.join(configDir, "settings.json"), JSON.stringify({ env: { ANTHROPIC_API_KEY: settingsSecret } }));
+    const envSource = resolveClaudeProviderEnv({
+      PATH: ENV_SOURCE.PATH,
+      HOME: ENV_SOURCE.HOME,
+      CLAUDE_CONFIG_DIR: configDir,
+    });
+    const { run } = makeRunner({ envSource });
+    const report = await run(makeDelivery({ task: "fake-claude://echo-secret" }));
+    expect(report.ok).toBe(true);
+    expect(report.finalText).not.toContain(settingsSecret);
+  });
+
   it("A2: --model and --append-system-prompt append only when configured", async () => {
     const { run } = makeRunner();
     const d = makeDelivery();
@@ -169,7 +257,13 @@ describe("A1–A3: the fixed argv and the dynamic sandbox settings", () => {
     const { run } = makeRunner();
     await run(makeDelivery());
 
-    const argv = readSidecar().argv;
+    const sidecar = readSidecar();
+    const argv = sidecar.argv;
+    // The runner-minted per-Run Claude temp root (Issue #50): exported to the
+    // child as CLAUDE_CODE_TMPDIR and granted read+write in the profile.
+    const runTemp = sidecar.env.CLAUDE_CODE_TMPDIR;
+    expect(runTemp!.startsWith(RUN_TEMP_PREFIX_PATH)).toBe(true);
+    expect(existsSync(runTemp!)).toBe(false); // released after the run
     const settings = JSON.parse(argv[argv.indexOf("--settings") + 1]!) as Record<string, unknown>;
     expect(settings).toEqual({
       sandbox: {
@@ -181,8 +275,8 @@ describe("A1–A3: the fixed argv and the dynamic sandbox settings", () => {
         filesystem: {
           disabled: false,
           denyRead: ["/"],
-          allowRead: [realpathSync(root), realpathSync(workdir)],
-          allowWrite: [realpathSync(root), realpathSync(workdir)],
+          allowRead: [realpathSync(root), realpathSync(workdir), runTemp],
+          allowWrite: [realpathSync(root), realpathSync(workdir), runTemp],
         },
         network: { strictAllowlist: true, allowedDomains: [] },
       },
@@ -213,10 +307,12 @@ describe("A1–A3: the fixed argv and the dynamic sandbox settings", () => {
     d.loop = { ...d.loop, workdir: root };
     await run(d);
 
-    const argv = JSON.parse(readFileSync(path.join(root, SIDECAR), "utf8")).argv as string[];
+    const sidecar = JSON.parse(readFileSync(path.join(root, SIDECAR), "utf8"));
+    const argv = sidecar.argv as string[];
+    const runTemp = sidecar.env.CLAUDE_CODE_TMPDIR as string;
     const settings = JSON.parse(argv[argv.indexOf("--settings") + 1]!);
-    expect(settings.sandbox.filesystem.allowRead).toEqual([realpathSync(root)]);
-    expect(settings.sandbox.filesystem.allowWrite).toEqual([realpathSync(root)]);
+    expect(settings.sandbox.filesystem.allowRead).toEqual([realpathSync(root), runTemp]);
+    expect(settings.sandbox.filesystem.allowWrite).toEqual([realpathSync(root), runTemp]);
   });
 });
 
@@ -458,6 +554,8 @@ describe("A13–A14: timeout and abort", () => {
     const report = await pending;
     expect(report.ok).toBe(false);
     expect(report.error).toContain("aborted");
+    // The per-Run temp root is released on the abort path too (Issue #50).
+    expect(existsSync(readSidecar().env.CLAUDE_CODE_TMPDIR!)).toBe(false);
   });
 });
 
@@ -486,14 +584,110 @@ describe("A15–A16: the scratch lifecycle", () => {
   });
 });
 
+describe("A23–A26: the per-Run Claude temp root (Issue #50)", () => {
+  it("A23: runner-minted per Run, granted in the profile, released after success — a user-supplied value can neither override nor widen", async () => {
+    const envSource = { ...ENV_SOURCE, CLAUDE_CODE_TMPDIR: "/tmp/loopzhb-user-supplied-evil" };
+    const { run } = makeRunner({ envSource });
+
+    await run(makeDelivery());
+    const first = readSidecar();
+    const firstTmp = first.env.CLAUDE_CODE_TMPDIR!;
+    expect(firstTmp.startsWith(RUN_TEMP_PREFIX_PATH)).toBe(true);
+    const firstSettings = JSON.parse(first.argv[first.argv.indexOf("--settings") + 1]!);
+    expect(firstSettings.sandbox.filesystem.allowRead).toContain(firstTmp);
+    expect(firstSettings.sandbox.filesystem.allowWrite).toContain(firstTmp);
+    expect(JSON.stringify(firstSettings)).not.toContain("loopzhb-user-supplied-evil");
+    expect(existsSync(firstTmp)).toBe(false); // released
+
+    rmSync(path.join(workdir, SIDECAR));
+    await run(makeDelivery({ runId: "run-2" }));
+    const secondTmp = readSidecar().env.CLAUDE_CODE_TMPDIR!;
+    expect(secondTmp.startsWith(RUN_TEMP_PREFIX_PATH)).toBe(true);
+    expect(secondTmp).not.toBe(firstTmp); // fresh per Run
+    expect(existsSync(secondTmp)).toBe(false);
+  });
+
+  it("A24: released after a FAILED run (non-zero exit)", async () => {
+    const { run } = makeRunner();
+    const report = await run(makeDelivery({ task: "fake-claude://exit3" }));
+    expect(report.ok).toBe(false);
+    expect(existsSync(readSidecar().env.CLAUDE_CODE_TMPDIR!)).toBe(false);
+  });
+
+  it("A25: released after a timeout kill", async () => {
+    const { run } = makeRunner({ timeoutMs: 300 });
+    const report = await run(makeDelivery({ task: "fake-claude://hang" }));
+    expect(report.error).toContain("timed out");
+    expect(existsSync(readSidecar().env.CLAUDE_CODE_TMPDIR!)).toBe(false);
+  });
+
+  it("A26: a failed run-temp release FAILS the run — the success report is discarded", async () => {
+    const { run } = makeRunner();
+    await expect(run(makeDelivery({ task: "fake-claude://self-swap-runtemp" }))).rejects.toThrow(
+      /replaced before release/,
+    );
+  });
+
+  it("A27: a spawn error still releases the per-Run temp root", async () => {
+    // The spawnImpl seam captures the runner-minted temp root from the child
+    // env at spawn-attempt time, then lets the REAL spawn fail (ENOENT).
+    let mintedTmp: string | null = null;
+    const { spawnWithTimeout } = await import("./subprocess.js");
+    const { run } = makeRunner({
+      claudeBin: path.join(base, "no-such-claude"),
+      spawnImpl: (options) => {
+        mintedTmp = options.env.CLAUDE_CODE_TMPDIR ?? null;
+        return spawnWithTimeout(options);
+      },
+    });
+    const report = await run(makeDelivery());
+    expect(report.ok).toBe(false);
+    expect(report.error).toContain("failed to spawn claude");
+    expect(mintedTmp!.startsWith(RUN_TEMP_PREFIX_PATH)).toBe(true);
+    expect(existsSync(mintedTmp!)).toBe(false); // released despite the spawn error
+  });
+
+  it("A28: a run-temp-release failure never masks a ProcessControlError in flight", async () => {
+    // Swap the minted temp root for a symlink (release must refuse), THEN
+    // fail process control: the fatal signal must survive, with the release
+    // failure riding in the message (review round-2 P1 extended to the new
+    // resource, spec §4.6 error-priority matrix).
+    const runner = createClaudeRunner({
+      jail,
+      claudeBin: FIXTURE,
+      timeoutMs: 10_000,
+      envSource: ENV_SOURCE,
+      controlRoot,
+      spawnImpl: (options) => {
+        const tmp = options.env.CLAUDE_CODE_TMPDIR!;
+        rmSync(tmp, { recursive: true, force: true });
+        symlinkSync("/", tmp, "dir");
+        return Promise.reject(new ProcessControlError("process control failed: kill EPERM"));
+      },
+    });
+    const err = await runner
+      .run(makeDelivery(), { signal: new AbortController().signal, onProgress: () => {} })
+      .then(
+        () => null,
+        (e: unknown) => e,
+      );
+    expect(err).toBeInstanceOf(ProcessControlError);
+    expect((err as Error).message).toContain("EPERM");
+    expect((err as Error).message).toContain("release also failed");
+    expect((err as Error).message).toContain("replaced before release");
+  });
+});
+
 describe("A22: a scratch-release failure never masks a process-control failure (review round-2 P1)", () => {
   it("the ProcessControlError survives a throwing release — the fatal signal reaches the runtime", async () => {
     const resolution: ResolvedWorkdir = { cwd: workdir, effectiveRoots: [realpathSync(root)], scratchDir: null };
     const stub: WorkdirJail = {
       daemonRoots: [realpathSync(root)],
+      scratchRoot: path.join(base, "unused-test-scratch"),
       resolve: () => Promise.resolve(resolution),
       revalidate: () => Promise.resolve(),
       release: () => Promise.reject(new JailError("scratch identity broken")),
+      dispose: () => Promise.resolve(),
     };
     const runner = createClaudeRunner({
       jail: stub,
@@ -523,6 +717,7 @@ describe("A17–A19: jail wiring", () => {
     const resolution: ResolvedWorkdir = { cwd: workdir, effectiveRoots: [realpathSync(root)], scratchDir: null };
     const stub: WorkdirJail = {
       daemonRoots: [realpathSync(root)],
+      scratchRoot: path.join(base, "unused-test-scratch"),
       resolve: (input) => {
         calls.resolve = input;
         return Promise.resolve(resolution);
@@ -532,6 +727,7 @@ describe("A17–A19: jail wiring", () => {
         return Promise.resolve();
       },
       release: () => Promise.resolve(),
+      dispose: () => Promise.resolve(),
       ...overrides,
     };
     return { stub, calls };
@@ -568,5 +764,262 @@ describe("A17–A19: jail wiring", () => {
     expect(env.LOOPZHB_MACHINE_CREDENTIAL).toBeNull();
     expect(env.GITHUB_TOKEN).toBeNull();
     expect(env.PATH).toContain(path.dirname(process.execPath));
+  });
+});
+
+/**
+ * V-group (Phase 4 Batch 2, plan §2.1/§2.2): the terminal-protocol v1
+ * execution path — control directory, journal env injection, task-file
+ * preflight, daemon-built prompt, journal collection and task-file sync.
+ * The fixture's v1 scenarios are selected via <cwd>/.fake-claude-v1-scenario
+ * (the -p value is the built prompt now, not the scenario selector).
+ */
+const V1_SCENARIO = ".fake-claude-v1-scenario";
+const V1_TASK_CONTENT = "# Task\n\n## Spec\n\ndo the thing\n";
+
+function makeV1Delivery(overrides: Partial<Delivery> = {}): Delivery {
+  const taskFile = path.join(workdir, "TASK.md");
+  writeFileSync(taskFile, V1_TASK_CONTENT);
+  return makeDelivery({
+    terminalProtocol: 1,
+    task: "[loop run]\nwire task text the v1 daemon must ignore",
+    loop: {
+      id: "loop-1",
+      name: "Loop",
+      workdir,
+      taskFile,
+      workflow: null,
+      model: null,
+      allowControl: false,
+      goal: "close the gap",
+    },
+    ...overrides,
+  });
+}
+
+function writeScenario(name: string): void {
+  writeFileSync(path.join(workdir, V1_SCENARIO), name);
+}
+
+function sidecarSettings(): { filesystem: { allowRead: string[]; allowWrite: string[] } } {
+  const argv = readSidecar().argv;
+  const raw = argv[argv.indexOf("--settings") + 1]!;
+  return (JSON.parse(raw) as { sandbox: { filesystem: { allowRead: string[]; allowWrite: string[] } } }).sandbox;
+}
+
+describe("V1–V4: v1 spawn shape — prompt, sandbox, journal env", () => {
+  it("V1: -p is the daemon-built prompt, the sandbox opens wrapper/context read-only + outbox writable", async () => {
+    const { run } = makeRunner();
+    writeScenario("journal-none"); // success exit, no record → journal_missing
+    const delivery = makeV1Delivery();
+    const report = await run(delivery);
+    expect(report).toEqual({ ok: false, error: "journal_missing" });
+
+    const sidecar = readSidecar();
+    // The prompt is built locally — the wire task text never reaches the CLI.
+    expect(sidecar.prompt).not.toContain("wire task text");
+    expect(sidecar.prompt).toContain('Goal: "close the gap"');
+    expect(sidecar.prompt).toContain(JSON.stringify(realpathSync(delivery.loop.taskFile!)));
+    expect(sidecar.prompt).toContain("prev-state.json");
+    expect(sidecar.prompt).toContain("loopzhb finish --reason"); // Closed Loop
+    expect(sidecar.argv[1]).toBe(sidecar.prompt);
+
+    // The sandbox profile: control root (wrapper), context and the daemon's
+    // exact Node executable read-only; outbox is the ONLY extra writable dir.
+    const outbox = sidecar.env.LOOPZHB_JOURNAL_OUTBOX!;
+    const settings = sidecarSettings();
+    expect(settings.filesystem.allowRead).toContain(controlRoot.rootDir);
+    expect(settings.filesystem.allowRead).toContain(path.join(path.dirname(outbox), "context"));
+    expect(settings.filesystem.allowRead).toContain(controlRoot.nodePath);
+    expect(settings.filesystem.allowWrite).toContain(outbox);
+    expect(settings.filesystem.allowWrite).not.toContain(controlRoot.rootDir);
+    expect(settings.filesystem.allowWrite).not.toContain(controlRoot.nodePath);
+    // The per-Run Claude temp root joins BOTH lists (Issue #50).
+    expect(settings.filesystem.allowRead).toContain(sidecar.env.CLAUDE_CODE_TMPDIR);
+    expect(settings.filesystem.allowWrite).toContain(sidecar.env.CLAUDE_CODE_TMPDIR);
+
+    // PATH binds env(1)'s node lookup to the runtime that started the daemon.
+    expect(sidecar.env.PATH!.split(path.delimiter).slice(0, 2)).toEqual([
+      controlRoot.wrapperDir,
+      controlRoot.nodeDir,
+    ]);
+    expect(outbox.startsWith(`${controlRoot.rootDir}/`)).toBe(true);
+    expect(sidecar.env.LOOPZHB_MACHINE_CREDENTIAL).toBeNull();
+    expect(sidecar.env.GITHUB_TOKEN).toBeNull();
+  });
+
+  it("V2: an Open Loop's prompt NEVER shows the finish example", async () => {
+    const { run } = makeRunner();
+    writeScenario("journal-none");
+    const delivery = makeV1Delivery();
+    await run({ ...delivery, loop: { ...delivery.loop, goal: null } });
+    expect(readSidecar().prompt).not.toContain("loopzhb finish");
+  });
+
+  it("V3: the prompt points at the run's OWN context/prev-state.json inside the control root", async () => {
+    const { run } = makeRunner();
+    writeScenario("journal-none");
+    await run(makeV1Delivery({ prevState: { cursor: 7 } }));
+    const outbox = readSidecar().env.LOOPZHB_JOURNAL_OUTBOX!;
+    const prevStatePath = path.join(path.dirname(outbox), "context", "prev-state.json");
+    expect(readSidecar().prompt).toContain(JSON.stringify(prevStatePath));
+    expect(prevStatePath.startsWith(controlRoot.rootDir)).toBe(true);
+  });
+
+  it("V4: a v0 delivery gets NO journal surface even with a control root present", async () => {
+    const { run } = makeRunner();
+    const report = await run(makeDelivery()); // v0: fake-claude://ok
+    expect(report.ok).toBe(true);
+    const sidecar = readSidecar();
+    expect(sidecar.env.LOOPZHB_JOURNAL_OUTBOX).toBeNull();
+    expect(sidecar.env.PATH!.startsWith(`${controlRoot.wrapperDir}:`)).toBe(false);
+    expect(sidecar.prompt).toBe("fake-claude://ok");
+    expect(sidecarSettings().filesystem.allowRead).not.toContain(controlRoot.rootDir);
+    expect(sidecarSettings().filesystem.allowRead).not.toContain(controlRoot.nodePath);
+  });
+});
+
+describe("V5–V8: task-file preflight refuses WITHOUT spawning", () => {
+  it("V5: no taskFile configured → stable refusal, no spawn", async () => {
+    const { run } = makeRunner();
+    const delivery = makeV1Delivery();
+    const report = await run({ ...delivery, loop: { ...delivery.loop, taskFile: null } });
+    expect(report).toEqual({ ok: false, error: "task file not configured (terminal-protocol v1 requires one)" });
+    expect(existsSync(path.join(workdir, SIDECAR))).toBe(false);
+  });
+
+  it("V6: a missing task file → preflight missing, no spawn", async () => {
+    const { run } = makeRunner();
+    const delivery = makeV1Delivery();
+    rmSync(delivery.loop.taskFile!);
+    const report = await run(delivery);
+    expect(report).toEqual({ ok: false, error: "task file preflight: missing" });
+    expect(existsSync(path.join(workdir, SIDECAR))).toBe(false);
+  });
+
+  it("V7: a task file outside the roots → preflight outside_jail, no spawn", async () => {
+    const { run } = makeRunner();
+    const outside = path.join(base, "TASK.md");
+    writeFileSync(outside, V1_TASK_CONTENT);
+    const delivery = makeV1Delivery();
+    const report = await run({ ...delivery, loop: { ...delivery.loop, taskFile: outside } });
+    expect(report).toEqual({ ok: false, error: "task file preflight: outside_jail" });
+    expect(existsSync(path.join(workdir, SIDECAR))).toBe(false);
+  });
+
+  it("V8: a v1 delivery without a control-root dep fails closed, no spawn", async () => {
+    const progress: string[] = [];
+    const runner = createClaudeRunner({ jail, claudeBin: FIXTURE, timeoutMs: 10_000, envSource: ENV_SOURCE });
+    const report = await runner.run(makeV1Delivery(), {
+      signal: new AbortController().signal,
+      onProgress: (label) => progress.push(label),
+    });
+    expect(report).toEqual({ ok: false, error: "terminal-protocol v1 run refused: this daemon has no control root" });
+    expect(existsSync(path.join(workdir, SIDECAR))).toBe(false);
+  });
+});
+
+describe("V9–V14: the journal drives the terminal command", () => {
+  it("V9: a legal report record → ok with the terminal command + the synced task-file content", async () => {
+    const { run } = makeRunner();
+    writeScenario("report-resolved");
+    const report = await run(makeV1Delivery());
+    expect(report.ok).toBe(true);
+    expect(report.terminal).toEqual({ kind: "report", status: "resolved", message: "done" });
+    expect(report.taskFileContent).toBe(V1_TASK_CONTENT);
+    expect(report.taskFileSyncError).toBeUndefined();
+  });
+
+  it("V10: the record's state rides the terminal command", async () => {
+    const { run } = makeRunner();
+    writeScenario("report-with-state");
+    const report = await run(makeV1Delivery());
+    expect(report.ok).toBe(true);
+    expect(report.terminal).toEqual({ kind: "report", status: "resolved", message: "done", state: { cursor: 2 } });
+  });
+
+  it("V11: a finish record → terminal finish", async () => {
+    const { run } = makeRunner();
+    writeScenario("finish");
+    const report = await run(makeV1Delivery());
+    expect(report.ok).toBe(true);
+    expect(report.terminal).toEqual({ kind: "finish", reason: "goal met" });
+  });
+
+  it("V12: two records → journal_multiple; a symlink entry → journal_multiple", async () => {
+    const two = makeRunner();
+    writeScenario("journal-two");
+    expect(await two.run(makeV1Delivery())).toEqual({ ok: false, error: "journal_multiple" });
+
+    const link = makeRunner();
+    writeScenario("journal-symlink");
+    expect((await link.run(makeV1Delivery())).error).toBe("journal_multiple: outbox holds a non-record entry");
+  });
+
+  it("V13: corrupt / marker / policy-violating records → journal_corrupt / journal_invalid", async () => {
+    const corrupt = makeRunner();
+    writeScenario("journal-corrupt");
+    expect(await corrupt.run(makeV1Delivery())).toEqual({ ok: false, error: "journal_corrupt" });
+
+    const marker = makeRunner();
+    writeScenario("journal-invalid");
+    expect((await marker.run(makeV1Delivery())).error).toBe("journal_invalid: the wrapper rejected the terminal invocation");
+
+    const policy = makeRunner();
+    writeScenario("journal-policy");
+    expect((await policy.run(makeV1Delivery())).error).toBe("journal_invalid: malformed terminal command");
+  });
+
+  it("V14: a Claude failure always wins — the journal content is ignored", async () => {
+    const { run } = makeRunner();
+    writeScenario("journal-then-exit1");
+    const report = await run(makeV1Delivery());
+    expect(report.ok).toBe(false);
+    expect(report.error).toContain("blew up");
+    expect(report.error).not.toContain("journal");
+    expect(report.terminal).toBeUndefined();
+  });
+});
+
+describe("V15–V18: sync, redaction and cleanup", () => {
+  it("V15: a post-run task-file failure downgrades to the sync error — the run stays ok", async () => {
+    const { run } = makeRunner();
+    writeScenario("report-delete-task"); // deletes <cwd>/TASK.md mid-run
+    const report = await run(makeV1Delivery());
+    expect(report.ok).toBe(true);
+    expect(report.terminal).toEqual({ kind: "report", status: "resolved", message: "done" });
+    expect(report.taskFileContent).toBeUndefined();
+    expect(report.taskFileSyncError).toBe("missing");
+  });
+
+  it("V16: the daemon's second redaction layer scrubs journal text", async () => {
+    const { run } = makeRunner();
+    writeScenario("report-secret-text");
+    const report = await run(makeV1Delivery());
+    expect(report.ok).toBe(true);
+    expect(JSON.stringify(report)).not.toContain("sk-ant-fixture-secret");
+    expect(report.terminal).toMatchObject({ kind: "report", status: "resolved" });
+  });
+
+  it("V17: the run's control directory is released after the run", async () => {
+    const { run } = makeRunner();
+    writeScenario("report-resolved");
+    await run(makeV1Delivery());
+    expect(readdirSync(controlRoot.rootDir)).toEqual(["bin"]);
+  });
+
+  it("V18: the journal outbox env points inside the run's OWN control dir (per-run isolation)", async () => {
+    const { run } = makeRunner();
+    writeScenario("journal-none");
+    await run(makeV1Delivery({ runId: "run-A" }));
+    const firstOutbox = readSidecar().env.LOOPZHB_JOURNAL_OUTBOX!;
+    rmSync(path.join(workdir, SIDECAR));
+    await run(makeV1Delivery({ runId: "run-B" }));
+    const secondOutbox = readSidecar().env.LOOPZHB_JOURNAL_OUTBOX!;
+    expect(firstOutbox).not.toBe(secondOutbox);
+    for (const outbox of [firstOutbox, secondOutbox]) {
+      expect(outbox.startsWith(controlRoot.rootDir)).toBe(true);
+      expect(outbox.endsWith("/outbox")).toBe(true);
+    }
   });
 });

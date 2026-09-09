@@ -14,3 +14,7 @@ dist/
 # phase close (see AGENTS.md). Already-tracked Phase 1 files remain as legacy;
 # new handoff files must not be committed.
 docs/handoff/
+
+# Build-generated wrapper integrity manifest. The source graph is bundled
+# before daemon typecheck/build/test and the compiled manifest ships in dist.
+packages/daemon/src/wrapper-artifact.generated.ts

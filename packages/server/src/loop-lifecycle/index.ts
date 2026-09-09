@@ -345,6 +345,17 @@ export type ReportWritePlan =
       deleteLease: true;
     }
   | {
+      /** A PLAIN v1 success report that lands after the loop legally
+       *  Completed (another run's finish won the race): the RUN still
+       *  finalizes done/exec and saves status/message/state, but every Loop
+       *  field is frozen — no state promotion, no task-file sync, no
+       *  updatedAt (ADR-009 修订 2026-09-01 决策 2). */
+      kind: "v1_late_success";
+      runWrites: Partial<Omit<NewRun, "state">> & RunTerminalWrites;
+      loopWrites: null;
+      deleteLease: true;
+    }
+  | {
       /** Structurally legal but policy-invalid v1 success → stable run failure,
        *  zero Loop writes, lease consumed. */
       kind: "terminal_protocol_invalid";
@@ -509,6 +520,12 @@ export function planReportWrites(input: ReportPlanInput): ReportWritePlan {
     error: null,
     state: stateCheck === undefined ? null : stateCheck.state,
   };
+
+  // Late plain report against a legally Completed loop (ADR-009 修订
+  // 2026-09-01 决策 2): the run finalizes normally, but the loop is frozen.
+  if (finishReason === null && loop.completedAt !== null) {
+    return { kind: "v1_late_success", runWrites, loopWrites: null, deleteLease: true };
+  }
 
   const loopWrites: LoopV1Writes = {
     ...(stateCheck !== undefined ? { state: stateCheck.state } : {}),

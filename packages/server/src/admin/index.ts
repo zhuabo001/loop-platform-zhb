@@ -19,6 +19,7 @@ import { randomUUID } from "node:crypto";
 import { and, asc, desc, eq, inArray } from "drizzle-orm";
 
 import type { CreateLoopRequest, LoopSummary, MachineSummary, RunSummary } from "@loopzhb/protocol";
+import { normalizeGoal } from "@loopzhb/protocol";
 
 import type { Db } from "../db/index.js";
 import { loops, machines, runs, type Loop } from "../db/schema.js";
@@ -77,11 +78,15 @@ export const loopSummaryColumns = {
   updatedAt: loops.updatedAt,
   cron: loops.cron,
   timezone: loops.timezone,
-  // Phase 4 observation fields (goal/completion/task-file sync) are DECLARED
-  // in the wire DTO but deliberately NOT projected here while Batch 1 keeps
-  // them dormant (ADR-009 决策 11): the production observation
-  // surface stays byte-identical to Phase 3. Batch 2 opts them back in — the
-  // lockstep test in list.test.ts names the exact deferred key set.
+  // Phase 4 observation fields (goal/completion/task-file sync) — opened by
+  // Batch 2 (ADR-009 决策 11's dormancy ends here; the wire DTOs always
+  // declared them as additive optional).
+  goal: loops.goal,
+  completedAt: loops.completedAt,
+  completionReason: loops.completionReason,
+  taskFileSyncedAt: loops.taskFileSyncedAt,
+  taskFileSyncAttemptedAt: loops.taskFileSyncAttemptedAt,
+  taskFileSyncError: loops.taskFileSyncError,
 } as const;
 
 export const runSummaryColumns = {
@@ -145,7 +150,15 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
       if (input.workdir !== undefined && input.workdir.length > LOOP_PATH_CAP) {
         throw new LoopValidationError("workdir");
       }
-      if (input.taskFile !== undefined && input.taskFile.length > LOOP_PATH_CAP) {
+      // Phase 4 Batch 2 (plan §2.2): the task file is REQUIRED at the
+      // application layer — the wire field stays optional so old clients keep
+      // parsing, but a new Loop without one is a 400. Legacy loops created
+      // before this rule stay queryable and can be backfilled via
+      // PATCH /task-file.
+      if (input.taskFile === undefined) {
+        throw new LoopValidationError("taskFile");
+      }
+      if (input.taskFile.length > LOOP_PATH_CAP) {
         throw new LoopValidationError("taskFile");
       }
       if (input.cron !== undefined && input.cron.length > SCHEDULE_FIELD_CAP) {
@@ -153,6 +166,16 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
       }
       if (input.timezone !== undefined && input.timezone.length > SCHEDULE_FIELD_CAP) {
         throw new LoopValidationError("timezone");
+      }
+
+      // Phase 4 goal: normalized through the terminal-policy rule (trim,
+      // non-empty, single line, ≤2000 UTF-8 bytes); the NORMALIZED value is
+      // persisted. goalRevision starts at 0 (ADR-009 决策 2).
+      let goal: string | null = null;
+      if (input.goal !== undefined && input.goal !== null) {
+        const normalized = normalizeGoal(input.goal);
+        if (!normalized.ok) throw new LoopValidationError("goal");
+        goal = normalized.goal;
       }
 
       const machine = await getMachine(deps.db, input.machineId);
@@ -196,6 +219,8 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
           scheduleRevision: 0,
           scheduleActivatedAt: isActive ? nowIso : null,
           lastScheduledAt: null,
+          goal,
+          goalRevision: 0,
           createdAt: nowIso,
           updatedAt: nowIso,
         })

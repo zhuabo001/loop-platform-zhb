@@ -44,7 +44,20 @@ export const FAKE_RUNNER_MESSAGE = "fake runner completed";
 
 export function createFakeRunner(): AgentRunner {
   return {
-    run(_delivery: Delivery, _context: RunnerContext): Promise<RunnerReport> {
+    run(delivery: Delivery, _context: RunnerContext): Promise<RunnerReport> {
+      // Phase 4 Batch 2: a v1 delivery's success report must carry a terminal
+      // command and exactly one task-file sync result (the fake reads no files
+      // and honestly reports the sync as missing). v0 deliveries keep the
+      // byte-identical Phase 3 report.
+      if (delivery.terminalProtocol === 1) {
+        return Promise.resolve({
+          ok: true,
+          outcome: "exec",
+          durationMs: 0,
+          terminal: { kind: "report", status: "resolved", message: FAKE_RUNNER_MESSAGE },
+          taskFileSyncError: "missing",
+        });
+      }
       return Promise.resolve({
         ok: true,
         outcome: "exec",

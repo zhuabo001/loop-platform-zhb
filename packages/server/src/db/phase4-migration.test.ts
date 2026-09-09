@@ -347,11 +347,13 @@ describe("M: Phase 4 migration and schema", () => {
     const [after] = await handle.db.select().from(loops);
     expect(after).toEqual(before);
 
-    // Migration journal has exactly four entries (0000–0003), applied once each.
+    // Migration journal has exactly five entries (0000–0004), applied once
+    // each — 0004 is the additive loops.revision OCC column (review
+    // SPEC-1/SPEC-3 fix; ADR-003 additive-column discipline).
     const journal = await handle.client.query<{ count: string }>(
       'SELECT COUNT(*) AS count FROM "drizzle"."__drizzle_migrations"',
     );
-    expect(Number(journal.rows[0]!.count)).toBe(4);
+    expect(Number(journal.rows[0]!.count)).toBe(5);
 
     // Exactly one completion CHECK exists.
     const checks = await handle.client.query<{ count: string }>(

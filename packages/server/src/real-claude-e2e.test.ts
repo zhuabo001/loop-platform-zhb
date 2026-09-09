@@ -34,6 +34,7 @@ import path from "node:path";
 import { serve, type ServerType } from "@hono/node-server";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { collectSecretValues, resolveClaudeProviderEnv } from "@loopzhb/daemon";
 import { createLoopResponseSchema, runListResponseSchema, triggerRunResponseSchema } from "@loopzhb/protocol";
 import { machineIdFromToken } from "@loopzhb/protocol/node";
 
@@ -146,7 +147,15 @@ describe.skipIf(!ENABLED)("real Claude E2E (opt-in)", () => {
         stdio: ["ignore", "pipe", "pipe"],
       });
       const supervisor = new DetachedProcessSupervisor(daemon);
-      const logs = new DaemonLogObserver([TOKEN], MAX_LOG_BYTES);
+      // Scan for every credential the daemon could hold: the machine
+      // credential plus the COMPLETE provider secret set its own startup
+      // bootstrap converges (explicit env + the user-level Claude settings).
+      // The values are never logged here — the observer only reports whether
+      // any needle was seen.
+      const logs = new DaemonLogObserver(
+        [TOKEN, ...collectSecretValues(resolveClaudeProviderEnv(process.env))],
+        MAX_LOG_BYTES,
+      );
       const control = new DaemonControlObserver((event) => {
         if (event.kind === "started") supervisor.trackProcessGroup(event.pgid);
         else supervisor.releaseProcessGroup(event.pgid);
