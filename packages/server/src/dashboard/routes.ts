@@ -123,9 +123,11 @@ export function normalizeHost(authority: string): string | null {
 export interface DashboardRouteDeps {
   /** The read seam — narrow on purpose (see dashboard/index.ts). */
   read: DashboardRead;
-  /** The manual trigger, narrowed to its call shape. Slice 3 swaps the body
-   *  for `enqueueExecRun(loopId, { kind: "manual", pendingPolicy: "skip" })`
-   *  and nothing else in this module changes. */
+  /** The manual trigger, narrowed to its call shape. The no-supersede policy
+   *  (`{ kind: "manual", pendingPolicy: "skip" }`) is wired in `start.ts`, not
+   *  here: this module holds no trigger semantics, so the seam stays one
+   *  argument. That also means a dropped policy is invisible to the type
+   *  checker — `mount.test.ts` pins the assembled behaviour instead. */
   enqueue: (loopId: string) => Promise<EnqueueExecRunResult>;
   /** Minted once per bootstrap; test-only injectable (see start.ts). */
   csrfToken: string;
@@ -202,10 +204,11 @@ export function createDashboardRoutes(deps: DashboardRouteDeps): DashboardRoutes
       // Always present for this route pattern; the fallback folds the
       // impossible case into the ordinary "unknown loop" outcome.
       const loopId = c.req.param("id") ?? "";
-      // T7 lives in the coordinator; every business outcome — created, loop
-      // gone, completed, already active — is the same redirect, so the page
-      // never reports a result it cannot verify. A throw is NOT swallowed into
-      // a redirect: 500 must not be disguised as success.
+      // The decision lives in the coordinator; every business outcome —
+      // created, loop gone, completed, already running, already pending (the
+      // skip policy this route is wired to) — is the same redirect, so the
+      // page never reports a result it cannot verify. A throw is NOT swallowed
+      // into a redirect: 500 must not be disguised as success.
       await deps.enqueue(loopId);
       return new Response(null, {
         status: 303,

@@ -97,6 +97,45 @@ export function formatUtc(iso: string | null | undefined): string {
   return `${new Date(ms).toISOString().slice(0, 19).replace("T", " ")} UTC`;
 }
 
+const RUN_DISABLED_COMPLETED = "Loop 已完成（Completed），Run Now 会被拒绝。";
+const RUN_DISABLED_RUNNING = "已有 Running Run，避免重复触发。";
+const RUN_DISABLED_PENDING = "已有 Pending Run，等待执行。";
+
+/**
+ * Why the Run Now button is disabled, or `null` when it is available. The rule
+ * lives HERE, once, as data a test can assert on.
+ *
+ * It is the same rule as the backend's manual branch (`store/runs.ts`, Batch 3
+ * plan §3 「按钮规则与后端规则一致」), in the same order:
+ *   completed → the pre-transaction refusal (`loop_completed`, HTTP 409)
+ *   running   → `running_exists`
+ *   pending   → `pending_exists` (the Dashboard's `pendingPolicy: "skip"`)
+ *
+ * `lifecycle === "completed"` is equivalent to the backend's
+ * `completedAt !== null` for every row the database can hold: the
+ * `loops_completion_ck` CHECK keeps the completion triple atomic (see
+ * `classifyDisplayLifecycle`).
+ *
+ * Paused-but-not-completed with no active run stays ENABLED: a manual trigger
+ * deliberately bypasses the enablement check (ADR-008), and a missing
+ * `terminal-journal-v1` capability only shows the upgrade hint — it never
+ * changes the trigger rule.
+ *
+ * The page can be up to one meta-refresh (3s) stale, so this is advisory: the
+ * backend's skip is the authority, and a click on a stale-looking button still
+ * cannot replace a pending run.
+ */
+export function runNowDisabledReason(input: {
+  lifecycle: LoopLifecycle;
+  pendingCount: number;
+  runningCount: number;
+}): string | null {
+  if (input.lifecycle === "completed") return RUN_DISABLED_COMPLETED;
+  if (input.runningCount > 0) return RUN_DISABLED_RUNNING;
+  if (input.pendingCount > 0) return RUN_DISABLED_PENDING;
+  return null;
+}
+
 /** One in-flight Run line. `phaseLabel` is rendered so the pending/running
  *  distinction never rests on styling alone. */
 export interface LoopActivityLine {
@@ -123,10 +162,13 @@ export interface LoopLastRunView {
 export interface LoopCard {
   id: string;
   machineId: string;
-  /** The Run Now form action. Slice 2 renders the button ALWAYS ENABLED: the
-   *  disabled rules and the atomic no-supersede policy land in slice 3, so the
-   *  backend rule and the button rule ship together (batch plan §3). */
+  /** The Run Now form action. */
   runAction: string;
+  /** Whether that form's button is disabled, and why — the two travel together
+   *  so the page can never render a disabled button without a stated reason
+   *  (colour alone is not a signal). `runDisabledReason === null` ⟺ enabled. */
+  runDisabled: boolean;
+  runDisabledReason: string | null;
   nameLabel: string;
   lifecycle: LoopLifecycle;
   lifecycleLabel: string;
@@ -192,11 +234,18 @@ function toLoopCard(entry: DashboardLoop): LoopCard {
   const syncedAt = loop.taskFileSyncedAt ?? null;
   const attemptedAt = loop.taskFileSyncAttemptedAt ?? null;
   const syncError = loop.taskFileSyncError ?? null;
+  const runDisabledReason = runNowDisabledReason({
+    lifecycle: entry.lifecycle,
+    pendingCount: entry.pending.length,
+    runningCount: entry.running.length,
+  });
 
   return {
     id: loop.id,
     machineId: loop.machineId,
     runAction: dashboardRunAction(loop.id),
+    runDisabled: runDisabledReason !== null,
+    runDisabledReason,
     nameLabel: loop.name ?? NONE_TEXT,
     lifecycle: entry.lifecycle,
     lifecycleLabel: LIFECYCLE_LABELS[entry.lifecycle],

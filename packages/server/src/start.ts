@@ -119,8 +119,13 @@ export async function bootstrapServer(
     const dashboard = isLoopbackHost(config.host)
       ? createDashboardRoutes({
           read: createDashboardRead({ admin, db: handle.db, clock }),
-          // Slice 3 adds `{ kind: "manual", pendingPolicy: "skip" }` here.
-          enqueue: (loopId) => coordinator.enqueueExecRun(loopId),
+          // The Dashboard is the ONE caller that must not supersede: a button
+          // click can never replace a run the operator already queued. The
+          // policy rides this closure, so `dashboard/routes.ts` stays a plain
+          // one-argument seam — and `mount.test.ts` pins this line's effect
+          // end-to-end, because forgetting it would fail no typecheck.
+          enqueue: (loopId) =>
+            coordinator.enqueueExecRun(loopId, { kind: "manual", pendingPolicy: "skip" }),
           csrfToken: overrides.csrfToken?.trim() ? overrides.csrfToken : mintCsrfToken(),
         })
       : undefined;

@@ -85,6 +85,8 @@ h2 { font-size: 16px; margin: 0; }
 .run-head { display: flex; flex-wrap: wrap; gap: 0 8px; }
 .run-form { margin: 12px 0 0; }
 .run-form button { font: inherit; padding: 4px 14px; cursor: pointer; }
+.run-form button:disabled { cursor: not-allowed; opacity: 0.6; }
+.run-note { margin: 6px 0 0; color: var(--muted); }
 @media (max-width: 640px) {
   .fields dt { min-width: 0; }
 }
@@ -120,12 +122,20 @@ function lastRunBlock(lastRun: LoopLastRunView | null) {
 /** The ONLY interactive control on the page (roadmap: one button). The form
  *  carries exactly ONE named control — the hidden token — because the server
  *  rejects any submission with a field other than `csrf` (400). A named submit
- *  button would therefore break every real click; page.test.ts pins that. */
+ *  button would therefore break every real click; page.test.ts pins that.
+ *
+ *  The disabled state (Batch 3 切片三) rides the button ATTRIBUTE, not a hidden
+ *  field: the rule is advisory, the backend's `pendingPolicy: "skip"` is the
+ *  authority. The reason is rendered as text so a disabled control is never
+ *  signalled by colour alone — and `lifecycle`/`pending`/`running` are all the
+ *  view model needs, so the template stays dumb. An enabled card's bytes are
+ *  unchanged from before this existed. */
 function runForm(item: LoopCard, csrfToken: string) {
   return html`<form class="run-form" method="post" action="${item.runAction}">
 <input type="hidden" name="${CSRF_FIELD}" value="${csrfToken}">
-<button type="submit">Run Now</button>
-</form>`;
+<button type="submit"${item.runDisabled ? html` disabled` : ""}>Run Now</button>
+</form>
+${item.runDisabledReason === null ? "" : html`<p class="run-note">${item.runDisabledReason}</p>`}`;
 }
 
 function card(item: LoopCard, csrfToken: string) {

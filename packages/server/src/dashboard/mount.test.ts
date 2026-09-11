@@ -20,7 +20,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { closeDb, type DbHandle } from "../db/index.js";
 import { bootstrapServer, type BootedServer } from "../start.js";
-import { seedLoop } from "../testkit/index.js";
+import { seedLoop, snapshotRuns } from "../testkit/index.js";
 
 const handles: DbHandle[] = [];
 const dirs: string[] = [];
@@ -49,6 +49,12 @@ function csrfFrom(html: string): string {
   const match = html.match(/name="csrf" value="([^"]+)"/);
   if (match === null) throw new Error("no csrf field in the rendered page");
   return match[1]!;
+}
+
+/** The two facts every run assertion here needs, ordered by id (testkit's
+ *  `snapshotRuns` order), so a snapshot compare is byte-exact. */
+async function runPhases(handle: DbHandle): Promise<{ id: string; phase: string; outcome: string | null }[]> {
+  return (await snapshotRuns(handle.db)).map((r) => ({ id: r.id, phase: r.phase, outcome: r.outcome }));
 }
 
 function postRun(app: BootedServer["app"], body: string): Promise<Response> {
@@ -116,5 +122,24 @@ describe("H-group (Batch 3 Dashboard mount): assembly through bootstrapServer", 
     expect((await postRun(second.app, `csrf=${encodeURIComponent(firstToken)}`)).status).toBe(403);
     // …while the instance's own token still works.
     expect((await postRun(second.app, `csrf=${encodeURIComponent(secondToken)}`)).status).toBe(303);
+  });
+
+  it("H9: a second Run Now leaves the queued run alone — the skip policy is really assembled", async () => {
+    const booted = await boot("127.0.0.1", await tmpDataDir());
+    await seedLoop(booted.handle.db, { id: "loop-1" });
+    const token = csrfFrom(await (await booted.app.request("/", { headers: { host: "127.0.0.1" } })).text());
+
+    const first = await postRun(booted.app, `csrf=${encodeURIComponent(token)}`);
+    expect(first.status).toBe(303);
+    const afterFirst = await runPhases(booted.handle);
+    expect(afterFirst).toHaveLength(1);
+    expect(afterFirst[0]).toMatchObject({ phase: "pending", outcome: null });
+
+    // THIS is the assertion that fails if `start.ts` ever drops the
+    // `pendingPolicy: "skip"` argument: the type checker cannot see the
+    // difference, and no other test drives the REAL composition root.
+    const second = await postRun(booted.app, `csrf=${encodeURIComponent(token)}`);
+    expect(second.status).toBe(303);
+    expect(await runPhases(booted.handle)).toEqual(afterFirst);
   });
 });

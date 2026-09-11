@@ -85,7 +85,10 @@ function buildApp(options: FreshOptions & { csrfToken: string }): ReturnType<typ
       options.enqueue ??
       ((loopId) => {
         enqueueCalls.push(loopId);
-        return coordinator.enqueueExecRun(loopId);
+        // The SAME policy start.ts wires (Batch 3 切片三): a test seam that
+        // kept the default would let every H-group assertion below pass while
+        // production superseded — the exact drift mount.test.ts also guards.
+        return coordinator.enqueueExecRun(loopId, { kind: "manual", pendingPolicy: "skip" });
       }),
     csrfToken: options.csrfToken,
   });
@@ -311,10 +314,13 @@ describe("H-group (Batch 3 Dashboard HTTP): routes and security", () => {
     expect(await runRows()).toEqual(before);
 
     // Only now the one non-reject left: a charset parameter is tolerated
-    // (browsers may add one), and it really does trigger.
+    // (browsers may add one), so the request REACHES the handler. 303 rather
+    // than 415 is what proves the media type was accepted — and under Batch 3
+    // 切片三 it also finds run-1 still pending, so the skip policy answers 303
+    // with ZERO writes (slice 2 pinned the opposite: a supersede).
     const withCharset = await postForm(app, "loop-1", formBody(TOKEN_A), { "content-type": `${FORM}; charset=UTF-8` });
     expect(withCharset.status).toBe(303);
-    expect(await runRows()).not.toEqual(before);
+    expect(await runRows()).toEqual(before);
   });
 
   it("H5: a token from one instance never authorises another", async () => {
@@ -345,25 +351,24 @@ describe("H-group (Batch 3 Dashboard HTTP): routes and security", () => {
     expect((await runRows()).map((r) => r.id).sort()).toEqual(["run-1", "run-running"]);
     expect(enqueueCalls).toEqual(["idle", "nope", "completed", "busy"]);
 
-    // A reason this slice does not know yet (slice 3's `pending_exists`) is
-    // still a business outcome, not an error.
+    // A reason the union does not have today is still a business outcome, not
+    // an error: the route folds EVERY non-throwing result into 303.
     const future = buildApp({
       csrfToken: TOKEN_A,
-      // Not a member of today's union — that is the point: a reason this
-      // slice has never heard of is still a business outcome, not an error.
-      enqueue: async () => ({ enqueued: false, reason: "pending_exists" }) as unknown as EnqueueExecRunResult,
+      // Deliberately not a member of today's union — that is the point.
+      enqueue: async () => ({ enqueued: false, reason: "some_future_reason" }) as unknown as EnqueueExecRunResult,
     });
     expect((await postForm(future, "idle", formBody(TOKEN_A))).status).toBe(303);
 
-    // Slice 2's TEMPORARY semantics, pinned: a manual trigger still supersedes
-    // EVERY pending exec run of the loop (run-1 and run-pending both go), and
-    // leaves the running one alone. Slice 3 flips this to "skip".
+    // Batch 3 切片三, FLIPPED from slice 2's pinned temporary behaviour: the
+    // Dashboard never supersedes. With run-1 AND run-pending both pending the
+    // click is a zero-write `pending_exists` — both rows stay pending, the
+    // running one is untouched, and no replacement run is ever created.
     await seedRun(db, { id: "run-pending", loopId: "idle", phase: "pending" });
     expect((await postForm(app, "idle", formBody(TOKEN_A))).status).toBe(303);
     expect((await runRows()).sort((a, b) => a.id.localeCompare(b.id))).toEqual([
-      { id: "run-1", phase: "canceled", outcome: "skipped" },
-      { id: "run-2", phase: "pending", outcome: null },
-      { id: "run-pending", phase: "canceled", outcome: "skipped" },
+      { id: "run-1", phase: "pending", outcome: null },
+      { id: "run-pending", phase: "pending", outcome: null },
       { id: "run-running", phase: "running", outcome: null },
     ]);
 
@@ -394,6 +399,72 @@ describe("H-group (Batch 3 Dashboard HTTP): routes and security", () => {
     const pageFailed = await readBoom.request("/", { headers: LOOPBACK });
     expect(pageFailed.status).toBe(500);
     expect(await pageFailed.text()).not.toContain("secret-token-xyz");
+  });
+
+  it("H8: the rendered button state and the backend outcome agree on every state", async () => {
+    await fresh();
+    await seedLoop(db, { id: "idle" });
+    await seedLoop(db, { id: "paused", enabled: false });
+    await seedLoop(db, {
+      id: "completed",
+      goal: "g",
+      completedAt: "2026-07-01T00:00:01.000Z",
+      completionReason: "done",
+      enabled: false,
+    });
+    await seedLoop(db, { id: "busy" });
+    await seedRun(db, { id: "r-run", loopId: "busy", phase: "running" });
+    await seedLoop(db, { id: "queued" });
+    await seedRun(db, { id: "r-pend", loopId: "queued", phase: "pending" });
+
+    const html = await (await app.request("/", { headers: LOOPBACK })).text();
+    /** The <button>…</button> inside THIS loop's form — disabled or not. */
+    const button = (loopId: string): string => {
+      const form = html.slice(html.indexOf(`action="/dashboard/loops/${loopId}/run"`));
+      const open = form.indexOf("<button");
+      return form.slice(open, form.indexOf("</button>", open) + "</button>".length);
+    };
+
+    // The two rules are written in different modules (view.ts vs store/runs.ts)
+    // and read different sources (the page snapshot vs the live transaction),
+    // so this is the test that keeps 「按钮规则与后端规则一致」 true.
+    const cases = [
+      ["idle", true],
+      // Paused-but-not-completed: a manual trigger deliberately bypasses the
+      // enablement check (ADR-008), so the button stays available.
+      ["paused", true],
+      ["completed", false],
+      ["busy", false],
+      ["queued", false],
+    ] as const;
+
+    const before = await runRows();
+    for (const [loopId, writable] of cases) {
+      expect([loopId, button(loopId).includes("disabled")]).toEqual([loopId, !writable]);
+      // A disabled button's POST still redirects — the page never reports a
+      // result it cannot verify — but writes nothing.
+      expect([loopId, (await postForm(app, loopId, formBody(TOKEN_A))).status]).toEqual([loopId, 303]);
+    }
+
+    const after = await db.select({ id: runs.id, loopId: runs.loopId, phase: runs.phase }).from(runs);
+    const created = after.filter((row) => !before.some((old) => old.id === row.id));
+    expect(created.map((row) => row.loopId).sort()).toEqual(["idle", "paused"]);
+    // …and nothing was canceled on the way.
+    expect(after.filter((row) => row.phase === "canceled")).toEqual([]);
+
+    // The reason is TEXT, never colour alone.
+    expect(html).toContain("已有 Pending Run");
+    expect(html).toContain("已有 Running Run");
+    expect(html).toContain("Loop 已完成");
+
+    // Staleness: the page lives up to one meta-refresh (3s) behind, so the
+    // button it rendered for `idle` still says "available" while the loop now
+    // HAS a pending run. The backend is the authority — that click is a
+    // zero-write skip, never a replacement.
+    expect(button("idle")).toBe('<button type="submit">Run Now</button>');
+    const settled = await runRows();
+    expect((await postForm(app, "idle", formBody(TOKEN_A))).status).toBe(303);
+    expect(await runRows()).toEqual(settled);
   });
 
   it("H7: gates every route on a loopback Host, and forwarded headers cannot flip it", async () => {

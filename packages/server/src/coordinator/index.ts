@@ -64,13 +64,31 @@ import {
 import { InvalidMachineCredentialError, RunCapabilityInvalidError } from "./errors.js";
 
 /**
+ * The manual trigger's pending-run policy (Batch 3 plan §3 切片三).
+ *
+ *  - `"supersede"` (the DEFAULT, and what every caller got before this
+ *    existed): T7 — cancel every older pending exec run, insert one fresh one.
+ *  - `"skip"`: if ANY run of the loop is already pending, do nothing at all —
+ *    no insert, no cancel, no revision bump. The Dashboard uses this so its
+ *    Run Now button can never replace a queued run.
+ *
+ * Deliberately NOT on the public HTTP DTO: `POST /api/loops/:id/run` keeps
+ * T7, as do cron and catch-up (ADR-007 批次三 §4, ADR-008).
+ */
+export type PendingPolicy = "skip" | "supersede";
+
+/**
  * Exec run trigger metadata — distinguishes manual from scheduled enqueues.
  *
  * Phase 3 Batch 2: scheduled triggers carry occurrence timestamp and revision
  * for atomic watermark progression and stale-config rejection.
+ *
+ * Batch 3: the manual arm carries an OPTIONAL `pendingPolicy`; `"supersede"`
+ * is the default for both an omitted field and an omitted trigger, so every
+ * pre-existing call site is unchanged.
  */
 export type ExecTrigger =
-  | { kind: "manual" }
+  | { kind: "manual"; pendingPolicy?: PendingPolicy }
   | {
       kind: "scheduled";
       scheduledFor: string; // ISO timestamp of the cron occurrence
@@ -142,6 +160,10 @@ export function createRunCoordinator(deps: RunCoordinatorDependencies) {
      * Phase 3 Batch 2: accepts optional trigger metadata. Manual triggers
      * (default) bypass schedule validation; scheduled triggers validate
      * revision, cron, enabled state, and atomically advance lastScheduledAt.
+     *
+     * Batch 3: a manual trigger may carry `pendingPolicy: "skip"` (the
+     * Dashboard), which turns an existing pending run into a zero-write
+     * `pending_exists` instead of a supersede.
      */
     enqueueExecRun(loopId: string, trigger?: ExecTrigger): Promise<EnqueueExecRunResult> {
       return serialize(`enqueue:${loopId}`, async () => {

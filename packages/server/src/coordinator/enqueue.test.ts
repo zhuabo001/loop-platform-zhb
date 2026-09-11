@@ -21,7 +21,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
 import { runs } from "../db/schema.js";
 import { SUPERSEDED_MESSAGE } from "../store/runs.js";
-import { FakeClock, seedLoop, seedMachine, seedRun, snapshotRuns, testDeps } from "../testkit/index.js";
+import { updateSchedule } from "../schedule/state-machine.js";
+import { FakeClock, seedLoop, seedMachine, seedRun, snapshotLoops, snapshotRuns, testDeps } from "../testkit/index.js";
 import { createRunCoordinator, type RunCoordinator } from "./index.js";
 
 const handles: DbHandle[] = [];
@@ -177,5 +178,140 @@ describe("enqueueExecRun (T7)", () => {
     const superseded = rows.filter((r) => r.phase === "canceled");
     expect(superseded).toHaveLength(1);
     expect(superseded[0]).toMatchObject({ outcome: "skipped", message: SUPERSEDED_MESSAGE });
+  });
+});
+
+/**
+ * Q-group (Batch 3 切片三): the Dashboard's `pendingPolicy: "skip"`.
+ *
+ * The Dashboard must never replace a run the operator already queued, so an
+ * existing pending run — of ANY role — turns the trigger into a zero-write
+ * `pending_exists`, and the supersede block is bypassed entirely. Every
+ * negative case compares BOTH tables byte-for-byte: "no Run changed" is not
+ * enough when the plan also forbids touching `loops.revision`.
+ */
+describe("enqueueExecRun pendingPolicy (Q-group)", () => {
+  const SKIP = { kind: "manual", pendingPolicy: "skip" } as const;
+
+  it("Q1: creates exactly one pending on an idle or paused loop, superseding nothing", async () => {
+    await seeded();
+    const idle = await coordinator.enqueueExecRun("loop-1", SKIP);
+    expect(idle).toEqual({ enqueued: true, runId: "run-1", supersededRunIds: [] });
+
+    // Paused (enabled=false, manual-only) is NOT a reason to refuse: a manual
+    // trigger deliberately bypasses the enablement check (ADR-008), and the
+    // page keeps that button available too.
+    await seedLoop(db, { id: "loop-paused", enabled: false });
+    const paused = await coordinator.enqueueExecRun("loop-paused", SKIP);
+    expect(paused).toEqual({ enqueued: true, runId: "run-2", supersededRunIds: [] });
+
+    const pendings = (await snapshotRuns(db)).filter((r) => r.phase === "pending");
+    expect(pendings.map((r) => r.id).sort()).toEqual(["run-1", "run-2"]);
+  });
+
+  it("Q2: skips with zero writes on pending(exec), pending(non-exec), running and completed", async () => {
+    await seeded();
+    await seedLoop(db, {
+      id: "loop-done",
+      goal: "g",
+      completedAt: "2026-07-01T00:00:01.000Z",
+      completionReason: "done",
+      enabled: false,
+    });
+    await seedLoop(db, { id: "loop-queued" });
+    await seedRun(db, { id: "run-queued", loopId: "loop-queued", phase: "pending" });
+    await seedLoop(db, { id: "loop-evolving" });
+    // A pending NON-exec run: out of the supersede scan's scope, but the skip
+    // probe is deliberately role-agnostic (batch plan §3 「任意 role」).
+    await seedRun(db, { id: "run-evolving", loopId: "loop-evolving", phase: "pending", role: "evolve" });
+    await seedLoop(db, { id: "loop-busy" });
+    await seedRun(db, { id: "run-busy", loopId: "loop-busy", phase: "running", role: "edit" });
+
+    const cases = [
+      ["loop-queued", "pending_exists"],
+      ["loop-evolving", "pending_exists"],
+      ["loop-busy", "running_exists"],
+      ["loop-done", "loop_completed"],
+    ] as const;
+
+    for (const [loopId, reason] of cases) {
+      const runsBefore = await snapshotRuns(db);
+      const loopsBefore = await snapshotLoops(db);
+      expect([loopId, await coordinator.enqueueExecRun(loopId, SKIP)]).toEqual([
+        loopId,
+        { enqueued: false, reason },
+      ]);
+      // Zero writes means BOTH tables — a revision bump would be a write even
+      // though no Run row changed (batch plan §3: 不修改 Loop revision).
+      expect(await snapshotRuns(db)).toEqual(runsBefore);
+      expect(await snapshotLoops(db)).toEqual(loopsBefore);
+    }
+  });
+
+  it("Q3: a repeated skip trigger stays a zero-write no-op", async () => {
+    await seeded();
+    expect((await coordinator.enqueueExecRun("loop-1", SKIP)).enqueued).toBe(true);
+    const after = { runs: await snapshotRuns(db), loops: await snapshotLoops(db) };
+
+    for (let i = 0; i < 2; i += 1) {
+      expect(await coordinator.enqueueExecRun("loop-1", SKIP)).toEqual({ enqueued: false, reason: "pending_exists" });
+    }
+    expect(await snapshotRuns(db)).toEqual(after.runs);
+    expect(await snapshotLoops(db)).toEqual(after.loops);
+    // …and the loop never accumulated a second pending.
+    expect((await snapshotRuns(db)).filter((r) => r.phase === "pending")).toHaveLength(1);
+  });
+
+  it("Q4: a competing enqueue that commits before the write transaction is never superseded", async () => {
+    // The hook commits a REAL competing enqueue — a second coordinator over the
+    // same handle, so there is no shared per-loop mutex — after this one's loop
+    // lookup but before its write transaction. It lands in the FIRST pass: the
+    // in-transaction pending probe is authoritative, so the race costs one pass
+    // and writes nothing.
+    let hookCalls = 0;
+    let competitor: RunCoordinator | undefined;
+    await seeded({
+      hooks: {
+        afterEnqueueLoopResolve: async () => {
+          hookCalls += 1;
+          if (hookCalls > 1) return;
+          expect((await competitor!.enqueueExecRun("loop-1")).enqueued).toBe(true);
+        },
+      },
+    });
+    competitor = createRunCoordinator(testDeps(db, clock));
+
+    const result = await coordinator.enqueueExecRun("loop-1", SKIP);
+    expect(result).toEqual({ enqueued: false, reason: "pending_exists" });
+    expect(hookCalls).toBe(1);
+
+    // Exactly one pending survives — the COMPETITOR's — and nothing was
+    // canceled: `supersededRunIds` would have named it under T7.
+    const rows = await snapshotRuns(db);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ id: "run-1", phase: "pending", outcome: null });
+  });
+
+  it("Q4: a lost CAS re-resolves the loop instead of reusing the stale read", async () => {
+    // Here the competitor changes only the LOOP (a schedule PATCH bumps
+    // `revision` and leaves no run), so the probes still say "idle" and the
+    // revision CAS is what loses — then the bounded retry must re-resolve and
+    // re-probe on fresh state rather than trust the snapshot it started with.
+    let hookCalls = 0;
+    await seeded({
+      hooks: {
+        afterEnqueueLoopResolve: async () => {
+          hookCalls += 1;
+          if (hookCalls > 1) return;
+          const updated = await updateSchedule({ db, clock }, "loop-1", { cron: "0 12 * * *" });
+          expect(updated).toMatchObject({ found: true, changed: true });
+        },
+      },
+    });
+
+    const result = await coordinator.enqueueExecRun("loop-1", SKIP);
+    expect(result).toEqual({ enqueued: true, runId: "run-1", supersededRunIds: [] });
+    expect(hookCalls).toBe(2);
+    expect((await snapshotRuns(db))[0]).toMatchObject({ id: "run-1", phase: "pending" });
   });
 });

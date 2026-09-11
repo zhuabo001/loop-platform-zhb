@@ -24,7 +24,7 @@ import { isOccurrence, isValidPersistedScheduleState, parseRfc3339Ms } from "../
 import { isHeartbeatWatermarkAnomalous } from "./machines.js";
 import { withGuardRetry } from "./guard-retry.js";
 import type { Clock } from "../time.js";
-import type { ExecTrigger } from "../coordinator/index.js";
+import type { ExecTrigger, PendingPolicy } from "../coordinator/index.js";
 
 /** The slice of coordinator dependencies the run store needs. */
 export interface RunStoreDeps {
@@ -59,6 +59,12 @@ export type EnqueueExecRunResult =
         | "loop_not_found"
         | "loop_completed"
         | "running_exists"
+        /** Batch 3: the Dashboard's `pendingPolicy: "skip"` found an existing
+         *  pending run (ANY role) and wrote nothing. INTERNAL — the public
+         *  trigger route never passes a policy, so this is unreachable over
+         *  HTTP (and app.ts's fallback would collapse it to `running_exists`
+         *  if it ever were). */
+        | "pending_exists"
         | "stale_revision"
         | "not_active"
         | "not_an_occurrence"
@@ -101,13 +107,18 @@ export async function getLoop(db: Db, loopId: string): Promise<Loop | undefined>
   return (await db.select().from(loops).where(eq(loops.id, loopId)))[0];
 }
 
-/** The enqueue transaction's running-run probe — ONE implementation shared by
- *  the manual and scheduled branches so the skip rule cannot drift. */
-async function hasRunningExecRun(tx: Db, loopId: string): Promise<boolean> {
+/** The enqueue transaction's active-run probe — ONE implementation shared by
+ *  the manual and scheduled branches so the skip rule cannot drift.
+ *
+ *  Role-agnostic on purpose: the enqueue path only ever CREATES exec runs, but
+ *  a run of any role occupying the loop must not be queued behind (the
+ *  original T7 rule), and under the Dashboard's `"skip"` policy must not be
+ *  replaced either (Batch 3 plan §3: 任意 role). */
+async function hasRunInPhase(tx: Db, loopId: string, phase: "pending" | "running"): Promise<boolean> {
   const rows = await tx
     .select({ id: runs.id })
     .from(runs)
-    .where(and(eq(runs.loopId, loopId), eq(runs.phase, "running")))
+    .where(and(eq(runs.loopId, loopId), eq(runs.phase, phase)))
     .limit(1);
   return rows.length > 0;
 }
@@ -129,6 +140,11 @@ export async function getRun(db: Db, runId: string): Promise<Run | undefined> {
  * Phase 3 Batch 2: scheduled triggers validate revision/cron/enabled state
  * and atomically advance lastScheduledAt watermark. Running runs still skip
  * but watermark advances. Manual triggers (default) bypass all schedule checks.
+ *
+ * Batch 3: a manual trigger may carry `pendingPolicy: "skip"` (the Dashboard).
+ * Then an existing pending run of ANY role is a zero-write `pending_exists` —
+ * probed BEFORE the revision CAS, so a skip touches neither Run nor Loop, and
+ * the supersede block is bypassed entirely. Scheduled triggers are always T7.
  */
 export async function enqueueExecRunTx(
   deps: RunStoreDeps,
@@ -214,6 +230,12 @@ export async function enqueueExecRunTx(
       }
 
       return db.transaction(async (tx) => {
+        // Batch 3: `trigger === undefined` is the original manual call shape,
+        // and a scheduled callback is always T7 (ADR-007 §4 / ADR-008), so both
+        // keep the default. Only the Dashboard asks for "skip".
+        const pendingPolicy: PendingPolicy =
+          trigger?.kind === "manual" ? (trigger.pendingPolicy ?? "supersede") : "supersede";
+
         if (trigger?.kind === "scheduled") {
           const updated = await tx
             .update(loops)
@@ -222,12 +244,22 @@ export async function enqueueExecRunTx(
             .returning({ id: loops.id });
           if (updated.length !== 1) throw new EnqueueLoopGuardLostError(loop.id);
 
-          if (await hasRunningExecRun(tx, loop.id)) {
+          if (await hasRunInPhase(tx, loop.id, "running")) {
             return { enqueued: false as const, reason: "running_exists" as const };
           }
         } else {
-          if (await hasRunningExecRun(tx, loop.id)) {
+          if (await hasRunInPhase(tx, loop.id, "running")) {
             return { enqueued: false as const, reason: "running_exists" as const };
+          }
+
+          // The Dashboard's no-supersede rule (Batch 3 plan §3): any pending run
+          // of ANY role blocks the trigger. Deliberately probed BEFORE the
+          // revision CAS below — a skip must not modify the Loop either, and the
+          // plan requires exactly that ("不修改 Loop revision"). A competitor
+          // that commits between this probe and the CAS bumps the revision, so
+          // the guard loses and the bounded retry re-resolves and re-probes.
+          if (pendingPolicy === "skip" && (await hasRunInPhase(tx, loop.id, "pending"))) {
+            return { enqueued: false as const, reason: "pending_exists" as const };
           }
 
           const guarded = await tx
@@ -238,23 +270,29 @@ export async function enqueueExecRunTx(
           if (guarded.length !== 1) throw new EnqueueLoopGuardLostError(loop.id);
         }
 
-    // Supersede all pending exec runs
-        const pendings = await tx
-          .select({ id: runs.id })
-          .from(runs)
-          .where(and(eq(runs.loopId, loop.id), eq(runs.phase, "pending"), eq(runs.role, "exec")))
-          .orderBy(asc(runs.ts), asc(runs.id));
-
         const ts = clock.now().toISOString();
         const supersededRunIds: string[] = [];
-        for (const pending of pendings) {
-          const updated = await tx
-            .update(runs)
-            .set({ phase: "canceled", outcome: "skipped", message: SUPERSEDED_MESSAGE, ts })
-            .where(and(eq(runs.id, pending.id), eq(runs.phase, "pending")))
-            .returning({ id: runs.id });
-          if (updated.length === 0) throw new EnqueueGuardLostError(pending.id);
-          supersededRunIds.push(pending.id);
+
+        // Supersede all pending exec runs — T7, and T7 only. Under "skip" the
+        // probe above already proved there is nothing to supersede, but the
+        // block is bypassed ENTIRELY so that "the Dashboard's write path can
+        // never cancel a run" is a structural fact rather than a consequence.
+        if (pendingPolicy === "supersede") {
+          const pendings = await tx
+            .select({ id: runs.id })
+            .from(runs)
+            .where(and(eq(runs.loopId, loop.id), eq(runs.phase, "pending"), eq(runs.role, "exec")))
+            .orderBy(asc(runs.ts), asc(runs.id));
+
+          for (const pending of pendings) {
+            const updated = await tx
+              .update(runs)
+              .set({ phase: "canceled", outcome: "skipped", message: SUPERSEDED_MESSAGE, ts })
+              .where(and(eq(runs.id, pending.id), eq(runs.phase, "pending")))
+              .returning({ id: runs.id });
+            if (updated.length === 0) throw new EnqueueGuardLostError(pending.id);
+            supersededRunIds.push(pending.id);
+          }
         }
 
         const runId = newRunId();

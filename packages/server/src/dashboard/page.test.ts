@@ -63,6 +63,11 @@ function dashLoop(loop: LoopSummary, extra: Partial<DashboardLoop> = {}): Dashbo
   return { loop, lifecycle: "open", pending: [], running: [], terminalJournalV1: true, ...extra };
 }
 
+/** One in-flight Run, for the button-rule fixtures. */
+function activity(phase: "pending" | "running", role: DashboardActiveRun["role"]): DashboardActiveRun {
+  return { id: `run-${phase}`, role, phase, ts: iso(1), progress: null, message: null, error: null };
+}
+
 const TEST_CSRF = "test-csrf-token";
 
 function render(loops: DashboardLoop[], listCap = 100): string {
@@ -244,19 +249,87 @@ describe("renderDashboardPage", () => {
     expect(page.match(/<form /g)).toHaveLength(2);
     expect(page.match(/<form class="run-form" method="post" action="\/dashboard\/loops\/loop-1\/run">/g)).toHaveLength(1);
     expect(page).toContain(`<input type="hidden" name="csrf" value="${TEST_CSRF}">`);
+    // An available card's bytes are exactly what they were before the disabled
+    // rules existed — no stray attribute, no whitespace change.
     expect(page).toContain('<button type="submit">Run Now</button>');
 
     // The server rejects any submission carrying a field other than `csrf`
     // (400), so a NAMED submit button would break every real click, and a
     // second named input would break it just as silently. Exactly one named
-    // control, and it is the token.
+    // control, and it is the token — `disabled` has no name, so it is free.
     const form = page.slice(page.indexOf("<form "), page.indexOf("</form>"));
     expect(form.match(/name="[^"]*"/g)).toEqual(['name="csrf"']);
     expect(form).not.toContain("<button type=\"submit\" name=");
 
-    // Slice 2 ships the button ALWAYS ENABLED: the disabled rules land in
-    // slice 3 together with the backend no-supersede policy.
-    expect(page).not.toContain("disabled");
+    // Both cards are idle Open loops: available, and with no reason line.
+    // (Assert on the MARKUP, not the page: `run-note` also names a CSS rule.)
+    expect(page.match(/<button type="submit" disabled>/g)).toBeNull();
+    expect(page).not.toContain('<p class="run-note">');
+  });
+
+  it("disables the button for Completed / Pending / Running, with the reason as text", () => {
+    const page = render([
+      dashLoop(loopSummary({ id: "idle" })),
+      // Paused-but-not-completed with no active run: a manual trigger
+      // deliberately bypasses enablement, so this MUST stay available.
+      dashLoop(loopSummary({ id: "paused", enabled: false }), { lifecycle: "paused" }),
+      dashLoop(
+        loopSummary({ id: "completed", goal: "g", completedAt: iso(9), completionReason: "done", enabled: false }),
+        { lifecycle: "completed" },
+      ),
+      dashLoop(loopSummary({ id: "queued" }), {
+        pending: [activity("pending", "exec")],
+      }),
+      dashLoop(loopSummary({ id: "busy" }), {
+        running: [activity("running", "exec")],
+      }),
+    ]);
+
+    const button = (loopId: string): string => {
+      const form = page.slice(page.indexOf(`action="/dashboard/loops/${loopId}/run"`));
+      const open = form.indexOf("<button");
+      return form.slice(open, form.indexOf("</button>", open) + "</button>".length);
+    };
+
+    expect(button("idle")).toBe('<button type="submit">Run Now</button>');
+    expect(button("paused")).toBe('<button type="submit">Run Now</button>');
+    for (const id of ["completed", "queued", "busy"]) {
+      expect([id, button(id)]).toEqual([id, '<button type="submit" disabled>Run Now</button>']);
+    }
+
+    // The reason is rendered TEXT, so a disabled control never depends on
+    // colour alone — and the CSS `:disabled` rule must not be the only signal.
+    expect(page).toContain("Loop 已完成（Completed），Run Now 会被拒绝。");
+    expect(page).toContain("已有 Pending Run，等待执行。");
+    expect(page).toContain("已有 Running Run，避免重复触发。");
+    // The reason is visible text inside a <p>, never an attribute.
+    expect(page).toContain('<p class="run-note">');
+    expect(page).not.toContain('title="');
+  });
+
+  it("keeps the Completed reason ahead of an active run, and never adds a second named control", () => {
+    // A late running Run can outlive completion (slice 1 keeps lifecycle and
+    // activity independent) — the precedence must match the backend's check
+    // order: completed (pre-transaction) > running > pending.
+    const page = render([
+      dashLoop(
+        loopSummary({ id: "late", goal: "g", completedAt: iso(9), completionReason: "done", enabled: false }),
+        {
+          lifecycle: "completed",
+          running: [activity("running", "exec")],
+          pending: [activity("pending", "exec")],
+        },
+      ),
+    ]);
+
+    expect(page).toContain("Loop 已完成（Completed），Run Now 会被拒绝。");
+    expect(page).not.toContain("已有 Running Run");
+
+    // Even disabled, the form still carries exactly the one named control: the
+    // server would 400 any extra field, disabled or not.
+    const form = page.slice(page.indexOf("<form "), page.indexOf("</form>"));
+    expect(form.match(/name="[^"]*"/g)).toEqual(['name="csrf"']);
+    expect(form).toContain('<button type="submit" disabled>Run Now</button>');
   });
 
   it("percent-encodes the loop id in the action and pins that no style attribute exists", () => {

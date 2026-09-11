@@ -282,6 +282,10 @@ export function createServerApp(
       // untouched so Phase 3 readers keep parsing.
       return jsonError(c, 409, "loop is completed", LOOP_COMPLETED_CODE);
     }
+    // The literal is the wire contract (Phase 3 readers only know this one
+    // reason). The fallback is load-bearing since Batch 3: the internal
+    // `pending_exists` is unreachable HERE precisely because this route never
+    // passes a pendingPolicy — reaching this line with it would mislabel it.
     return c.json({ enqueued: false, reason: "running_exists" }, 200);
   });
 
