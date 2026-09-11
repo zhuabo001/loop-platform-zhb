@@ -31,9 +31,17 @@
  * 404 not found / 500 internal. `code` stays the optional additive field —
  * the full (status, code) set this adapter can emit is pinned by the
  * taxonomy test in app.test.ts.
+ *
+ * Batch 3 adds an OPTIONAL Dashboard (mounts two HTML routes and, with them, a
+ * GLOBAL loopback-Host gate — see `dashboard` below). When it is absent this
+ * adapter is unchanged in every respect; the JSON taxonomy pin covers the
+ * JSON routes only and the Dashboard's statuses (303/403/415) are asserted by
+ * its own suite (dashboard/routes.test.ts).
  */
 import { bodyLimit } from "hono/body-limit";
 import { Hono, type Context } from "hono";
+import type { DashboardRoutes } from "../dashboard/routes.js";
+import { DASHBOARD_RUN_PATH } from "../dashboard/routes.js";
 
 import {
   cancelRunRequestSchema,
@@ -63,13 +71,11 @@ import {
   type ScheduleAdmin,
 } from "../schedule/index.js";
 import { CapabilityDeclarationInvalidError } from "../store/machines.js";
+import { jsonError } from "./json-error.js";
 
 /** Both machine endpoints share one wire body cap (plan §HTTP). */
 const BODY_CAP_BYTES = 2 * 1024 * 1024;
 
-function jsonError(c: Context, status: 400 | 401 | 409 | 413 | 404 | 500, error: string, code?: string): Response {
-  return c.json(code === undefined ? { error } : { error, code }, status);
-}
 
 /** Extract `Bearer <token>` — anything else is no credential at all. */
 function bearerToken(c: Context): string | undefined {
@@ -107,8 +113,24 @@ export function createServerApp(
   schedule: ScheduleAdmin,
   ownerControl: OwnerControl,
   onScheduleCommitted?: (loop: Loop) => void,
+  /**
+   * The local Dashboard (Batch 3). Present ONLY when the server is bound to a
+   * loopback address — `bootstrapServer` decides, so this module never reads
+   * config. Its presence means every request MUST address a loopback host
+   * (see `hostGate` below); absent, the app stays exactly the JSON seam it
+   * has always been, which is why the 11 existing call sites are unchanged.
+   */
+  dashboard?: DashboardRoutes,
 ): Hono {
   const app = new Hono();
+
+  // Registered BEFORE any route: this is the DNS-rebinding gate, and a
+  // loopback-bound server has no legitimate non-loopback Host. It must also
+  // precede the dashboard's body cap, or an oversized hostile request would
+  // get a 413 and learn that the route exists. A late or per-route
+  // registration would leave a bypass (the JSON API is what a rebinding
+  // attacker reads first: /api/loops hands over every loop id).
+  if (dashboard !== undefined) app.use("*", dashboard.hostGate);
 
   /**
    * The ONE schedule-commit seam (Batch 2 plan §2): invoked synchronously after
@@ -403,6 +425,14 @@ export function createServerApp(
     if (!loopSummary) return jsonError(c, 404, "not found");
     return c.json({ loop: loopSummary }, 200);
   });
+
+  // The Dashboard's two HTML routes. Registered last, but their gate is the
+  // global middleware above — registering the gate here would leave `/` and
+  // the POST reachable with a hostile Host, and would not protect the API.
+  if (dashboard !== undefined) {
+    app.get("/", dashboard.index);
+    app.post(DASHBOARD_RUN_PATH, dashboard.formContentType, dashboard.bodyCap, dashboard.run);
+  }
 
   return app;
 }

@@ -5,7 +5,8 @@
  * Every dynamic value goes through `${...}` interpolation, which escapes
  * `& < > " '` — so a Loop name, goal, path, message or run error containing
  * markup is rendered as text, in text and attribute position alike. `raw()`
- * is never called.
+ * is never called. The one interactive control is the Run Now form (the CSRF
+ * token rides in a hidden field; the action is a percent-encoded path).
  *
  * `DASHBOARD_CSS` is a frozen constant with TWO invariants, both pinned by
  * tests in page.test.ts:
@@ -17,6 +18,7 @@
  */
 import { html } from "hono/html";
 
+import { CSRF_FIELD } from "./csrf.js";
 import type { DashboardPageModel, LoopActivityLine, LoopCard, LoopLastRunView } from "./view.js";
 import { NONE_TEXT } from "./view.js";
 
@@ -81,6 +83,8 @@ h2 { font-size: 16px; margin: 0; }
 .run-pending { border-left-color: #7a8699; }
 .run-running { border-left-color: #2f7d4f; }
 .run-head { display: flex; flex-wrap: wrap; gap: 0 8px; }
+.run-form { margin: 12px 0 0; }
+.run-form button { font: inherit; padding: 4px 14px; cursor: pointer; }
 @media (max-width: 640px) {
   .fields dt { min-width: 0; }
 }
@@ -113,7 +117,18 @@ function lastRunBlock(lastRun: LoopLastRunView | null) {
 <div><dt>最新 exec Run error</dt><dd class="wrap">${lastRun.errorLabel}</dd></div>`;
 }
 
-function card(item: LoopCard) {
+/** The ONLY interactive control on the page (roadmap: one button). The form
+ *  carries exactly ONE named control — the hidden token — because the server
+ *  rejects any submission with a field other than `csrf` (400). A named submit
+ *  button would therefore break every real click; page.test.ts pins that. */
+function runForm(item: LoopCard, csrfToken: string) {
+  return html`<form class="run-form" method="post" action="${item.runAction}">
+<input type="hidden" name="${CSRF_FIELD}" value="${csrfToken}">
+<button type="submit">Run Now</button>
+</form>`;
+}
+
+function card(item: LoopCard, csrfToken: string) {
   return html`<li class="card" data-lifecycle="${item.lifecycle}">
 <div class="card-head">
 <h2 class="wrap">${item.nameLabel}</h2>
@@ -138,10 +153,19 @@ ${item.pending.length === 0 ? "" : html`<ul class="runs"><li><strong>等待中 R
 ${item.running.length === 0 ? "" : html`<ul class="runs"><li><strong>运行中 Run（Running）</strong></li>${item.running.map(activityLine)}</ul>`}
 ${item.pending.length === 0 && item.running.length === 0 ? html`<p class="meta">暂无活跃 Run。</p>` : ""}
 ${item.capabilityWarning === null ? "" : html`<p class="warn">${item.capabilityWarning}</p>`}
+${runForm(item, csrfToken)}
 </li>`;
 }
 
-export function renderDashboardPage(model: DashboardPageModel): string {
+/** The CSRF token is a REQUIRED argument with no default: a defaulted token
+ *  would be a silent failure mode, and the caller (routes.ts) is the only
+ *  place that legitimately holds it. */
+export interface DashboardPageOptions {
+  csrfToken: string;
+}
+
+export function renderDashboardPage(model: DashboardPageModel, options: DashboardPageOptions): string {
+  const { csrfToken } = options;
   const page = html`<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -161,7 +185,7 @@ ${model.truncationNotice === null ? "" : html`<p class="warn">${model.truncation
 <main>
 ${model.emptyNotice === null ? "" : html`<p class="empty">${model.emptyNotice}</p>`}
 <ul class="loops">
-${model.loops.map(card)}
+${model.loops.map((item) => card(item, csrfToken))}
 </ul>
 </main>
 </body>

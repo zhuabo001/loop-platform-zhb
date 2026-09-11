@@ -63,9 +63,11 @@ function dashLoop(loop: LoopSummary, extra: Partial<DashboardLoop> = {}): Dashbo
   return { loop, lifecycle: "open", pending: [], running: [], terminalJournalV1: true, ...extra };
 }
 
+const TEST_CSRF = "test-csrf-token";
+
 function render(loops: DashboardLoop[], listCap = 100): string {
   const snapshot: DashboardSnapshot = { generatedAt: iso(0), loops, listCap };
-  return renderDashboardPage(buildDashboardPageModel(snapshot));
+  return renderDashboardPage(buildDashboardPageModel(snapshot), { csrfToken: TEST_CSRF });
 }
 
 describe("formatUtc", () => {
@@ -231,6 +233,47 @@ describe("renderDashboardPage", () => {
     // A pending run has no `at` stamp yet.
     expect(page).toContain(`步骤 1：queued（${NONE_TEXT}）`);
     expect(page).not.toContain("暂无活跃 Run");
+  });
+
+  it("renders exactly one Run Now form per card, with one named control", () => {
+    const page = render([
+      dashLoop(loopSummary({ id: "loop-1" })),
+      dashLoop(loopSummary({ id: "loop-2" })),
+    ]);
+
+    expect(page.match(/<form /g)).toHaveLength(2);
+    expect(page.match(/<form class="run-form" method="post" action="\/dashboard\/loops\/loop-1\/run">/g)).toHaveLength(1);
+    expect(page).toContain(`<input type="hidden" name="csrf" value="${TEST_CSRF}">`);
+    expect(page).toContain('<button type="submit">Run Now</button>');
+
+    // The server rejects any submission carrying a field other than `csrf`
+    // (400), so a NAMED submit button would break every real click, and a
+    // second named input would break it just as silently. Exactly one named
+    // control, and it is the token.
+    const form = page.slice(page.indexOf("<form "), page.indexOf("</form>"));
+    expect(form.match(/name="[^"]*"/g)).toEqual(['name="csrf"']);
+    expect(form).not.toContain("<button type=\"submit\" name=");
+
+    // Slice 2 ships the button ALWAYS ENABLED: the disabled rules land in
+    // slice 3 together with the backend no-supersede policy.
+    expect(page).not.toContain("disabled");
+  });
+
+  it("percent-encodes the loop id in the action and pins that no style attribute exists", () => {
+    const hostileId = `a"/><script>alert(1)</script>`;
+    const page = render([dashLoop(loopSummary({ id: hostileId }))]);
+
+    const action = page.match(/action="([^"]*)"/)?.[1];
+    expect(action).toBe(`/dashboard/loops/${encodeURIComponent(hostileId)}/run`);
+    // No raw quote or angle bracket survives inside the attribute…
+    expect(action).not.toContain('"');
+    expect(action).not.toContain("<");
+    // …and the id is still visible as escaped TEXT in the card head.
+    expect(page).toContain("&lt;script&gt;");
+
+    // CSP hashes never cover `style="..."` attributes (that needs
+    // 'unsafe-hashes'), so the page must not use any.
+    expect(page).not.toContain("style=");
   });
 
   it("explains an absence of active Runs and of the capability, with wrap-safe text", () => {

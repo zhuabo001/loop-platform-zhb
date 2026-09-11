@@ -17,6 +17,24 @@ import type { DashboardActiveRun, DashboardLoop, DashboardSnapshot, LoopLifecycl
 /** The one placeholder for "this value is not set" (plan §2 切片一). */
 export const NONE_TEXT = "暂无";
 
+/**
+ * The Run Now endpoint, in both the shapes that must agree: the Hono pattern
+ * `routes.ts` registers (with the parameter placeholder) and the concrete
+ * action `page.ts` renders. They live here, side by side, because a drift
+ * between them is a silent 404 in the browser — and `page.test.ts` /
+ * `routes.test.ts` both close the loop by round-tripping a rendered action.
+ */
+export const DASHBOARD_RUN_PREFIX = "/dashboard/loops";
+export const DASHBOARD_RUN_PATH = `${DASHBOARD_RUN_PREFIX}/:id/run`;
+
+/** The form action for one loop. The id is a PATH SEGMENT: percent-encode it,
+ *  so a hostile id cannot break out of the attribute (the template would
+ *  escape it anyway) and cannot introduce a second path segment. Hono
+ *  percent-decodes `:id` on the way back in, so the round trip is lossless. */
+export function dashboardRunAction(loopId: string): string {
+  return `${DASHBOARD_RUN_PREFIX}/${encodeURIComponent(loopId)}/run`;
+}
+
 /** Kept in English on purpose: these are domain terms, not UI chrome. */
 const LIFECYCLE_LABELS: Record<LoopLifecycle, string> = {
   open: "Open",
@@ -105,6 +123,10 @@ export interface LoopLastRunView {
 export interface LoopCard {
   id: string;
   machineId: string;
+  /** The Run Now form action. Slice 2 renders the button ALWAYS ENABLED: the
+   *  disabled rules and the atomic no-supersede policy land in slice 3, so the
+   *  backend rule and the button rule ship together (batch plan §3). */
+  runAction: string;
   nameLabel: string;
   lifecycle: LoopLifecycle;
   lifecycleLabel: string;
@@ -174,6 +196,7 @@ function toLoopCard(entry: DashboardLoop): LoopCard {
   return {
     id: loop.id,
     machineId: loop.machineId,
+    runAction: dashboardRunAction(loop.id),
     nameLabel: loop.name ?? NONE_TEXT,
     lifecycle: entry.lifecycle,
     lifecycleLabel: LIFECYCLE_LABELS[entry.lifecycle],

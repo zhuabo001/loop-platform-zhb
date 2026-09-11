@@ -19,7 +19,10 @@ import { serve, type ServerType } from "@hono/node-server";
 
 import { createLoopAdmin, newUuidLoopId } from "./admin/index.js";
 import { createRunCoordinator, mintRunCredential, newUuidRunId, type CoordinatorHooks, type RunCoordinator } from "./coordinator/index.js";
-import { loadServerConfig, unauthenticatedExposureWarning, type ServerConfig } from "./config.js";
+import { isLoopbackHost, loadServerConfig, unauthenticatedExposureWarning, type ServerConfig } from "./config.js";
+import { mintCsrfToken } from "./dashboard/csrf.js";
+import { createDashboardRead } from "./dashboard/index.js";
+import { createDashboardRoutes } from "./dashboard/routes.js";
 import { closeDb, openMigratedDb, type DbHandle } from "./db/index.js";
 import { createServerApp } from "./http/app.js";
 import { createLifecycleAdmin, type LifecycleOpsHooks } from "./loop-lifecycle/admin.js";
@@ -61,6 +64,11 @@ export interface BootstrapOverrides {
    *  LifecycleAdmin (review SPEC-1: C8 commits a real claim between the
    *  retarget's resolve and its guarded write). */
   lifecycleHooks?: LifecycleOpsHooks;
+  /** TEST-ONLY pinned Dashboard CSRF token. Production mints a fresh random
+   *  one per boot (ADR-009: a restart invalidates every old token); an empty
+   *  or whitespace override is IGNORED rather than honoured, so no test seam
+   *  can silently disable CSRF. */
+  csrfToken?: string;
 }
 
 /**
@@ -102,9 +110,30 @@ export async function bootstrapServer(
       clock,
       cronFactory,
     });
+    // The Dashboard exists ONLY on a loopback bind (Batch 3 plan §2): the
+    // mount decision is made HERE, from config, so no request header can ever
+    // turn it on. Its presence also arms the global loopback-Host gate — on a
+    // non-loopback bind there is no way to tell a rebinding client from a
+    // legitimate one, so the existing "no auth, trusted network" posture
+    // stands unchanged (and is warned about at boot).
+    const dashboard = isLoopbackHost(config.host)
+      ? createDashboardRoutes({
+          read: createDashboardRead({ admin, db: handle.db, clock }),
+          // Slice 3 adds `{ kind: "manual", pendingPolicy: "skip" }` here.
+          enqueue: (loopId) => coordinator.enqueueExecRun(loopId),
+          csrfToken: overrides.csrfToken?.trim() ? overrides.csrfToken : mintCsrfToken(),
+        })
+      : undefined;
+
     return {
-      app: createServerApp(coordinator, admin, lifecycle, schedule, ownerControl, (loop) =>
-        scheduler.reconcile(loop),
+      app: createServerApp(
+        coordinator,
+        admin,
+        lifecycle,
+        schedule,
+        ownerControl,
+        (loop) => scheduler.reconcile(loop),
+        dashboard,
       ),
       coordinator,
       sweep,
