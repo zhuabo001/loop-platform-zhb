@@ -183,7 +183,13 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
   - Server：capability 快照与门控（`terminal-journal-v1`）、claim 事务权威 Loop 快照 mint v1 Lease、最终 Report 单事务分支表（stale_goal/迟到冻结/wake finish）、Finish 取消 pending 保留 running、Reopen 旧代际撤销、Completed 全部守卫（claim/cron/catch-up/Run Now/schedule enable/goal）。
   - 首轮/第二轮 code review 发现已全部修复；第三轮 Standards/Spec/Adversarial 确定性三轨 **PASS**，Issues #39–#47 已核销关闭。修复含 `loops.revision` OCC additive 列、双向真实交错、no-follow 有界读取、encoding-aware 秘密边界、control/scratch root 生命周期与 HTTP 窄接口收口；全量确定性质量门全绿。
   - 2026-09-07 的固定二进制完整 `test:phase4:batch2:e2e`（1/1，46.99s）与三次生产 smoke 保持有效，#38/#49 已核销；#50 的三项复审 P2 已由独立 Standards/Spec 核销，2026-09-08 最终生产 R 在同一固定 Claude 2.1.236/hash 上通过另一 Run temp 直连及 symlink 读写、wrapper/OpenSSL 配置篡改拒绝检查，#50 核销证据完整。版本因果关系仍未被证明。
-- **Batch 3 — 最小 Dashboard 与阶段收口：未开始**（scope 见 `docs/plan/codex-phase4-dev-roadmap.md`）。
+- **Batch 3 — 最小 Dashboard 与阶段收口：进行中**（分支 `feat/phase4-batch3-dev`，scope 见 `docs/plan/codex-phase4-dev-roadmap.md` 与 `docs/plan/codex-phase4-batch3-plan.md`）
+  - 切片一（只读数据与页面）已完成：`690e395`，新增 `packages/server/src/dashboard/` 读模型与 SSR 页面（D1–D5）。
+  - 切片二（路由与安全装配）已完成：`e1dd98b`，两个 HTML 路由、loopback 挂载门禁、每 bootstrap CSRF、CSP/`no-store`（H1–H9）。
+  - 切片三（禁止 Dashboard 替换已有 pending）已完成：`6198680`，manual trigger 的 `pendingPolicy: "skip"`、零写跳过与按钮规则（Q1–Q6）；本批新增 Issue #54 已核销关闭。
+  - 切片四（核销遗留 Issue）进行中：范围 #33、#36、#51、#52、#53，核销状态以 GitHub Issue 为准。
+  - 切片五（真实 Claude 门与阶段收口）未开始：`pnpm test:phase4:e2e` 入口、Phase 4 验收文档扩充与最终 roadmap 收口仍待完成。
+  - **Phase 4 尚未完成**：本批切片四、五未收口前，不得把 Batch 3 或 Phase 4 标记为已完成。
 
 ## Phase 5 — 存储与协作（第 9–14 周）
 

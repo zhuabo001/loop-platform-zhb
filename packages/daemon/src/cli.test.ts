@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, existsSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -295,6 +296,49 @@ describe("prepareDaemon — the startup provider bootstrap (Issue #38)", () => {
       expect(existsSync(minted!)).toBe(false); // no loopzhb-control-* residue
       expect(scratchRoot).not.toBeNull();
       expect(existsSync(scratchRoot!)).toBe(false); // no loopzhb-runs-* residue
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("a hostile config-dir path never reaches the daemon's startup log (Issue #51)", async () => {
+    // Batch plan §4 S1 (#51), the log half: a startup failure must not write
+    // the config-dir path to stderr. The issue's exact reproduction — the
+    // config dir NAME carries a credential-shaped segment. Asserted over a
+    // REAL `dist/cli.js` process — the direct-run wrapper prints
+    // `err.message`, so this is the daemon log itself, not a stand-in for it.
+    // Like the cross-package E2E, this pins the BUILT artifact: `pnpm test`
+    // builds the daemon first.
+    const PATH_TOKEN = "sk-ant-path-secret-9f8e";
+    const base = mkdtempSync(path.join(realpathSync(tmpdir()), "loopzhb-cli-leak-"));
+    const configDir = path.join(base, PATH_TOKEN);
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(path.join(configDir, "settings.json"), '{ "env": { "ANTHROPIC_API_KEY": "frag-9f8e');
+    try {
+      const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+      const child = spawnSync(process.execPath, [cli], {
+        env: {
+          ...process.env,
+          LOOPZHB_SERVER_URL: "http://127.0.0.1:1", // never reached
+          LOOPZHB_MACHINE_CREDENTIAL: "dk_leak_test_credential",
+          LOOPZHB_ALLOWED_ROOTS: JSON.stringify([realpathSync(tmpdir())]),
+          LOOPZHB_CLAUDE_BIN: FIXTURE,
+          CLAUDE_CONFIG_DIR: configDir,
+        },
+        encoding: "utf-8",
+        timeout: 30_000,
+      });
+      // Fail-closed startup: a non-zero exit with the stable classification.
+      expect(child.status).not.toBe(0);
+      expect(child.stderr).toContain("daemon stopped:");
+      expect(child.stderr).toContain("claude provider settings are not valid JSON");
+      // …and the log carries neither the token-shaped path segment nor the
+      // mangled settings document.
+      expect(child.stderr).not.toContain(PATH_TOKEN);
+      expect(child.stderr).not.toContain(configDir);
+      expect(child.stderr).not.toContain("settings.json");
+      expect(child.stderr).not.toContain("frag-9f8e");
+      expect(child.stdout).not.toContain(PATH_TOKEN);
     } finally {
       rmSync(base, { recursive: true, force: true });
     }

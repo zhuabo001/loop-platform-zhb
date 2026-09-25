@@ -47,6 +47,19 @@
  *   journal-invalid     {"kind":"invalid"} marker + success (→ journal_invalid)
  *   journal-policy      report/new WITHOUT message + success (→ journal_invalid)
  *   report-secret-text  report message embeds $ANTHROPIC_API_KEY (redaction pin)
+ *   report-secret-output  report message AND the success result text embed
+ *                    $ANTHROPIC_API_KEY — the normal-output redaction pin of
+ *                    the settings-derived provider credential (Issue #53)
+ *   report-state-derived  report/resolved whose state carries a BASE64
+ *                    encoding of the credential + success (→ journal_invalid,
+ *                    state never promoted: Issue #53 fail-closed pin)
+ *   secret-session-derived  report/resolved + success whose session_id
+ *                    embeds $ANTHROPIC_API_KEY — a column NO run summary
+ *                    projects, so only a full-row DB scan can see the leak
+ *                    (Issue #53 round-1 review)
+ *   task-file-derived  valid record, then <cwd>/TASK.md gains a BASE64
+ *                    encoding of the credential (→ sync error unreadable, the
+ *                    poisoned content never reaches the database: Issue #53)
  *   journal-then-exit1  valid record, is_error terminal, exit 1 (claude failure wins)
  *   report-delete-task  valid record, then <cwd>/TASK.md is deleted (sync → missing)
  *   finish-observe-prev-state  reads the run's prev-state.json (derived as the
@@ -229,6 +242,44 @@ if (isV1) {
       writeJournal({ kind: "report", status: "resolved", message: `token is ${key}` });
       successResult();
       break;
+    case "report-secret-output":
+      // Issue #53: the credential reaches the child env legitimately, so the
+      // child's OWN output can quote it. Both carrier paths are exercised at
+      // once — the accepted journal message and the CLI result text.
+      writeJournal({ kind: "report", status: "resolved", message: `provider said ${key}` });
+      successResult({ result: `used credential ${key} while working` });
+      break;
+    case "report-state-derived":
+      // A DERIVED encoding of the credential inside state: the collector must
+      // fail closed (ADR-009 修订 8) — never redact-and-persist, which would
+      // invent state the agent never reported.
+      writeJournal({
+        kind: "report",
+        status: "resolved",
+        message: "complete",
+        state: { cursor: 1, token: Buffer.from(key, "utf8").toString("base64") },
+      });
+      successResult();
+      break;
+    case "secret-session-derived":
+      // Issue #53 round-1 review: the credential rides a column that NO summary
+      // projection exposes (`runs.session_id` is absent from runSummarySchema),
+      // so only a COMPLETE-ROW scan can see a leak here. The adapter must
+      // redact the child-supplied session id before it enters the report.
+      writeJournal({ kind: "report", status: "resolved", message: "complete" });
+      successResult({ session_id: `sess-${key}` });
+      break;
+    case "task-file-derived": {
+      // The agent appends a BASE64 encoding of the credential to its own Task
+      // File: the post-run snapshot must refuse it, so the poisoned content
+      // never enters the database (the run itself still reports normally).
+      const taskPath = path.join(process.cwd(), "TASK.md");
+      const existing = existsSync(taskPath) ? readFileSync(taskPath, "utf8") : "";
+      writeFileSync(taskPath, `${existing}\n- cached token: ${Buffer.from(key, "utf8").toString("base64")}\n`);
+      writeJournal({ kind: "report", status: "resolved", message: "complete" });
+      successResult();
+      break;
+    }
     case "journal-then-exit1":
       writeJournal({ kind: "report", status: "resolved", message: "done" });
       line({ type: "result", subtype: "error_during_execution", is_error: true, result: "blew up" });
