@@ -191,12 +191,16 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
   - 切片五（真实 Claude 门与阶段收口）未开始：`pnpm test:phase4:e2e` 入口、Phase 4 验收文档扩充与最终 roadmap 收口仍待完成。
   - **Phase 4 尚未完成**：本批切片四、五未收口前，不得把 Batch 3 或 Phase 4 标记为已完成。
 
+### 右移项
+
+- [Issue #56](https://github.com/zhuabo001/loop-platform-zhb/issues/56)：**Phase 5 加固**——JSON API 的状态变更路由缺同源意图校验（无 `Origin`/`Referer` 检查）、缺 `Content-Type` 门禁，且触发/取消路由接受空体（`parseJsonBodyOrEmpty` 把空文本归一为 `{}`）。切片三决议只记录不改代码；当前不构成可利用漏洞（Loop/Run id 为随机 UUID 不可猜，且全仓无 CORS 响应头 ⇒ 跨站读不到 id），但该边界只押在 id 不可猜上，加固排入 Phase 5 的认证层。
+
 ## Phase 5 — 存储与协作（第 9–14 周）
 
 按依赖顺序，每层独立可验：
 
 1. **Artifact 同步**：chokidar watcher、全量 sha256 manifest（删除=缺席）、增量哈希、协商上传（needHashes + PUT 验哈希）、每文件/每 loop 上限、never-sync 目录双侧一致、run 快照与 diff。
-2. **团队与认证**：GitHub 登录、Team/Membership、connect key（24h TTL、不存本体）、机器归属、跨团队 fail-closed。**此层完成前 server 不得公开暴露。**
+2. **团队与认证**：GitHub 登录、Team/Membership、connect key（24h TTL、不存本体）、机器归属、跨团队 fail-closed。**此层完成前 server 不得公开暴露。**同一暴露面下的加固项见 [Issue #56](https://github.com/zhuabo001/loop-platform-zhb/issues/56)（状态变更路由的同源意图校验、`Content-Type` 门禁与拒绝空体）。
 3. **通知**：失败告警 + 连续失败熔断自动暂停。
 
 ## Phase 6 — 生产硬化（独立阶段）
