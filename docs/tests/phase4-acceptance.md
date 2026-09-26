@@ -249,7 +249,7 @@ $ LOOPZHB_CLAUDE_PERMISSION_PROBE=1 pnpm --filter @loopzhb/daemon test src/claud
 ```text
 $ pnpm test            # 全仓（protocol + daemon + server）
 packages/protocol: Test Files  11 passed (11)         Tests  174 passed (174)
-packages/daemon:   Test Files  22 passed | 2 skipped  Tests  529 passed | 5 skipped (534)
+packages/daemon:   Test Files  22 passed | 2 skipped  Tests  529 passed | 6 skipped (535)
 packages/server:   Test Files  50 passed | 3 skipped  Tests  599 passed | 3 skipped (602)
 
 $ pnpm typecheck       # Done（三包）
