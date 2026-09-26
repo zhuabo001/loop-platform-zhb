@@ -126,5 +126,13 @@ LOOPZHB_EXPECTED_CLAUDE_SHA256=<approved-64-hex-sha256> pnpm test:phase2:e2e
 LOOPZHB_EXPECTED_CLAUDE_SHA256=<approved-64-hex-sha256> pnpm test:phase4:e2e
 ```
 
+权限层探针（opt-in，**不调用模型、零费用**，但依赖本机安装的 Claude Code 内部判定）：
+
+```bash
+# 用生产 argv/settings 驱动真实 CLI（mock provider 提供 canned Bash tool_use），
+# 断言"含 ;/= 的终局命令在无放行规则时被拒、有规则时执行且 outbox 记录逐字节相符"
+LOOPZHB_CLAUDE_PERMISSION_PROBE=1 pnpm --filter @loopzhb/daemon test src/claude-permission-probe.test.ts
+```
+
 仓库工作规约（文档四层分流、批次收口仪式）见 `AGENTS.md`。
 

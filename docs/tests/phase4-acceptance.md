@@ -219,6 +219,30 @@ Phase 4 Batch 2 的确定性验收目标及第二轮审查反例均有对应测�
 
 **结论：真实 Claude 门尚未通过，Phase 4 不收口。** 上述两项修复并复验前，Batch 3 与 Phase 4 保持进行中（roadmap 已同步）。
 
+## 两个阻塞项的修复与本地权限探针（#57 / #58，2026-09-26）
+
+修复在**真实门复验之前**完成，且不消耗任何模型调用。理由：权限判定发生在已安装的 CLI 内部，**与模型无关**——用 mock provider 提供 canned `Bash` tool_use，真实 CLI 就会在**生产 argv、生产 settings、真实控制根 / 每 Run 临时根 / OS sandbox** 下作出真实裁决，而"命令是否真的执行"由 **outbox 里是否出现记录**回答（记录在，即 wrapper 真的在沙箱内跑过）。
+
+**F1 修复（放行 wrapper 入口）**：v1 Run 的 sandbox settings 增加唯一的权限放行 `permissions.allow: ["Bash(loopzhb:*)"]`；v0 不新增任何键，A3 的 settings pin 逐字节未动。裁决与安全论证见 ADR-006 2026-09-26 修订与 ADR-009 同日修订第 1 条。
+
+**F2 修复（探测惰性化）**：显式 `--help`/`-h`/`help`/`--version` 探测不再写记录（打印文法，exit 0）；判定是**位置性**的（命令槽或 flag 槽），`loopzhb finish --reason --help` 仍是"reason 恰为 `--help`"的合法调用。裁决见 ADR-009 同日修订第 2 条。
+
+**本地权限探针（`packages/daemon/src/claude-permission-probe.test.ts`，opt-in、零费用）**
+
+```text
+$ LOOPZHB_CLAUDE_PERMISSION_PROBE=1 pnpm --filter @loopzhb/daemon test src/claude-permission-probe.test.ts
+ Test Files  1 passed (1)      Tests  2 passed (2)      Duration  10.99s
+```
+
+| 终端命令 | 无放行规则 | 有放行规则（本次修复） |
+|---|---|---|
+| `loopzhb report --status new --message "…" --state '{"step":1,…}'` | 允许（sandbox auto-allow） | 允许 |
+| `loopzhb finish --reason "goal met; state-marker=<A>; timeline-marker=<B>"` | **拒绝**（`… don't ask mode`，outbox 空） | **执行**，outbox 恰好一条且 reason 逐字节相符 |
+
+第二行就是全部要点：同一命令、同一 profile、只差一个键。它同时否证了另一个假设——"引号内的 `;` 会被当作子命令切分从而使规则失配"：规则匹配在含 `;`/`=` 的引号参数上照常成立。**残余不确定性**：探针依赖本机 CLI 版本（2.1.273）的内部判定，因此它是**证据补充而非替代**；两 Run 全绿仍只能由真实门证明。
+
+**结论（修复落地时点）**：两项修复已落地并通过确定性门与全仓离线套件；真实 Claude 门**尚未复验**，Phase 4 仍不收口。复验需操作者的费用批准，并按切片五纪律单独取证、失败只记录不自动重试。
+
 ## 完整质量门（`86bd353`）
 
 ```text

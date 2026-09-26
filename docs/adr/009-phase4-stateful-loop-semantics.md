@@ -173,6 +173,13 @@ Batch 3 新增本机 Dashboard 与它独有的 manual 触发策略。以下为�
 5. **按钮规则与后端规则同源且同序**（Completed > Running > Pending），禁用原因以文字表达而不只靠颜色。页面最多陈旧一个 meta-refresh 周期，因此按钮是**建议**、后端 skip 才是权威；"页面说可点、后端仍 skip" 是设计内的合法组合。
 6. **验收分层，确定性门不得替代真实门。** Batch 3 的全链路验收由两层构成：确定性门用 fake Claude 走完**同一**生产装配（真实 listener、生产 daemon CLI、生产 runner、Dashboard 表单与 CSRF），真实门只把 Claude 换成操作者批准 hash 的真模型。两层共用同一证据形状：测试期随机标记由首个 Run 从 Task File 移入 state，第二个 Run 必须同时报回**前次 state 的标记**与**更新后 Timeline 的标记**——因此 completion reason 是对磁盘的测量，而不是对测试期望的回声（沿用 2026-09-02（二）第 4 条的"不能用 fake 结果替代真实门"）。真实门为 opt-in，须先校验批准 hash 并取得费用批准，失败只记录原因、绝不自动重试真实调用。
 
+### 2026-09-26（二）：Issue #57/#58 终端通道可达性与探测裁决
+
+真实门第五次执行暴露的两个发现（`docs/tests/phase4-acceptance.md`），各自落地为长期裁决。两条都属"**数据内容不得决定命令能否成立**"这一族。
+
+1. **终局命令的可执行性不得由数据内容决定。** v1 收口命令的参数含 agent 自撰文本，而 `dontAsk` 下的沙箱 auto-allow 会拒绝其分析器无法归约为简单命令的形态。实测：同一命令在 reason 含 `;`/`=` 时被拒（`Permission to use Bash has been denied because Claude Code is running in don't ask mode`，outbox 零记录），而**只加一条 wrapper 放行规则**后同一命令正常执行并写出逐字节相符的 reason。因此 v1 Run 的 sandbox settings 携带**唯一**一条权限放行——`Bash(<WRAPPER_COMMAND>:*)`，即 wrapper 裸命令名——v0 不携带；沙箱 profile 不变（安全论证见 ADR-006 同日修订）。这条同时否证了"引号内的 `;` 会被当子命令切分导致规则失配"的假设：规则匹配在含 `;`/`=` 的引号参数上成立。确定性侧证据由 `claude-permission-probe.test.ts` 承担（mock provider + 真实 CLI，零费用；**不替代**真实门）。
+2. **显式帮助/版本探测惰性化，且 help 判定必须是位置性的。** wrapper 的"每次调用恰好一条记录"契约（模块契约 + 2026-09-01 第 9 条的 `journal_missing`/`journal_multiple` 分类语义）增加**唯一**例外：显式 `--help` / `-h` / `help` / `--version` 探测不写记录，改为打印文法并 exit 0；它在 outbox 缺失时同样可用，因为它什么都不写。判定只在**命令槽**（argv[0]，或真实子命令之后的 argv[1]）与 **flag 槽**成立，绝不"argv 任意位置含 help token"：`loopzhb finish --reason --help` 是 reason 恰为 `--help` 的**合法**调用，按任意位置判定会静默吞掉该 Run 的唯一记录，正是第 1 条要消除的同类缺陷（该性质由测试钉住，并经变异验证：改成任意位置扫描后两条内容安全用例立即变红）。不新增失败分类：只探测而不收口者仍以 `journal_missing` 收口，与"从未调用"同级。
+
 ### 2026-08-31：实现期裁决固化
 
 在不改变任何已裁决语义的前提下，固化实现期确认的八处裁决：
