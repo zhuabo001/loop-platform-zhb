@@ -179,12 +179,24 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 3 real Claude E2E (opt-in)", () => {
         "run.",
         "",
         "Branch B — `prev-state.json` is NOT null, so step 1 already ran. This run",
-        "still owes its own terminal command: read the `marker` field out of",
-        "`prev-state.json` and the value on the `- keep marker:` line below, then",
-        "copy this line ONCE with the two `<...>` slots REPLACED by those two",
-        "values (never leave a placeholder in place, never invent a value):",
+        "still owes its own terminal command. Do these two things, in order:",
+        "",
+        "1. Write a file `RUN-NOTES.md` next to this task file containing exactly",
+        "   two lines:",
+        "",
+        "       marker-read: <the `marker` field you read from prev-state.json, or",
+        "                     the exact error text if that file could not be read>",
+        "       command: <the exact command line you are about to run>",
+        "",
+        "2. Then read the value on the `- keep marker:` line below and run ONCE,",
+        "   substituting both values into this line (never leave a placeholder in",
+        "   place, never invent a value):",
         "",
         `    loopzhb finish --reason "goal met; state-marker=<marker from prev-state.json>; timeline-marker=<keep marker from the Timeline>"`,
+        "",
+        "If reading `prev-state.json` fails, still write `RUN-NOTES.md` (with the",
+        "exact error) and still run exactly ONE command — use Branch A's report",
+        "command in that case, so the run ends with the one call it owes.",
         "",
         "Never use `--state-file` or `--message-file`, and never write anything into",
         "the outbox directory. Do not run the command twice to confirm it worked —",
@@ -490,6 +502,12 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 3 real Claude E2E (opt-in)", () => {
           const tree = await readdir(workdir, { recursive: true }).catch(() => ["<unreadable>"]);
           console.error(`[b3-real] workdir listing: ${JSON.stringify(tree)}`);
           console.error(`[b3-real] TASK.md after the run:\n${await readFile(taskFile, "utf-8").catch(() => "<unreadable>")}`);
+          // The agent's own breadcrumb (Branch B writes it): the ONE place the
+          // model's read values and intended command become observable without
+          // reading a session transcript.
+          console.error(
+            `[b3-real] RUN-NOTES.md:\n${await readFile(path.join(workdir, "RUN-NOTES.md"), "utf-8").catch(() => "<absent>")}`,
+          );
         } catch {
           // Diagnostics must never mask the acceptance failure itself.
         }
