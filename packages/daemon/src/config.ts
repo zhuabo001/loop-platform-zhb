@@ -38,6 +38,8 @@ export interface DaemonConfig {
   /** Claude Code binary name/path; executability is NOT probed here. */
   claudeBin: string;
   agentTimeoutMs: number;
+  /** Optional Claude CLI spending threshold per Run, in USD. */
+  claudeMaxBudgetUsd?: number;
 }
 
 export class DaemonConfigError extends Error {
@@ -54,9 +56,11 @@ export type DaemonConfigEnv = {
   LOOPZHB_ALLOWED_ROOTS?: string | undefined;
   LOOPZHB_CLAUDE_BIN?: string | undefined;
   LOOPZHB_AGENT_TIMEOUT_MS?: string | undefined;
+  LOOPZHB_CLAUDE_MAX_BUDGET_USD?: string | undefined;
 };
 
 export function loadDaemonConfig(env: DaemonConfigEnv): DaemonConfig {
+  const budget = parseClaudeMaxBudgetUsd(env.LOOPZHB_CLAUDE_MAX_BUDGET_USD);
   return {
     serverUrl: parseServerUrl(env.LOOPZHB_SERVER_URL),
     machineCredential: parseMachineCredential(env.LOOPZHB_MACHINE_CREDENTIAL),
@@ -64,7 +68,18 @@ export function loadDaemonConfig(env: DaemonConfigEnv): DaemonConfig {
     allowedRoots: parseAllowedRoots(env.LOOPZHB_ALLOWED_ROOTS),
     claudeBin: parseClaudeBin(env.LOOPZHB_CLAUDE_BIN),
     agentTimeoutMs: parseAgentTimeoutMs(env.LOOPZHB_AGENT_TIMEOUT_MS),
+    ...(budget !== undefined ? { claudeMaxBudgetUsd: budget } : {}),
   };
+}
+
+function parseClaudeMaxBudgetUsd(raw: string | undefined): number | undefined {
+  if (raw == null || raw.trim() === "") return undefined;
+  const text = raw.trim();
+  const amount = Number(text);
+  if (!/^\d+(?:\.\d+)?$/.test(text) || !Number.isFinite(amount) || amount <= 0) {
+    throw new DaemonConfigError("LOOPZHB_CLAUDE_MAX_BUDGET_USD must be a finite positive decimal");
+  }
+  return amount;
 }
 
 /** Absolute http/https URL: no userinfo, no query, no fragment; trailing

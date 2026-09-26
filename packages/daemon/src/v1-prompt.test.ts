@@ -16,6 +16,12 @@ const INPUT = {
 };
 
 describe("buildV1Prompt", () => {
+  it("distinguishes record-free probes from the exactly-one terminal requirement", () => {
+    const prompt = buildV1Prompt(INPUT);
+    expect(prompt).toContain("zero terminal calls, repeated terminal calls, or an invalid call fails");
+    expect(prompt).toContain("write no record and do not count as a terminal call");
+    expect(prompt).not.toContain("exactly one `loopzhb` call");
+  });
   it("a Closed Loop carries the goal line, both paths, and the finish example", () => {
     const prompt = buildV1Prompt(INPUT);
     expect(prompt).toContain('Goal: "close the gap" — the highest-priority completion condition');

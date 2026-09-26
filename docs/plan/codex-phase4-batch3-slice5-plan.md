@@ -51,7 +51,7 @@ git diff --check "$(git merge-base HEAD main)"...HEAD
 真实验收在具备 loopback 监听权限、Claude 认证和费用批准的环境单独执行：
 
 ```bash
-LOOPZHB_EXPECTED_CLAUDE_SHA256=<approved-sha256> pnpm test:phase4:e2e
+LOOPZHB_PHASE4_ACCEPTANCE_BUDGET_USD=<approved-total-usd> LOOPZHB_EXPECTED_CLAUDE_SHA256=<approved-sha256> pnpm test:phase4:e2e
 ```
 
 全部完成条件：确定性门和全量质量门通过；批准哈希匹配的真实 Claude 两次 Run 与连续两次重启验收通过；Dashboard 仍保持本机可见、服务端渲染、无客户端 JavaScript 和单一 Run Now 控件；没有未经批准的 schema migration、公共 JSON DTO 或对外 Dashboard API 变化；三轨复审没有未解决的 P1/P2；Phase 4 阻塞 Issues 均完成独立核销；ADR、验收记录、README、roadmap、Issue 和 PR 内容互相一致。任一门失败时，roadmap 保持 Batch 3 / Phase 4 进行中，记录实际失败并修复后复验。
@@ -62,3 +62,11 @@ LOOPZHB_EXPECTED_CLAUDE_SHA256=<approved-sha256> pnpm test:phase4:e2e
 - 不新增数据库迁移、公共 JSON DTO、客户端 JavaScript、Dashboard 编辑功能或额外产品路由；Dashboard 页面入口保持 `GET /`，Run 表单保持 `POST /dashboard/loops/:id/run`。
 - Issue #56 的 API 同源意图校验、JSON Content-Type 门禁与拒绝空请求体由 Phase 5 处理，不作为切片五的隐藏工作。
 - 切片五是 Batch 3 最后一个计划切片；若独立复审发现新的 Phase 4 阻塞项，先登记并解决/重新规划后再收口，不能为了维持“五片”而提前标记 Phase 4 完成。
+
+## 2026-09-27 收口补充
+
+- 真实任务仅提交独立的 terminal 命令。移除调试用 `; echo "exit=$?"`：相同 CLI/hash 下其权限检查仍拒绝整个 Bash 调用；不扩展 wrapper 放行到 echo，不改变 reason 的内容。诊断使用工具返回结果，成功以 host Journal 和数据库终态为准。
+- marker A 只存在于 Run 1 可删除的 Timeline 行；Run 2 启动前检查 Task File 及工作目录文件不含 A。随机 marker 与前次 state 错误必须使门转红。
+- 每 Run 先执行一次显式 record-free help，再提交恰好一条 report/finish，以真实链路核查 #58。
+- 用户批准本次一次两 Run 真实验收，总上限 $3；入口必须提供批准总预算，传递每 Run 为总额三分之一的 CLI `--max-budget-usd` 阈值，保留三分之一余量。Run 1 费用缺失或剩余不足时不得触发 Run 2；完成后记录实际两 Run 费用。CLI 阈值按请求检查，不宣称账户级精确硬限额。失败不自动重试。
+- 真实门与 secret E2E 使用各自私有的 daemon TMPDIR，避免并行套件误把另一 daemon 的控制根当作自己的资源。shutdown 前确认资源真实存在，再核查关闭后消失。

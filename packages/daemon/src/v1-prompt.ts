@@ -51,6 +51,9 @@ export function buildV1Prompt(input: V1PromptInput): string {
       "  - Finish ONLY when real evidence shows the Goal above is met; finishing completes the loop permanently.",
     );
   }
-  lines.push("Anything other than exactly one `loopzhb` call — zero calls, repeated calls, or an invalid call — fails the run.");
+  lines.push(
+    "Exactly one terminal report/finish call is required — zero terminal calls, repeated terminal calls, or an invalid call fails the run.",
+    "Explicit help/version probes (`loopzhb --help`, `-h`, `help`, `--version`) write no record and do not count as a terminal call.",
+  );
   return lines.join("\n");
 }

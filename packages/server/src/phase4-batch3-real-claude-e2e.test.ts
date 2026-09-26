@@ -68,6 +68,7 @@ import { loops, runLeases, runs } from "./db/schema.js";
 import { DaemonControlObserver, DaemonLogObserver, DetachedProcessSupervisor } from "./real-claude-e2e-harness.js";
 import { bootstrapServer, waitForListening, type BootedServer } from "./start.js";
 import { FakeClock, FakeCronFactory } from "./testkit/index.js";
+import { assertBatch3StateSource, buildBatch3AcceptanceTask } from "./phase4-batch3-acceptance-task.js";
 
 const ENABLED = process.env.LOOPZHB_REAL_CLAUDE_E2E === "1";
 const TOKEN = "dk_e2e_batch3_real_claude";
@@ -151,72 +152,18 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 3 real Claude E2E (opt-in)", () => {
         );
       }
 
+      const approvedBudget = Number(process.env.LOOPZHB_PHASE4_ACCEPTANCE_BUDGET_USD);
+      if (!Number.isFinite(approvedBudget) || approvedBudget <= 0) {
+        throw new Error("Batch 3 real gate requires an explicit positive LOOPZHB_PHASE4_ACCEPTANCE_BUDGET_USD");
+      }
+      // Reserve one third for per-request threshold overshoot. Two Runs only.
+      const perRunBudget = approvedBudget / 3;
+
       // Two markers minted at test time: the model cannot have seen them in
       // any prompt or fixture — it can only report them by READING the files.
       const markerA = `mk-a-${randomBytes(8).toString("hex")}`;
       const markerB = `mk-b-${randomBytes(8).toString("hex")}`;
-      const taskContent = [
-        "# Batch 3 Dashboard acceptance task",
-        "",
-        "## Spec",
-        "",
-        "This loop is driven by a human clicking Run Now, one run per click. EVERY",
-        "run ends with EXACTLY ONE `loopzhb` terminal command. A run that ends with",
-        "none, or with more than one, FAILS: the wrapper writes a single record into",
-        "a host-checked directory, and a second record — or any extra file left in",
-        "that directory (`$LOOPZHB_JOURNAL_OUTBOX`) — fails the whole run.",
-        "",
-        "Read `prev-state.json` (its absolute path is given in the run prompt) and",
-        "pick exactly ONE branch:",
-        "",
-        "Branch A — `prev-state.json` is `null`, nothing recorded yet. Copy this",
-        "line verbatim and run it once:",
-        "",
-        `    loopzhb report --status new --message "step 1 recorded the task file" --state '{"step":1,"marker":"${markerA}"}'`,
-        "",
-        "Then edit this file: delete the line beginning `- step-1 marker:` and",
-        "append `- step 1 recorded` at the end of the Timeline. That is the whole",
-        "run.",
-        "",
-        "Branch B — `prev-state.json` is NOT null, so step 1 already ran. This run",
-        "still owes its own terminal command. Do these two things, in order:",
-        "",
-        "1. Run the command below ONCE, substituting both values (never leave a",
-        "   placeholder in place, never invent a value). Capture its result by",
-        "   appending a trailing `; echo \"exit=$?\"` — that echo is a shell builtin,",
-        "   NOT a second loopzhb call, and appending it is expected:",
-        "",
-        `    loopzhb finish --reason "goal met; state-marker=<marker from prev-state.json>; timeline-marker=<keep marker from the Timeline>" ; echo "exit=$?"`,
-        "",
-        "2. THEN write a file `RUN-NOTES.md` next to this task file containing",
-        "   exactly these four lines:",
-        "",
-        "       marker-read: <the `marker` field you read from prev-state.json, or",
-        "                     the exact error text if that file could not be read>",
-        "       command: <the exact command line you ran>",
-        "       exit-status: <the number the echo printed, or `not-run` if you never",
-        "                     ran the command>",
-        "       output: <everything the command printed, or the reason you did not",
-        "                run it — write `(nothing)` if it printed nothing>",
-        "",
-        "If reading `prev-state.json` fails, still run exactly ONE command — use",
-        "Branch A's report command in that case, so the run ends with the one call",
-        "it owes — and still write the four lines above.",
-        "",
-        "Never use `--state-file` or `--message-file`, and never write anything into",
-        "the outbox directory. Do not run the command twice to confirm it worked —",
-        "a silent success is a success, and a second call is what fails the run.",
-        "",
-        "## Current understanding",
-        "Unknown on purpose: read `prev-state.json` (path given in the run prompt)",
-        "to see what earlier runs recorded, and follow Branch A or Branch B above.",
-        "",
-        "## Timeline",
-        "",
-        `- step-1 marker: ${markerA}`,
-        `- keep marker: ${markerB}`,
-        "",
-      ].join("\n");
+      const taskContent = buildBatch3AcceptanceTask(markerA, markerB);
 
       // 1. Allowed root with the workdir + Task File.
       const allowedRoot = await mkdtemp(path.join(tmpdir(), `loopzhb-b3real-root-${process.pid}-`));
@@ -275,16 +222,21 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 3 real Claude E2E (opt-in)", () => {
       //    the values are never printed, only the verdict.
       const claudeBin = process.env.LOOPZHB_CLAUDE_BIN?.trim() || "claude";
       const secrets = [TOKEN, ...collectSecretValues(resolveClaudeProviderEnv(process.env))];
-      const controlRootsBefore = new Set(readdirSync(tmpdir()).filter((n) => n.startsWith("loopzhb-control-")));
-      const scratchRootsBefore = new Set(readdirSync(tmpdir()).filter((n) => n.startsWith("loopzhb-runs-")));
+      const daemonTmp = await mkdtemp(path.join(tmpdir(), "loopzhb-b3real-daemon-tmp-"));
+      tempDirs.push(daemonTmp);
+      const controlRootsBefore = new Set(readdirSync(daemonTmp).filter((n) => n.startsWith("loopzhb-control-")));
+      const scratchRootsBefore = new Set(readdirSync(daemonTmp).filter((n) => n.startsWith("loopzhb-runs-")));
       const daemon = spawn(process.execPath, [path.join(__dirname, "../../daemon/dist/cli.js")], {
         env: {
           ...process.env,
+          TMPDIR: daemonTmp,
           LOOPZHB_SERVER_URL: baseUrl,
           LOOPZHB_MACHINE_CREDENTIAL: TOKEN,
           LOOPZHB_ALLOWED_ROOTS: JSON.stringify([allowedRoot]),
           LOOPZHB_CLAUDE_BIN: claudeBin,
           LOOPZHB_REAL_CLAUDE_E2E: "1",
+          LOOPZHB_CLAUDE_MAX_BUDGET_USD: String(perRunBudget),
+          LOOPZHB_AGENT_TIMEOUT_MS: String(AGENT_TIMEOUT_MS),
           NODE_ENV: "production",
         },
         shell: false,
@@ -399,9 +351,22 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 3 real Claude E2E (opt-in)", () => {
         const afterRun1 = await readFile(taskFile, "utf-8");
         expect(afterRun1).not.toBe(taskContent);
         expect(afterRun1).toContain(markerB);
-        expect(afterRun1).not.toContain(`- step-1 marker: ${markerA}`);
+        assertBatch3StateSource(afterRun1, markerA, markerB);
+        // No copied marker in auxiliary files may become an alternate source.
+        const filesAfterRun1 = await readdir(workdir, { recursive: true });
+        for (const file of filesAfterRun1) {
+          const absolute = path.join(workdir, file);
+          if ((await stat(absolute)).isFile()) {
+            expect(await readFile(absolute, "utf-8")).not.toContain(markerA);
+          }
+        }
         expect(rows1.taskFileContent).toBe(afterRun1);
         expect(rows1.taskFileSyncError).toBeNull();
+
+        const firstCost = (await first.booted.handle.db.select().from(runs).where(eq(runs.id, run1Id)))[0]!.costUsd;
+        expect(firstCost).not.toBeNull();
+        expect(firstCost!).toBeLessThanOrEqual(approvedBudget - perRunBudget);
+        console.log(`[b3-real] Run 1 cost USD: ${firstCost}`);
 
         // ---- RUN 2: the finish reports BOTH markers ----
         const run2Id = await runViaDashboard(2);
@@ -409,14 +374,17 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 3 real Claude E2E (opt-in)", () => {
         expect(run2).toMatchObject({ phase: "done", outcome: "exec", status: "resolved", error: null });
         // Marker A could only come from the promoted state, marker B only from
         // the rewritten Timeline: the reason is the cross-run proof.
-        expect(run2.message).toContain(markerA);
-        expect(run2.message).toContain(markerB);
+        expect(run2.message).toBe(`goal met; state-marker=${markerA}; timeline-marker=${markerB}`);
+
+        const secondCost = (await first.booted.handle.db.select().from(runs).where(eq(runs.id, run2Id)))[0]!.costUsd;
+        expect(secondCost).not.toBeNull();
+        expect(firstCost! + secondCost!).toBeLessThanOrEqual(approvedBudget);
+        console.log(`[b3-real] Run 2 cost USD: ${secondCost}; total USD: ${firstCost! + secondCost!}`);
 
         // Completed atomically: completion + schedule disable + state kept.
         const rows2 = (await first.booted.handle.db.select().from(loops).where(eq(loops.id, loopId)))[0]!;
         expect(rows2.completedAt).not.toBeNull();
-        expect(rows2.completionReason).toContain(markerA);
-        expect(rows2.completionReason).toContain(markerB);
+        expect(rows2.completionReason).toBe(`goal met; state-marker=${markerA}; timeline-marker=${markerB}`);
         expect(rows2.enabled).toBe(false);
         expect(rows2.state).toMatchObject({ step: 1, marker: markerA });
         expect(await first.booted.handle.db.select().from(runLeases)).toHaveLength(0);
@@ -432,6 +400,14 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 3 real Claude E2E (opt-in)", () => {
 
         // 8. Graceful daemon shutdown: exit 0 and every observed Claude
         //    process group closed.
+        const ownedControlRoots = readdirSync(daemonTmp)
+          .filter((n) => n.startsWith("loopzhb-control-") && !controlRootsBefore.has(n))
+          .map((n) => path.join(daemonTmp, n));
+        const ownedScratchRoots = readdirSync(daemonTmp)
+          .filter((n) => n.startsWith("loopzhb-runs-") && !scratchRootsBefore.has(n))
+          .map((n) => path.join(daemonTmp, n));
+        expect(ownedControlRoots).toHaveLength(1);
+        expect(ownedScratchRoots).toHaveLength(1);
         const closed = await supervisor.terminate({ graceMs: 5000, killWaitMs: 2000 });
         expect(closed).toEqual({ kind: "closed", code: 0, signal: null });
         control.assertHealthy();
@@ -440,14 +416,7 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 3 real Claude E2E (opt-in)", () => {
 
         // Per-start resources leave WITH the daemon: the control root (wrapper,
         // journal outboxes) and the per-run scratch root.
-        for (const root of readdirSync(tmpdir())
-          .filter((n) => n.startsWith("loopzhb-control-") && !controlRootsBefore.has(n))
-          .map((n) => path.join(tmpdir(), n))) {
-          await expect(stat(root)).rejects.toMatchObject({ code: "ENOENT" });
-        }
-        for (const root of readdirSync(tmpdir())
-          .filter((n) => n.startsWith("loopzhb-runs-") && !scratchRootsBefore.has(n))
-          .map((n) => path.join(tmpdir(), n))) {
+        for (const root of [...ownedControlRoots, ...ownedScratchRoots]) {
           await expect(stat(root)).rejects.toMatchObject({ code: "ENOENT" });
         }
 

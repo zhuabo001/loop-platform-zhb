@@ -129,6 +129,7 @@ export async function prepareDaemon(
         jail,
         claudeBin: config.claudeBin,
         timeoutMs: config.agentTimeoutMs,
+        ...(config.claudeMaxBudgetUsd !== undefined ? { maxBudgetUsd: config.claudeMaxBudgetUsd } : {}),
         envSource: runnerEnvSource,
         controlRoot,
         // The probe-pinned binary identity: every run re-verifies it before

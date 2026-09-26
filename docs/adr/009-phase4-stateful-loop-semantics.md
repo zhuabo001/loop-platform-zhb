@@ -200,3 +200,10 @@ Batch 3 新增本机 Dashboard 与它独有的 manual 触发策略。以下为�
 - capability 协商是 ADR-002 决策 2「无协商」的明确例外：仍保持 additive optional wire、无握手、无版本比较，只按 capability 成员关系开放 Phase 4 语义（见 ADR-002 修订记录）。
 - 双层 Completion 防线（DB CHECK + 领域 fail-closed）使半完成态既不能落库、也不能被读取方采信。
 - 代价：Batch 1 的测试面（M/P/D/T/R 五组）大于代码面；冻结的 Phase 3 reader 夹具必须维护到 Phase 3 兼容承诺结束。
+
+### 2026-09-27 — Phase 4 收口测量与诊断命令
+
+1. 权限放行覆盖裸 `loopzhb` 入口，不保证另一个 shell 子命令或参数展开也被允许。真实门的 `finish … ; echo "exit=$?"` 在固定 2.1.273/hash 下仍被拒绝，独立 finish 则写入正确记录。验收移除该调试后缀，保留完整的 finish reason；不增加 echo 放行、不伪造退出状态。成功的权威证据是 host 校验的恰好一条 Journal、Report 和数据库终态，agent 笔记只是诊断。
+2. 跨 Run 测量不得允许 marker 从 Task File 的命令示例或辅助文件泄漏。marker A 仅植入可移除的 Timeline 行，report 命令使用占位符；Run 2 之前验证整个 Task File 和工作目录文件不含 A。Run 2 的完成原因必须逐字节等于从前次 state 的 A 与 Timeline 的 B 组成的期望结果。
+3. 显式帮助探测不属于 terminal 写入；真实任务先 help 再恰好一次 report/finish，host 的单记录规则继续生效。
+4. 有批准费用上限的验收必须显式设置总预算。daemon 可选 `LOOPZHB_CLAUDE_MAX_BUDGET_USD` 将正有限十进制阈值交给 CLI 的 `--max-budget-usd`；默认 argv 不变。每 Run 设置总预算三分之一的阈值，留出按请求结算的余量；Run 1 费用缺失或剩余不足即停止，完整门记录总费用。CLI 阈值不是账户级硬限额，不自动重试失败的真实验收。

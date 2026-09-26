@@ -43,9 +43,8 @@ const ENABLED = process.env.LOOPZHB_CLAUDE_PERMISSION_PROBE === "1";
 const PROVIDER = fileURLToPath(new URL("../test-fixtures/mock-anthropic-provider.mjs", import.meta.url));
 const CLI_TIMEOUT_MS = 90_000;
 
-/** The two shapes that matter. The first is the one the real gate's Run 1
- *  used (and which always ran); the second is the one its Run 2 used (and
- *  which was refused four times) — a measured reason carrying `;` and `=`. */
+/** Standalone terminal commands used by the acceptance task. Shell diagnostic
+ * suffixes are separate commands with separate permission checks. */
 const RECORDED = 'loopzhb report --status new --message "step 1 recorded the task file" --state \'{"step":1,"marker":"mk-a-probe"}\'';
 const MEASURED = 'loopzhb finish --reason "goal met; state-marker=mk-a-probe; timeline-marker=mk-b-probe"';
 
@@ -219,8 +218,26 @@ describe.skipIf(!ENABLED)("Issue #57: the terminal command must not be judged by
       expect(withoutRule.records).toEqual([]); // refused ⇒ nothing reached the outbox
 
       const withRule = await probe(MEASURED, true);
+      expect(withRule.exitCode).toBe(0);
       expect(withRule.denied).toBe(false);
       expect(withRule.records).toEqual([
+        { kind: "finish", reason: "goal met; state-marker=mk-a-probe; timeline-marker=mk-b-probe" },
+      ]);
+    },
+    (CLI_TIMEOUT_MS + 30_000) * 2,
+  );
+
+  it(
+    "the old exit-status suffix is refused even with the grant; help then standalone finish keeps exactly one record",
+    async () => {
+      const suffixed = await probe(`${MEASURED} ; echo "exit=$?"`, true);
+      expect(suffixed.denied).toBe(true);
+      expect(suffixed.denialText).toContain("don't ask mode");
+      expect(suffixed.records).toEqual([]);
+      const helped = await probe(`loopzhb --help && ${MEASURED}`, true);
+      expect(helped.exitCode).toBe(0);
+      expect(helped.denied).toBe(false);
+      expect(helped.records).toEqual([
         { kind: "finish", reason: "goal met; state-marker=mk-a-probe; timeline-marker=mk-b-probe" },
       ]);
     },

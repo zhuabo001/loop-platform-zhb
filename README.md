@@ -94,6 +94,7 @@ pnpm --filter @loopzhb/daemon start
 | `LOOPZHB_ALLOWED_ROOTS` | ✅ | — | JSON 字符串数组；绝对路径、无 `..` 段；启动时校验存在且为目录（fail-fast） |
 | `LOOPZHB_POLL_MS` | 否 | `3000` | 严格十进制，250–60000 |
 | `LOOPZHB_CLAUDE_BIN` | 否 | `claude` | Claude Code 二进制名/路径；启动时以无凭据 env 探测 `--version`（≥2.1.219）与 `--help`，每次调用前后均复核 stat+sha256；真实 Run 的 spawn 前再复核，漂移或探测失败即拒绝执行 |
+| `LOOPZHB_CLAUDE_MAX_BUDGET_USD` | 否 | 无 | 正有限十进制 USD；传给 Claude CLI `--max-budget-usd`，逐 Run 停止阈值（按请求结算，可能越过阈值，不是账户级硬限额） |
 | `LOOPZHB_AGENT_TIMEOUT_MS` | 否 | `1800000` | 严格十进制，1–2147483647 |
 
 **平台**：macOS / Linux / WSL2。原生 Windows 不支持（subprocess 进程组语义是 POSIX 的）。
@@ -123,7 +124,7 @@ LOOPZHB_EXPECTED_CLAUDE_SHA256=<approved-64-hex-sha256> pnpm test:phase2:e2e
 
 # Phase 4 Batch 3 全链路门：从 Dashboard 页面触发两次真实 Run
 # （state 晋升 → Task File 改写 → Finish 完成）并连续重启两次
-LOOPZHB_EXPECTED_CLAUDE_SHA256=<approved-64-hex-sha256> pnpm test:phase4:e2e
+LOOPZHB_PHASE4_ACCEPTANCE_BUDGET_USD=<approved-total-usd> LOOPZHB_EXPECTED_CLAUDE_SHA256=<approved-64-hex-sha256> pnpm test:phase4:e2e
 ```
 
 权限层探针（opt-in，**不调用模型、零费用**，但依赖本机安装的 Claude Code 内部判定）：

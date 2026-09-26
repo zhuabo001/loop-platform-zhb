@@ -145,8 +145,9 @@ const USAGE =
     "  loopzhb report --status <new|resolved|nothing-new> [--message <text> | --message-file <path>] [--state <json> | --state-file <path>]",
     "  loopzhb finish --reason <text> [--message <text> | --message-file <path>] [--state <json> | --state-file <path>]",
     "",
-    "Exactly ONE invocation per run. An invalid invocation writes a journal",
-    "record that fails the run; `--help` is the only record-free form.",
+    "Exactly ONE terminal report/finish invocation per run. An invalid invocation",
+    "writes a journal record that fails the run. Explicit --help, -h, help and",
+    "--version probes are record-free and do not count as terminal invocations.",
   ].join("\n") + "\n";
 
 /** Strict flag parsing: every token must be a known `--flag` followed by a

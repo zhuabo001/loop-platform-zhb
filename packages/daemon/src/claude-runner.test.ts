@@ -25,7 +25,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Delivery } from "@loopzhb/protocol";
 
 import { resolveClaudeProviderEnv } from "./claude-provider-env.js";
-import { createClaudeRunner, type ClaudeRunnerDeps } from "./claude-runner.js";
+import { buildClaudeArgs, createClaudeRunner, type ClaudeRunnerDeps } from "./claude-runner.js";
 import { WRAPPER_COMMAND, createControlRoot, type ControlRoot } from "./control-root.js";
 import { JailError, createWorkdirJail, type ResolvedWorkdir, type WorkdirJail } from "./jail.js";
 import type { ClaudeBinaryIdentity } from "./probe-claude.js";
@@ -34,6 +34,16 @@ import type { AgentRunner, RunnerReport } from "./runner.js";
 import { ProcessControlError } from "./subprocess.js";
 
 const FIXTURE = fileURLToPath(new URL("../test-fixtures/fake-claude.mjs", import.meta.url));
+
+it("pins the opt-in budget argv and rejects invalid direct adapter budgets", async () => {
+  const { run } = makeRunner({ maxBudgetUsd: 1 });
+  expect((await run(makeDelivery())).ok).toBe(true);
+  const argv = readSidecar().argv;
+  expect(argv[argv.indexOf("--max-budget-usd") + 1]).toBe("1");
+  for (const budget of [0, -1, NaN, Infinity]) {
+    expect(() => buildClaudeArgs(makeDelivery(), "{}", undefined, budget)).toThrow("invalid Claude per-Run budget");
+  }
+});
 const SIDECAR = ".fake-claude-session.json";
 // The canonical base the runner mints its per-Run CLAUDE_CODE_TMPDIR roots
 // under (run-temp.ts): `/private/tmp` on macOS, the realpath of the system

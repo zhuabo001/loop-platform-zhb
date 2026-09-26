@@ -75,6 +75,7 @@ export interface ClaudeRunnerDeps {
   jail: WorkdirJail;
   claudeBin: string;
   timeoutMs: number;
+  maxBudgetUsd?: number;
   /** The daemon process env — filtered through the agent-env whitelist. */
   envSource: NodeJS.ProcessEnv;
   /** The daemon-start control root (Phase 4 Batch 2). REQUIRED for
@@ -155,7 +156,7 @@ export function buildSandboxSettings(
  *  the flag — the protocol contract). A v1 run substitutes the daemon-built
  *  prompt for the wire task text (ADR-009 修订 10); v0 passes NO override
  *  and stays byte-identical. */
-export function buildClaudeArgs(delivery: Delivery, settingsJson: string, taskOverride?: string): string[] {
+export function buildClaudeArgs(delivery: Delivery, settingsJson: string, taskOverride?: string, maxBudgetUsd?: number): string[] {
   const args = [
     "-p",
     taskOverride ?? delivery.task,
@@ -177,6 +178,10 @@ export function buildClaudeArgs(delivery: Delivery, settingsJson: string, taskOv
     "--settings",
     settingsJson,
   ];
+  if (maxBudgetUsd !== undefined) {
+    if (!Number.isFinite(maxBudgetUsd) || maxBudgetUsd <= 0) throw new Error("invalid Claude per-Run budget");
+    args.push("--max-budget-usd", String(maxBudgetUsd));
+  }
   if (delivery.loop.model !== null && delivery.loop.model !== "") {
     args.push("--model", delivery.loop.model);
   }
@@ -314,7 +319,7 @@ export function createClaudeRunner(deps: ClaudeRunnerDeps): AgentRunner {
         });
         const spawned = await spawn({
           command,
-          args: buildClaudeArgs(delivery, settingsJson, taskOverride),
+          args: buildClaudeArgs(delivery, settingsJson, taskOverride, deps.maxBudgetUsd),
           cwd: resolved.cwd,
           env: childEnv,
           timeoutMs: deps.timeoutMs,

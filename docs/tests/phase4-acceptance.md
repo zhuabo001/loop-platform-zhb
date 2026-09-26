@@ -287,3 +287,11 @@ $ git diff --check     # 无输出（clean）
 - 新增 npm 脚本仅 `test:phase4:e2e`（opt-in，默认跳过）；`pnpm test:phase4:batch2:e2e` 行为未变。
 - 右移项：JSON API 的同源意图校验、`Content-Type` 门禁与拒绝空体属 [Issue #56](https://github.com/zhuabo001/loop-platform-zhb/issues/56)（Phase 5），不在本批范围。
 
+
+## 2026-09-27 — 收口补充取证（执行中）
+
+前述 #57 根因的范围收窄：参数含 `NAME=value` 并非一概不可执行，独立 finish 的 wrapper 放行已生效；真实门调试后缀 `; echo "exit=$?"` 是仍未被覆盖的命令形态。固定 Claude 2.1.273、批准 SHA-256 下，零费用探针证明：旧完整命令被拒且 outbox 空；移除后缀的同一 reason 写出正确单条 finish；帮助探测后 finish 仍恰好一条记录。
+
+验收任务取消 shell 退出状态后缀，诊断改用 Bash 工具返回结果，成功判定仍来自 host Journal 与数据库。marker A 只植入可删除的 Timeline 行，Run 2 前核查 Task File 和工作目录文件均不含 A。shutdown 前捕获实际存在的控制根和 scratch root，再断言退出后不存在。secret E2E 的 daemon TMPDIR 也改为独占目录，以避免并行测试误认控制根。
+
+本轮操作者批准一次两 Run、总费用上限 $3；真实门使用每 Run $1 的 CLI 停止阈值，保留 $1 余量，Run 1 费用缺失或剩余不足时拒绝 Run 2，失败不重试。本节目前不声明真实门通过；最终固定提交、结果和独立核销将在执行后追加。

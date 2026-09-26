@@ -315,9 +315,12 @@ describe("Phase 4 Batch 3 slice 4 (Issue #53): the settings-derived provider sec
 
       // 4. The production daemon CLI with the fake Claude binary, on an env
       //    stripped of every inherited provider credential.
-      const controlRootsBefore = new Set(readdirSync(tmpdir()).filter((n) => n.startsWith("loopzhb-control-")));
+      const daemonTmp = await mkdtemp(path.join(tmpdir(), "loopzhb-s4e2e-daemon-tmp-"));
+      tempDirs.push(daemonTmp);
+      const controlRootsBefore = new Set(readdirSync(daemonTmp));
       const childEnv: NodeJS.ProcessEnv = {
         ...process.env,
+        TMPDIR: daemonTmp,
         LOOPZHB_SERVER_URL: baseUrl,
         LOOPZHB_MACHINE_CREDENTIAL: TOKEN,
         LOOPZHB_ALLOWED_ROOTS: JSON.stringify([allowedRoot]),
@@ -373,9 +376,9 @@ describe("Phase 4 Batch 3 slice 4 (Issue #53): the settings-derived provider sec
 
         // 6. The control root exists (0700) and its static wrapper carries
         //    neither the machine credential nor the settings-derived secret.
-        const newRoots = readdirSync(tmpdir())
+        const newRoots = readdirSync(daemonTmp)
           .filter((n) => n.startsWith("loopzhb-control-") && !controlRootsBefore.has(n))
-          .map((n) => path.join(tmpdir(), n));
+          .map((n) => path.join(daemonTmp, n));
         expect(newRoots).toHaveLength(1);
         // The daemon realpaths its mkdtemp base (macOS /var → /private/var).
         const controlRoot = await realpath(newRoots[0]!);
