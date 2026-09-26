@@ -23,7 +23,11 @@
  *  - every invocation writes EXACTLY ONE record into $LOOPZHB_JOURNAL_OUTBOX
  *    with a random name via open(wx, 0600) — a valid invocation writes the
  *    terminal command, an invalid one writes a stable `{kind:"invalid"}`
- *    marker carrying NO user-supplied value;
+ *    marker carrying NO user-supplied value. The ONE exception (Issue #58):
+ *    an explicit help/version probe writes NOTHING, prints the grammar and
+ *    exits 0, so an agent's diagnostic invocation cannot poison the run's
+ *    journal (in the 2026-09-26 real gate a denied command plus seven probes
+ *    turned one failure into a different one);
  *  - the wrapper itself holds NO secret: it derives redaction needles from
  *    the provider/proxy environment it inherits (ANTHROPIC_*,
  *    CLAUDE_CODE_OAUTH_TOKEN, proxy variables) and redacts message/reason
@@ -89,6 +93,62 @@ interface ParsedArgs {
   stateFile?: string;
 }
 
+/** The single flag table: every flag that TAKES A VALUE. parseArgs rejects
+ *  anything else, and the help scan below needs the same set to tell a flag
+ *  slot from a value slot — one table, so a new flag reaches both. */
+const FLAG_KEYS: Record<string, keyof ParsedArgs> = {
+  "--status": "status",
+  "--reason": "reason",
+  "--message": "message",
+  "--message-file": "messageFile",
+  "--state": "state",
+  "--state-file": "stateFile",
+};
+
+const HELP_TOKENS: ReadonlySet<string> = new Set(["help", "--help", "-h", "--version"]);
+
+/** True when the invocation is an EXPLICIT help/version probe (Issue #58).
+ *  The test is POSITIONAL — the command slot (argv[0], or argv[1] right after
+ *  a real subcommand) or a FLAG slot — never "a help token anywhere in
+ *  argv": a value slot may legitimately hold "--help" as DATA
+ *  (`loopzhb finish --reason --help` is a valid finish whose reason is the
+ *  four characters), and reading it as a probe would silently suppress the
+ *  run's one record — a content-decides-behaviour bug of exactly the kind
+ *  Issue #57 removed from the permission layer. A help token in flag position
+ *  cannot be part of any VALID invocation, so nothing legitimate is swallowed. */
+function isHelpInvocation(argv: readonly string[]): boolean {
+  const first = argv[0];
+  if (first === undefined) return false;
+  if (HELP_TOKENS.has(first)) return true;
+  if (first !== "report" && first !== "finish") return false;
+  let inValueSlot = false;
+  for (let i = 1; i < argv.length; i += 1) {
+    const token = argv[i]!;
+    if (inValueSlot) {
+      inValueSlot = false;
+      continue;
+    }
+    if (HELP_TOKENS.has(token)) return true;
+    if (token in FLAG_KEYS) inValueSlot = true;
+  }
+  return false;
+}
+
+/** What an explicit probe gets INSTEAD of a journal record: the grammar, so
+ *  an agent never has to guess it. Probing is what turned one denied command
+ *  into a destroyed run in the 2026-09-26 real gate — this channel is now
+ *  free of consequences, which is the point. */
+const USAGE =
+  [
+    "loopzhb — the loop run's terminal-command wrapper (terminal protocol v1)",
+    "",
+    "  loopzhb report --status <new|resolved|nothing-new> [--message <text> | --message-file <path>] [--state <json> | --state-file <path>]",
+    "  loopzhb finish --reason <text> [--message <text> | --message-file <path>] [--state <json> | --state-file <path>]",
+    "",
+    "Exactly ONE invocation per run. An invalid invocation writes a journal",
+    "record that fails the run; `--help` is the only record-free form.",
+  ].join("\n") + "\n";
+
 /** Strict flag parsing: every token must be a known `--flag` followed by a
  *  value; duplicates, positionals, unknown flags, mutually-exclusive pairs
  *  and missing values all reject. */
@@ -97,14 +157,6 @@ function parseArgs(argv: string[], command: "report" | "finish"): ParsedArgs | n
     command === "report"
       ? new Set(["--status", "--message", "--message-file", "--state", "--state-file"])
       : new Set(["--reason", "--message", "--message-file", "--state", "--state-file"]);
-  const FLAG_KEYS: Record<string, keyof ParsedArgs> = {
-    "--status": "status",
-    "--reason": "reason",
-    "--message": "message",
-    "--message-file": "messageFile",
-    "--state": "state",
-    "--state-file": "stateFile",
-  };
   const out: ParsedArgs = {};
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i]!;
@@ -125,7 +177,19 @@ function parseArgs(argv: string[], command: "report" | "finish"): ParsedArgs | n
  * I/O goes through the inherited env/cwd and the outbox directory, so the
  * same function backs the spawned static executable AND direct unit tests.
  */
-export async function runLoopzhbWrapper(argv: string[], env: NodeJS.ProcessEnv, cwd: string): Promise<number> {
+export async function runLoopzhbWrapper(
+  argv: string[],
+  env: NodeJS.ProcessEnv,
+  cwd: string,
+  write: (text: string) => void = (text) => process.stdout.write(text),
+): Promise<number> {
+  // Issue #58, before EVERY other rule: an explicit help/version probe is
+  // inert — no record, exit 0. It writes nothing, so it needs no outbox and
+  // is answered even when the environment is otherwise unusable.
+  if (isHelpInvocation(argv)) {
+    write(USAGE);
+    return 0;
+  }
   const outbox = env[JOURNAL_OUTBOX_ENV];
   if (outbox === undefined || outbox === "" || !path.isAbsolute(outbox)) return 2;
   const invalid = async (): Promise<number> => {

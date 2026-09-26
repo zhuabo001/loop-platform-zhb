@@ -153,6 +153,53 @@ describe("invalid invocations write the secret-free marker and exit 1", () => {
   });
 });
 
+describe("explicit help/version probes are inert (Issue #58: grammar, no record, exit 0)", () => {
+  const helpCases: Array<[string, string[]]> = [
+    ["--help", ["--help"]],
+    ["-h", ["-h"]],
+    ["help", ["help"]],
+    ["--version", ["--version"]],
+    ["report --help", ["report", "--help"]],
+    ["finish --help", ["finish", "--help"]],
+    ["a half-typed call ending in --help", ["report", "--status", "new", "--help"]],
+  ];
+  for (const [label, argv] of helpCases) {
+    it(`${label}: prints the grammar, writes nothing, exits 0`, async () => {
+      const printed: string[] = [];
+      expect(await runLoopzhbWrapper(argv, env(), cwd, (text) => printed.push(text))).toBe(0);
+      expect(records()).toEqual([]); // the run's journal stays untouched
+      expect(printed.join("")).toContain("loopzhb report --status");
+      expect(printed.join("")).toContain("loopzhb finish --reason");
+    });
+  }
+
+  it("is answered even with no outbox at all (it writes nothing, so it needs nothing)", async () => {
+    const printed: string[] = [];
+    expect(await runLoopzhbWrapper(["--help"], { ANTHROPIC_API_KEY: SECRET }, cwd, (t) => printed.push(t))).toBe(0);
+    expect(printed.join("")).toContain("loopzhb");
+  });
+
+  it("a help token in a VALUE slot is DATA, never a probe", async () => {
+    // The content-sensitivity pin: `--help` after a value-taking flag is an
+    // ordinary string, so these are VALID invocations, not probes.
+    expect(await runLoopzhbWrapper(["finish", "--reason", "--help"], env(), cwd, () => {})).toBe(0);
+    expect(await runLoopzhbWrapper(["report", "--status", "resolved", "--message", "--help"], env(), cwd, () => {})).toBe(0);
+    // records() sorts by the RANDOM record name, so assert membership, never
+    // write order.
+    const written = records();
+    expect(written).toHaveLength(2);
+    expect(written).toContainEqual({ kind: "finish", reason: "--help" });
+    expect(written).toContainEqual({ kind: "report", status: "resolved", message: "--help" });
+  });
+
+  it("does NOT rescue a genuinely invalid invocation", async () => {
+    // An unknown subcommand stays an invalid invocation: help is recognized
+    // in the command slot only after a REAL subcommand.
+    expect(await runLoopzhbWrapper(["frobnicate", "--help"], env(), cwd, () => {})).toBe(1);
+    expect(records()).toEqual([{ kind: "invalid" }]);
+  });
+});
+
 describe("the env-derived secret boundary", () => {
   it("redacts a provider secret out of the message BEFORE the record lands", async () => {
     expect(await runLoopzhbWrapper(["report", "--status", "resolved", "--message", `token ${SECRET} end`], env(), cwd)).toBe(0);
