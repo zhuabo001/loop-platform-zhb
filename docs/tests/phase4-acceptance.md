@@ -184,6 +184,13 @@ Phase 4 Batch 2 的确定性验收目标及第二轮审查反例均有对应测�
 - 判定：这是**验收协议**问题而非产品缺陷——`journal_multiple` 是（多记录/非普通条目）的既定 fail-closed 语义，ADR-009 已冻结 outbox 恰好一条的契约。最可能成因是模型对同一 Run 调用了两次 wrapper（首次命令万一未如愿即重试），或以文件形式向 outbox 落过临时产物；两者都会产生第二条条目。
 - 修复（不改产品语义）：① 任务协议改为显式声明后果——「终端命令整个 Run 只能调用一次」，重复调用或向 outbox 留任何文件都会使该 Run 失败；禁止 `--state-file`/`--message-file` 与任何 outbox 写入；并说明「命令几乎无输出即成功，不要重跑确认」。② 真实门新增失败诊断：失败时打印 agent 工作目录清单、TASK.md 现内容与 Run 行（phase/error/message/sessionId），使下一次 `journal_multiple` 有可观测上下文。**未自动重试任何真实调用。**
 
+**2026-09-26 第二次执行（提交 `2a301fa`）：未通过（不记为通过）**
+
+- 通过部分：provenance 与批准 sha256 一致；**Run 1 全绿**——`done/exec`、`status=new`、`message="step 1 recorded the task file"`、`sessionId` 非空；诊断 dump 显示磁盘 TASK.md 中 `- step-1 marker:` 行已删除、`- step 1 recorded` 已追加到 Timeline。收紧后的「恰好一次」协议在 Run 1 上奏效（第一次执行的 `journal_multiple` 未复现）。
+- 失败点：**Run 2 以 `journal_missing` 收口**（outbox 零记录），即该 Run 从未成功调用 wrapper；进程组正常开启并关闭，`message`/`sessionId` 均为 null。
+- 根因（均在**验收协议**，不在产品）：① Task File 的 `## Current understanding` 写死「Step 1 has not been recorded yet」，而 run prompt 明确告诉模型该节是**已知基线**——第二个 Run 时它与 `prev-state.json`、Timeline 直接矛盾，"无需动作"因此成为一条合理路径，而零调用即失败。② 更根本：step 2 的命令把两个标记值**预先代入**，模型照抄即可——那样 `completionReason` 只证明"抄写"，不证明"读过 `prev-state.json` 与更新后的 Timeline"，削弱了本门的跨 Run 测量语义（与计划 §2.2 相悖）。该缺陷是**验收设计缺陷**，本次记录在案。
+- 修复（不改产品语义）：任务协议改为**单一决策规则**——每次 Run 恒以恰好一条命令收尾，分支由 `prev-state.json` 是否为 null 决定（Branch A 记录 state 并改写 Timeline；Branch B 必须**在运行时读出**两个标记并替换进 finish reason 的两个槽位）；删除与之矛盾的 `## Current understanding` 内容，改为指向 `prev-state.json` 的中性说明；继续禁止任何 outbox 写入与二次调用。
+
 ## 完整质量门（`86bd353`）
 
 ```text
