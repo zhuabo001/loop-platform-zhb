@@ -243,6 +243,24 @@ $ LOOPZHB_CLAUDE_PERMISSION_PROBE=1 pnpm --filter @loopzhb/daemon test src/claud
 
 **结论（修复落地时点）**：两项修复已落地并通过确定性门与全仓离线套件；真实 Claude 门**尚未复验**，Phase 4 仍不收口。复验需操作者的费用批准，并按切片五纪律单独取证、失败只记录不自动重试。
 
+### 修复提交的完整质量门（`2326a8f`）
+
+```text
+$ pnpm test            # 全仓（protocol + daemon + server）
+packages/protocol: Test Files  11 passed (11)         Tests  174 passed (174)
+packages/daemon:   Test Files  22 passed | 2 skipped  Tests  529 passed | 5 skipped (534)
+packages/server:   Test Files  50 passed | 3 skipped  Tests  599 passed | 3 skipped (602)
+
+$ pnpm typecheck       # Done（三包）
+$ pnpm build           # Done（三包）
+$ pnpm --filter @loopzhb/server db:check
+No schema changes, nothing to migrate
+
+$ git diff --check     # 无输出（clean）
+```
+
+（daemon 侧 2 个 skipped 文件 = 既有 opt-in `claude-smoke.test.ts` + 本次新增的本地权限探针 `claude-permission-probe.test.ts`（opt-in，零费用）。修复提交：`0c1bc8e`（#57）、`2a86826`（#58）、`2326a8f`（文档）。）
+
 ## 完整质量门（`86bd353`）
 
 ```text
