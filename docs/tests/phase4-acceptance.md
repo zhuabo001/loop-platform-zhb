@@ -199,6 +199,19 @@ Phase 4 Batch 2 的确定性验收目标及第二轮审查反例均有对应测�
 - 未定项（诚实记录）：本门现有证据**无法观测模型的命令与实际输出**（`journal_missing` 是按 ADR-009 修订 8/9 刻意 content-free 的分类；runner 在该失败路径不上报子进程 finalText；未读取 agent 会话记录）。因此成因仍属假设：可能是分支判定受阻、命令未被执行，或 Bash 调用被环境拒绝。
 - 处置：按计划「记录实际失败并修复后复验」，**未自动重试**；下一步选项与费用由操作者裁决。产品侧链路本身在本次三次执行中未发现异常——确定性门已独立证明 state 晋升、Task File 改写/同步、Finish 原子完成与 Completed 守卫。
 
+**2026-09-26 第四次执行（提交 `a549978`）：未通过（不记为通过）——但排除了一整类假设**
+
+- 通过部分：Run 1 再次全绿。失败点：Run 2 再次 `journal_missing`。
+- 新增仪器（`RUN-NOTES.md`，由 agent 自己写）：记录到 `marker-read: mk-a-…` 与 `command: loopzhb finish --reason "goal met; state-marker=<A>; timeline-marker=<B>"`——**模型成功读取了 `prev-state.json` 并正确替换了两个标记**。
+- 结论：失败**不在**模型的读取或组合环节；问题收窄为"那条命令是否真的落盘"。
+
+**2026-09-26 第五次执行（提交 `254fef7`）：未通过（不记为通过）——定位到根因**
+
+- 通过部分：Run 1 再次全绿。失败点：Run 2 `journal_multiple`；`RUN-NOTES.md` 记录 `exit-status: not-run`，并附 agent 的完整说明。
+- **F1（产品级发现，可能阻塞）**：agent 报告——每次执行命令都在**执行前**被 `--permission-mode dontAsk` 拒绝（"Permission to use Bash has been denied because Claude Code is running in don't ask mode"），对裸 PATH、绝对路径、单引号 reason、`node --openssl-config=…` 解释器四种形式均可复现；触发点是 reason 模板中的 `=`（`state-marker=…` / `timeline-marker=…`）。agent 自测 A/B：`loopzhb bogus --reason "goal met"` **执行**、`loopzhb bogus --reason "foo=bar"` **被拒**。即：**权限分析器只在没有参数 token 含 `NAME=value` 时才放行这个未识别二进制**。这与四次失败的形状完全自洽——Run 1 的命令（`--status new` / `--message "…"` / `--state '{"step":1,…}'`）不含 `=` 故始终通过；Run 2 的 reason 因需要报告测量值而必然含 `=`，故永远无法执行。该结论来自 agent 自述及其自测，本次未做独立复验（属 Claude Code 内部行为，本仓无法本地验证）。
+- **F2（产品级发现，已由代码确证，无需付费运行）**：`wrapper-main.ts:141` 对任何非 `report`/`finish` 的调用执行 `invalid()` 并写记录，因此 `loopzhb --help` 这类**纯探测**同样落盘。第五次的 `journal_multiple` 正是 agent 诊断期间 7 次探测各自的 `{kind:"invalid"}` 记录。也就是说，agent 只要探一下 CLI，就会破坏"恰好一条"契约并使 Run 失败；agent 明确拒绝删除这些文件（删除等于篡改 host 校验目录、掩盖错误），该判断与 ADR-009 修订 8 的边界一致。
+- 处置：两项均登记为待裁决发现；**未自动重试**，也未为绕开拒绝而修改验收任务或做任何混淆。
+
 ## 完整质量门（`86bd353`）
 
 ```text
