@@ -66,6 +66,16 @@ PATCH /api/loops/:id/schedule
 
 详见 `docs/adr/008-phase3-batch2-online-scheduler.md` 与 `docs/adr/007-phase3-batch1-schedule-foundation.md`（批次三追加裁决）。
 
+## Dashboard（本机）
+
+仅当 server 绑定**回环地址**时存在，入口是 `GET /`（例如 `http://127.0.0.1:3000/`）；绑定非回环地址时完全不挂载——`GET /` 与写路由都落回普通 404，与任意未知路径不可区分。
+
+- **只读页面，单一动作**：服务端渲染、无客户端 JavaScript、每 3 秒 meta refresh；单页最多显示 100 条 Loop（按最近更新时间倒序），页面自己写明当前条数与排序口径。
+- **Run Now**：每张卡片一个按钮（`POST /dashboard/loops/:id/run`，表单带每 boot 一枚的 CSRF token，重启即失效）。按钮可用条件与后端规则同源、同序：已完成（Completed）禁用 → 已有 Running Run 禁用 → 已有 Pending Run 禁用；Paused 且无活跃 Run 仍可用。页面最多陈旧 3 秒，**后端才是权威**：按钮可点但后端判定已有 Run 时，结果是零写跳过而不是替换。
+- **不替换已有 Run**：Dashboard 触发的 Run Now **不会**取消或替换任何已排队的 Run——任意 role 的 pending/running 都会让它零写跳过（不改 Run、不推进 revision 与调度水位）。cron 与重启 catch-up 的 T7 supersede 语义不受影响（ADR-007 §4 / ADR-008）。
+- **Completed 行为**：Loop 完成后页面显示 Completed、按钮禁用并给出原因；`POST /api/loops/:id/run`、重新启用调度与修改 Goal 均为 `409 loop_completed`（只有 Reopen 能恢复）。
+- **信任模型**：回环绑定时生效的全局 Host 门禁只封 DNS rebinding，**不是认证**——本机上的其他进程仍可直接请求，与 JSON API 的既有边界一致。Dashboard 不是对外服务。
+
 ## Daemon 运行
 
 daemon 在用户本机执行 Agent Run；server 只调度与存储，绝不执行用户代码。
@@ -110,6 +120,10 @@ LOOPZHB_CLAUDE_SMOKE=1 pnpm --filter @loopzhb/daemon test src/claude-smoke.test.
 # 全链路 E2E：验证完整生产链路（HTTP → daemon → Claude → DB）
 # 先独立核对本机 Claude realpath/version，并计算、审核其 SHA-256
 LOOPZHB_EXPECTED_CLAUDE_SHA256=<approved-64-hex-sha256> pnpm test:phase2:e2e
+
+# Phase 4 Batch 3 全链路门：从 Dashboard 页面触发两次真实 Run
+# （state 晋升 → Task File 改写 → Finish 完成）并连续重启两次
+LOOPZHB_EXPECTED_CLAUDE_SHA256=<approved-64-hex-sha256> pnpm test:phase4:e2e
 ```
 
 仓库工作规约（文档四层分流、批次收口仪式）见 `AGENTS.md`。

@@ -66,6 +66,17 @@
  *                    sibling of $LOOPZHB_JOURNAL_OUTBOX) and embeds its raw
  *                    content in the finish reason — the cross-run state
  *                    promotion pin of the Batch-2 E2E
+ *   batch3-e2e-record  (Batch 3 slice 5, E1) the run-1 half of the Dashboard
+ *                    marker chain: takes the `- step-1 marker: <A>` value out
+ *                    of <cwd>/TASK.md, reports it as state, and rewrites the
+ *                    Timeline WITHOUT that line (its value now lives in state)
+ *   batch3-e2e-finish  (Batch 3 slice 5, E1) the run-2 half: reads the marker
+ *                    back out of prev-state.json AND the keep-marker out of the
+ *                    rewritten <cwd>/TASK.md, then finishes with BOTH values
+ *                    plus whether the step-1 marker really left the file. The
+ *                    finished reason is the black-box proof of state promotion
+ *                    + the Task File mutation, and the server stores it as the
+ *                    Loop's completionReason
  */
 import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -308,6 +319,54 @@ if (isV1) {
       }
       writeJournal({ kind: "finish", reason: `goal met; observed prev-state ${observed}` });
       successResult();
+      break;
+    }
+    case "batch3-e2e-record": {
+      // Run 1 of the Dashboard marker chain. The test plants two random markers
+      // in the Timeline; this scenario moves the step-1 one INTO state and takes
+      // its line back OUT of the file. Both halves must be observable later:
+      // the state marker only through prev-state.json, the removal only through
+      // the server's Task File snapshot.
+      const taskPath = path.join(process.cwd(), "TASK.md");
+      const content = readFileSync(taskPath, "utf8");
+      const marker = /^- step-1 marker: (.+)$/m.exec(content)?.[1] ?? "<missing>";
+      writeFileSync(
+        taskPath,
+        content
+          .split("\n")
+          .filter((text) => !text.startsWith("- step-1 marker:"))
+          .join("\n"),
+      );
+      writeJournal({
+        kind: "report",
+        status: "new",
+        message: "step 1 recorded the task file",
+        state: { step: 1, marker },
+      });
+      successResult({ result: "step 1 complete" });
+      break;
+    }
+    case "batch3-e2e-finish": {
+      // Run 2: every value in the reason is READ FROM DISK at run time, so the
+      // reason is a measurement, not an echo of what the test hoped for.
+      const outbox = process.env.LOOPZHB_JOURNAL_OUTBOX;
+      const prevStatePath = path.join(path.dirname(outbox), "context", "prev-state.json");
+      let previous = null;
+      try {
+        previous = JSON.parse(readFileSync(prevStatePath, "utf8"));
+      } catch {
+        previous = null;
+      }
+      const stateMarker = typeof previous?.marker === "string" ? previous.marker : "<missing>";
+      const content = readFileSync(path.join(process.cwd(), "TASK.md"), "utf8");
+      const keepMarker = /^- keep marker: (.+)$/m.exec(content)?.[1] ?? "<missing>";
+      // The step-1 marker must be GONE from the file: it left with run 1.
+      const taskFileClean = content.includes(stateMarker) ? "no" : "yes";
+      writeJournal({
+        kind: "finish",
+        reason: `goal met; state-marker=${stateMarker}; timeline-marker=${keepMarker}; task-file-clean=${taskFileClean}`,
+      });
+      successResult({ result: "step 2 complete" });
       break;
     }
     default:

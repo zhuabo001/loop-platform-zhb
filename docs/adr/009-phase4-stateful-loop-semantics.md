@@ -162,6 +162,17 @@ Batch 2 首轮 code review（FAIL）后，固化修复期确认的四处裁决�
 
    第二轮复审补充：错误检测基于完整 tool-result，仅证据展示可截断，tool-use 命令文本不参与 marker 判定。诊断与验收账本共享排他锁及未完成/未知费用/损坏状态门；独立预算只隔离次数、时间和金额计算，不隔离未决费用。compat harness 的资源所有权从首次临时能力分配开始，覆盖 setup、预算预留、runner 和失败退出，避免启动拒绝及锁异常绕过清理。
 
+### 2026-09-26：Batch 3 Dashboard 与 Run Now no-supersede 裁决
+
+Batch 3 新增本机 Dashboard 与它独有的 manual 触发策略。以下为可跨阶段复用的长期裁决；页面版式、文案与 CSS 属实现，不在此列。
+
+1. **Dashboard 的存在由 BINDING 决定，永不由请求决定。** `bootstrapServer` 只在本机回环绑定时构造 Dashboard 并将其交给 app；非回环绑定下 Dashboard 对象根本不存在，页面路由与写路由一起落回普通 JSON 404，与任意未知路径逐字节不可区分（不返回 Dashboard 专属响应头）。请求头、查询参数或路径都无法开启它。
+2. **全局 loopback Host 门禁的职责是 DNS rebinding，不是认证。** 它在任何路由之前以 app 级中间件注册（晚注册或按路由注册都留旁路），拒绝 Host 非回环的请求。**边界必须写准**：浏览器直接访问 `127.0.0.1` 的请求带的就是回环 Host，因此该门禁不阻止本机上的其他进程或页面发起请求——Dashboard 的信任模型仍是"本机即可信"，与 JSON API 一致。
+3. **CSRF 是每 boot 一枚的实例内存 token。** 只以隐藏字段出现在渲染的表单里（表单恰有一个具名控件，额外字段即 400 `bad_form`），校验前置于任何业务调用；缺失/重复/不匹配分别 403，重启使旧 token 失效。token 永不进入 URL、日志行或错误体；页面响应带 `no-store`。
+4. **Run Now 的 no-supersede 只属于 Dashboard。** `pendingPolicy: "skip"` 只对 manual 触发生效，且只由组合根（`start.ts` 的缝）传入，因此公共 HTTP DTO 与路由签名不变。两条性质是结构性的而非巧合：pending 探针**不带 role 过滤**（任意 role 的活跃 Run 都挡住 Dashboard）且排在 revision CAS **之前**，故跳过严格零写（不改 Run、不推进 `revision` 与调度水位）；`"skip"` 下 supersede 整块不执行。scheduled（cron 与重启 catch-up）语义一字不变，仍按 ADR-007 §4 / ADR-008 的 T7 supersede。`pending_exists` 是内部结果，不得进入任何公共 wire union。
+5. **按钮规则与后端规则同源且同序**（Completed > Running > Pending），禁用原因以文字表达而不只靠颜色。页面最多陈旧一个 meta-refresh 周期，因此按钮是**建议**、后端 skip 才是权威；"页面说可点、后端仍 skip" 是设计内的合法组合。
+6. **验收分层，确定性门不得替代真实门。** Batch 3 的全链路验收由两层构成：确定性门用 fake Claude 走完**同一**生产装配（真实 listener、生产 daemon CLI、生产 runner、Dashboard 表单与 CSRF），真实门只把 Claude 换成操作者批准 hash 的真模型。两层共用同一证据形状：测试期随机标记由首个 Run 从 Task File 移入 state，第二个 Run 必须同时报回**前次 state 的标记**与**更新后 Timeline 的标记**——因此 completion reason 是对磁盘的测量，而不是对测试期望的回声（沿用 2026-09-02（二）第 4 条的"不能用 fake 结果替代真实门"）。真实门为 opt-in，须先校验批准 hash 并取得费用批准，失败只记录原因、绝不自动重试真实调用。
+
 ### 2026-08-31：实现期裁决固化
 
 在不改变任何已裁决语义的前提下，固化实现期确认的八处裁决：

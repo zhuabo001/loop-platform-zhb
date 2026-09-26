@@ -14,6 +14,7 @@
     "test:phase2:e2e": "pnpm build && LOOPZHB_REAL_CLAUDE_E2E=1 pnpm --filter @loopzhb/server test src/real-claude-e2e.test.ts",
     "test:claude:compat": "pnpm --filter @loopzhb/daemon build && node packages/daemon/scripts/claude-compat.mjs",
     "test:phase4:batch2:e2e": "pnpm build && LOOPZHB_REAL_CLAUDE_E2E=1 pnpm --filter @loopzhb/server test src/phase4-batch2-real-claude-e2e.test.ts",
+    "test:phase4:e2e": "pnpm build && LOOPZHB_REAL_CLAUDE_E2E=1 pnpm --filter @loopzhb/server test src/phase4-batch3-real-claude-e2e.test.ts",
     "typecheck": "pnpm -r typecheck"
   }
 }
