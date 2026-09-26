@@ -231,15 +231,16 @@ Phase 4 Batch 2 的确定性验收目标及第二轮审查反例均有对应测�
 
 ```text
 $ LOOPZHB_CLAUDE_PERMISSION_PROBE=1 pnpm --filter @loopzhb/daemon test src/claude-permission-probe.test.ts
- Test Files  1 passed (1)      Tests  2 passed (2)      Duration  10.99s
+ Test Files  1 passed (1)      Tests  3 passed (3)      Duration  8.53s
 ```
 
 | 终端命令 | 无放行规则 | 有放行规则（本次修复） |
 |---|---|---|
 | `loopzhb report --status new --message "…" --state '{"step":1,…}'` | 允许（sandbox auto-allow） | 允许 |
 | `loopzhb finish --reason "goal met; state-marker=<A>; timeline-marker=<B>"` | **拒绝**（`… don't ask mode`，outbox 空） | **执行**，outbox 恰好一条且 reason 逐字节相符 |
+| `loopzhb-helper finish --reason "goal met; state-marker=<A>"`（同前缀兄弟名） | — | **拒绝**（放行只覆盖 wrapper 本身，不覆盖同前缀名） |
 
-第二行就是全部要点：同一命令、同一 profile、只差一个键。它同时否证了另一个假设——"引号内的 `;` 会被当作子命令切分从而使规则失配"：规则匹配在含 `;`/`=` 的引号参数上照常成立。**残余不确定性**：探针依赖本机 CLI 版本（2.1.273）的内部判定，因此它是**证据补充而非替代**；两 Run 全绿仍只能由真实门证明。
+第二行就是全部要点：同一命令、同一 profile、只差一个键。它同时否证了另一个假设——"引号内的 `;` 会被当作子命令切分从而使规则失配"：规则匹配在含 `;`/`=` 的引号参数上照常成立。第三行用**非简单形态**（简单形态会被 auto-allow 放行，因而无法说明规则边界）证明放行是窄的：若改成 `Bash(loopzhb*)` 即变红。**残余不确定性**：探针依赖本机 CLI 版本（2.1.273）的内部判定，因此它是**证据补充而非替代**；两 Run 全绿仍只能由真实门证明。
 
 **结论（修复落地时点）**：两项修复已落地并通过确定性门与全仓离线套件；真实 Claude 门**尚未复验**，Phase 4 仍不收口。复验需操作者的费用批准，并按切片五纪律单独取证、失败只记录不自动重试。
 

@@ -226,4 +226,21 @@ describe.skipIf(!ENABLED)("Issue #57: the terminal command must not be judged by
     },
     (CLI_TIMEOUT_MS + 30_000) * 2,
   );
+
+  it(
+    "the grant is NARROW: a sibling command name in the same PATH is not covered",
+    async () => {
+      // `Bash(cmd:*)` is the documented equivalent of `Bash(cmd *)`, whose
+      // trailing wildcard requires the space — so a DIFFERENT executable whose
+      // name merely starts with the wrapper's must still be refused. This is
+      // what keeps the grant "the wrapper entry" rather than "anything named
+      // loopzhb-ish"; it would go red if someone wrote `Bash(loopzhb*)`.
+      // The shape must be one auto-allow REFUSES (a simple shape would be
+      // permitted by the sandbox and prove nothing about the rule).
+      const sibling = await probe('loopzhb-helper finish --reason "goal met; state-marker=mk-a-probe"', true);
+      expect(sibling.denied).toBe(true);
+      expect(sibling.records).toEqual([]);
+    },
+    CLI_TIMEOUT_MS + 30_000,
+  );
 });
