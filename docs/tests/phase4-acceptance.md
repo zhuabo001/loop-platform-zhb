@@ -191,6 +191,14 @@ Phase 4 Batch 2 的确定性验收目标及第二轮审查反例均有对应测�
 - 根因（均在**验收协议**，不在产品）：① Task File 的 `## Current understanding` 写死「Step 1 has not been recorded yet」，而 run prompt 明确告诉模型该节是**已知基线**——第二个 Run 时它与 `prev-state.json`、Timeline 直接矛盾，"无需动作"因此成为一条合理路径，而零调用即失败。② 更根本：step 2 的命令把两个标记值**预先代入**，模型照抄即可——那样 `completionReason` 只证明"抄写"，不证明"读过 `prev-state.json` 与更新后的 Timeline"，削弱了本门的跨 Run 测量语义（与计划 §2.2 相悖）。该缺陷是**验收设计缺陷**，本次记录在案。
 - 修复（不改产品语义）：任务协议改为**单一决策规则**——每次 Run 恒以恰好一条命令收尾，分支由 `prev-state.json` 是否为 null 决定（Branch A 记录 state 并改写 Timeline；Branch B 必须**在运行时读出**两个标记并替换进 finish reason 的两个槽位）；删除与之矛盾的 `## Current understanding` 内容，改为指向 `prev-state.json` 的中性说明；继续禁止任何 outbox 写入与二次调用。
 
+**2026-09-26 第三次执行（提交 `95711a3`）：未通过（不记为通过）**
+
+- 通过部分：provenance 与批准 sha256 一致；**Run 1 再次全绿**（`done/exec`、`status=new`、message 正确、Timeline 已改写：`- step-1 marker:` 行删除、`- step 1 recorded` 追加）。
+- 失败点：**Run 2 再次 `journal_missing`**（零调用），与第二次完全同型；进程组正常开启并关闭，`message`/`sessionId` 为 null。整测 36.28s（两次真实 Run + 两次重启）。
+- 判定：**不是替换错误**——若模型执行了带占位符的命令，outbox 仍会得到一条记录（成功或 wrapper 拒绝都会落盘），failure 会是"reason 断言不符"而非 `journal_missing`。零调用意味着该 Run 根本没有执行任何 `loopzhb` 命令。三次尝试的模式一致：**Branch A（读 Task File + 执行命令）稳定成功，Branch B（先读 `prev-state.json` 再组合命令）连续两次零调用**。
+- 未定项（诚实记录）：本门现有证据**无法观测模型的命令与实际输出**（`journal_missing` 是按 ADR-009 修订 8/9 刻意 content-free 的分类；runner 在该失败路径不上报子进程 finalText；未读取 agent 会话记录）。因此成因仍属假设：可能是分支判定受阻、命令未被执行，或 Bash 调用被环境拒绝。
+- 处置：按计划「记录实际失败并修复后复验」，**未自动重试**；下一步选项与费用由操作者裁决。产品侧链路本身在本次三次执行中未发现异常——确定性门已独立证明 state 晋升、Task File 改写/同步、Finish 原子完成与 Completed 守卫。
+
 ## 完整质量门（`86bd353`）
 
 ```text
