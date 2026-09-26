@@ -46,7 +46,7 @@
  */
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -64,7 +64,7 @@ import {
 import { machineIdFromToken } from "@loopzhb/protocol/node";
 
 import { closeDb } from "./db/index.js";
-import { loops, runLeases } from "./db/schema.js";
+import { loops, runLeases, runs } from "./db/schema.js";
 import { DaemonControlObserver, DaemonLogObserver, DetachedProcessSupervisor } from "./real-claude-e2e-harness.js";
 import { bootstrapServer, waitForListening, type BootedServer } from "./start.js";
 import { FakeClock, FakeCronFactory } from "./testkit/index.js";
@@ -160,20 +160,34 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 3 real Claude E2E (opt-in)", () => {
         "",
         "## Spec",
         "",
-        "This loop is driven by a human clicking Run Now. Work in small steps and",
-        "end every run with EXACTLY ONE `loopzhb` terminal command.",
+        "This loop is driven by a human clicking Run Now. Work in small steps.",
+        "",
+        "THE TERMINAL COMMAND IS THE WHOLE RUN, AND IT MUST BE INVOKED EXACTLY",
+        "ONCE. The loopzhb wrapper writes ONE record into a directory the host",
+        "checks; a second invocation — or any other file left in that directory",
+        "— makes the whole run FAIL with `journal_multiple` and none of the work",
+        "counts. Therefore:",
+        "",
+        "  - run the command below ONCE, at the very end of the run;",
+        "  - pass state inline as `--state '<json>'`; never use `--state-file` or",
+        "    `--message-file`, and never write anything into",
+        "    `$LOOPZHB_JOURNAL_OUTBOX` or any directory named `outbox`;",
+        "  - if the command prints little or nothing, that is SUCCESS — do NOT",
+        "    run it again to confirm, and do not retry it. A retry is exactly what",
+        "    fails the run.",
         "",
         "Step 1 — when `prev-state.json` is `null` (nothing recorded yet):",
-        "record the step-1 marker as state with exactly this command:",
+        "record the step-1 marker as state by copying this line verbatim:",
         "",
         `    loopzhb report --status new --message "step 1 recorded the task file" --state '{"step":1,"marker":"${markerA}"}'`,
         "",
         "then edit this file: delete the line that begins `- step-1 marker:` and",
-        "append `- step 1 recorded` at the end of the Timeline.",
+        "append `- step 1 recorded` at the end of the Timeline. Editing this file",
+        "and running the one command above is the entire run.",
         "",
         "Step 2 — when `prev-state.json` already carries the step-1 marker:",
         "read that marker out of `prev-state.json` and the keep marker out of this",
-        "file's Timeline, then complete the loop with exactly this command:",
+        "file's Timeline, then complete the loop by copying this line verbatim:",
         "",
         `    loopzhb finish --reason "goal met; state-marker=${markerA}; timeline-marker=${markerB}"`,
         "",
@@ -467,6 +481,38 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 3 real Claude E2E (opt-in)", () => {
         // 9. The daemon's complete stdout/stderr lifecycle is credential-free.
         expect(logs.secretSeen).toBe(false);
       } catch (err) {
+        // Failure diagnostics — and deliberately NOT a retry. `journal_multiple`
+        // is a content-free classification by design (ADR-009 修订 8/9), so the
+        // observable context has to come from outside it: the agent's own
+        // workdir (the one surface the acceptance mutates) and the Run rows.
+        // Neither reads a transcript nor a credential.
+        try {
+          const tree = await readdir(workdir, { recursive: true }).catch(() => ["<unreadable>"]);
+          console.error(`[b3-real] workdir listing: ${JSON.stringify(tree)}`);
+          console.error(`[b3-real] TASK.md after the run:\n${await readFile(taskFile, "utf-8").catch(() => "<unreadable>")}`);
+        } catch {
+          // Diagnostics must never mask the acceptance failure itself.
+        }
+        for (const lifetime of bootedServers) {
+          try {
+            const rows = await lifetime.handle.db.select().from(runs);
+            console.error(
+              `[b3-real] run rows: ${JSON.stringify(
+                rows.map((row) => ({
+                  id: row.id,
+                  phase: row.phase,
+                  outcome: row.outcome,
+                  status: row.status,
+                  error: row.error,
+                  message: row.message,
+                  sessionId: row.sessionId,
+                })),
+              )}`,
+            );
+          } catch {
+            // A closed handle simply has nothing to report.
+          }
+        }
         const tail = logs.secretSeen ? "[suppressed because a credential was detected]" : logs.diagnosticTail();
         console.error(`[b3-real] bounded redacted daemon log tail (max ${MAX_LOG_BYTES} bytes):\n${tail}`);
         throw err;

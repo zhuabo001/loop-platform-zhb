@@ -1,6 +1,6 @@
-# Phase 4 Batch 2 验收测试记录
+# Phase 4 验收测试记录
 
-> 本文档记录 Phase 4 Batch 2（Task File、State 与 Finish 全链路）最终验收的完整执行证据。Batch 1 的批次内验收见 ADR-009 与其复审记录；本文档固定 **Batch 2 切片 5 收口时** 的全量证据。
+> 本文档记录 Phase 4 的最终验收证据。**Batch 2（Task File、State 与 Finish 全链路）** 部分保留原样，作为该批次收口时的历史证据（Batch 1 的批次内验收见 ADR-009 与其复审记录）；**Batch 3（最小 Dashboard、Run Now no-supersede、安全装配）** 部分见文末「Batch 3 / Phase 4 收口验收」。
 
 ## 测试环境
 
@@ -140,3 +140,72 @@ $ git diff --check main  # 无输出（clean）；基线 6af3b29
 ## 结论
 
 Phase 4 Batch 2 的确定性验收目标及第二轮审查反例均有对应测试，Issues #39–#47 已核销关闭。**真实 Claude 业务门已于 2026-09-07 通过**，#38/#49 保持核销；#50 的三轨整改及最终真实 R 已于 2026-09-08 完成核销。该事实不能用于把 Claude Code 2.1.236 认定为版本根因。Batch 3 在真实门脚本上追加 Dashboard 与重启断言。
+
+---
+
+# Batch 3 / Phase 4 收口验收
+
+> 本节记录 Phase 4 Batch 3（最小 Dashboard、Run Now no-supersede、安全装配、切片五真实门）的收口证据。上方 Batch 2 记录未被改动，作为历史证据保留。
+
+## 测试环境
+
+- **日期**: 2026-09-26
+- **平台**: macOS 26.6.2（Darwin 25.6.0），arm64
+- **Node.js**: v22.17.0
+- **pnpm**: 10.6.1
+- **分支**: `feat/phase4-batch3-dev`
+- **验收提交**: `86bd353`（切片五实现：确定性 E1–E2 门、真实门 harness 与根脚本 `pnpm test:phase4:e2e`）；批次一–四的代码提交为 `690e395`、`e1dd98b`、`6198680`、`34ea6b9`
+- **计划**: `docs/plan/codex-phase4-batch3-plan.md`、`docs/plan/codex-phase4-batch3-slice5-plan.md`
+- **Claude**: `/opt/homebrew/Caskroom/claude-code/2.1.273/claude`，version `2.1.273`，sha256 `953e9880dbcb0b70f31c1f508de6a3fd389753d131688557fd992da9184693fb`（操作者批准值；生产 probe 实测与其一致后才触发真实 Run）
+
+## 验收范围（Batch 3 目标复述）
+
+- 本机只读 Dashboard：`GET /`（服务端渲染、无客户端 JavaScript、100 条展示上限），仅在回环绑定时存在。
+- `POST /dashboard/loops/:id/run`：每 boot 一枚 CSRF token 的表单；触发采用 **no-supersede**（任意 role 的 pending/running 都零写跳过），cron 与 catch-up 的 T7 语义不变。
+- 真实门：从页面触发两次真实 Claude Run，验证 state 晋升、Task File 同步与改写、Finish 原子完成，并在 Completed 后连续重启两次不产生新 Run。
+
+## 确定性门 E1–E2（`packages/server/src/phase4-batch3-e2e.test.ts`）
+
+生产装配全链路：文件型 PGlite（`bootstrapServer`）→ 真实 `127.0.0.1` listener → 生产 daemon CLI 子进程 → 生产 Claude runner → fake-claude fixture；两次 Run **都经页面表单 + CSRF token** 触发（不是 JSON API）。
+
+1. 反空转设计：Task File 携带两个**测试期随机标记**。Run 1（fixture `batch3-e2e-record`）把标记 A 从 Timeline 移入所报 state 并把该行从文件删除；Run 2（`batch3-e2e-finish`）从该 Run 的 `context/prev-state.json` 读回 A、从改写后的 Timeline 读回 B，finish reason 逐字节等于 `goal met; state-marker=<A>; timeline-marker=<B>; task-file-clean=yes`，并原样成为 `loops.completionReason` 与页面「完成原因」。断言含 `runs.state`（标记 A 的行内快照）、磁盘 TASK.md、`loops.taskFileContent`（等于改写后内容）、`enabled=false`、lease 清空。
+2. Completed 页面与守卫：页面渲染 `data-lifecycle="completed"`、禁用按钮与原因文字；`POST /api/loops/:id/run`、`PATCH /schedule`、`PATCH /goal` 全部 `409 loop_completed`。
+3. 连续重启：生产关闭顺序（scheduler drain → listener → DB）后推进测试时钟跨越约 210 个 minutely occurrence，同一数据目录重启两次。**对照未完成 Loop 必须补跑**（恰好 1 条 pending、水位推进到 `2026-08-27T12:30:00.000Z`、启动扫描恰好注册 1 个 job），而 Completed Loop 整行逐字段与重启前相等、Run 数恒为 2——因此「0 新 Run」是测量而非同义反复。
+4. **变异核销**（施加于 fixture，随后按字节还原，`git status` 无残留）：① 令 Run 1 不删除 step-1 行 → Task File 快照断言转红；② 令 Run 2 读不到 `prev-state.json` → completionReason 断言在 `state-marker=<missing>` 处转红。
+
+## 真实 Claude 门（`pnpm test:phase4:e2e`）
+
+生产 daemon CLI + 真实 Claude（批准 sha256）+ 真实 OS sandbox + 真实 HTTP + 文件型 PGlite；仅注入 Clock/CronFactory 以确定性跨越重启时间，未替换业务路径或 Claude runner。两次 Run 均由 `GET /` 取 token 后 `POST /dashboard/loops/:id/run` 触发。
+
+**2026-09-26 第一次执行：未通过（不记为通过）**
+
+- 通过部分：生产 probe 报出的 Claude provenance 与批准 sha256 一致；daemon 启动与轮询正常；Claude 进程组正常开启并关闭；页面 token 抓取与表单 POST 正常（303）。
+- 失败点：Run 1 以 `journal_multiple` 收口。分类按 ADR-009 修订 8/9 刻意不含内容，**outbox 内的实际条目无法从该分类读出**；本次执行未保留 outbox（每 Run 控制目录随 Run 释放）。
+- 判定：这是**验收协议**问题而非产品缺陷——`journal_multiple` 是（多记录/非普通条目）的既定 fail-closed 语义，ADR-009 已冻结 outbox 恰好一条的契约。最可能成因是模型对同一 Run 调用了两次 wrapper（首次命令万一未如愿即重试），或以文件形式向 outbox 落过临时产物；两者都会产生第二条条目。
+- 修复（不改产品语义）：① 任务协议改为显式声明后果——「终端命令整个 Run 只能调用一次」，重复调用或向 outbox 留任何文件都会使该 Run 失败；禁止 `--state-file`/`--message-file` 与任何 outbox 写入；并说明「命令几乎无输出即成功，不要重跑确认」。② 真实门新增失败诊断：失败时打印 agent 工作目录清单、TASK.md 现内容与 Run 行（phase/error/message/sessionId），使下一次 `journal_multiple` 有可观测上下文。**未自动重试任何真实调用。**
+
+## 完整质量门（`86bd353`）
+
+```text
+$ pnpm test            # 全仓（protocol + daemon + server）
+packages/protocol: Test Files  11 passed (11)         Tests  174 passed (174)
+packages/daemon:   Test Files  22 passed | 1 skipped  Tests  518 passed | 3 skipped (521)
+packages/server:   Test Files  50 passed | 3 skipped  Tests  599 passed | 3 skipped (602)
+
+$ pnpm typecheck       # Done（protocol / daemon / server 全部通过）
+$ pnpm build           # Done（三包）
+$ pnpm --filter @loopzhb/server db:check
+No schema changes, nothing to migrate
+
+$ git diff --check     # 无输出（clean）
+```
+
+（server 侧 3 个 skipped 文件为 opt-in 真实 Claude 门：`real-claude-e2e.test.ts`、`phase4-batch2-real-claude-e2e.test.ts`、`phase4-batch3-real-claude-e2e.test.ts`。）
+
+## 显式边界核对（相对基线 `main@e51894b`）
+
+- 无 DB migration（`db:check` 无 diff）、无新增公共 JSON DTO、无客户端 JavaScript、无新依赖。
+- Dashboard 页面入口是 `GET /`，写路由是 `POST /dashboard/loops/:id/run`；`pendingPolicy` 与 `pending_exists` 均不进入公共 wire 契约。
+- 新增 npm 脚本仅 `test:phase4:e2e`（opt-in，默认跳过）；`pnpm test:phase4:batch2:e2e` 行为未变。
+- 右移项：JSON API 的同源意图校验、`Content-Type` 门禁与拒绝空体属 [Issue #56](https://github.com/zhuabo001/loop-platform-zhb/issues/56)（Phase 5），不在本批范围。
+
