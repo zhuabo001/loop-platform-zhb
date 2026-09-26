@@ -212,6 +212,13 @@ Phase 4 Batch 2 的确定性验收目标及第二轮审查反例均有对应测�
 - **F2（产品级发现，已由代码确证，无需付费运行）**：`wrapper-main.ts:141` 对任何非 `report`/`finish` 的调用执行 `invalid()` 并写记录，因此 `loopzhb --help` 这类**纯探测**同样落盘。第五次的 `journal_multiple` 正是 agent 诊断期间 7 次探测各自的 `{kind:"invalid"}` 记录。也就是说，agent 只要探一下 CLI，就会破坏"恰好一条"契约并使 Run 失败；agent 明确拒绝删除这些文件（删除等于篡改 host 校验目录、掩盖错误），该判断与 ADR-009 修订 8 的边界一致。
 - 处置：两项均登记为待裁决发现；**未自动重试**，也未为绕开拒绝而修改验收任务或做任何混淆。
 
+**由第五次执行登记的两个 Phase 4 收口阻塞项（本次真实门未通过的直接原因）**
+
+- [Issue #57](https://github.com/zhuabo001/loop-platform-zhb/issues/57)：终端收口命令在参数含 `NAME=value` 时被权限层拒绝。**直接阻塞本门**——验收要求 Run 2 在 finish reason 中报告两个运行时读出的标记，而该 reason 必然含 `=`。
+- [Issue #58](https://github.com/zhuabo001/loop-platform-zhb/issues/58)：wrapper 对任何调用（含 `loopzhb --help`）都写记录，agent 一次探测即破坏"恰好一条"契约。第五次的 `journal_multiple` 即由此产生。
+
+**结论：真实 Claude 门尚未通过，Phase 4 不收口。** 上述两项修复并复验前，Batch 3 与 Phase 4 保持进行中（roadmap 已同步）。
+
 ## 完整质量门（`86bd353`）
 
 ```text
