@@ -295,3 +295,16 @@ $ git diff --check     # 无输出（clean）
 验收任务取消 shell 退出状态后缀，诊断改用 Bash 工具返回结果，成功判定仍来自 host Journal 与数据库。marker A 只植入可删除的 Timeline 行，Run 2 前核查 Task File 和工作目录文件均不含 A。shutdown 前捕获实际存在的控制根和 scratch root，再断言退出后不存在。secret E2E 的 daemon TMPDIR 也改为独占目录，以避免并行测试误认控制根。
 
 本轮操作者批准一次两 Run、总费用上限 $3；真实门使用每 Run $1 的 CLI 停止阈值，保留 $1 余量，Run 1 费用缺失或剩余不足时拒绝 Run 2，失败不重试。本节目前不声明真实门通过；最终固定提交、结果和独立核销将在执行后追加。
+
+### 本轮离线质量门与独立复审
+
+- 固定实现：`552b632e34e1cafbd4e3081bacef3827aaed0505`；当前阶段指针整改 `936f672`。
+- protocol：11 files / 174 passed；daemon 最终复验：22 passed files + 2 skipped / 532 passed + 7 skipped；server：51 passed files + 3 skipped / 602 passed + 3 skipped。
+- typecheck、build、db:check（无 schema 变化）、相对 main merge-base 的 diff --check 全部通过。
+- 零费用真实 CLI 权限探针与 config/runner/wrapper：4 files / 139 passed；server 验收任务协议、Dashboard E1–E2、settings-secret E2E：3 files / 5 passed；最终 prompt/config/runner/wrapper：4 files / 140 passed。
+- Standards 文档 P2 经 `936f672` 后续独立复审核销；Spec 实现 PASS；Adversarial 除费用授权边界外技术 PASS。五个遗留 Issue 的技术条件均有后续独立核销意见。
+- 费用裁决待答复：CLI 阈值按请求检查，预留余量不能证明用户原 $3 绝对上限。已向操作者说明；真实门尚未执行，#57/#58 与 Phase4 保持待收口。
+
+### 切片四遗留 Issue 最终核销
+
+2026-09-27，#33/#36/#51/#52/#53 均已按仓库流程追加固定修复、测试和后续独立三轨核销证据并关闭。独立审查范围包括本轮修复和 Batch3 相对 `main@e51894b` 的最终批次范围；#33/#36 同时直接复核既有实现与回归。切片四已完成。#57/#58 仍为 OPEN，真实门尚未执行，Phase4 保持进行中。

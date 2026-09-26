@@ -177,7 +177,7 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
 
 - **Batch 1 — Schema、Protocol 与领域基础：已完成**（2026-08-31，`main@6af3b29`，ADR-009）
   - loops/runs/leases 的 Phase 4 字段与 CHECK、terminal command wire、goal/task-file/state 列、领域 planner 纯函数。
-  - 复审发现登记为 `phase-4` Issues #33/#36（核销状态以 Issue 为准）。
+  - Batch 1 遗留 state 可写域与 finish message 复审项已于 2026-09-27 经后续独立三轨复审核销。
 - **Batch 2 — Task File、State 与 Finish 全链路：业务链路及 sandbox 兼容性核销完成**（2026-09-08，分支 `feat/phase4-batch2-dev`，ADR-006/ADR-009；证据 `docs/tests/phase4-acceptance.md`「真实 Claude 门」）
   - Daemon：0700 控制根 + 静态无 secret `loopzhb` wrapper（严格 report/finish 文法、`open(wx,0600)` 单条 journal、双层脱敏）；每 Run 控制目录（只读 prev-state + outbox）；Task File 解析/jail/漂移重验/Run 后同步快照；v1 prompt 由 Daemon 构建（v0 golden 字节不变）。
   - Server：capability 快照与门控（`terminal-journal-v1`）、claim 事务权威 Loop 快照 mint v1 Lease、最终 Report 单事务分支表（stale_goal/迟到冻结/wake finish）、Finish 取消 pending 保留 running、Reopen 旧代际撤销、Completed 全部守卫（claim/cron/catch-up/Run Now/schedule enable/goal）。
@@ -187,9 +187,9 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
   - 切片一（只读数据与页面）已完成：`690e395`，新增 `packages/server/src/dashboard/` 读模型与 SSR 页面（D1–D5）。
   - 切片二（路由与安全装配）已完成：`e1dd98b`，两个 HTML 路由、loopback 挂载门禁、每 bootstrap CSRF、CSP/`no-store`（H1–H9）。
   - 切片三（禁止 Dashboard 替换已有 pending）已完成：`6198680`，manual trigger 的 `pendingPolicy: "skip"`、零写跳过与按钮规则（Q1–Q6）；本批新增 Issue #54 已核销关闭。
-  - 切片四（核销遗留 Issue）进行中：范围 #33、#36、#51、#52、#53，核销状态以 GitHub Issue 为准。
+  - 切片四（核销遗留 Issue）已完成：`34ea6b9` 的修复与复验证据经 2026-09-27 后续独立三轨核销，五个遗留 Issue 均已关闭；完整证据见 `docs/tests/phase4-acceptance.md`。
   - 切片五（真实 Claude 门与阶段收口）进行中：确定性 E1–E2 门（Dashboard 表单 + CSRF 触发两次 Run，state 晋升 / Task File 改写 / Completed 守卫 / 连续两次重启不新增 Run）、`pnpm test:phase4:e2e` 入口、ADR-009 裁决、README 与验收文档扩充已交付（`86bd353`…`881ce30`）。**真实门 5 次执行未通过**，根因已定位并登记为 [Issue #57](https://github.com/zhuabo001/loop-platform-zhb/issues/57)（终局命令的权限兼容性；独立 finish 已放行，已移除被拒绝的调试后缀，待真实门复验）与 [Issue #58](https://github.com/zhuabo001/loop-platform-zhb/issues/58)（任何 wrapper 调用含探测都写记录）。**两项修复已落地**（v1 唯一的 wrapper 权限放行 + 帮助探测惰性化，裁决记入 ADR-006/ADR-009），并由零费用的本地权限探针 `claude-permission-probe.test.ts` 给出"无规则被拒 / 有规则执行且 outbox 逐字节相符"的对照；二者仍为 **Phase 4 收口阻塞项**：经复审、真实门复验全绿前不得收口。
-  - **Phase 4 尚未完成**：本批切片四、五未收口前，不得把 Batch 3 或 Phase 4 标记为已完成。
+  - **Phase 4 尚未完成**：切片四已核销，切片五待最终真实门与费用裁决；#57/#58 未核销前不得把 Batch 3 或 Phase 4 标记为已完成。
 
 ### 右移项
 
