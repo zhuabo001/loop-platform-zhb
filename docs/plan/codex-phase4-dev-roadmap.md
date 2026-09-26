@@ -312,10 +312,10 @@ pnpm typecheck
 pnpm build
 pnpm --filter @loopzhb/server db:check
 git diff --check "$(git merge-base HEAD main)"...HEAD
-LOOPZHB_EXPECTED_CLAUDE_SHA256=<approved-sha256> pnpm test:phase4:e2e
+LOOPZHB_PHASE4_ACCEPTANCE_BUDGET_USD=<approved-total-usd> LOOPZHB_EXPECTED_CLAUDE_SHA256=<approved-sha256> pnpm test:phase4:e2e
 ```
 
-真实 Claude E2E 是 Phase 4 必须通过的收口门；应在允许监听 `127.0.0.1` 且明确接受模型费用的环境执行。
+真实 Claude E2E 是 Phase 4 必须通过的收口门；应在允许监听 `127.0.0.1` 且明确接受模型费用的环境执行。必须提供本次批准总预算；CLI 逐 Run 停止阈值按请求检查，不能宣称账户级硬限额，严格费用上限需额外提供商控制或操作者明确接受阈值边界。
 
 ## 五、文档与完成定义
 
