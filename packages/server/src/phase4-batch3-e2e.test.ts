@@ -62,7 +62,7 @@ import { machineIdFromToken } from "@loopzhb/protocol/node";
 
 import { closeDb } from "./db/index.js";
 import { loops, runLeases, runs, type Loop } from "./db/schema.js";
-import { DaemonLogObserver, DetachedProcessSupervisor } from "./real-claude-e2e-harness.js";
+import { AcceptedReportCostObserver, DaemonLogObserver, DetachedProcessSupervisor } from "./real-claude-e2e-harness.js";
 import { bootstrapServer, waitForListening, type BootedServer } from "./start.js";
 import { FakeClock, FakeCronFactory } from "./testkit/index.js";
 
@@ -118,10 +118,12 @@ async function waitFor(check: () => Promise<boolean>, timeoutMs: number, interva
   throw new Error(`waitFor timeout after ${timeoutMs}ms`);
 }
 
+const reportCosts = new AcceptedReportCostObserver();
+
 async function bootLifetime(dataDir: string, clock: FakeClock): Promise<Lifetime> {
   const cronFactory = new FakeCronFactory();
   const booted = await bootstrapServer({ host: "127.0.0.1", port: 0, dataDir }, { clock, cronFactory });
-  const server = serve({ fetch: booted.app.fetch, port: 0, hostname: "127.0.0.1" });
+  const server = serve({ fetch: (req: Request) => reportCosts.fetch(req, (r) => booted.app.fetch(r)), port: 0, hostname: "127.0.0.1" });
   const lifetime: Lifetime = { booted, server, cronFactory, baseUrl: "" };
   try {
     await waitForListening(server);
@@ -327,6 +329,8 @@ describe("Phase 4 Batch 3 deterministic E2E (E1–E2): Dashboard → state → f
         // ---- E1 · RUN 1: the state marker leaves the Task File ----
         const run1 = await runViaDashboard("batch3-e2e-record", 1);
         const run1Rows = await first.booted.handle.db.select().from(runs).where(eq(runs.id, run1.id));
+        expect(reportCosts.requireCost(run1.id)).toBe(0.125);
+        expect(run1Rows[0]!.costUsd).toBeNull(); // cost remains parse-only in production
         expect(run1Rows[0]).toMatchObject({
           phase: "done",
           outcome: "exec",
@@ -357,6 +361,7 @@ describe("Phase 4 Batch 3 deterministic E2E (E1–E2): Dashboard → state → f
 
         // ---- E1 · RUN 2: the finish reports BOTH markers ----
         const run2 = await runViaDashboard("batch3-e2e-finish", 2);
+        expect(reportCosts.requireCost(run2.id)).toBe(0.125);
         const run2Rows = await first.booted.handle.db.select().from(runs).where(eq(runs.id, run2.id));
         expect(run2Rows[0]).toMatchObject({
           phase: "done",

@@ -70,3 +70,9 @@ LOOPZHB_PHASE4_ACCEPTANCE_BUDGET_USD=<approved-total-usd> LOOPZHB_EXPECTED_CLAUD
 - 每 Run 先执行一次显式 record-free help，再提交恰好一条 report/finish，以真实链路核查 #58。
 - 用户批准本次一次两 Run 真实验收，总上限 $3；入口必须提供批准总预算，传递每 Run 为总额三分之一的 CLI `--max-budget-usd` 阈值，保留三分之一余量。Run 1 费用缺失或剩余不足时不得触发 Run 2；完成后记录实际两 Run 费用。CLI 阈值按请求检查，不宣称账户级精确硬限额。失败不自动重试。
 - 真实门与 secret E2E 使用各自私有的 daemon TMPDIR，避免并行套件误把另一 daemon 的控制根当作自己的资源。shutdown 前确认资源真实存在，再核查关闭后消失。
+
+### 费用取证修订（第六次真实门后）
+
+- 用户已明确接受阈值末次请求可能超额，原预算授权P2核销。
+- `runs.costUsd` 的生产契约是parse-only，不能作为验收费用来源；按 #59 改观察已接受的生产Report numeric USD，真实HTTP app和生产daemon路径保持。只保留runId/number，不保留body/Authorization。
+- 第六次真实门 Run1正常、Run2未触发；费用未留存记未知，不推定为0。新一次付费复验须重新明确批准，既有门失败不自动重试。

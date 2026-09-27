@@ -308,3 +308,15 @@ $ git diff --check     # 无输出（clean）
 ### 切片四遗留 Issue 最终核销
 
 2026-09-27，#33/#36/#51/#52/#53 均已按仓库流程追加固定修复、测试和后续独立三轨核销证据并关闭。独立审查范围包括本轮修复和 Batch3 相对 `main@e51894b` 的最终批次范围；#33/#36 同时直接复核既有实现与回归。切片四已完成。#57/#58 仍为 OPEN，真实门尚未执行，Phase4 保持进行中。
+
+## 2026-09-27 — 第六次真实门：费用来源断言失败（不记为通过）
+
+- 固定候选：`8957f83271c1ff8cf503b62b9c24f2cac1ca5cee`，其 CI `36257101286` SUCCESS。
+- macOS26.6.2 / Nodev22.17.0 / pnpm10.6.1；Claude2.1.273，生产 provenance 实测与批准 SHA256 `953e9880dbcb0b70f31c1f508de6a3fd389753d131688557fd992da9184693fb` 相符。
+- 用户明确接受每 Run $1 CLI 停止阈值、总目标 $3、末次请求可能超额；Adversarial 后续独立核销原预算授权 P2。该裁决不将阈值称为硬限额。
+- 命令：`LOOPZHB_PHASE4_ACCEPTANCE_BUDGET_USD=3 LOOPZHB_EXPECTED_CLAUDE_SHA256=953e9880dbcb0b70f31c1f508de6a3fd389753d131688557fd992da9184693fb pnpm test:phase4:e2e`。
+- 结果：1 failed，26.28s（测试体25.66s）。Run1 report / state晋升 / Task File改写及 marker A来源排除断言全部通过，随后 `expect(firstCost).not.toBeNull()` 得到null。Run2 **未触发**，没有额外付费重试。
+- 直接原因：[Issue #59](https://github.com/zhuabo001/loop-platform-zhb/issues/59)。生产 `cost` 是 parse-only，Server故意不将 Report cost写入 `runs.costUsd`；新验收门错误地从该列取费用。此失败不证明 #57/#58 修复回归，但也不满足其真实两Run核销条件。
+- 本次 Run1 **实际费用未知**：没有在请求接受边界保留该 numeric cost，临时资源已清理，数据库null不等于费用0，不把 $1 停止阈值当作实际收费。
+- 零费用复现：fake Claude明确输出0.125，生产 CLI→Report→DB 后字段仍null，使同一成本断言红。修复观察已被真实HTTP app接受的 Report numeric USD，两次fake Run各0.125，数据库仍null。拒绝请求、缺失/非法cost、重复accepted证据均fail-closed。无生产持久化/DTO/schema改变。
+- 定向回归：Report观察器 + 完整Dashboard E1–E2 + coordinator report，3 files / 41 passed。最终全量质量门与独立复审另补。新的付费复验须重新获得授权，本轮不自动重试。

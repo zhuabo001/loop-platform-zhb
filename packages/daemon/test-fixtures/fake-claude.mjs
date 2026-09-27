@@ -343,7 +343,7 @@ if (isV1) {
         message: "step 1 recorded the task file",
         state: { step: 1, marker },
       });
-      successResult({ result: "step 1 complete" });
+      successResult({ result: "step 1 complete", total_cost_usd: 0.125 });
       break;
     }
     case "batch3-e2e-finish": {
@@ -366,7 +366,7 @@ if (isV1) {
         kind: "finish",
         reason: `goal met; state-marker=${stateMarker}; timeline-marker=${keepMarker}; task-file-clean=${taskFileClean}`,
       });
-      successResult({ result: "step 2 complete" });
+      successResult({ result: "step 2 complete", total_cost_usd: 0.125 });
       break;
     }
     default:

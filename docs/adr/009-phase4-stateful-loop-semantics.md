@@ -207,3 +207,7 @@ Batch 3 新增本机 Dashboard 与它独有的 manual 触发策略。以下为�
 2. 跨 Run 测量不得允许 marker 从 Task File 的命令示例或辅助文件泄漏。marker A 仅植入可移除的 Timeline 行，report 命令使用占位符；Run 2 之前验证整个 Task File 和工作目录文件不含 A。Run 2 的完成原因必须逐字节等于从前次 state 的 A 与 Timeline 的 B 组成的期望结果。
 3. 显式帮助探测不属于 terminal 写入；真实任务先 help 再恰好一次 report/finish，host 的单记录规则继续生效。
 4. 有批准费用上限的验收必须显式设置总预算。daemon 可选 `LOOPZHB_CLAUDE_MAX_BUDGET_USD` 将正有限十进制阈值交给 CLI 的 `--max-budget-usd`；默认 argv 不变。每 Run 设置总预算三分之一的阈值，留出按请求结算的余量；Run 1 费用缺失或剩余不足即停止，完整门记录总费用。CLI 阈值不是账户级硬限额，不自动重试失败的真实验收。
+
+### 2026-09-27 — 验收费用的观察边界
+
+生产 Report 的 cost维持parse-only，不为验收改动持久化语义。验收费用从真实HTTP app已接受的生产Report读取，只保留runId与有限非负USD，完整body和Authorization不留存；拒绝请求不计入证据，缺失/非法/重复费用证据必须阻止下一次调用。确定性生产CLI链路同时证明numeric费用被观察且数据库列仍null。CLI阈值按请求检查；操作者已明确接受末次请求可能超额，不能将此称为账户硬限额。失败的真实门不能自动重试；未观察到的既有费用记未知，不当作0。

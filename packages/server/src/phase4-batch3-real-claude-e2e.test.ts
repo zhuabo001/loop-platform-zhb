@@ -65,7 +65,7 @@ import { machineIdFromToken } from "@loopzhb/protocol/node";
 
 import { closeDb } from "./db/index.js";
 import { loops, runLeases, runs } from "./db/schema.js";
-import { DaemonControlObserver, DaemonLogObserver, DetachedProcessSupervisor } from "./real-claude-e2e-harness.js";
+import { AcceptedReportCostObserver, DaemonControlObserver, DaemonLogObserver, DetachedProcessSupervisor } from "./real-claude-e2e-harness.js";
 import { bootstrapServer, waitForListening, type BootedServer } from "./start.js";
 import { FakeClock, FakeCronFactory } from "./testkit/index.js";
 import { assertBatch3StateSource, buildBatch3AcceptanceTask } from "./phase4-batch3-acceptance-task.js";
@@ -179,13 +179,14 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 3 real Claude E2E (opt-in)", () => {
       const dataDir = await mkdtemp(path.join(tmpdir(), `loopzhb-b3real-data-${process.pid}-`));
       tempDirs.push(dataDir);
       const clock = new FakeClock(new Date());
+      const reportCosts = new AcceptedReportCostObserver();
       const bootOne = async (): Promise<{ booted: BootedServer; url: string }> => {
         const booted = await bootstrapServer(
           { host: "127.0.0.1", port: 0, dataDir },
           { clock, cronFactory: new FakeCronFactory() },
         );
         bootedServers.push(booted);
-        const listener = serve({ fetch: booted.app.fetch, port: 0, hostname: "127.0.0.1" });
+        const listener = serve({ fetch: (req: Request) => reportCosts.fetch(req, (r) => booted.app.fetch(r)), port: 0, hostname: "127.0.0.1" });
         servers.push(listener);
         await waitForListening(listener);
         const bound = listener.address();
@@ -363,9 +364,8 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 3 real Claude E2E (opt-in)", () => {
         expect(rows1.taskFileContent).toBe(afterRun1);
         expect(rows1.taskFileSyncError).toBeNull();
 
-        const firstCost = (await first.booted.handle.db.select().from(runs).where(eq(runs.id, run1Id)))[0]!.costUsd;
-        expect(firstCost).not.toBeNull();
-        expect(firstCost!).toBeLessThanOrEqual(approvedBudget - perRunBudget);
+        const firstCost = reportCosts.requireCost(run1Id);
+        expect(firstCost).toBeLessThanOrEqual(approvedBudget - perRunBudget);
         console.log(`[b3-real] Run 1 cost USD: ${firstCost}`);
 
         // ---- RUN 2: the finish reports BOTH markers ----
@@ -376,10 +376,9 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 3 real Claude E2E (opt-in)", () => {
         // the rewritten Timeline: the reason is the cross-run proof.
         expect(run2.message).toBe(`goal met; state-marker=${markerA}; timeline-marker=${markerB}`);
 
-        const secondCost = (await first.booted.handle.db.select().from(runs).where(eq(runs.id, run2Id)))[0]!.costUsd;
-        expect(secondCost).not.toBeNull();
-        expect(firstCost! + secondCost!).toBeLessThanOrEqual(approvedBudget);
-        console.log(`[b3-real] Run 2 cost USD: ${secondCost}; total USD: ${firstCost! + secondCost!}`);
+        const secondCost = reportCosts.requireCost(run2Id);
+        expect(firstCost + secondCost).toBeLessThanOrEqual(approvedBudget);
+        console.log(`[b3-real] Run 2 cost USD: ${secondCost}; total USD: ${firstCost + secondCost}`);
 
         // Completed atomically: completion + schedule disable + state kept.
         const rows2 = (await first.booted.handle.db.select().from(loops).where(eq(loops.id, loopId)))[0]!;
