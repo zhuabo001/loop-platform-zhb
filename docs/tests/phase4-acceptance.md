@@ -345,7 +345,7 @@ $ git diff --check     # 无输出（clean）
 - 用户明确接受本次收口及已披露的费用留存限制。第七次真实门费用合计已证明<=3美元，精确金额未留存；不得补写虚构数字。
 - 未来日志留存修复 `4fa825ef1df0316cd4ec370811888f2040202371`：零费用fixture及后续独立Standards/Spec/Adversarial全部PASS；远端CI `36291600913` SUCCESS（2026-09-27 03:38:17 UTC）。无额外模型调用。
 - #60依据修复、后续独立复审及用户对历史记录例外的明确裁决核销；#57/#58及全部Phase4阻塞Issue已关闭，#56继续Phase5右移。
-- Batch3切片一至五与Phase4验收收口完成。PR #55保持开放待合入；代码已在开发分支远端，未声称已进入main。最终纯文档提交CI以PR Checks为准。
+- Batch3切片一至五与Phase4验收收口完成。**PR #55 已于 2026-09-27 04:40:40 UTC 合入 `main`**（merge commit `c7d8ff2e3703ce2d3b8115c97e6e78c2cc372ae5`，父 `e51894b` + `f5fd492`；开发分支 `feat/phase4-batch3-dev` 按惯例保留在 `f5fd492`），合入前 head `f5fd492` 的 `pull_request` CI 与该 merge commit 的 `main` push CI 均通过。
 
 ### 第八次真实门：收口后独立确认运行（2026-09-27）
 
