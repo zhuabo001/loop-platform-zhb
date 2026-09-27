@@ -47,12 +47,36 @@
  *   journal-invalid     {"kind":"invalid"} marker + success (→ journal_invalid)
  *   journal-policy      report/new WITHOUT message + success (→ journal_invalid)
  *   report-secret-text  report message embeds $ANTHROPIC_API_KEY (redaction pin)
+ *   report-secret-output  report message AND the success result text embed
+ *                    $ANTHROPIC_API_KEY — the normal-output redaction pin of
+ *                    the settings-derived provider credential (Issue #53)
+ *   report-state-derived  report/resolved whose state carries a BASE64
+ *                    encoding of the credential + success (→ journal_invalid,
+ *                    state never promoted: Issue #53 fail-closed pin)
+ *   secret-session-derived  report/resolved + success whose session_id
+ *                    embeds $ANTHROPIC_API_KEY — a column NO run summary
+ *                    projects, so only a full-row DB scan can see the leak
+ *                    (Issue #53 round-1 review)
+ *   task-file-derived  valid record, then <cwd>/TASK.md gains a BASE64
+ *                    encoding of the credential (→ sync error unreadable, the
+ *                    poisoned content never reaches the database: Issue #53)
  *   journal-then-exit1  valid record, is_error terminal, exit 1 (claude failure wins)
  *   report-delete-task  valid record, then <cwd>/TASK.md is deleted (sync → missing)
  *   finish-observe-prev-state  reads the run's prev-state.json (derived as the
  *                    sibling of $LOOPZHB_JOURNAL_OUTBOX) and embeds its raw
  *                    content in the finish reason — the cross-run state
  *                    promotion pin of the Batch-2 E2E
+ *   batch3-e2e-record  (Batch 3 slice 5, E1) the run-1 half of the Dashboard
+ *                    marker chain: takes the `- step-1 marker: <A>` value out
+ *                    of <cwd>/TASK.md, reports it as state, and rewrites the
+ *                    Timeline WITHOUT that line (its value now lives in state)
+ *   batch3-e2e-finish  (Batch 3 slice 5, E1) the run-2 half: reads the marker
+ *                    back out of prev-state.json AND the keep-marker out of the
+ *                    rewritten <cwd>/TASK.md, then finishes with BOTH values
+ *                    plus whether the step-1 marker really left the file. The
+ *                    finished reason is the black-box proof of state promotion
+ *                    + the Task File mutation, and the server stores it as the
+ *                    Loop's completionReason
  */
 import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -229,6 +253,44 @@ if (isV1) {
       writeJournal({ kind: "report", status: "resolved", message: `token is ${key}` });
       successResult();
       break;
+    case "report-secret-output":
+      // Issue #53: the credential reaches the child env legitimately, so the
+      // child's OWN output can quote it. Both carrier paths are exercised at
+      // once — the accepted journal message and the CLI result text.
+      writeJournal({ kind: "report", status: "resolved", message: `provider said ${key}` });
+      successResult({ result: `used credential ${key} while working` });
+      break;
+    case "report-state-derived":
+      // A DERIVED encoding of the credential inside state: the collector must
+      // fail closed (ADR-009 修订 8) — never redact-and-persist, which would
+      // invent state the agent never reported.
+      writeJournal({
+        kind: "report",
+        status: "resolved",
+        message: "complete",
+        state: { cursor: 1, token: Buffer.from(key, "utf8").toString("base64") },
+      });
+      successResult();
+      break;
+    case "secret-session-derived":
+      // Issue #53 round-1 review: the credential rides a column that NO summary
+      // projection exposes (`runs.session_id` is absent from runSummarySchema),
+      // so only a COMPLETE-ROW scan can see a leak here. The adapter must
+      // redact the child-supplied session id before it enters the report.
+      writeJournal({ kind: "report", status: "resolved", message: "complete" });
+      successResult({ session_id: `sess-${key}` });
+      break;
+    case "task-file-derived": {
+      // The agent appends a BASE64 encoding of the credential to its own Task
+      // File: the post-run snapshot must refuse it, so the poisoned content
+      // never enters the database (the run itself still reports normally).
+      const taskPath = path.join(process.cwd(), "TASK.md");
+      const existing = existsSync(taskPath) ? readFileSync(taskPath, "utf8") : "";
+      writeFileSync(taskPath, `${existing}\n- cached token: ${Buffer.from(key, "utf8").toString("base64")}\n`);
+      writeJournal({ kind: "report", status: "resolved", message: "complete" });
+      successResult();
+      break;
+    }
     case "journal-then-exit1":
       writeJournal({ kind: "report", status: "resolved", message: "done" });
       line({ type: "result", subtype: "error_during_execution", is_error: true, result: "blew up" });
@@ -257,6 +319,54 @@ if (isV1) {
       }
       writeJournal({ kind: "finish", reason: `goal met; observed prev-state ${observed}` });
       successResult();
+      break;
+    }
+    case "batch3-e2e-record": {
+      // Run 1 of the Dashboard marker chain. The test plants two random markers
+      // in the Timeline; this scenario moves the step-1 one INTO state and takes
+      // its line back OUT of the file. Both halves must be observable later:
+      // the state marker only through prev-state.json, the removal only through
+      // the server's Task File snapshot.
+      const taskPath = path.join(process.cwd(), "TASK.md");
+      const content = readFileSync(taskPath, "utf8");
+      const marker = /^- step-1 marker: (.+)$/m.exec(content)?.[1] ?? "<missing>";
+      writeFileSync(
+        taskPath,
+        content
+          .split("\n")
+          .filter((text) => !text.startsWith("- step-1 marker:"))
+          .join("\n"),
+      );
+      writeJournal({
+        kind: "report",
+        status: "new",
+        message: "step 1 recorded the task file",
+        state: { step: 1, marker },
+      });
+      successResult({ result: "step 1 complete", total_cost_usd: 0.125 });
+      break;
+    }
+    case "batch3-e2e-finish": {
+      // Run 2: every value in the reason is READ FROM DISK at run time, so the
+      // reason is a measurement, not an echo of what the test hoped for.
+      const outbox = process.env.LOOPZHB_JOURNAL_OUTBOX;
+      const prevStatePath = path.join(path.dirname(outbox), "context", "prev-state.json");
+      let previous = null;
+      try {
+        previous = JSON.parse(readFileSync(prevStatePath, "utf8"));
+      } catch {
+        previous = null;
+      }
+      const stateMarker = typeof previous?.marker === "string" ? previous.marker : "<missing>";
+      const content = readFileSync(path.join(process.cwd(), "TASK.md"), "utf8");
+      const keepMarker = /^- keep marker: (.+)$/m.exec(content)?.[1] ?? "<missing>";
+      // The step-1 marker must be GONE from the file: it left with run 1.
+      const taskFileClean = content.includes(stateMarker) ? "no" : "yes";
+      writeJournal({
+        kind: "finish",
+        reason: `goal met; state-marker=${stateMarker}; timeline-marker=${keepMarker}; task-file-clean=${taskFileClean}`,
+      });
+      successResult({ result: "step 2 complete", total_cost_usd: 0.125 });
       break;
     }
     default:

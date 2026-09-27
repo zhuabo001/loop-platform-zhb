@@ -27,7 +27,9 @@
  *    working); an unreadable file, non-object JSON, a non-object `env`, or a
  *    non-string allowed field is FAIL-CLOSED at startup;
  *  - errors are stable and value-free: no file content, no field value, no
- *    token — a field NAME and the settings path are the most they carry;
+ *    token, and NO filesystem path — a config dir can itself carry a
+ *    credential-shaped segment (Issue #51), and startup failures go straight
+ *    to stderr. An ALLOW-LISTED field NAME is the most an error carries;
  *  - returns a NEW env object; the source is never mutated and nothing is
  *    logged here.
  *
@@ -40,7 +42,7 @@ import path from "node:path";
 import { isProviderEnvKey } from "./agent-env.js";
 
 /** Startup-fatal provider bootstrap failure. The message is stable and
- *  carries NO file content, field value or credential. */
+ *  carries NO file content, field value, credential or filesystem path. */
 export class ClaudeProviderEnvError extends Error {
   constructor(message: string) {
     super(message);
@@ -59,14 +61,15 @@ export interface ClaudeProviderEnvDeps {
 
 /** Production reader: ENOENT (including an unlink race between any existence
  *  check and the read) means "no user config"; everything else is an
- *  unreadable-file startup failure. The underlying error message is NOT
- *  propagated — adapters may embed arbitrary text. */
+ *  unreadable-file startup failure. Neither the underlying error message NOR
+ *  the path is propagated — adapters may embed arbitrary text, and the config
+ *  dir may itself be credential-shaped (Issue #51). */
 const nodeReadSettingsFile: SettingsFileReader = (settingsPath) => {
   try {
     return readFileSync(settingsPath, "utf8");
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
-    throw new ClaudeProviderEnvError(`claude provider settings are unreadable: ${settingsPath}`);
+    throw new ClaudeProviderEnvError("claude provider settings are unreadable");
   }
 };
 
@@ -102,7 +105,7 @@ export function resolveClaudeProviderEnv(
     raw = readSettingsFile(settingsPath);
   } catch (err) {
     if (err instanceof ClaudeProviderEnvError) throw err;
-    throw new ClaudeProviderEnvError(`claude provider settings are unreadable: ${settingsPath}`);
+    throw new ClaudeProviderEnvError("claude provider settings are unreadable");
   }
   if (raw === null) return resolved;
 
@@ -110,15 +113,15 @@ export function resolveClaudeProviderEnv(
   try {
     parsed = JSON.parse(raw);
   } catch {
-    throw new ClaudeProviderEnvError(`claude provider settings are not valid JSON: ${settingsPath}`);
+    throw new ClaudeProviderEnvError("claude provider settings are not valid JSON");
   }
   if (!isPlainObject(parsed)) {
-    throw new ClaudeProviderEnvError(`claude provider settings must be a JSON object: ${settingsPath}`);
+    throw new ClaudeProviderEnvError("claude provider settings must be a JSON object");
   }
   const settingsEnv = parsed["env"];
   if (settingsEnv === undefined) return resolved; // no env block: nothing to fill
   if (!isPlainObject(settingsEnv)) {
-    throw new ClaudeProviderEnvError(`claude provider settings "env" must be an object: ${settingsPath}`);
+    throw new ClaudeProviderEnvError('claude provider settings "env" must be an object');
   }
 
   for (const [key, value] of Object.entries(settingsEnv)) {
@@ -128,9 +131,11 @@ export function resolveClaudeProviderEnv(
     if (!isProviderEnvKey(key)) continue;
     // An ALLOWED field of the wrong type is a schema violation: fail closed
     // (a silently dropped endpoint/token would surface as an opaque auth
-    // failure far from the cause). The key name is not sensitive.
+    // failure far from the cause). Naming the KEY is deliberate and safe —
+    // only the name travels, never the value, and the path stays out of the
+    // message (Issue #51).
     if (typeof value !== "string") {
-      throw new ClaudeProviderEnvError(`claude provider settings field ${key} must be a string: ${settingsPath}`);
+      throw new ClaudeProviderEnvError(`claude provider settings field ${key} must be a string`);
     }
     if (value === "") continue; // an empty settings value fills nothing
     const explicit = resolved[key];

@@ -177,21 +177,33 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
 
 - **Batch 1 — Schema、Protocol 与领域基础：已完成**（2026-08-31，`main@6af3b29`，ADR-009）
   - loops/runs/leases 的 Phase 4 字段与 CHECK、terminal command wire、goal/task-file/state 列、领域 planner 纯函数。
-  - 复审发现登记为 `phase-4` Issues #33/#36（核销状态以 Issue 为准）。
+  - Batch 1 遗留 state 可写域与 finish message 复审项已于 2026-09-27 经后续独立三轨复审核销。
 - **Batch 2 — Task File、State 与 Finish 全链路：业务链路及 sandbox 兼容性核销完成**（2026-09-08，分支 `feat/phase4-batch2-dev`，ADR-006/ADR-009；证据 `docs/tests/phase4-acceptance.md`「真实 Claude 门」）
   - Daemon：0700 控制根 + 静态无 secret `loopzhb` wrapper（严格 report/finish 文法、`open(wx,0600)` 单条 journal、双层脱敏）；每 Run 控制目录（只读 prev-state + outbox）；Task File 解析/jail/漂移重验/Run 后同步快照；v1 prompt 由 Daemon 构建（v0 golden 字节不变）。
   - Server：capability 快照与门控（`terminal-journal-v1`）、claim 事务权威 Loop 快照 mint v1 Lease、最终 Report 单事务分支表（stale_goal/迟到冻结/wake finish）、Finish 取消 pending 保留 running、Reopen 旧代际撤销、Completed 全部守卫（claim/cron/catch-up/Run Now/schedule enable/goal）。
   - 首轮/第二轮 code review 发现已全部修复；第三轮 Standards/Spec/Adversarial 确定性三轨 **PASS**，Issues #39–#47 已核销关闭。修复含 `loops.revision` OCC additive 列、双向真实交错、no-follow 有界读取、encoding-aware 秘密边界、control/scratch root 生命周期与 HTTP 窄接口收口；全量确定性质量门全绿。
   - 2026-09-07 的固定二进制完整 `test:phase4:batch2:e2e`（1/1，46.99s）与三次生产 smoke 保持有效，#38/#49 已核销；#50 的三项复审 P2 已由独立 Standards/Spec 核销，2026-09-08 最终生产 R 在同一固定 Claude 2.1.236/hash 上通过另一 Run temp 直连及 symlink 读写、wrapper/OpenSSL 配置篡改拒绝检查，#50 核销证据完整。版本因果关系仍未被证明。
-- **Batch 3 — 最小 Dashboard 与阶段收口：未开始**（scope 见 `docs/plan/codex-phase4-dev-roadmap.md`）。
+- **Batch 3 — 最小 Dashboard 与阶段收口：已完成**（分支 `feat/phase4-batch3-dev`，scope 见 `docs/plan/codex-phase4-dev-roadmap.md` 与 `docs/plan/codex-phase4-batch3-plan.md`）
+  - 切片一（只读数据与页面）已完成：`690e395`，新增 `packages/server/src/dashboard/` 读模型与 SSR 页面（D1–D5）。
+  - 切片二（路由与安全装配）已完成：`e1dd98b`，两个 HTML 路由、loopback 挂载门禁、每 bootstrap CSRF、CSP/`no-store`（H1–H9）。
+  - 切片三（禁止 Dashboard 替换已有 pending）已完成：`6198680`，manual trigger 的 `pendingPolicy: "skip"`、零写跳过与按钮规则（Q1–Q6）；本批新增 Issue #54 已核销关闭。
+  - 切片四（核销遗留 Issue）已完成：`34ea6b9` 的修复与复验证据经 2026-09-27 后续独立三轨核销，五个遗留 Issue 均已关闭；完整证据见 `docs/tests/phase4-acceptance.md`。
+  - 切片五（真实 Claude 门与阶段收口）：2026-09-27 固定 `fb2b17e` 的完整真实门 1/1 PASS（60.97s），两 Run、state/Task File继承、Completed守卫、连续两次重启、资源/秘密检查全部通过；后续独立 Standards/Spec/Adversarial 核销 #57/#58，二者已关闭。真实功能验收证据见 `docs/tests/phase4-acceptance.md`。收口后另行授权的独立确认运行在 `10275c9`（相对 `fb2b17e` 仅 `package.json` 日志留存修复与 docs，被测系统未变）再次 1/1 PASS（58.83s），并首次留存真实费用 $0.370838（0.259125 + 0.111713，未触及阈值超额）。
+  - **Phase 4 已完成（2026-09-27）**：真实门与后续独立三轨复审通过，全部 Phase4 阻塞 Issue 已核销。用户明确接受第七次的费用记录限制：合计经门内断言证明 <= $3，该次精确金额未留存且不得回填（收口后的确认运行已补上实测数字，见上条）；未来成功日志入口已修复并零费用验证，裁决见 ADR-009。代码候选 `4fa825e` 远端 CI SUCCESS；最终收口文档的 CI 以 PR Checks 为准。PR #55 待合入，分支验收完成不等于已合入 main。
+
+### 右移项
+
+- [Issue #56](https://github.com/zhuabo001/loop-platform-zhb/issues/56)：**Phase 5 加固**——JSON API 的状态变更路由缺同源意图校验（无 `Origin`/`Referer` 检查）、缺 `Content-Type` 门禁，且触发/取消路由接受空体（`parseJsonBodyOrEmpty` 把空文本归一为 `{}`）。切片三决议只记录不改代码；当前不构成可利用漏洞（Loop/Run id 为随机 UUID 不可猜，且全仓无 CORS 响应头 ⇒ 跨站读不到 id），但该边界只押在 id 不可猜上，加固排入 Phase 5 的认证层。
 
 ## Phase 5 — 存储与协作（第 9–14 周）
 
 按依赖顺序，每层独立可验：
 
 1. **Artifact 同步**：chokidar watcher、全量 sha256 manifest（删除=缺席）、增量哈希、协商上传（needHashes + PUT 验哈希）、每文件/每 loop 上限、never-sync 目录双侧一致、run 快照与 diff。
-2. **团队与认证**：GitHub 登录、Team/Membership、connect key（24h TTL、不存本体）、机器归属、跨团队 fail-closed。**此层完成前 server 不得公开暴露。**
+2. **团队与认证**：GitHub 登录、Team/Membership、connect key（24h TTL、不存本体）、机器归属、跨团队 fail-closed。**此层完成前 server 不得公开暴露。**同一暴露面下的加固项见 [Issue #56](https://github.com/zhuabo001/loop-platform-zhb/issues/56)（状态变更路由的同源意图校验、`Content-Type` 门禁与拒绝空体）。
 3. **通知**：失败告警 + 连续失败熔断自动暂停。
+
+环境与验收维护项：[Issue #61](https://github.com/zhuabo001/loop-platform-zhb/issues/61)——运行时 preload 环境隔离的明确防回归证据与验收环境记录；不重新打开已收口的 Phase4。
 
 ## Phase 6 — 生产硬化（独立阶段）
 

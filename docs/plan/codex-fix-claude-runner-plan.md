@@ -1,10 +1,26 @@
 # Claude Runner Provider 配置修复计划
 
-- 状态：已裁决，待实施
+- 状态：**已实施**（provider bootstrap 落于 `08ca356`，随 Batch 2 交付）
 - 日期：2026-09-02
 - 目标分支：`feat/phase4-batch2-dev`
 - 问题记录：`docs/handoff/claude-execution-error-record.md`（Issue #38）
 - 关联决策：ADR-005、ADR-006、ADR-009
+
+### 实施与审查状态（2026-09-25 更新）
+
+- **实施**：§4.1 的 provider bootstrap 规则、§5.1 的独立模块（`packages/daemon/src/claude-provider-env.ts`）
+  与 §5.3 的 composition root 一次性解析（`prepareDaemon`）均已落地；§5.2 的字段分类复用
+  `agent-env.ts` 的单一 `isProviderEnvKey` 与 `collectSecretValues`；§5.4 的 runner 隔离参数
+  （`--safe-mode --setting-sources ""`）保持不变。
+- **三轨审查**：Batch 2 首轮三轨审查确认真实门认证已恢复，并在本计划范围内新增三项 P2 ——
+  #51（bootstrap 错误回显配置路径）、#52（本计划状态与 ADR-006/cli.ts 启动顺序漂移）、
+  #53（settings 来源 secret 缺一条全链路确定性证据）。三项由 Phase 4 Batch 3 切片四处理，核销以
+  GitHub Issue 为准。
+- **真实门**：#38（真实 Claude E2E 门）、#49（wrapper 自包含）、#50（sandbox 兼容性）均已关闭，
+  最新 Batch 2 真实 E2E 记录见 `docs/tests/phase4-acceptance.md`「真实 Claude 门」；
+  roadmap 的 Phase 4 Batch 2 条目记录同一链路。本计划不恢复任何已过时的阻塞关系。
+- **确定性证据**：Batch 2 的 `phase4-batch2-e2e.test.ts` 覆盖显式环境变量来源的 provider secret；
+  settings 来源 secret 的全链路确定性证据由 #53 补齐（切片四）。
 
 ## 1. 背景与根因
 
@@ -198,6 +214,9 @@ CLAUDE_CONFIG_DIR/settings.json 或 $HOME/.claude/settings.json
 
 ## 6. 实施顺序
 
+**（历史执行顺序记录——第 1–7 步均已执行完毕，其中第 6/7 步的真实门条件已由 #38/#49/#50 的关闭满足；
+本节保留原始计划文本，当前状态以文首「实施与审查状态」为准。）**
+
 1. 先增加 provider bootstrap 模块及纯单元测试，固定解析、优先级和拒绝规则。
 2. 提取/复用环境字段分类，确保导入的值必经现有 secret 收集与脱敏。
 3. 接入 `prepareDaemon()`，完成 startup 回收和 probe 无凭据回归测试。
@@ -240,10 +259,14 @@ LOOPZHB_EXPECTED_CLAUDE_SHA256=<approved-sha256> pnpm test:phase4:batch2:e2e
 
   通过两次 Run 的 Task File → state → `prev-state.json` → Finish 全链路，断言 Completed、调度
   停止、Run Now 409、进程组关闭，以及日志无 provider/machine/run secret。
-- 在真实门成功、验收记录与复审结论均已追加前，Issue #38 保持 OPEN；不得以 fake Claude
-  确定性测试替代真实 Claude 门。
+- **（历史前置条件，已满足）** 在真实门成功、验收记录与复审结论均已追加前，Issue #38 保持 OPEN。
+  该条件已随 #38/#49/#50 的关闭满足，当前状态为**已关闭**（见文首）。其中「不得以 fake Claude
+  确定性测试替代真实 Claude 门」是持续有效的原则，不是历史条目：确定性门与真实门并存，互不替代。
 
 ## 8. 临时运维绕过
+
+**（历史条目——provider bootstrap 已于 `08ca356` 落地，本节描述的临时绕过不再是必需手段；
+环境变量路径仍然是受支持的部署方式，见 §7.1 最后一条。此处保留原始文本作为背景。）**
 
 在实现完成前，启动 daemon 的父进程可显式提供所需 `ANTHROPIC_*`、OAuth、proxy/TLS 环境变量。
 现有 `buildAgentEnv()` 已会按白名单转发，并将敏感值纳入脱敏。不得把实际 token 写入仓库、命令

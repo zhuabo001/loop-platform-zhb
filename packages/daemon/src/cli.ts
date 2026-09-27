@@ -1,9 +1,10 @@
 /**
- * THE daemon composition root (plan §1/§4): validated config → startup jail →
- * Claude CLI probe → provider env bootstrap → Machine client → Claude Runner
- * → runtime foreground loop, with ONE AbortController fanning SIGINT/SIGTERM
- * out to the poll sleep, in-flight HTTP and report retries. The core never
- * calls process.exit: a clean signal shutdown returns from run() (exit 0);
+ * THE daemon composition root (plan §1/§4): validated config → startup jail /
+ * control root → credential-free Claude CLI probe → provider env bootstrap →
+ * Machine client → Claude Runner → runtime foreground loop, with ONE
+ * AbortController fanning SIGINT/SIGTERM out to the poll sleep, in-flight
+ * HTTP and report retries. The core never calls process.exit: a clean signal
+ * shutdown returns from run() (exit 0);
  * config failure, a failed startup jail/probe/provider bootstrap, or a
  * protocol-fatal poll/report rejects main() and the direct-run wrapper exits
  * non-zero.
@@ -61,9 +62,11 @@ export async function createStartupControlRoot(): Promise<ControlRoot> {
  *  adapter. The Fake Runner survives only as a test/loopback fixture. */
 export const productionRunnerFactory: (deps: ClaudeRunnerDeps) => AgentRunner = (deps) => createClaudeRunner(deps);
 
-/** The testable composition: config → startup jail → Claude probe → client →
- *  Claude Runner → runtime. Polls begin only after this resolves, so the
- *  probe provably precedes the first poll (plan §2.2). */
+/** The testable composition: config → startup jail / control root →
+ *  credential-free Claude probe → provider bootstrap → client → Claude Runner
+ *  → runtime (ADR-006 决策 3). Polls begin only after this resolves, so the
+ *  probe provably precedes the first poll (plan §2.2), and the bootstrap
+ *  provably precedes the first runner. */
 export interface PrepareDaemonOptions {
   /** Opt-in acceptance observer. It receives the exact identity pinned by
    *  the production probe, not a second test-side resolution. */
@@ -126,6 +129,7 @@ export async function prepareDaemon(
         jail,
         claudeBin: config.claudeBin,
         timeoutMs: config.agentTimeoutMs,
+        ...(config.claudeMaxBudgetUsd !== undefined ? { maxBudgetUsd: config.claudeMaxBudgetUsd } : {}),
         envSource: runnerEnvSource,
         controlRoot,
         // The probe-pinned binary identity: every run re-verifies it before

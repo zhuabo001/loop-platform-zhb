@@ -14,6 +14,14 @@ const VALID = {
 };
 
 describe("loadDaemonConfig", () => {
+  it("validates an optional per-Run Claude spending threshold without changing defaults", () => {
+    expect(loadDaemonConfig(VALID)).not.toHaveProperty("claudeMaxBudgetUsd");
+    expect(loadDaemonConfig({ ...VALID, LOOPZHB_CLAUDE_MAX_BUDGET_USD: " " })).not.toHaveProperty("claudeMaxBudgetUsd");
+    expect(loadDaemonConfig({ ...VALID, LOOPZHB_CLAUDE_MAX_BUDGET_USD: "1.25" }).claudeMaxBudgetUsd).toBe(1.25);
+    for (const value of ["0", "-1", "NaN", "Infinity", "1e3", "0x10", "1; echo unsafe", "9".repeat(400)]) {
+      expect(() => loadDaemonConfig({ ...VALID, LOOPZHB_CLAUDE_MAX_BUDGET_USD: value })).toThrow(DaemonConfigError);
+    }
+  });
   it("parses a minimal valid config and applies the defaults (pollMs, claudeBin, agentTimeoutMs)", () => {
     expect(loadDaemonConfig(VALID)).toEqual({
       serverUrl: "http://127.0.0.1:3000",

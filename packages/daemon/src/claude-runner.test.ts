@@ -25,8 +25,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Delivery } from "@loopzhb/protocol";
 
 import { resolveClaudeProviderEnv } from "./claude-provider-env.js";
-import { createClaudeRunner, type ClaudeRunnerDeps } from "./claude-runner.js";
-import { createControlRoot, type ControlRoot } from "./control-root.js";
+import { buildClaudeArgs, createClaudeRunner, type ClaudeRunnerDeps } from "./claude-runner.js";
+import { WRAPPER_COMMAND, createControlRoot, type ControlRoot } from "./control-root.js";
 import { JailError, createWorkdirJail, type ResolvedWorkdir, type WorkdirJail } from "./jail.js";
 import type { ClaudeBinaryIdentity } from "./probe-claude.js";
 import { statClaudeBinary } from "./probe-claude.js";
@@ -34,6 +34,16 @@ import type { AgentRunner, RunnerReport } from "./runner.js";
 import { ProcessControlError } from "./subprocess.js";
 
 const FIXTURE = fileURLToPath(new URL("../test-fixtures/fake-claude.mjs", import.meta.url));
+
+it("pins the opt-in budget argv and rejects invalid direct adapter budgets", async () => {
+  const { run } = makeRunner({ maxBudgetUsd: 1 });
+  expect((await run(makeDelivery())).ok).toBe(true);
+  const argv = readSidecar().argv;
+  expect(argv[argv.indexOf("--max-budget-usd") + 1]).toBe("1");
+  for (const budget of [0, -1, NaN, Infinity]) {
+    expect(() => buildClaudeArgs(makeDelivery(), "{}", undefined, budget)).toThrow("invalid Claude per-Run budget");
+  }
+});
 const SIDECAR = ".fake-claude-session.json";
 // The canonical base the runner mints its per-Run CLAUDE_CODE_TMPDIR roots
 // under (run-temp.ts): `/private/tmp` on macOS, the realpath of the system
@@ -286,18 +296,7 @@ describe("A1–A3: the fixed argv and the dynamic sandbox settings", () => {
 
     // The audit: no key ANYWHERE in the settings tree may open an escape
     // hatch, and the permission mode is never bypass.
-    const keys: string[] = [];
-    const walk = (v: unknown): void => {
-      if (Array.isArray(v)) v.forEach(walk);
-      else if (typeof v === "object" && v !== null) {
-        for (const [k, inner] of Object.entries(v)) {
-          keys.push(k);
-          walk(inner);
-        }
-      }
-    };
-    walk(settings);
-    expect(keys.filter((k) => /mcp|plugin|skill|hook(?!s$)|bypass/i.test(k) && k !== "disableAllHooks")).toEqual([]);
+    expect(auditSettingsKeys(settings)).toEqual([]);
     expect(argv).not.toContain("bypassPermissions");
   });
 
@@ -801,10 +800,31 @@ function writeScenario(name: string): void {
   writeFileSync(path.join(workdir, V1_SCENARIO), name);
 }
 
-function sidecarSettings(): { filesystem: { allowRead: string[]; allowWrite: string[] } } {
+/** The whole settings JSON handed to the CLI (the sidecar's argv取证). */
+function sidecarSettingsFull(): Record<string, unknown> {
   const argv = readSidecar().argv;
-  const raw = argv[argv.indexOf("--settings") + 1]!;
-  return (JSON.parse(raw) as { sandbox: { filesystem: { allowRead: string[]; allowWrite: string[] } } }).sandbox;
+  return JSON.parse(argv[argv.indexOf("--settings") + 1]!) as Record<string, unknown>;
+}
+
+function sidecarSettings(): { filesystem: { allowRead: string[]; allowWrite: string[] } } {
+  return (sidecarSettingsFull() as { sandbox: { filesystem: { allowRead: string[]; allowWrite: string[] } } }).sandbox;
+}
+
+/** The A3 key-walk audit, shared so the v1 profile is held to the same
+ *  standard as the v0 one: no key ANYWHERE may name an escape hatch. */
+function auditSettingsKeys(settings: Record<string, unknown>): string[] {
+  const keys: string[] = [];
+  const walk = (v: unknown): void => {
+    if (Array.isArray(v)) v.forEach(walk);
+    else if (typeof v === "object" && v !== null) {
+      for (const [k, inner] of Object.entries(v)) {
+        keys.push(k);
+        walk(inner);
+      }
+    }
+  };
+  walk(settings);
+  return keys.filter((k) => /mcp|plugin|skill|hook(?!s$)|bypass/i.test(k) && k !== "disableAllHooks");
 }
 
 describe("V1–V4: v1 spawn shape — prompt, sandbox, journal env", () => {
@@ -876,6 +896,35 @@ describe("V1–V4: v1 spawn shape — prompt, sandbox, journal env", () => {
     expect(sidecar.prompt).toBe("fake-claude://ok");
     expect(sidecarSettings().filesystem.allowRead).not.toContain(controlRoot.rootDir);
     expect(sidecarSettings().filesystem.allowRead).not.toContain(controlRoot.nodePath);
+  });
+
+  it("V4b: the v1 profile's ONE permission grant is the wrapper entry — and a v0 profile carries none", async () => {
+    const { run } = makeRunner();
+    writeScenario("journal-none");
+    await run(makeV1Delivery());
+
+    // Issue #57: under dontAsk a Bash call runs only as a read-only builtin,
+    // through an allow rule, or by sandbox auto-allow — and the auto-allow
+    // DECLINES any shape its analyzer cannot reduce to a simple command. The
+    // v1 terminal command carries agent-authored text, so without this grant
+    // the run's DATA would decide whether it can finish at all (measured
+    // against the real CLI: the same command with a `;`+`=`-bearing reason is
+    // refused without the rule and executed with it).
+    const v1 = sidecarSettingsFull();
+    // EXACT equality, not toContain: a later `Bash(*)` must not ride along.
+    expect(v1.permissions).toEqual({ allow: [`Bash(${WRAPPER_COMMAND}:*)`] });
+    // The grant is a permission-layer entry, never a sandbox escape.
+    const sandbox = v1.sandbox as Record<string, unknown>;
+    expect(sandbox.allowUnsandboxedCommands).toBe(false);
+    expect(sandbox.excludedCommands).toEqual([]);
+    expect(auditSettingsKeys(v1)).toEqual([]);
+    expect(JSON.stringify(v1)).not.toContain("Bash(*)");
+    expect(JSON.stringify(v1)).not.toContain("bypass");
+
+    // v0: no wrapper on PATH, no grant — the profile stays exactly A3's.
+    const report = await run(makeDelivery());
+    expect(report.ok).toBe(true);
+    expect(sidecarSettingsFull()).not.toHaveProperty("permissions");
   });
 });
 

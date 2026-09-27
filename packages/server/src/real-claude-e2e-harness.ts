@@ -1,6 +1,37 @@
 import type { ChildProcess } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 
+/** Acceptance-only observer. Cost is parse-only on the server, so the
+ * database is not a billing source. Keep only numeric cost from Reports the
+ * real HTTP app accepted; never retain request bodies or Authorization. */
+export class AcceptedReportCostObserver {
+  private readonly costs = new Map<string, number | null>();
+  private duplicate = false;
+
+  async fetch(request: Request, next: (request: Request) => Response | Promise<Response>): Promise<Response> {
+    if (request.method !== "POST" || new URL(request.url).pathname !== "/api/machine/report") return next(request);
+    const body = await request.clone().json().catch(() => null) as { runId?: unknown; cost?: { usd?: unknown } } | null;
+    const response = await next(request);
+    const verdict = response.status === 200
+      ? await response.clone().json().catch(() => null) as { ok?: unknown } | null
+      : null;
+    if (verdict?.ok === true && typeof body?.runId === "string") {
+      if (this.costs.has(body.runId)) this.duplicate = true;
+      const usd = body.cost?.usd;
+      this.costs.set(body.runId, typeof usd === "number" && Number.isFinite(usd) && usd >= 0 ? usd : null);
+    }
+    return response;
+  }
+
+  requireCost(runId: string): number {
+    if (this.duplicate) throw new Error("duplicate accepted Report cost evidence");
+    if (!this.costs.has(runId)) throw new Error("no accepted Report cost evidence for Run");
+    const cost = this.costs.get(runId);
+    if (cost == null) throw new Error("accepted Report has no finite USD cost");
+    return cost;
+  }
+}
+
 export type DaemonLogStream = "stdout" | "stderr";
 
 export class DaemonLogObserver {

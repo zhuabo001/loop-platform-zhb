@@ -1,6 +1,6 @@
-# Phase 4 Batch 2 验收测试记录
+# Phase 4 验收测试记录
 
-> 本文档记录 Phase 4 Batch 2（Task File、State 与 Finish 全链路）最终验收的完整执行证据。Batch 1 的批次内验收见 ADR-009 与其复审记录；本文档固定 **Batch 2 切片 5 收口时** 的全量证据。
+> 本文档记录 Phase 4 的最终验收证据。**Batch 2（Task File、State 与 Finish 全链路）** 部分保留原样，作为该批次收口时的历史证据（Batch 1 的批次内验收见 ADR-009 与其复审记录）；**Batch 3（最小 Dashboard、Run Now no-supersede、安全装配）** 部分见文末「Batch 3 / Phase 4 收口验收」。
 
 ## 测试环境
 
@@ -140,3 +140,220 @@ $ git diff --check main  # 无输出（clean）；基线 6af3b29
 ## 结论
 
 Phase 4 Batch 2 的确定性验收目标及第二轮审查反例均有对应测试，Issues #39–#47 已核销关闭。**真实 Claude 业务门已于 2026-09-07 通过**，#38/#49 保持核销；#50 的三轨整改及最终真实 R 已于 2026-09-08 完成核销。该事实不能用于把 Claude Code 2.1.236 认定为版本根因。Batch 3 在真实门脚本上追加 Dashboard 与重启断言。
+
+---
+
+# Batch 3 / Phase 4 收口验收
+
+> 本节记录 Phase 4 Batch 3（最小 Dashboard、Run Now no-supersede、安全装配、切片五真实门）的收口证据。上方 Batch 2 记录未被改动，作为历史证据保留。
+
+## 测试环境
+
+- **日期**: 2026-09-26
+- **平台**: macOS 26.6.2（Darwin 25.6.0），arm64
+- **Node.js**: v22.17.0
+- **pnpm**: 10.6.1
+- **分支**: `feat/phase4-batch3-dev`
+- **验收提交**: `86bd353`（切片五实现：确定性 E1–E2 门、真实门 harness 与根脚本 `pnpm test:phase4:e2e`）；批次一–四的代码提交为 `690e395`、`e1dd98b`、`6198680`、`34ea6b9`
+- **计划**: `docs/plan/codex-phase4-batch3-plan.md`、`docs/plan/codex-phase4-batch3-slice5-plan.md`
+- **Claude**: `/opt/homebrew/Caskroom/claude-code/2.1.273/claude`，version `2.1.273`，sha256 `953e9880dbcb0b70f31c1f508de6a3fd389753d131688557fd992da9184693fb`（操作者批准值；生产 probe 实测与其一致后才触发真实 Run）
+
+## 验收范围（Batch 3 目标复述）
+
+- 本机只读 Dashboard：`GET /`（服务端渲染、无客户端 JavaScript、100 条展示上限），仅在回环绑定时存在。
+- `POST /dashboard/loops/:id/run`：每 boot 一枚 CSRF token 的表单；触发采用 **no-supersede**（任意 role 的 pending/running 都零写跳过），cron 与 catch-up 的 T7 语义不变。
+- 真实门：从页面触发两次真实 Claude Run，验证 state 晋升、Task File 同步与改写、Finish 原子完成，并在 Completed 后连续重启两次不产生新 Run。
+
+## 确定性门 E1–E2（`packages/server/src/phase4-batch3-e2e.test.ts`）
+
+生产装配全链路：文件型 PGlite（`bootstrapServer`）→ 真实 `127.0.0.1` listener → 生产 daemon CLI 子进程 → 生产 Claude runner → fake-claude fixture；两次 Run **都经页面表单 + CSRF token** 触发（不是 JSON API）。
+
+1. 反空转设计：Task File 携带两个**测试期随机标记**。Run 1（fixture `batch3-e2e-record`）把标记 A 从 Timeline 移入所报 state 并把该行从文件删除；Run 2（`batch3-e2e-finish`）从该 Run 的 `context/prev-state.json` 读回 A、从改写后的 Timeline 读回 B，finish reason 逐字节等于 `goal met; state-marker=<A>; timeline-marker=<B>; task-file-clean=yes`，并原样成为 `loops.completionReason` 与页面「完成原因」。断言含 `runs.state`（标记 A 的行内快照）、磁盘 TASK.md、`loops.taskFileContent`（等于改写后内容）、`enabled=false`、lease 清空。
+2. Completed 页面与守卫：页面渲染 `data-lifecycle="completed"`、禁用按钮与原因文字；`POST /api/loops/:id/run`、`PATCH /schedule`、`PATCH /goal` 全部 `409 loop_completed`。
+3. 连续重启：生产关闭顺序（scheduler drain → listener → DB）后推进测试时钟跨越约 210 个 minutely occurrence，同一数据目录重启两次。**对照未完成 Loop 必须补跑**（恰好 1 条 pending、水位推进到 `2026-08-27T12:30:00.000Z`、启动扫描恰好注册 1 个 job），而 Completed Loop 整行逐字段与重启前相等、Run 数恒为 2——因此「0 新 Run」是测量而非同义反复。
+4. **变异核销**（施加于 fixture，随后按字节还原，`git status` 无残留）：① 令 Run 1 不删除 step-1 行 → Task File 快照断言转红；② 令 Run 2 读不到 `prev-state.json` → completionReason 断言在 `state-marker=<missing>` 处转红。
+
+## 真实 Claude 门（`pnpm test:phase4:e2e`）
+
+生产 daemon CLI + 真实 Claude（批准 sha256）+ 真实 OS sandbox + 真实 HTTP + 文件型 PGlite；仅注入 Clock/CronFactory 以确定性跨越重启时间，未替换业务路径或 Claude runner。两次 Run 均由 `GET /` 取 token 后 `POST /dashboard/loops/:id/run` 触发。
+
+**2026-09-26 第一次执行：未通过（不记为通过）**
+
+- 通过部分：生产 probe 报出的 Claude provenance 与批准 sha256 一致；daemon 启动与轮询正常；Claude 进程组正常开启并关闭；页面 token 抓取与表单 POST 正常（303）。
+- 失败点：Run 1 以 `journal_multiple` 收口。分类按 ADR-009 修订 8/9 刻意不含内容，**outbox 内的实际条目无法从该分类读出**；本次执行未保留 outbox（每 Run 控制目录随 Run 释放）。
+- 判定：这是**验收协议**问题而非产品缺陷——`journal_multiple` 是（多记录/非普通条目）的既定 fail-closed 语义，ADR-009 已冻结 outbox 恰好一条的契约。最可能成因是模型对同一 Run 调用了两次 wrapper（首次命令万一未如愿即重试），或以文件形式向 outbox 落过临时产物；两者都会产生第二条条目。
+- 修复（不改产品语义）：① 任务协议改为显式声明后果——「终端命令整个 Run 只能调用一次」，重复调用或向 outbox 留任何文件都会使该 Run 失败；禁止 `--state-file`/`--message-file` 与任何 outbox 写入；并说明「命令几乎无输出即成功，不要重跑确认」。② 真实门新增失败诊断：失败时打印 agent 工作目录清单、TASK.md 现内容与 Run 行（phase/error/message/sessionId），使下一次 `journal_multiple` 有可观测上下文。**未自动重试任何真实调用。**
+
+**2026-09-26 第二次执行（提交 `2a301fa`）：未通过（不记为通过）**
+
+- 通过部分：provenance 与批准 sha256 一致；**Run 1 全绿**——`done/exec`、`status=new`、`message="step 1 recorded the task file"`、`sessionId` 非空；诊断 dump 显示磁盘 TASK.md 中 `- step-1 marker:` 行已删除、`- step 1 recorded` 已追加到 Timeline。收紧后的「恰好一次」协议在 Run 1 上奏效（第一次执行的 `journal_multiple` 未复现）。
+- 失败点：**Run 2 以 `journal_missing` 收口**（outbox 零记录），即该 Run 从未成功调用 wrapper；进程组正常开启并关闭，`message`/`sessionId` 均为 null。
+- 根因（均在**验收协议**，不在产品）：① Task File 的 `## Current understanding` 写死「Step 1 has not been recorded yet」，而 run prompt 明确告诉模型该节是**已知基线**——第二个 Run 时它与 `prev-state.json`、Timeline 直接矛盾，"无需动作"因此成为一条合理路径，而零调用即失败。② 更根本：step 2 的命令把两个标记值**预先代入**，模型照抄即可——那样 `completionReason` 只证明"抄写"，不证明"读过 `prev-state.json` 与更新后的 Timeline"，削弱了本门的跨 Run 测量语义（与计划 §2.2 相悖）。该缺陷是**验收设计缺陷**，本次记录在案。
+- 修复（不改产品语义）：任务协议改为**单一决策规则**——每次 Run 恒以恰好一条命令收尾，分支由 `prev-state.json` 是否为 null 决定（Branch A 记录 state 并改写 Timeline；Branch B 必须**在运行时读出**两个标记并替换进 finish reason 的两个槽位）；删除与之矛盾的 `## Current understanding` 内容，改为指向 `prev-state.json` 的中性说明；继续禁止任何 outbox 写入与二次调用。
+
+**2026-09-26 第三次执行（提交 `95711a3`）：未通过（不记为通过）**
+
+- 通过部分：provenance 与批准 sha256 一致；**Run 1 再次全绿**（`done/exec`、`status=new`、message 正确、Timeline 已改写：`- step-1 marker:` 行删除、`- step 1 recorded` 追加）。
+- 失败点：**Run 2 再次 `journal_missing`**（零调用），与第二次完全同型；进程组正常开启并关闭，`message`/`sessionId` 为 null。整测 36.28s（两次真实 Run + 两次重启）。
+- 判定：**不是替换错误**——若模型执行了带占位符的命令，outbox 仍会得到一条记录（成功或 wrapper 拒绝都会落盘），failure 会是"reason 断言不符"而非 `journal_missing`。零调用意味着该 Run 根本没有执行任何 `loopzhb` 命令。三次尝试的模式一致：**Branch A（读 Task File + 执行命令）稳定成功，Branch B（先读 `prev-state.json` 再组合命令）连续两次零调用**。
+- 未定项（诚实记录）：本门现有证据**无法观测模型的命令与实际输出**（`journal_missing` 是按 ADR-009 修订 8/9 刻意 content-free 的分类；runner 在该失败路径不上报子进程 finalText；未读取 agent 会话记录）。因此成因仍属假设：可能是分支判定受阻、命令未被执行，或 Bash 调用被环境拒绝。
+- 处置：按计划「记录实际失败并修复后复验」，**未自动重试**；下一步选项与费用由操作者裁决。产品侧链路本身在本次三次执行中未发现异常——确定性门已独立证明 state 晋升、Task File 改写/同步、Finish 原子完成与 Completed 守卫。
+
+**2026-09-26 第四次执行（提交 `a549978`）：未通过（不记为通过）——但排除了一整类假设**
+
+- 通过部分：Run 1 再次全绿。失败点：Run 2 再次 `journal_missing`。
+- 新增仪器（`RUN-NOTES.md`，由 agent 自己写）：记录到 `marker-read: mk-a-…` 与 `command: loopzhb finish --reason "goal met; state-marker=<A>; timeline-marker=<B>"`——**模型成功读取了 `prev-state.json` 并正确替换了两个标记**。
+- 结论：失败**不在**模型的读取或组合环节；问题收窄为"那条命令是否真的落盘"。
+
+**2026-09-26 第五次执行（提交 `254fef7`）：未通过（不记为通过）——定位到根因**
+
+- 通过部分：Run 1 再次全绿。失败点：Run 2 `journal_multiple`；`RUN-NOTES.md` 记录 `exit-status: not-run`，并附 agent 的完整说明。
+- **F1（产品级发现，可能阻塞）**：agent 报告——每次执行命令都在**执行前**被 `--permission-mode dontAsk` 拒绝（"Permission to use Bash has been denied because Claude Code is running in don't ask mode"），对裸 PATH、绝对路径、单引号 reason、`node --openssl-config=…` 解释器四种形式均可复现；触发点是 reason 模板中的 `=`（`state-marker=…` / `timeline-marker=…`）。agent 自测 A/B：`loopzhb bogus --reason "goal met"` **执行**、`loopzhb bogus --reason "foo=bar"` **被拒**。即：**权限分析器只在没有参数 token 含 `NAME=value` 时才放行这个未识别二进制**。这与四次失败的形状完全自洽——Run 1 的命令（`--status new` / `--message "…"` / `--state '{"step":1,…}'`）不含 `=` 故始终通过；Run 2 的 reason 因需要报告测量值而必然含 `=`，故永远无法执行。该结论来自 agent 自述及其自测，本次未做独立复验（属 Claude Code 内部行为，本仓无法本地验证）。
+- **F2（产品级发现，已由代码确证，无需付费运行）**：`wrapper-main.ts:141` 对任何非 `report`/`finish` 的调用执行 `invalid()` 并写记录，因此 `loopzhb --help` 这类**纯探测**同样落盘。第五次的 `journal_multiple` 正是 agent 诊断期间 7 次探测各自的 `{kind:"invalid"}` 记录。也就是说，agent 只要探一下 CLI，就会破坏"恰好一条"契约并使 Run 失败；agent 明确拒绝删除这些文件（删除等于篡改 host 校验目录、掩盖错误），该判断与 ADR-009 修订 8 的边界一致。
+- 处置：两项均登记为待裁决发现；**未自动重试**，也未为绕开拒绝而修改验收任务或做任何混淆。
+
+**由第五次执行登记的两个 Phase 4 收口阻塞项（本次真实门未通过的直接原因）**
+
+- [Issue #57](https://github.com/zhuabo001/loop-platform-zhb/issues/57)：终端收口命令在参数含 `NAME=value` 时被权限层拒绝。**直接阻塞本门**——验收要求 Run 2 在 finish reason 中报告两个运行时读出的标记，而该 reason 必然含 `=`。
+- [Issue #58](https://github.com/zhuabo001/loop-platform-zhb/issues/58)：wrapper 对任何调用（含 `loopzhb --help`）都写记录，agent 一次探测即破坏"恰好一条"契约。第五次的 `journal_multiple` 即由此产生。
+
+**结论：真实 Claude 门尚未通过，Phase 4 不收口。** 上述两项修复并复验前，Batch 3 与 Phase 4 保持进行中（roadmap 已同步）。
+
+## 两个阻塞项的修复与本地权限探针（#57 / #58，2026-09-26）
+
+修复在**真实门复验之前**完成，且不消耗任何模型调用。理由：权限判定发生在已安装的 CLI 内部，**与模型无关**——用 mock provider 提供 canned `Bash` tool_use，真实 CLI 就会在**生产 argv、生产 settings、真实控制根 / 每 Run 临时根 / OS sandbox** 下作出真实裁决，而"命令是否真的执行"由 **outbox 里是否出现记录**回答（记录在，即 wrapper 真的在沙箱内跑过）。
+
+**F1 修复（放行 wrapper 入口）**：v1 Run 的 sandbox settings 增加唯一的权限放行 `permissions.allow: ["Bash(loopzhb:*)"]`；v0 不新增任何键，A3 的 settings pin 逐字节未动。裁决与安全论证见 ADR-006 2026-09-26 修订与 ADR-009 同日修订第 1 条。
+
+**F2 修复（探测惰性化）**：显式 `--help`/`-h`/`help`/`--version` 探测不再写记录（打印文法，exit 0）；判定是**位置性**的（命令槽或 flag 槽），`loopzhb finish --reason --help` 仍是"reason 恰为 `--help`"的合法调用。裁决见 ADR-009 同日修订第 2 条。
+
+**本地权限探针（`packages/daemon/src/claude-permission-probe.test.ts`，opt-in、零费用）**
+
+```text
+$ LOOPZHB_CLAUDE_PERMISSION_PROBE=1 pnpm --filter @loopzhb/daemon test src/claude-permission-probe.test.ts
+ Test Files  1 passed (1)      Tests  3 passed (3)      Duration  8.53s
+```
+
+| 终端命令 | 无放行规则 | 有放行规则（本次修复） |
+|---|---|---|
+| `loopzhb report --status new --message "…" --state '{"step":1,…}'` | 允许（sandbox auto-allow） | 允许 |
+| `loopzhb finish --reason "goal met; state-marker=<A>; timeline-marker=<B>"` | **拒绝**（`… don't ask mode`，outbox 空） | **执行**，outbox 恰好一条且 reason 逐字节相符 |
+| `loopzhb-helper finish --reason "goal met; state-marker=<A>"`（同前缀兄弟名） | — | **拒绝**（放行只覆盖 wrapper 本身，不覆盖同前缀名） |
+
+第二行就是全部要点：同一命令、同一 profile、只差一个键。它同时否证了另一个假设——"引号内的 `;` 会被当作子命令切分从而使规则失配"：规则匹配在含 `;`/`=` 的引号参数上照常成立。第三行用**非简单形态**（简单形态会被 auto-allow 放行，因而无法说明规则边界）证明放行是窄的：若改成 `Bash(loopzhb*)` 即变红。**残余不确定性**：探针依赖本机 CLI 版本（2.1.273）的内部判定，因此它是**证据补充而非替代**；两 Run 全绿仍只能由真实门证明。
+
+**结论（修复落地时点）**：两项修复已落地并通过确定性门与全仓离线套件；真实 Claude 门**尚未复验**，Phase 4 仍不收口。复验需操作者的费用批准，并按切片五纪律单独取证、失败只记录不自动重试。
+
+### 修复提交的完整质量门（`2326a8f`）
+
+```text
+$ pnpm test            # 全仓（protocol + daemon + server）
+packages/protocol: Test Files  11 passed (11)         Tests  174 passed (174)
+packages/daemon:   Test Files  22 passed | 2 skipped  Tests  529 passed | 6 skipped (535)
+packages/server:   Test Files  50 passed | 3 skipped  Tests  599 passed | 3 skipped (602)
+
+$ pnpm typecheck       # Done（三包）
+$ pnpm build           # Done（三包）
+$ pnpm --filter @loopzhb/server db:check
+No schema changes, nothing to migrate
+
+$ git diff --check     # 无输出（clean）
+```
+
+（daemon 侧 2 个 skipped 文件 = 既有 opt-in `claude-smoke.test.ts` + 本次新增的本地权限探针 `claude-permission-probe.test.ts`（opt-in，零费用）。修复提交：`0c1bc8e`（#57）、`2a86826`（#58）、`2326a8f`（文档）。）
+
+## 完整质量门（`86bd353`）
+
+```text
+$ pnpm test            # 全仓（protocol + daemon + server）
+packages/protocol: Test Files  11 passed (11)         Tests  174 passed (174)
+packages/daemon:   Test Files  22 passed | 1 skipped  Tests  518 passed | 3 skipped (521)
+packages/server:   Test Files  50 passed | 3 skipped  Tests  599 passed | 3 skipped (602)
+
+$ pnpm typecheck       # Done（protocol / daemon / server 全部通过）
+$ pnpm build           # Done（三包）
+$ pnpm --filter @loopzhb/server db:check
+No schema changes, nothing to migrate
+
+$ git diff --check     # 无输出（clean）
+```
+
+（server 侧 3 个 skipped 文件为 opt-in 真实 Claude 门：`real-claude-e2e.test.ts`、`phase4-batch2-real-claude-e2e.test.ts`、`phase4-batch3-real-claude-e2e.test.ts`。）
+
+## 显式边界核对（相对基线 `main@e51894b`）
+
+- 无 DB migration（`db:check` 无 diff）、无新增公共 JSON DTO、无客户端 JavaScript、无新依赖。
+- Dashboard 页面入口是 `GET /`，写路由是 `POST /dashboard/loops/:id/run`；`pendingPolicy` 与 `pending_exists` 均不进入公共 wire 契约。
+- 新增 npm 脚本仅 `test:phase4:e2e`（opt-in，默认跳过）；`pnpm test:phase4:batch2:e2e` 行为未变。
+- 右移项：JSON API 的同源意图校验、`Content-Type` 门禁与拒绝空体属 [Issue #56](https://github.com/zhuabo001/loop-platform-zhb/issues/56)（Phase 5），不在本批范围。
+
+
+## 2026-09-27 — 收口补充取证（执行中）
+
+前述 #57 根因的范围收窄：参数含 `NAME=value` 并非一概不可执行，独立 finish 的 wrapper 放行已生效；真实门调试后缀 `; echo "exit=$?"` 是仍未被覆盖的命令形态。固定 Claude 2.1.273、批准 SHA-256 下，零费用探针证明：旧完整命令被拒且 outbox 空；移除后缀的同一 reason 写出正确单条 finish；帮助探测后 finish 仍恰好一条记录。
+
+验收任务取消 shell 退出状态后缀，诊断改用 Bash 工具返回结果，成功判定仍来自 host Journal 与数据库。marker A 只植入可删除的 Timeline 行，Run 2 前核查 Task File 和工作目录文件均不含 A。shutdown 前捕获实际存在的控制根和 scratch root，再断言退出后不存在。secret E2E 的 daemon TMPDIR 也改为独占目录，以避免并行测试误认控制根。
+
+本轮操作者批准一次两 Run、总费用上限 $3；真实门使用每 Run $1 的 CLI 停止阈值，保留 $1 余量，Run 1 费用缺失或剩余不足时拒绝 Run 2，失败不重试。本节目前不声明真实门通过；最终固定提交、结果和独立核销将在执行后追加。
+
+### 本轮离线质量门与独立复审
+
+- 固定实现：`552b632e34e1cafbd4e3081bacef3827aaed0505`；当前阶段指针整改 `936f672`。
+- protocol：11 files / 174 passed；daemon 最终复验：22 passed files + 2 skipped / 532 passed + 7 skipped；server：51 passed files + 3 skipped / 602 passed + 3 skipped。
+- typecheck、build、db:check（无 schema 变化）、相对 main merge-base 的 diff --check 全部通过。
+- 零费用真实 CLI 权限探针与 config/runner/wrapper：4 files / 139 passed；server 验收任务协议、Dashboard E1–E2、settings-secret E2E：3 files / 5 passed；最终 prompt/config/runner/wrapper：4 files / 140 passed。
+- Standards 文档 P2 经 `936f672` 后续独立复审核销；Spec 实现 PASS；Adversarial 除费用授权边界外技术 PASS。五个遗留 Issue 的技术条件均有后续独立核销意见。
+- 费用裁决待答复：CLI 阈值按请求检查，预留余量不能证明用户原 $3 绝对上限。已向操作者说明；真实门尚未执行，#57/#58 与 Phase4 保持待收口。
+
+### 切片四遗留 Issue 最终核销
+
+2026-09-27，#33/#36/#51/#52/#53 均已按仓库流程追加固定修复、测试和后续独立三轨核销证据并关闭。独立审查范围包括本轮修复和 Batch3 相对 `main@e51894b` 的最终批次范围；#33/#36 同时直接复核既有实现与回归。切片四已完成。#57/#58 仍为 OPEN，真实门尚未执行，Phase4 保持进行中。
+
+## 2026-09-27 — 第六次真实门：费用来源断言失败（不记为通过）
+
+- 固定候选：`8957f83271c1ff8cf503b62b9c24f2cac1ca5cee`，其 CI `36257101286` SUCCESS。
+- macOS26.6.2 / Nodev22.17.0 / pnpm10.6.1；Claude2.1.273，生产 provenance 实测与批准 SHA256 `953e9880dbcb0b70f31c1f508de6a3fd389753d131688557fd992da9184693fb` 相符。
+- 用户明确接受每 Run $1 CLI 停止阈值、总目标 $3、末次请求可能超额；Adversarial 后续独立核销原预算授权 P2。该裁决不将阈值称为硬限额。
+- 命令：`LOOPZHB_PHASE4_ACCEPTANCE_BUDGET_USD=3 LOOPZHB_EXPECTED_CLAUDE_SHA256=953e9880dbcb0b70f31c1f508de6a3fd389753d131688557fd992da9184693fb pnpm test:phase4:e2e`。
+- 结果：1 failed，26.28s（测试体25.66s）。Run1 report / state晋升 / Task File改写及 marker A来源排除断言全部通过，随后 `expect(firstCost).not.toBeNull()` 得到null。Run2 **未触发**，没有额外付费重试。
+- 直接原因：[Issue #59](https://github.com/zhuabo001/loop-platform-zhb/issues/59)。生产 `cost` 是 parse-only，Server故意不将 Report cost写入 `runs.costUsd`；新验收门错误地从该列取费用。此失败不证明 #57/#58 修复回归，但也不满足其真实两Run核销条件。
+- 本次 Run1 **实际费用未知**：没有在请求接受边界保留该 numeric cost，临时资源已清理，数据库null不等于费用0，不把 $1 停止阈值当作实际收费。
+- 零费用复现：fake Claude明确输出0.125，生产 CLI→Report→DB 后字段仍null，使同一成本断言红。修复观察已被真实HTTP app接受的 Report numeric USD，两次fake Run各0.125，数据库仍null。拒绝请求、缺失/非法cost、重复accepted证据均fail-closed。无生产持久化/DTO/schema改变。
+- 定向回归：Report观察器 + 完整Dashboard E1–E2 + coordinator report，3 files / 41 passed。最终全量质量门与独立复审另补。新的付费复验须重新获得授权，本轮不自动重试。
+
+### #59 最终技术核销与复验候选
+
+- 固定修复候选：`d25dcfd2598d750998a2275b64c3937cc0949b72`（ccc433a费用观察修复 + d25dcfd单测类型安全）；相对8957f83的新增改动经独立Standards/Spec/Adversarial全部技术PASS，无未解决P1/P2。
+- 完整离线质量门：protocol174 passed；daemon532 passed +7 skipped；server609 passed +3 skipped。typecheck/build/db:check/相对main merge-base diff --check全部通过。
+- #59已在远端追加修复、测试、后续独立核销记录并关闭，不替代最终真实门。#57/#58仍OPEN。
+- 下一次真实验收需新的明确费用批准，不能把前次“唯一一次”授权复用为失败后自动重试。当前仅已执行一次真实入口、一个Run1，实际费用未知，Run2未执行。费用阈值边界已获接受，后续新增两Run费用仍须另批准。
+
+### 第七次真实门：完整功能验收通过（2026-09-27）
+
+- 用户新增授权一次完整真实门；沿用每 Run $1 CLI停止阈值、总目标 $3，接受末次请求可能超额，失败不自动重试。
+- 固定候选 `fb2b17e0c497acbde76333aed20617a9aff65226`，其远端 CI `36290284880` SUCCESS。macOS26.6.2、Node22.17.0、pnpm10.6.1；批准 Claude2.1.273 / SHA256 `953e9880dbcb0b70f31c1f508de6a3fd389753d131688557fd992da9184693fb`，门内 provenance hash断言通过。
+- 命令：`LOOPZHB_PHASE4_ACCEPTANCE_BUDGET_USD=3 LOOPZHB_EXPECTED_CLAUDE_SHA256=953e9880dbcb0b70f31c1f508de6a3fd389753d131688557fd992da9184693fb pnpm test:phase4:e2e`，stdout/stderr 经 pipefail + tee 留存本地审计日志；没有重复执行。
+- 结果：2026-09-27 11:23:57（Asia/Shanghai）开始，exit0、1 file / 1 test passed、无skip；测试体60.32s，总60.97s。本机Vitest缓存亦记录60322.22775ms、failed:false。
+- 顺序断言全通过：Dashboard表单触发两个真实Run；Run1 done/exec、state晋升、Task File磁盘/快照同步、A在工作目录无其他来源；Run2 done/exec/resolved、finish reason严格包含前state A与Timeline B；Loop完成、state保留、schedule禁用、Lease清空；Completed页面按钮禁用、API Run Now返回409 loop_completed。
+- 连续两次重启：Completed Loop始终仅2个Run、完成字段/state全等；未完成对照Loop确实catch-up并保持一次，排除调度未启动造成假绿。daemon正常exit0、Claude进程组关闭、观察到的控制根/scratch根回收、全日志秘密检查通过。
+- 独立Standards/Spec/Adversarial对固定代码及执行日志均核销PASS：本次满足 #57/#58 的真实门关闭条件。该结论不证明真实帮助调用的独立计数；正常链路无journal污染，配合既有wrapper单测和真实CLI canned help→finish探针构成 #58 证据。
+- **费用记录限制（Issue #60）**：两个已接受Report费用均为有限非负数，Run1费用满足继续条件，合计经断言证明 <= $3。但Vitest agent reporter的MinimalReporter默认silent:"passed-only"，成功console被隐藏，实际分项和合计数字未留存、现有产物无法恢复。不能将预算或fixture金额当作实际收费。此限制不否定功能验收，计划/ADR要求的实际费用记录仍待用户裁决，Phase4暂不正式标记完成。
+- 后续入口显式 `--reporter=default --silent=false`，零费用临时fixture已验证PASS费用日志可留存（0.125/0.125仅是fixture数字）。没有为了补日志增加模型调用。
+
+### Phase4 正式收口裁决（2026-09-27）
+
+- 用户明确接受本次收口及已披露的费用留存限制。第七次真实门费用合计已证明<=3美元，精确金额未留存；不得补写虚构数字。
+- 未来日志留存修复 `4fa825ef1df0316cd4ec370811888f2040202371`：零费用fixture及后续独立Standards/Spec/Adversarial全部PASS；远端CI `36291600913` SUCCESS（2026-09-27 03:38:17 UTC）。无额外模型调用。
+- #60依据修复、后续独立复审及用户对历史记录例外的明确裁决核销；#57/#58及全部Phase4阻塞Issue已关闭，#56继续Phase5右移。
+- Batch3切片一至五与Phase4验收收口完成。PR #55保持开放待合入；代码已在开发分支远端，未声称已进入main。最终纯文档提交CI以PR Checks为准。
+
+### 第八次真实门：收口后独立确认运行（2026-09-27）
+
+- 用户新增授权一次完整真实门，用途为**独立确认**：在收口后的 HEAD 上重跑，检验曾阻塞验收的 #57/#58/#59 是否确已修复。
+- 固定提交 `10275c97f38eb33e940f906788419dbb3c76bb76`（工作树干净、与 origin 同步）；相对已通过的 `fb2b17e` 仅 `package.json` 的 `--reporter=default --silent=false`（#60 日志留存修复）与 docs 变化，**被测系统未变**。
+- 命令：`LOOPZHB_PHASE4_ACCEPTANCE_BUDGET_USD=3 LOOPZHB_EXPECTED_CLAUDE_SHA256=953e9880dbcb0b70f31c1f508de6a3fd389753d131688557fd992da9184693fb pnpm test:phase4:e2e`，stdout/stderr 经 pipefail + tee 留存审计日志；只执行一次，未重试。
+- 结果：2026-09-27 11:59:09（Asia/Shanghai）开始，exit0、1 file / 1 test passed、无skip；测试体 58.21s，总 58.83s。门内 Claude provenance 断言通过（2.1.273 / `953e9880…4693fb`）。
+- 顺序断言全通过，与第七次同构：两次页面触发真实 Run（state 晋升 → Task File 改写 → 双 marker Finish）→ Completed 页面与守卫 → 连续两次重启不新增 Run。
+- **#60 修复首次在付费运行中生效，真实费用首次留存**：`Run 1 cost USD: 0.259125`、`Run 2 cost USD: 0.111713; total USD: 0.370838`。每 Run 实际费用均低于 $1 停止阈值，**未触及阈值超额**；实际合计 $0.370838，远低于批准目标 $3。
+- 上一条（正式收口裁决）所指第七次的**精确金额仍未留存**（不得回填，该历史事实不因本次运行改变）；本次为同一被测系统提供了实测数字供对照，本次数字仅属本次运行。
+- 结论：曾阻塞验收的 #57（权限层由内容决定可执行性）、#58（探测污染 journal）、#59（费用来源）在当前 HEAD 上均未复现；本次确认运行与第七次功能结论一致。审计日志 `docs/handoff/phase4-real-10275c9-20260927.log`（gitignored，不提交）。

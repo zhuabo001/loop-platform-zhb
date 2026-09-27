@@ -2,7 +2,52 @@ import { spawn } from "node:child_process";
 
 import { describe, expect, it } from "vitest";
 
-import { DaemonControlObserver, DaemonLogObserver, DetachedProcessSupervisor } from "./real-claude-e2e-harness.js";
+import { AcceptedReportCostObserver, DaemonControlObserver, DaemonLogObserver, DetachedProcessSupervisor } from "./real-claude-e2e-harness.js";
+
+describe("AcceptedReportCostObserver", () => {
+  const request = (usd?: unknown) => new Request("http://localhost/api/machine/report", {
+    method: "POST", body: JSON.stringify({ runId: "run-cost", cost: { usd } }),
+    headers: { authorization: "Bearer must-not-be-retained" },
+  });
+  const accepted = () => Response.json({ ok: true });
+
+  it("observes actual accepted Report cost while leaving both bodies readable", async () => {
+    const observer = new AcceptedReportCostObserver();
+    const response = await observer.fetch(request(0.125), async (req) => {
+      expect(await req.json()).toMatchObject({ cost: { usd: 0.125 } });
+      return accepted();
+    });
+    expect(await response.json()).toEqual({ ok: true });
+    expect(observer.requireCost("run-cost")).toBe(0.125);
+    expect(JSON.stringify(observer)).not.toContain("must-not-be-retained");
+  });
+
+  it.each([401, 400, 409, 500])("ignores a rejected %i Report", async (status) => {
+    const observer = new AcceptedReportCostObserver();
+    await observer.fetch(request(9.99), () => new Response("rejected", { status }));
+    expect(() => observer.requireCost("run-cost")).toThrow("no accepted Report");
+  });
+
+  it("rejects missing, malformed and conflicting evidence, and accepts genuine zero cost", async () => {
+    for (const cost of [undefined, null, -1, "0.125"]) {
+      const observer = new AcceptedReportCostObserver();
+      await observer.fetch(request(cost), accepted);
+      expect(() => observer.requireCost("run-cost")).toThrow("no finite USD cost");
+    }
+    const observer = new AcceptedReportCostObserver();
+    await observer.fetch(request(0), accepted);
+    expect(observer.requireCost("run-cost")).toBe(0);
+    await observer.fetch(request(0), accepted);
+    expect(() => observer.requireCost("run-cost")).toThrow("duplicate accepted");
+  });
+
+  it("does not mistake a 200 rejection or other route for accepted Report evidence", async () => {
+    const observer = new AcceptedReportCostObserver();
+    await observer.fetch(request(0.125), () => Response.json({ ok: false }));
+    await observer.fetch(new Request("http://localhost/api/loops"), accepted);
+    expect(() => observer.requireCost("run-cost")).toThrow("no accepted Report");
+  });
+});
 
 describe("DaemonLogObserver", () => {
   it("keeps a sticky credential finding even when one oversized chunk is evicted from diagnostics", () => {

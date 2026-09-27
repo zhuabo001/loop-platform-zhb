@@ -281,6 +281,89 @@ describe("resolveClaudeProviderEnv — missing vs malformed (P11–P16)", () => 
   });
 });
 
+/** Batch plan §4 S1 (#51): the startup-fatal text is stable and carries no
+ *  path value, and the daemon's startup log is the same text. */
+describe("resolveClaudeProviderEnv — no failure echoes the config dir (Issue #51)", () => {
+  /** A config dir whose NAME carries a credential-shaped segment. The path IS
+   *  the sensitive value here (an operator can point CLAUDE_CONFIG_DIR at a
+   *  token-named directory), and every startup failure reaches stderr — so
+   *  every failure class must stay clean of it. */
+  const PATH_TOKEN = "sk-ant-path-secret-9f8e7d";
+
+  /** `<base>/<PATH_TOKEN>/settings.json`. `raw` writes the file; `directory`
+   *  makes settings.json a DIRECTORY instead, which is the deterministic
+   *  production-reader failure (EISDIR — no permission/root dependence). */
+  function hostileConfigDir(options: { raw?: string; directory?: boolean } = {}): string {
+    base = mkdtempSync(path.join(realpathSync(tmpdir()), "loopzhb-provider-env-leak-"));
+    const configDir = path.join(base, PATH_TOKEN);
+    mkdirSync(configDir, { recursive: true });
+    const settingsPath = path.join(configDir, "settings.json");
+    if (options.directory === true) mkdirSync(settingsPath);
+    else if (options.raw !== undefined) writeFileSync(settingsPath, options.raw);
+    return configDir;
+  }
+
+  /** The five failure classes with the stable category each must keep, plus
+   *  the poisoned document each one needs. */
+  const cases: Array<{ label: string; category: string; raw?: string; directory?: boolean }> = [
+    { label: "invalid JSON", category: "not valid JSON", raw: '{ "env": { "ANTHROPIC_API_KEY": "frag-9f8e' },
+    { label: "a non-object document", category: "must be a JSON object", raw: "42" },
+    { label: "a non-object env", category: '"env" must be an object', raw: '{"env": 7}' },
+    {
+      label: "an allowed field of the wrong type",
+      category: "ANTHROPIC_API_KEY must be a string",
+      raw: '{"env":{"ANTHROPIC_API_KEY":["v"]}}',
+    },
+    { label: "an unreadable file", category: "unreadable", directory: true },
+  ];
+
+  it("P19: every failure class is path-free and still classifiable", () => {
+    for (const { label, category, raw, directory } of cases) {
+      const configDir = hostileConfigDir({ raw, ...(directory !== undefined ? { directory } : {}) });
+      let thrown: unknown;
+      try {
+        resolveClaudeProviderEnv({ CLAUDE_CONFIG_DIR: configDir });
+        expect.unreachable(`${label} did not fail closed`);
+      } catch (err) {
+        thrown = err;
+      }
+      // Classifiable: the same stable category as before the path was removed.
+      expect(thrown, label).toBeInstanceOf(ClaudeProviderEnvError);
+      const message = (thrown as Error).message;
+      expect(message, label).toContain(category);
+      // Path-free: neither the token segment, nor the config dir, nor the
+      // settings file name may appear anywhere in the startup-fatal text.
+      expect(message, label).not.toContain(PATH_TOKEN);
+      expect(message, label).not.toContain(configDir);
+      expect(message, label).not.toContain("settings.json");
+      rmSync(base!, { recursive: true, force: true });
+      base = null;
+    }
+  });
+
+  it("P20: an injected reader's failure carries neither the path nor its own text", () => {
+    const configDir = hostileConfigDir();
+    let thrown: unknown;
+    try {
+      resolveClaudeProviderEnv(
+        { CLAUDE_CONFIG_DIR: configDir },
+        {
+          readSettingsFile: () => {
+            throw new Error(`EACCES: ${configDir} sk-adapter-text-9f8e`);
+          },
+        },
+      );
+      expect.unreachable();
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(ClaudeProviderEnvError);
+    // Byte-exact: the classification is the whole message — no adapter text,
+    // no path, nothing appended.
+    expect((thrown as Error).message).toBe("claude provider settings are unreadable");
+  });
+});
+
 describe("resolveClaudeProviderEnv — unreadable file (P17–P18)", () => {
   it("P17: a reader failure is a fail-closed startup error carrying no adapter detail", () => {
     expect(() =>

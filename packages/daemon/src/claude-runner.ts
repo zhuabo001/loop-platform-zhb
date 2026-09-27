@@ -51,7 +51,7 @@ import path from "node:path";
 
 import { buildAgentEnv, redactSecrets } from "./agent-env.js";
 import { createClaudeStreamParser, type ClaudeStreamParser } from "./claude-stream.js";
-import type { ControlRoot } from "./control-root.js";
+import { WRAPPER_COMMAND, type ControlRoot } from "./control-root.js";
 import type { ResolvedWorkdir, WorkdirJail } from "./jail.js";
 import { collectJournal } from "./journal.js";
 import { sameClaudeBinary, statClaudeBinary, type ClaudeBinaryIdentity } from "./probe-claude.js";
@@ -75,6 +75,7 @@ export interface ClaudeRunnerDeps {
   jail: WorkdirJail;
   claudeBin: string;
   timeoutMs: number;
+  maxBudgetUsd?: number;
   /** The daemon process env — filtered through the agent-env whitelist. */
   envSource: NodeJS.ProcessEnv;
   /** The daemon-start control root (Phase 4 Batch 2). REQUIRED for
@@ -102,7 +103,25 @@ export interface ClaudeRunnerDeps {
  *  the run's context dir read-only, the outbox as the ONE extra writable
  *  directory. The per-Run Claude temp root (run-temp.ts, Issue #50) joins
  *  BOTH lists — the CLI's sandboxed Bash reads AND writes its per-command
- *  `cwd-*` directories there. */
+ *  `cwd-*` directories there.
+ *
+ *  A v1 run additionally carries the ONE permission grant in the whole
+ *  profile (Issue #57): the wrapper entry, as the documented trailing-
+ *  wildcard rule. Under `--permission-mode dontAsk` a Bash call runs only if
+ *  it is a built-in read-only command, matches an allow rule, or the sandbox
+ *  auto-allows it — and the auto-allow DECLINES any command shape its
+ *  analyzer cannot reduce to a simple command. The v1 terminal command
+ *  carries agent-authored text (message/reason/state), so without this rule
+ *  the run's DATA CONTENT would decide whether the run can finish at all: the
+ *  same failure class as the `rc=$?` refusal recorded in ADR-006
+ *  (2026-08-21), which was fixable only because that command was fixed text.
+ *  The grant is scoped to the bare wrapper NAME (a static 0500 launcher whose
+ *  only job is to write one journal record) and is NOT a sandbox weakening:
+ *  the command still runs inside the profile below
+ *  (`allowUnsandboxedCommands: false`), so the OS boundary — never the
+ *  analyzer — remains the authority. v0 runs have no wrapper on PATH and get
+ *  byte-identical settings. Non-bare invocations (`/abs/path/loopzhb`) are
+ *  deliberately NOT covered: the v1 prompt's contract is the PATH form. */
 export function buildSandboxSettings(
   resolved: ResolvedWorkdir,
   journal?: { readOnly: string[]; writable: string[] },
@@ -126,6 +145,7 @@ export function buildSandboxSettings(
       },
       network: { strictAllowlist: true, allowedDomains: [] },
     },
+    ...(journal !== undefined ? { permissions: { allow: [`Bash(${WRAPPER_COMMAND}:*)`] } } : {}),
     disableAllHooks: true,
     autoMemoryEnabled: false,
   };
@@ -136,7 +156,7 @@ export function buildSandboxSettings(
  *  the flag — the protocol contract). A v1 run substitutes the daemon-built
  *  prompt for the wire task text (ADR-009 修订 10); v0 passes NO override
  *  and stays byte-identical. */
-export function buildClaudeArgs(delivery: Delivery, settingsJson: string, taskOverride?: string): string[] {
+export function buildClaudeArgs(delivery: Delivery, settingsJson: string, taskOverride?: string, maxBudgetUsd?: number): string[] {
   const args = [
     "-p",
     taskOverride ?? delivery.task,
@@ -158,6 +178,10 @@ export function buildClaudeArgs(delivery: Delivery, settingsJson: string, taskOv
     "--settings",
     settingsJson,
   ];
+  if (maxBudgetUsd !== undefined) {
+    if (!Number.isFinite(maxBudgetUsd) || maxBudgetUsd <= 0) throw new Error("invalid Claude per-Run budget");
+    args.push("--max-budget-usd", String(maxBudgetUsd));
+  }
   if (delivery.loop.model !== null && delivery.loop.model !== "") {
     args.push("--model", delivery.loop.model);
   }
@@ -295,7 +319,7 @@ export function createClaudeRunner(deps: ClaudeRunnerDeps): AgentRunner {
         });
         const spawned = await spawn({
           command,
-          args: buildClaudeArgs(delivery, settingsJson, taskOverride),
+          args: buildClaudeArgs(delivery, settingsJson, taskOverride, deps.maxBudgetUsd),
           cwd: resolved.cwd,
           env: childEnv,
           timeoutMs: deps.timeoutMs,
