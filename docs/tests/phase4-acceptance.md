@@ -339,3 +339,10 @@ $ git diff --check     # 无输出（clean）
 - 独立Standards/Spec/Adversarial对固定代码及执行日志均核销PASS：本次满足 #57/#58 的真实门关闭条件。该结论不证明真实帮助调用的独立计数；正常链路无journal污染，配合既有wrapper单测和真实CLI canned help→finish探针构成 #58 证据。
 - **费用记录限制（Issue #60）**：两个已接受Report费用均为有限非负数，Run1费用满足继续条件，合计经断言证明 <= $3。但Vitest agent reporter的MinimalReporter默认silent:"passed-only"，成功console被隐藏，实际分项和合计数字未留存、现有产物无法恢复。不能将预算或fixture金额当作实际收费。此限制不否定功能验收，计划/ADR要求的实际费用记录仍待用户裁决，Phase4暂不正式标记完成。
 - 后续入口显式 `--reporter=default --silent=false`，零费用临时fixture已验证PASS费用日志可留存（0.125/0.125仅是fixture数字）。没有为了补日志增加模型调用。
+
+### Phase4 正式收口裁决（2026-09-27）
+
+- 用户明确接受本次收口及已披露的费用留存限制。第七次真实门费用合计已证明<=3美元，精确金额未留存；不得补写虚构数字。
+- 未来日志留存修复 `4fa825ef1df0316cd4ec370811888f2040202371`：零费用fixture及后续独立Standards/Spec/Adversarial全部PASS；远端CI `36291600913` SUCCESS（2026-09-27 03:38:17 UTC）。无额外模型调用。
+- #60依据修复、后续独立复审及用户对历史记录例外的明确裁决核销；#57/#58及全部Phase4阻塞Issue已关闭，#56继续Phase5右移。
+- Batch3切片一至五与Phase4验收收口完成。PR #55保持开放待合入；代码已在开发分支远端，未声称已进入main。最终纯文档提交CI以PR Checks为准。

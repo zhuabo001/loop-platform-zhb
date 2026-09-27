@@ -183,13 +183,13 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
   - Server：capability 快照与门控（`terminal-journal-v1`）、claim 事务权威 Loop 快照 mint v1 Lease、最终 Report 单事务分支表（stale_goal/迟到冻结/wake finish）、Finish 取消 pending 保留 running、Reopen 旧代际撤销、Completed 全部守卫（claim/cron/catch-up/Run Now/schedule enable/goal）。
   - 首轮/第二轮 code review 发现已全部修复；第三轮 Standards/Spec/Adversarial 确定性三轨 **PASS**，Issues #39–#47 已核销关闭。修复含 `loops.revision` OCC additive 列、双向真实交错、no-follow 有界读取、encoding-aware 秘密边界、control/scratch root 生命周期与 HTTP 窄接口收口；全量确定性质量门全绿。
   - 2026-09-07 的固定二进制完整 `test:phase4:batch2:e2e`（1/1，46.99s）与三次生产 smoke 保持有效，#38/#49 已核销；#50 的三项复审 P2 已由独立 Standards/Spec 核销，2026-09-08 最终生产 R 在同一固定 Claude 2.1.236/hash 上通过另一 Run temp 直连及 symlink 读写、wrapper/OpenSSL 配置篡改拒绝检查，#50 核销证据完整。版本因果关系仍未被证明。
-- **Batch 3 — 最小 Dashboard 与阶段收口：进行中**（分支 `feat/phase4-batch3-dev`，scope 见 `docs/plan/codex-phase4-dev-roadmap.md` 与 `docs/plan/codex-phase4-batch3-plan.md`）
+- **Batch 3 — 最小 Dashboard 与阶段收口：已完成**（分支 `feat/phase4-batch3-dev`，scope 见 `docs/plan/codex-phase4-dev-roadmap.md` 与 `docs/plan/codex-phase4-batch3-plan.md`）
   - 切片一（只读数据与页面）已完成：`690e395`，新增 `packages/server/src/dashboard/` 读模型与 SSR 页面（D1–D5）。
   - 切片二（路由与安全装配）已完成：`e1dd98b`，两个 HTML 路由、loopback 挂载门禁、每 bootstrap CSRF、CSP/`no-store`（H1–H9）。
   - 切片三（禁止 Dashboard 替换已有 pending）已完成：`6198680`，manual trigger 的 `pendingPolicy: "skip"`、零写跳过与按钮规则（Q1–Q6）；本批新增 Issue #54 已核销关闭。
   - 切片四（核销遗留 Issue）已完成：`34ea6b9` 的修复与复验证据经 2026-09-27 后续独立三轨核销，五个遗留 Issue 均已关闭；完整证据见 `docs/tests/phase4-acceptance.md`。
   - 切片五（真实 Claude 门与阶段收口）：2026-09-27 固定 `fb2b17e` 的完整真实门 1/1 PASS（60.97s），两 Run、state/Task File继承、Completed守卫、连续两次重启、资源/秘密检查全部通过；后续独立 Standards/Spec/Adversarial 核销 #57/#58，二者已关闭。真实功能验收证据见 `docs/tests/phase4-acceptance.md`。
-  - **Phase 4 功能验收通过，正式收口待费用记录裁决**：[Issue #60](https://github.com/zhuabo001/loop-platform-zhb/issues/60)——本次费用合计经门内断言证明 <= $3，但成功日志被reporter抑制，具体金额未留存。日志入口已修复并零费用验证；无法补回的本次金额记录限制需用户明确接受。未额外付费重试。
+  - **Phase 4 已完成（2026-09-27）**：真实门与后续独立三轨复审通过，全部 Phase4 阻塞 Issue 已核销。用户明确接受本次费用记录限制：合计经门内断言证明 <= $3，精确金额未留存；未来成功日志入口已修复并零费用验证，裁决见 ADR-009。代码候选 `4fa825e` 远端 CI SUCCESS；最终收口文档的 CI 以 PR Checks 为准。PR #55 待合入，分支验收完成不等于已合入 main。
 
 ### 右移项
 
