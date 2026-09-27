@@ -327,3 +327,15 @@ $ git diff --check     # 无输出（clean）
 - 完整离线质量门：protocol174 passed；daemon532 passed +7 skipped；server609 passed +3 skipped。typecheck/build/db:check/相对main merge-base diff --check全部通过。
 - #59已在远端追加修复、测试、后续独立核销记录并关闭，不替代最终真实门。#57/#58仍OPEN。
 - 下一次真实验收需新的明确费用批准，不能把前次“唯一一次”授权复用为失败后自动重试。当前仅已执行一次真实入口、一个Run1，实际费用未知，Run2未执行。费用阈值边界已获接受，后续新增两Run费用仍须另批准。
+
+### 第七次真实门：完整功能验收通过（2026-09-27）
+
+- 用户新增授权一次完整真实门；沿用每 Run $1 CLI停止阈值、总目标 $3，接受末次请求可能超额，失败不自动重试。
+- 固定候选 `fb2b17e0c497acbde76333aed20617a9aff65226`，其远端 CI `36290284880` SUCCESS。macOS26.6.2、Node22.17.0、pnpm10.6.1；批准 Claude2.1.273 / SHA256 `953e9880dbcb0b70f31c1f508de6a3fd389753d131688557fd992da9184693fb`，门内 provenance hash断言通过。
+- 命令：`LOOPZHB_PHASE4_ACCEPTANCE_BUDGET_USD=3 LOOPZHB_EXPECTED_CLAUDE_SHA256=953e9880dbcb0b70f31c1f508de6a3fd389753d131688557fd992da9184693fb pnpm test:phase4:e2e`，stdout/stderr 经 pipefail + tee 留存本地审计日志；没有重复执行。
+- 结果：2026-09-27 11:23:57（Asia/Shanghai）开始，exit0、1 file / 1 test passed、无skip；测试体60.32s，总60.97s。本机Vitest缓存亦记录60322.22775ms、failed:false。
+- 顺序断言全通过：Dashboard表单触发两个真实Run；Run1 done/exec、state晋升、Task File磁盘/快照同步、A在工作目录无其他来源；Run2 done/exec/resolved、finish reason严格包含前state A与Timeline B；Loop完成、state保留、schedule禁用、Lease清空；Completed页面按钮禁用、API Run Now返回409 loop_completed。
+- 连续两次重启：Completed Loop始终仅2个Run、完成字段/state全等；未完成对照Loop确实catch-up并保持一次，排除调度未启动造成假绿。daemon正常exit0、Claude进程组关闭、观察到的控制根/scratch根回收、全日志秘密检查通过。
+- 独立Standards/Spec/Adversarial对固定代码及执行日志均核销PASS：本次满足 #57/#58 的真实门关闭条件。该结论不证明真实帮助调用的独立计数；正常链路无journal污染，配合既有wrapper单测和真实CLI canned help→finish探针构成 #58 证据。
+- **费用记录限制（Issue #60）**：两个已接受Report费用均为有限非负数，Run1费用满足继续条件，合计经断言证明 <= $3。但Vitest agent reporter的MinimalReporter默认silent:"passed-only"，成功console被隐藏，实际分项和合计数字未留存、现有产物无法恢复。不能将预算或fixture金额当作实际收费。此限制不否定功能验收，计划/ADR要求的实际费用记录仍待用户裁决，Phase4暂不正式标记完成。
+- 后续入口显式 `--reporter=default --silent=false`，零费用临时fixture已验证PASS费用日志可留存（0.125/0.125仅是fixture数字）。没有为了补日志增加模型调用。

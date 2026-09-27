@@ -76,3 +76,8 @@ LOOPZHB_PHASE4_ACCEPTANCE_BUDGET_USD=<approved-total-usd> LOOPZHB_EXPECTED_CLAUD
 - 用户已明确接受阈值末次请求可能超额，原预算授权P2核销。
 - `runs.costUsd` 的生产契约是parse-only，不能作为验收费用来源；按 #59 改观察已接受的生产Report numeric USD，真实HTTP app和生产daemon路径保持。只保留runId/number，不保留body/Authorization。
 - 第六次真实门 Run1正常、Run2未触发；费用未留存记未知，不推定为0。新一次付费复验须重新明确批准，既有门失败不自动重试。
+
+### 第七次真实门与记录限制
+
+- 用户重新授权的一次完整真实门在固定fb2b17e通过，1/1 PASS，全部产品、两次重启、资源与秘密断言完成，后续三轨核销 #57/#58。
+- 两Run numeric费用与合计<=3断言通过，但Vitest agent reporter隐藏成功console，精确金额未留存（#60）。后续入口显式default reporter/silent=false，零费用验证成功日志可见；本次记录条件的例外尚待用户裁决，未擅自降低本计划实际费用留存要求，未自动付费复验。
