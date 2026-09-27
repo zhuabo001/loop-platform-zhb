@@ -203,6 +203,8 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
 2. **团队与认证**：GitHub 登录、Team/Membership、connect key（24h TTL、不存本体）、机器归属、跨团队 fail-closed。**此层完成前 server 不得公开暴露。**同一暴露面下的加固项见 [Issue #56](https://github.com/zhuabo001/loop-platform-zhb/issues/56)（状态变更路由的同源意图校验、`Content-Type` 门禁与拒绝空体）。
 3. **通知**：失败告警 + 连续失败熔断自动暂停。
 
+环境与验收维护项：[Issue #61](https://github.com/zhuabo001/loop-platform-zhb/issues/61)——运行时 preload 环境隔离的明确防回归证据与验收环境记录；不重新打开已收口的 Phase4。
+
 ## Phase 6 — 生产硬化（独立阶段）
 
 Postgres（托管分层）/R2、迁移预检、body/rate/storage caps、SSRF 防护、GC、
