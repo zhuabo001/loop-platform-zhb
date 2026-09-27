@@ -189,7 +189,7 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
   - 切片三（禁止 Dashboard 替换已有 pending）已完成：`6198680`，manual trigger 的 `pendingPolicy: "skip"`、零写跳过与按钮规则（Q1–Q6）；本批新增 Issue #54 已核销关闭。
   - 切片四（核销遗留 Issue）已完成：`34ea6b9` 的修复与复验证据经 2026-09-27 后续独立三轨核销，五个遗留 Issue 均已关闭；完整证据见 `docs/tests/phase4-acceptance.md`。
   - 切片五（真实 Claude 门与阶段收口）：2026-09-27 固定 `fb2b17e` 的完整真实门 1/1 PASS（60.97s），两 Run、state/Task File继承、Completed守卫、连续两次重启、资源/秘密检查全部通过；后续独立 Standards/Spec/Adversarial 核销 #57/#58，二者已关闭。真实功能验收证据见 `docs/tests/phase4-acceptance.md`。收口后另行授权的独立确认运行在 `10275c9`（相对 `fb2b17e` 仅 `package.json` 日志留存修复与 docs，被测系统未变）再次 1/1 PASS（58.83s），并首次留存真实费用 $0.370838（0.259125 + 0.111713，未触及阈值超额）。
-  - **Phase 4 已完成（2026-09-27）**：真实门与后续独立三轨复审通过，全部 Phase4 阻塞 Issue 已核销。用户明确接受第七次的费用记录限制：合计经门内断言证明 <= $3，该次精确金额未留存且不得回填（收口后的确认运行已补上实测数字，见上条）；未来成功日志入口已修复并零费用验证，裁决见 ADR-009。代码候选 `4fa825e` 远端 CI SUCCESS；最终收口文档的 CI 以 PR Checks 为准。PR #55 待合入，分支验收完成不等于已合入 main。
+  - **Phase 4 已完成（2026-09-27）**：真实门与后续独立三轨复审通过，全部 Phase4 阻塞 Issue 已核销。用户明确接受第七次的费用记录限制：合计经门内断言证明 <= $3，该次精确金额未留存且不得回填（收口后的确认运行已补上实测数字，见上条）；未来成功日志入口已修复并零费用验证，裁决见 ADR-009。代码候选 `4fa825e` 远端 CI SUCCESS。**PR #55 已于 2026-09-27 04:40:40 UTC 合入 `main`**（merge commit `c7d8ff2`，父 `e51894b` + `f5fd492`；开发分支 `feat/phase4-batch3-dev` 按惯例保留），该 merge commit 的 `main` push CI 通过。
 
 ### 右移项
 
