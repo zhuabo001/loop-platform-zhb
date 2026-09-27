@@ -320,3 +320,10 @@ $ git diff --check     # 无输出（clean）
 - 本次 Run1 **实际费用未知**：没有在请求接受边界保留该 numeric cost，临时资源已清理，数据库null不等于费用0，不把 $1 停止阈值当作实际收费。
 - 零费用复现：fake Claude明确输出0.125，生产 CLI→Report→DB 后字段仍null，使同一成本断言红。修复观察已被真实HTTP app接受的 Report numeric USD，两次fake Run各0.125，数据库仍null。拒绝请求、缺失/非法cost、重复accepted证据均fail-closed。无生产持久化/DTO/schema改变。
 - 定向回归：Report观察器 + 完整Dashboard E1–E2 + coordinator report，3 files / 41 passed。最终全量质量门与独立复审另补。新的付费复验须重新获得授权，本轮不自动重试。
+
+### #59 最终技术核销与复验候选
+
+- 固定修复候选：`d25dcfd2598d750998a2275b64c3937cc0949b72`（ccc433a费用观察修复 + d25dcfd单测类型安全）；相对8957f83的新增改动经独立Standards/Spec/Adversarial全部技术PASS，无未解决P1/P2。
+- 完整离线质量门：protocol174 passed；daemon532 passed +7 skipped；server609 passed +3 skipped。typecheck/build/db:check/相对main merge-base diff --check全部通过。
+- #59已在远端追加修复、测试、后续独立核销记录并关闭，不替代最终真实门。#57/#58仍OPEN。
+- 下一次真实验收需新的明确费用批准，不能把前次“唯一一次”授权复用为失败后自动重试。当前仅已执行一次真实入口、一个Run1，实际费用未知，Run2未执行。费用阈值边界已获接受，后续新增两Run费用仍须另批准。

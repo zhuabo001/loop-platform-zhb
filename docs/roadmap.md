@@ -189,7 +189,7 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
   - 切片三（禁止 Dashboard 替换已有 pending）已完成：`6198680`，manual trigger 的 `pendingPolicy: "skip"`、零写跳过与按钮规则（Q1–Q6）；本批新增 Issue #54 已核销关闭。
   - 切片四（核销遗留 Issue）已完成：`34ea6b9` 的修复与复验证据经 2026-09-27 后续独立三轨核销，五个遗留 Issue 均已关闭；完整证据见 `docs/tests/phase4-acceptance.md`。
   - 切片五（真实 Claude 门与阶段收口）进行中：确定性 E1–E2 门（Dashboard 表单 + CSRF 触发两次 Run，state 晋升 / Task File 改写 / Completed 守卫 / 连续两次重启不新增 Run）、`pnpm test:phase4:e2e` 入口、ADR-009 裁决、README 与验收文档扩充已交付（`86bd353`…`881ce30`）。**真实门 5 次执行未通过**，根因已定位并登记为 [Issue #57](https://github.com/zhuabo001/loop-platform-zhb/issues/57)（终局命令的权限兼容性；独立 finish 已放行，已移除被拒绝的调试后缀，待真实门复验）与 [Issue #58](https://github.com/zhuabo001/loop-platform-zhb/issues/58)（任何 wrapper 调用含探测都写记录）。**两项修复已落地**（v1 唯一的 wrapper 权限放行 + 帮助探测惰性化，裁决记入 ADR-006/ADR-009），并由零费用的本地权限探针 `claude-permission-probe.test.ts` 给出"无规则被拒 / 有规则执行且 outbox 逐字节相符"的对照；二者仍为 **Phase 4 收口阻塞项**：经复审、真实门复验全绿前不得收口。
-  - **Phase 4 尚未完成**：切片四已核销，CLI费用阈值边界已获操作者裁决；第六次真实门在Run1之后因验收费用来源错误停止，Run2未触发。[Issue #59](https://github.com/zhuabo001/loop-platform-zhb/issues/59) 跟踪费用观察修复，#57/#58仍待完整真实门核销。新的付费复验需另获授权。
+  - **Phase 4 尚未完成**：切片四已核销，CLI费用阈值边界已获操作者裁决；第六次真实门在Run1之后因验收费用来源错误停止，Run2未触发。费用观察修复（ccc433a/d25dcfd）已完成完整离线质量门与独立三轨核销，#59已关闭；#57/#58仍待完整真实门核销。新的付费复验需另获授权。
 
 ### 右移项
 
