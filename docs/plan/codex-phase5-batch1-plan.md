@@ -122,10 +122,10 @@ Batch 2 将 binding plan 接入既有 Report 事务，并实现最终同步、30
 
 ## 4. 开发切片与测试编组
 
-| 切片 | 内容与完成条件 | 估时 |
-|---|---|---|
-| 1. 契约冻结 | Protocol DTO、`artifact-sync-v1`、tolerant-reader、共享 policy、canonical 指纹、错误/重试约定、8 MiB 有界解析工具、ADR-010 决策条目；加路由未挂载守卫 | AP1–AP12；AD1 守卫 | 0.5–1 天 |
-| 2. 模型与迁移 | Schema、`0005` 前滚 migration、Phase 4 `0000–0004` 冻结 fixture、唯一键与 revision 规则、配置事务及快照 binding plan；加 Create/Poll 守卫 | AM1–AM6、`db:check` 无 drift；AD2 守卫 | 0.5–1 天 |
+| 切片 | 内容 | 完成条件 | 估时 |
+|---|---|---|---|
+| 1. 契约冻结 | Protocol DTO、`artifact-sync-v1`、tolerant-reader、共享 policy、canonical 指纹、错误/重试约定、8 MiB 有界解析工具；冻结 BlobStore 与可信归属解析器的服务端内部接口及行为契约；写入 ADR-010 决策条目并加路由未挂载守卫 | AP1–AP12；两个内部接口可编译，输入/输出、职责和失败语义在 ADR-010 中明确；AD1 守卫 | 0.5–1 天 |
+| 2. 模型与迁移 | Schema、`0005` 前滚 migration、Phase 4 `0000–0004` 冻结 fixture、唯一键与 revision 规则、配置事务及快照 binding plan；加 Create/Poll 守卫 | AM1–AM6、`db:check` 无 drift、旧库升级后老 Loop/Run/Lease 行为不变；AD2 守卫 | 0.5–1 天 |
 | 3. BlobStore | 内存/本地 adapter，共享契约测试；独占临时文件、流式写入、size/hash 校验、fsync 后原子 rename；拒绝 symlink 与特殊文件；加生产启动不构造 BlobStore 守卫 | AB3、AB9、AB10；AD4 守卫 | 1 天 |
 | 4. ArtifactHome 状态机与事务实现 | 配置、prepare/PUT/commit；配置/base revision 校验、Loop CAS、唯一键冲突处理、原子提交及有界重试；requestId 幂等、1 小时 pending 过期、固定提交回执；加 Report 休眠守卫 | AC1–AC3、AC7、AC8、AC10；AB1、AB2、AB4、AB6、AB8 顺序场景；AD3 守卫 | 1–1.5 天 |
 | 5. 并发、交错与故障注入验收 | 通过 PGlite 真实事务、可控交错 hook 和故障注入验证片 4 已实现的事务保护，修复交错问题并完成回滚矩阵 | AC4–AC6、AC9；AB5、AB7；并发重试子场景 | 0.5–1 天 |
@@ -133,7 +133,7 @@ Batch 2 将 binding plan 接入既有 Report 事务，并实现最终同步、30
 
 片 4 的顺序执行场景不缩减实现契约：该片结束时事务、CAS、唯一键仲裁和有界重试必须已经实现。片 5 是并发与故障验收，不是首次补上并发保护；不得交付仅在单线程下正确的数据库写路径。
 
-片 2 与片 3 没有直接实现依赖，可以互换或并行；并行前提是片 1 已冻结 BlobStore 接口、错误分类和可信归属解析接口。
+片 2 与片 3 没有直接实现依赖，可以互换或并行；并行前提是片 1 已完成表中的两个服务端内部接口契约。错误分类与重试约定也在片 1 冻结，片 2/3 使用同一稳定分类。
 
 按原 roadmap 测试 ID 展开；每个编号至少包含下列独立场景，允许使用参数化用例：
 
