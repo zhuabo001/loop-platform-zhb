@@ -77,7 +77,7 @@ GitHub.com 登录采用授权码流程、一次性 state 和 PKCE S256；按 Git
 
 Session 使用服务端持久化的随机凭据哈希，默认绝对有效期 7 天；Cookie 设置 HttpOnly、SameSite=Lax，HTTPS 使用 Secure，HTTP 仅允许显式 loopback origin。退出登录撤销 Session。
 
-Connect key 固定 24 小时有效、单次消费，仅保存哈希，创建时显示一次。Daemon 本地生成 Machine Credential，通过 connect endpoint 换取归属；首次 poll 不再自注册。连接响应丢失时，以新凭据 poll 确认接入结果，不重复消费 key。
+Connect key 固定 24 小时有效、单次消费，仅保存哈希，创建时显示一次。Daemon 本地生成 Machine Credential，通过 connect endpoint 换取归属。**Batch 3 必须随管理面认证一起关闭首次 poll 自注册；Batch 4 才开放 connect endpoint。** 两批之间只能使用已认领且凭据有效的既有 Machine，新机器接入暂不可用。连接响应丢失时，以新凭据 poll 确认接入结果，不重复消费 key。
 
 失败告警只在 Dashboard 展示。连续失败按首次终态事件顺序计算：成功清零，取消与 supersede 不计数。第三次失败原子暂停自动调度；恢复必须显式操作，迟到成功不能自动恢复。
 
@@ -125,15 +125,17 @@ Connect key 固定 24 小时有效、单次消费，仅保存哈希，创建时�
 
 批次验收：只传缺失内容，删除正确，重启恢复同步；Run 快照不随后续编辑变化，失败同步不会阻塞最终报告。
 
-### Batch 3 — GitHub 登录、个人团队与旧数据归属（4–5 天）
+### Batch 3 — GitHub 登录、个人团队、关闭机器自注册与旧数据归属（5–6 天）
 
 实施：
 
 - 新增认证及个人团队模型、GitHub adapter、Session、登录/回调/退出接口。
 - 首次登录事务创建个人团队和 owner Membership；并发登录不能创建重复团队。
 - 接入 Dashboard 和全部管理读写 API 的 Session 认证，不保留匿名 loopback 旁路。
+- 同批删除生产 poll 的首次接触自注册分支。poll 只解析已存在、已归属有效团队且未撤销的 Machine；未知凭据统一返回 401，在 heartbeat、capability、Machine 创建和 Run claim 之前拒绝，零写入。
+- 不以 feature flag、缺省配置或“尚未实现 connect”为理由恢复自注册。既有测试通过显式 fixture 预置 Machine，生产装配不得引用测试注册入口。
 - 提供停止 Server 后执行的离线认领命令，按明确 GitHub 数字 ID 将无归属 Machine 及其资源链绑定到个人团队。
-- 未认领资源隔离且停止新增调度/领取；已有 Lease 保留原最终报告语义，升级前要求先 drain。
+- 未认领资源隔离且停止新增调度/领取，其 Machine 凭据不能通过 poll/sync；已认领的既有 Machine 保留原凭据并可继续运行。已有 Lease 保留原最终报告语义，升级前要求先 drain。
 - 新增 ADR-011，记录身份、认证、个人团队及迁移边界。
 
 测试编组：
@@ -141,15 +143,16 @@ Connect key 固定 24 小时有效、单次消费，仅保存哈希，创建时�
 - `AU1–AU12`：state/PKCE、回调重放、GitHub 错误、并发登录、身份稳定性。
 - `SE1–SE8`：Session 过期、撤销、Cookie、重启保持。
 - `LM1–LM10`：旧数据显式认领、错误目标、重复认领、零历史数据丢失。
+- `PG1–PG8`：生产装配下未知但形状合法凭据、缺失凭据、未认领或已撤销 Machine 均被拒绝且零写；已认领机器正常 poll/claim/report；新旧库启动和连续重启不能恢复自注册。
 
-批次验收：未登录不可读取或修改管理资源；任何首个访客都不能自动取得旧数据。本批仍不得公开暴露，机器接入隔离在 Batch 4 完成。
+批次验收：未登录不可读取或修改管理资源；任何首个访客都不能自动取得旧数据。仅部署 Batch 3 的提交、尚未安装 Batch 4 时，未知 Machine Credential 的 poll 必须返回 401，且不创建 Machine、不更新 heartbeat/capability、不 claim Run；已认领既有机器仍可运行。认证接入与关闭自注册作为同一个可部署提交或不可拆分的合入单元验收，不允许 main 出现管理面已认证而 poll 仍可自注册的中间态。新机器接入暂不可用，待 Batch 4 开放 connect；本批仍不得公开暴露，全资源跨团队隔离在 Batch 4 完成。
 
 ### Batch 4 — Connect、全资源权限隔离与 HTTP 加固（4–5 天）
 
 实施：
 
 - 开放 Connect key 创建/撤销、Machine connect、Machine 撤销及 Daemon connect CLI。
-- 删除生产首次 poll 自注册路径；未知 Machine Credential 一律拒绝。
+- 在 Batch 3 已关闭自注册的基础上，connect 成为唯一生产新机器接入入口；有效 key 的消费、Machine 创建与团队绑定在同一事务中完成。无效、过期、已消费 key 不能留下无归属 Machine；poll 不承担注册或补建职责。
 - 将 TeamScope/MachineScope 权限放入深模块和事务条件，覆盖列表、详情、触发、取消、schedule、goal、Task File、reopen、文件、快照和 diff。
 - 撤销 Machine 原子禁止后续 poll/sync，并取消其活跃 Run、撤销 Lease；历史数据保留。
 - 保留 Run Credential 的单 Run 权限边界；消费后的重试仍按既有 coded 401 确认。
@@ -221,7 +224,7 @@ git diff --check
 
 最终增加 Phase 5 E2E，并记录固定提交、运行环境、命令与证据。#11 仍是 Phase 6 真实 Postgres 阻塞项，PGlite 测试不能替代多物理连接并发验证。
 
-认证升级顺序固定为：备份数据 → 暂停并 drain Daemon/Server → migration → 离线认领旧数据 → 配置 GitHub OAuth/canonical origin → 启动认证 Server → 既有机器凭据验证 → 新机器 connect → 恢复调度。新旧 Server/Daemon 组合必须测试；新版 Daemon 对旧 Server 忽略缺失的 Artifact 配置。
+Batch 3 的认证升级顺序固定为：备份数据 → 暂停并 drain Daemon/Server → migration → 离线认领旧数据 → 配置 GitHub OAuth/canonical origin → 启动同时启用管理面认证并关闭自注册的 Server → 验证未知凭据零写拒绝及既有机器凭据可用 → 恢复既有机器调度。Batch 4 部署后再开放新机器 connect，并复验 poll 不能绕过 connect 注册。新旧 Server/Daemon 组合必须测试；新版 Daemon 对旧 Server 忽略缺失的 Artifact 配置。
 
 阶段完成要求：
 
