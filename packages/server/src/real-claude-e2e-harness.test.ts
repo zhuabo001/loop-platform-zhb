@@ -14,7 +14,7 @@ describe("AcceptedReportCostObserver", () => {
   it("observes actual accepted Report cost while leaving both bodies readable", async () => {
     const observer = new AcceptedReportCostObserver();
     const response = await observer.fetch(request(0.125), async (req) => {
-      expect((await req.json()).cost.usd).toBe(0.125);
+      expect(await req.json()).toMatchObject({ cost: { usd: 0.125 } });
       return accepted();
     });
     expect(await response.json()).toEqual({ ok: true });
