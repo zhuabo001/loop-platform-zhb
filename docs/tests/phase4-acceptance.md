@@ -346,3 +346,14 @@ $ git diff --check     # 无输出（clean）
 - 未来日志留存修复 `4fa825ef1df0316cd4ec370811888f2040202371`：零费用fixture及后续独立Standards/Spec/Adversarial全部PASS；远端CI `36291600913` SUCCESS（2026-09-27 03:38:17 UTC）。无额外模型调用。
 - #60依据修复、后续独立复审及用户对历史记录例外的明确裁决核销；#57/#58及全部Phase4阻塞Issue已关闭，#56继续Phase5右移。
 - Batch3切片一至五与Phase4验收收口完成。PR #55保持开放待合入；代码已在开发分支远端，未声称已进入main。最终纯文档提交CI以PR Checks为准。
+
+### 第八次真实门：收口后独立确认运行（2026-09-27）
+
+- 用户新增授权一次完整真实门，用途为**独立确认**：在收口后的 HEAD 上重跑，检验曾阻塞验收的 #57/#58/#59 是否确已修复。
+- 固定提交 `10275c97f38eb33e940f906788419dbb3c76bb76`（工作树干净、与 origin 同步）；相对已通过的 `fb2b17e` 仅 `package.json` 的 `--reporter=default --silent=false`（#60 日志留存修复）与 docs 变化，**被测系统未变**。
+- 命令：`LOOPZHB_PHASE4_ACCEPTANCE_BUDGET_USD=3 LOOPZHB_EXPECTED_CLAUDE_SHA256=953e9880dbcb0b70f31c1f508de6a3fd389753d131688557fd992da9184693fb pnpm test:phase4:e2e`，stdout/stderr 经 pipefail + tee 留存审计日志；只执行一次，未重试。
+- 结果：2026-09-27 11:59:09（Asia/Shanghai）开始，exit0、1 file / 1 test passed、无skip；测试体 58.21s，总 58.83s。门内 Claude provenance 断言通过（2.1.273 / `953e9880…4693fb`）。
+- 顺序断言全通过，与第七次同构：两次页面触发真实 Run（state 晋升 → Task File 改写 → 双 marker Finish）→ Completed 页面与守卫 → 连续两次重启不新增 Run。
+- **#60 修复首次在付费运行中生效，真实费用首次留存**：`Run 1 cost USD: 0.259125`、`Run 2 cost USD: 0.111713; total USD: 0.370838`。每 Run 实际费用均低于 $1 停止阈值，**未触及阈值超额**；实际合计 $0.370838，远低于批准目标 $3。
+- 上一条（正式收口裁决）所指第七次的**精确金额仍未留存**（不得回填，该历史事实不因本次运行改变）；本次为同一被测系统提供了实测数字供对照，本次数字仅属本次运行。
+- 结论：曾阻塞验收的 #57（权限层由内容决定可执行性）、#58（探测污染 journal）、#59（费用来源）在当前 HEAD 上均未复现；本次确认运行与第七次功能结论一致。审计日志 `docs/handoff/phase4-real-10275c9-20260927.log`（gitignored，不提交）。
