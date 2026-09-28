@@ -35,7 +35,9 @@ export type ArtifactBindingRejection =
   /** The manifest's namespace ≠ the run's resolved trusted attribution
    *  (决策 7 — attribution is re-derived per operation, never wire input). */
   | "cross_namespace"
-  /** The manifest was committed by a different machine. */
+  /** The machine chain is broken: manifest / run / loop / trusted
+   *  attribution machineIds are not all equal (#70 — in the no-FK model the
+   *  loop's machine is re-verified like every other link, never assumed). */
   | "cross_machine"
   /** The manifest belongs to a different loop. */
   | "cross_loop"
@@ -90,7 +92,16 @@ export function planArtifactSnapshotBinding(input: ArtifactBindingInput): Artifa
     runWrites: { artifactSnapshotId: null, artifactSyncError: reason },
   });
   if (manifest.namespaceId !== attribution.namespaceId) return reject("cross_namespace");
-  if (manifest.machineId !== run.machineId || manifest.machineId !== attribution.machineId) return reject("cross_machine");
+  // The four-party machine chain: manifest = run = loop = attribution. The
+  // transitive checks are complete — loop.machineId joins the run side, and
+  // the existing two comparisons tie manifest to both run and attribution.
+  if (
+    manifest.machineId !== run.machineId ||
+    manifest.machineId !== attribution.machineId ||
+    loop.machineId !== run.machineId
+  ) {
+    return reject("cross_machine");
+  }
   if (manifest.loopId !== run.loopId || run.loopId !== loop.id) return reject("cross_loop");
   if (manifest.configRevision !== loop.artifactConfigRevision) return reject("stale_config_generation");
   // Write the VERIFIED manifest id (post-check it equals snapshotId) — the

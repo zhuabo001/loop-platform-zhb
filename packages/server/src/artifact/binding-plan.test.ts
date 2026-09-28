@@ -151,6 +151,15 @@ describe("plan (pure): the fixed evaluation order", () => {
     });
   });
 
+  it("the loop's machine is part of the attribution chain — a mismatched loop.machineId rejects cross_machine (#70)", () => {
+    // Manifest, run and attribution all agree on m-1; ONLY the loop row
+    // points elsewhere. Pre-fix this fell through to bind.
+    expect(planArtifactSnapshotBinding(input({ loop: baseLoop({ machineId: "m-9" }) }))).toMatchObject({
+      kind: "record_error",
+      reason: "cross_machine",
+    });
+  });
+
   it("a fully consistent reference binds — runWrites is EXACTLY the artifact column", () => {
     const plan = planArtifactSnapshotBinding(input());
     expect(plan).toEqual({ kind: "bind", runWrites: { artifactSnapshotId: "amf-1" } });
@@ -268,6 +277,23 @@ describe("persistence (real PGlite)", () => {
     expect(after.artifactSnapshotId).toBeNull();
     expect(after.artifactSyncError).toBe("snapshot_not_committed");
     expect(after.outcome).toBe(before.outcome);
+  });
+
+  it("a loop whose machineId breaks the attribution chain records cross_machine, never binds (#70)", async () => {
+    await fresh();
+    await db.insert(artifactManifests).values(baseManifest());
+    // The loop row itself points at another machine (no-FK: the chain is
+    // re-verified at bind time, never assumed) — resolve the REAL row.
+    await db.update(loops).set({ machineId: "m-9" }).where(eq(loops.id, "loop-1"));
+    const before = await getRun();
+    const loopRow = (await db.select().from(loops).where(eq(loops.id, "loop-1")))[0]!;
+    const found = (await db.select().from(artifactManifests).where(eq(artifactManifests.id, "amf-1")))[0]!;
+    const plan = planArtifactSnapshotBinding(input({ run: before, loop: loopRow, manifest: found }));
+    expect(plan).toMatchObject({ kind: "record_error", reason: "cross_machine" });
+    await applyArtifactBindingPlan(db, before, plan);
+    const after = await getRun();
+    expect(after.artifactSnapshotId).toBeNull();
+    expect(after.artifactSyncError).toBe("cross_machine");
   });
 
   it("a moved phase between resolve and apply throws ArtifactBindingGuardLostError and writes nothing", async () => {
