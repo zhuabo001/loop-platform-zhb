@@ -114,6 +114,17 @@ describe("plan (pure): the fixed evaluation order", () => {
     });
   });
 
+  it("a manifest row whose id is NOT the referenced snapshot id is snapshot_not_committed — never bind an unverified id (#69)", () => {
+    // Everything else about the manifest is consistent (namespace / machine /
+    // loop / generation) — only the presented row is not the referenced id.
+    const plan = planArtifactSnapshotBinding(input({ snapshotId: "amf-ghost" }));
+    expect(plan).toEqual({
+      kind: "record_error",
+      reason: "snapshot_not_committed",
+      runWrites: { artifactSnapshotId: null, artifactSyncError: "snapshot_not_committed" },
+    });
+  });
+
   it("cross-resource references reject with their own literal (AM4 关联约束)", () => {
     expect(planArtifactSnapshotBinding(input({ manifest: baseManifest({ namespaceId: "ns-2" }) }))).toMatchObject({
       kind: "record_error",
@@ -240,6 +251,23 @@ describe("persistence (real PGlite)", () => {
       expect(after.artifactSnapshotId).toBeNull();
       expect(after.artifactSyncError).toBe((plan as { reason: string }).reason);
     }
+  });
+
+  it("a committed manifest does not launder a DIFFERENT referenced id — the run records snapshot_not_committed, never binds (#69)", async () => {
+    await fresh();
+    await db.insert(artifactManifests).values(baseManifest());
+    const before = await getRun();
+    // The manifest input IS the caller's real lookup row (id "amf-1"); the
+    // report references a DIFFERENT id — without the id check this plan
+    // would bind "amf-ghost" against a fully consistent "amf-1" row.
+    const found = (await db.select().from(artifactManifests).where(eq(artifactManifests.id, "amf-1")))[0]!;
+    const plan = planArtifactSnapshotBinding(input({ run: before, snapshotId: "amf-ghost", manifest: found }));
+    expect(plan).toMatchObject({ kind: "record_error", reason: "snapshot_not_committed" });
+    await applyArtifactBindingPlan(db, before, plan);
+    const after = await getRun();
+    expect(after.artifactSnapshotId).toBeNull();
+    expect(after.artifactSyncError).toBe("snapshot_not_committed");
+    expect(after.outcome).toBe(before.outcome);
   });
 
   it("a moved phase between resolve and apply throws ArtifactBindingGuardLostError and writes nothing", async () => {

@@ -5,8 +5,9 @@
  *
  * A run's final report may reference an artifact snapshot (the immutable
  * manifest id minted at commit). Binding is VALIDATED, never trusted: the
- * manifest must exist (committed) and its namespace / machine / loop /
- * config generation must match the run and the loop's CURRENT generation.
+ * manifest row must exist (committed), its id must BE the referenced
+ * snapshot id (#69), and its namespace / machine / loop / config generation
+ * must match the run and the loop's CURRENT generation.
  * An illegal reference is recorded as the run's `artifactSyncError` and
  * NEVER changes the run's own outcome — artifact sync failure is not run
  * failure. Canceled, superseded or reclaimed runs that never produced a
@@ -26,8 +27,10 @@ import { runs, type ArtifactManifestRow, type Loop, type Run } from "../db/schem
  *  free-form `runs.artifactSyncError` column (Batch 2 owns the final
  *  taxonomy; the wire report field stays free-form). */
 export type ArtifactBindingRejection =
-  /** No committed manifest row with that id (never existed, or cross-scope
-   *  unknown — existence never leaks across namespaces). */
+  /** No committed manifest row evidences the referenced snapshot id: the
+   *  caller's lookup found nothing, OR the row it returned is NOT the
+   *  referenced id — an unverified id never binds (#69). Existence never
+   *  leaks across namespaces. */
   | "snapshot_not_committed"
   /** The manifest's namespace ≠ the run's resolved trusted attribution
    *  (决策 7 — attribution is re-derived per operation, never wire input). */
@@ -66,14 +69,15 @@ export interface ArtifactBindingInput {
 
 /**
  * Fixed evaluation order (first match wins): no snapshotId → skip → run not
- * `running` → skip → no manifest row → record_error/snapshot_not_committed →
- * namespace → machine → loop → stale generation → bind.
+ * `running` → skip → no manifest row OR the row is not the referenced id →
+ * record_error/snapshot_not_committed → namespace → machine → loop → stale
+ * generation → bind.
  */
 export function planArtifactSnapshotBinding(input: ArtifactBindingInput): ArtifactBindingPlan {
   const { run, loop, manifest, snapshotId, attribution } = input;
   if (snapshotId === undefined) return { kind: "skip" };
   if (run.phase !== "running") return { kind: "skip" };
-  if (manifest === null) {
+  if (manifest === null || manifest.id !== snapshotId) {
     return {
       kind: "record_error",
       reason: "snapshot_not_committed",
@@ -89,7 +93,9 @@ export function planArtifactSnapshotBinding(input: ArtifactBindingInput): Artifa
   if (manifest.machineId !== run.machineId || manifest.machineId !== attribution.machineId) return reject("cross_machine");
   if (manifest.loopId !== run.loopId || run.loopId !== loop.id) return reject("cross_loop");
   if (manifest.configRevision !== loop.artifactConfigRevision) return reject("stale_config_generation");
-  return { kind: "bind", runWrites: { artifactSnapshotId: snapshotId } };
+  // Write the VERIFIED manifest id (post-check it equals snapshotId) — the
+  // run never carries an id that only the caller asserted (#69).
+  return { kind: "bind", runWrites: { artifactSnapshotId: manifest.id } };
 }
 
 /** The guarded run write observed zero rows — the run's phase moved between
