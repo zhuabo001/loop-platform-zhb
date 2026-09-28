@@ -107,3 +107,10 @@ wire 错误形状复用 `apiErrorSchema` `{error, code?}`；错误文本不是�
 
 - **决策 2 措辞修正（A1）**：原文「schema 层只钉形状（`z.string()`/`z.number()`）」改为 typeof 形状——`size` 不得用 `z.number()`（Zod 4 在 schema 层拒绝非有限数，会让 wire `1e400` 在 Server 死于 zod issue、在 Daemon 死于 policy `size_invalid`，违反本决策自身的单一分类要求）。决策语义（值域单一来源在共享 policy）不变，实现措辞对齐。
 - **决策 14 细化（S1）**：明确 `read` 的两阶段失败通道与 `has` 对 symlink/特殊文件的分类（见决策 14 正文）。接口冻结时尚无 adapter 依赖旧措辞，属实现前修正而非行为变更。
+
+### 2026-09-28（片 2 模型与迁移）
+
+- **schema 落定（决策 8/9/11/12 的持久化形状）**：`loops` 增 7 列、`runs` 增 2 列、新表 3 张（`artifact_sync_sessions` / `artifact_manifests` / `artifact_blobs`），migration `0005` 前滚；沿用既有纪律：无外键、无新 CHECK（revision 非负/单调/上界是写路径纪律，同 `goalRevision`/`scheduleRevision`）、ISO text 时间戳、jsonb 存规范化 manifest 与回执。唯一键即声明的仲裁面：session `(namespaceId, machineId, requestId)`、manifest `(loopId, manifestRevision)`、blob 复合主键 `(namespaceId, hash)`。
+- **revision 上界耗尽的稳定分类**：内部字面量 `config_revision_exhausted`（本片配置事务；镜像 schedule 域 `schedule_revision_exhausted` 先例）与 `manifest_revision_exhausted`（片 4 commit 路径预声明）。二者在 Batch 1 无路由可达，**wire 映射推迟到 Batch 2 路由接线时裁决**；稳定拒绝（结果联合、不抛异常、零写入）即本批契约。配置 planner 求值序钉死为 validate → noop → exhaustion：等值命令在 int32 上界仍是 noop（零写入优先），非法值即使与存储值相等也拒绝。
+- **配置更新无 completed-loop 限制**：镜像 `updateTaskFile`（运维重定向）而非 `updateGoal`（完成冻结语义）——决策 8 未列完成态限制，此处记录为有意的默认。
+- **快照绑定的内部分类字面量**（`runs.artifact_sync_error` 自由文本列的值集种子，Batch 2 拥有最终分类法）：`snapshot_not_committed` / `cross_namespace` / `cross_machine` / `cross_loop` / `stale_config_generation`。绑定资格为 `run.phase === "running"`：canceled/superseded 不绑定；**reclaimed（terminal-grace 唤醒报告）路径在本层保守排除**，Batch 2 把 binding plan 接入 report 事务的 reconcile 分支时须显式裁决是否放行。

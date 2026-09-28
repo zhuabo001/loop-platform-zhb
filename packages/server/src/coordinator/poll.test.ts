@@ -14,9 +14,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import { machineIdFromToken, sha256 } from "@loopzhb/protocol/node";
 
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
-import { machines, type Machine } from "../db/schema.js";
+import { loops, machines, type Machine } from "../db/schema.js";
 import { HEARTBEAT_SKEW_SLACK_MS, applyMachinePollContact } from "../store/machines.js";
-import { FakeClock, seedMachineForToken, testDeps } from "../testkit/index.js";
+import { FakeClock, seedLoop, seedMachineForToken, seedRun, testDeps } from "../testkit/index.js";
 import { createRunCoordinator, type RunCoordinator } from "./index.js";
 
 const TOKEN = "dk_test_machine_alpha";
@@ -299,5 +299,37 @@ describe("poll: heartbeat watermark + identity snapshot (A-13)", () => {
     // Once named, later hosts never overwrite it.
     await coordinator.poll(TOKEN, { host: "second-host" });
     expect((await getRow(id))!).toMatchObject({ name: "first-host", hostname: "second-host" });
+  });
+});
+
+describe("AD2(b): poll never emits watch and never gates on artifact config (ADR-010 决策 16)", () => {
+  it("an idle poll carrying watchDigest resolves to EXACTLY the idle shape", async () => {
+    await fresh();
+    await seedMachineForToken(db, TOKEN);
+    // The request DTO tolerantly accepts watchDigest (slice 1); the Batch 1
+    // response must carry NEITHER watch nor watchDigest.
+    await expect(coordinator.poll(TOKEN, { watchDigest: "w-1" })).resolves.toEqual({ deliveries: [] });
+  });
+
+  it("a configured loop's artifact columns play no role in the claim; the response carries no watch", async () => {
+    await fresh();
+    const machineId = await seedMachineForToken(db, TOKEN);
+    await seedLoop(db, { id: "loop-1", taskFile: "/home/dev/TASK.md" });
+    // Simulate a loop whose artifact config was set via the internal write
+    // path — the production claim path must not read these columns.
+    await db.update(loops).set({ artifactDir: "/data/out", artifactConfigRevision: 3 }).where(eq(loops.id, "loop-1"));
+    await seedRun(db, { id: "run-1", machineId });
+
+    const result = await coordinator.poll(TOKEN, {
+      capabilities: ["terminal-journal-v1"],
+      watchDigest: "w-1",
+    });
+    // The claim succeeds exactly as before (delivery + running run + lease).
+    expect(result.deliveries).toHaveLength(1);
+    expect(result.deliveries[0]!.runId).toBe("run-1");
+    expect(result).not.toHaveProperty("watch");
+    expect(result).not.toHaveProperty("watchDigest");
+    // The delivered loop projection carries no artifact fields either.
+    expect(result.deliveries[0]!).not.toHaveProperty("watch");
   });
 });

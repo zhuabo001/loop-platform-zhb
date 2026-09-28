@@ -37,7 +37,7 @@ import { ScheduleRevisionExhaustedError, ScheduleValidationError, createSchedule
 import { CapabilityDeclarationInvalidError } from "../store/machines.js";
 import type { LifecycleAdmin } from "../loop-lifecycle/admin.js";
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
-import { machines } from "../db/schema.js";
+import { loops, machines } from "../db/schema.js";
 import { createOwnerControl, type OwnerControl } from "../owner/index.js";
 import {
   FakeClock,
@@ -1014,5 +1014,47 @@ describe("AD1: artifact routes are NOT mounted (Phase 5 Batch 1 dormancy, ADR-01
       expect(res.status, `${method} ${path}`).toBe(404);
       expect(await res.text(), `${method} ${path}`).toBe(canonicalBody);
     }
+  });
+});
+
+describe("AD2(a): production Create never persists artifact config (ADR-010 决策 16)", () => {
+  // The wire DTO ACCEPTS artifactDir (slice 1, tolerant shape) but the
+  // production create path must NOT persist it — the column exists (slice 2)
+  // and stays dormant until the Batch 2 PATCH route opens. The insert
+  // mapping (admin/index.ts) enumerates columns explicitly; this guard fails
+  // loudly if artifactDir ever slips into it.
+  it("201 with artifactDir in the body — the row keeps it null and the response never emits it", async () => {
+    await fresh();
+    await seedMachine(db, MACHINE_ID);
+    const res = await createLoopReq({
+      machineId: MACHINE_ID,
+      taskFile: "/home/dev/TASK.md",
+      artifactDir: "/home/dev/project/dist",
+    });
+    expect(res.status).toBe(201);
+    const parsed = createLoopResponseSchema.parse(await res.json());
+    expect(parsed.loop).not.toHaveProperty("artifactDir");
+
+    const [row] = await db.select().from(loops);
+    expect(row.artifactDir).toBeNull();
+    expect(row.artifactConfigRevision).toBe(0);
+    expect(row.artifactManifestRevision).toBe(0);
+    expect(row.artifactManifestId).toBeNull();
+    expect([row.artifactSyncAttemptedAt, row.artifactSyncSucceededAt, row.artifactSyncError]).toEqual([
+      null,
+      null,
+      null,
+    ]);
+  });
+
+  it("400 for an explicit artifactDir: null — creation accepts absence, never an explicit clear", async () => {
+    await fresh();
+    await seedMachine(db, MACHINE_ID);
+    // createLoopRequestSchema is optional-but-not-nullable (clearing is the
+    // Batch 2 PATCH route's required-nullable shape, not creation's).
+    await expectJsonError(await createLoopReq({ machineId: MACHINE_ID, taskFile: "/t/TASK.md", artifactDir: null }), 400, {
+      error: "invalid request",
+    });
+    expect(await snapshotLoops(db)).toEqual([]);
   });
 });
