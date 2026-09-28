@@ -53,9 +53,8 @@ describe("pollRequestSchema", () => {
   });
 
   it("strips unknown keys (tolerant reader: a newer peer's fields never break us)", () => {
-    const parsed = pollRequestSchema.parse({ host: "h", watchDigest: "abc", futureField: 42 });
+    const parsed = pollRequestSchema.parse({ host: "h", futureField: 42 });
     expect(parsed).toEqual({ host: "h" });
-    expect(parsed).not.toHaveProperty("watchDigest");
     expect(parsed).not.toHaveProperty("futureField");
   });
 

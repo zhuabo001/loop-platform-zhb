@@ -61,6 +61,10 @@ export const createLoopRequestSchema = z.object({
   /** Phase 4: initial goal — null/omitted creates an Open Loop. Trim/single-
    *  line/2000-byte rules are terminal-policy, enforced server-side. */
   goal: nulFreeString().min(1).nullable().optional(),
+  /** Phase 5: initial artifact directory (ADR-010) — a machine-side path;
+   *  the workdir-relative/absolute rule is server-side policy (决策 8).
+   *  Omitted = not configured; creation does not accept explicit null. */
+  artifactDir: nulFreeString().min(1).optional(),
 });
 export type CreateLoopRequest = z.infer<typeof createLoopRequestSchema>;
 
@@ -137,6 +141,10 @@ export const loopSummarySchema = z.object({
   taskFileSyncedAt: isoTimestampSchema.nullable().optional(),
   taskFileSyncAttemptedAt: isoTimestampSchema.nullable().optional(),
   taskFileSyncError: taskFileSyncErrorSchema.nullable().optional(),
+  /** Phase 5 additive (ADR-010). Optional so Phase 4 servers remain readable;
+   *  the server only starts emitting it once the column exists — Batch 1
+   *  declares the shape, its server emits nothing yet (ADR-002 决策 6). */
+  artifactDir: z.string().nullable().optional(),
 });
 export type LoopSummary = z.infer<typeof loopSummarySchema>;
 
@@ -273,3 +281,22 @@ export const reopenLoopResponseSchema = z.object({
   loop: loopSummarySchema,
 });
 export type ReopenLoopResponse = z.infer<typeof reopenLoopResponseSchema>;
+
+// ---- PATCH /api/loops/:id/artifact-dir (Phase 5 — declared, routes mount in Batch 2) ----
+
+/** PATCH /api/loops/:id/artifact-dir — set, change or clear the loop's
+ *  artifact directory (ADR-010 决策 8). `artifactDir: null` CLEARS the
+ *  configuration (required-nullable, mirroring updateGoalRequestSchema);
+ *  a string is NUL-free/non-empty at the boundary — the workdir-relative /
+ *  absolute-path rule and jail checks are server/daemon policy, not schema.
+ *  Equal updates are no-ops; an effective set/change/clear bumps the
+ *  artifact config revision. */
+export const updateArtifactDirRequestSchema = z.object({
+  artifactDir: nulFreeString().min(1).nullable(),
+});
+export type UpdateArtifactDirRequest = z.infer<typeof updateArtifactDirRequestSchema>;
+
+export const updateArtifactDirResponseSchema = z.object({
+  loop: loopSummarySchema,
+});
+export type UpdateArtifactDirResponse = z.infer<typeof updateArtifactDirResponseSchema>;

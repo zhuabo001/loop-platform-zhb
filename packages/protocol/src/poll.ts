@@ -6,12 +6,15 @@
  * reference (loop-platform packages/daemon/src/daemon.ts `buildPollBody`,
  * packages/server/src/routes/api.machine.poll.ts:17-27).
  *
- * Evolution notes (ADR-002): `watchDigest` (artifact-sync echo) joins in
- * Phase 3 as an additive optional field; unknown keys are stripped on parse,
- * so a newer peer's extra fields never break an older reader.
+ * Evolution notes (ADR-002): additive optional fields only — unknown keys are
+ * stripped on parse, so a newer peer's extra fields never break an older
+ * reader. Phase 5 declares the artifact-sync fields (`watchDigest` on the
+ * request, `watch`/`watchDigest` on the response; ADR-010); Batch 1 opens no
+ * consumer for them (决策 6), the watcher wiring arrives in Batch 2.
  */
 import { z } from "zod";
 
+import { artifactWatchItemSchema } from "./artifact.js";
 import { codingAgentSchema, runRoleSchema } from "./enums.js";
 
 /** Live "what's it doing" line for one in-flight run (the server stamps `at`). */
@@ -45,6 +48,10 @@ export const pollRequestSchema = z.object({
    *  daemon). The server snapshots it verbatim after dedupe+sort; it never
    *  does version-string comparison. */
   capabilities: z.array(z.string()).optional(),
+  /** Phase 5 artifact sync (ADR-010): the digest of the watch configuration
+   *  set the daemon currently runs. The server compares it against the digest
+   *  of the current normalized watch set and only sends `watch` on drift. */
+  watchDigest: z.string().optional(),
 });
 export type PollRequest = z.infer<typeof pollRequestSchema>;
 
@@ -105,5 +112,12 @@ export const pollResponseSchema = z.object({
    *  lacks the capabilities they require (["terminal-journal-v1"]). Never
    *  sent on an idle poll (ADR-009 决策 7). */
   requiredCapabilities: z.array(z.string()).optional(),
+  /** Phase 5 artifact sync (ADR-010): the COMPLETE watch configuration set —
+   *  ABSENT ⇒ no update needed, `[]` ⇒ clear all watches. Sent only on digest
+   *  drift; Batch 1 never emits it (the watcher wiring is Batch 2). */
+  watch: z.array(artifactWatchItemSchema).optional(),
+  /** The digest of the normalized watch configuration set the server compared
+   *  against. Covers the watch CONFIGURATION only — never file content. */
+  watchDigest: z.string().optional(),
 });
 export type PollResponse = z.infer<typeof pollResponseSchema>;
