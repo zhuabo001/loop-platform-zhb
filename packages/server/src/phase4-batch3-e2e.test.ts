@@ -240,12 +240,18 @@ describe("Phase 4 Batch 3 deterministic E2E (E1–E2): Dashboard → state → f
       // 3. The production daemon CLI with the fake Claude binary.
       //    CLAUDE_CONFIG_DIR is pinned to an EMPTY fixture: a deterministic
       //    test must never read the developer's real ~/.claude/settings.json
-      //    through the daemon's provider bootstrap (plan §5.5).
+      //    through the daemon's provider bootstrap (plan §5.5). The daemon
+      //    gets a PRIVATE TMPDIR (the slice4-secret-e2e precedent) so its
+      //    control/scratch roots never pollute another e2e file's shared-
+      //    tmpdir audit under vitest's 2 parallel workers.
       const fakeClaudeConfigDir = await mkdtemp(path.join(tmpdir(), `loopzhb-b3e2e-claude-config-${process.pid}-`));
       tempDirs.push(fakeClaudeConfigDir);
+      const daemonTmp = await mkdtemp(path.join(tmpdir(), `loopzhb-b3e2e-daemon-tmp-${process.pid}-`));
+      tempDirs.push(daemonTmp);
       const daemon = spawn(process.execPath, [path.join(__dirname, "../../daemon/dist/cli.js")], {
         env: {
           ...process.env,
+          TMPDIR: daemonTmp,
           LOOPZHB_SERVER_URL: first.baseUrl,
           LOOPZHB_MACHINE_CREDENTIAL: TOKEN,
           LOOPZHB_ALLOWED_ROOTS: JSON.stringify([allowedRoot]),
