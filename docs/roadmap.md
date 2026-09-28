@@ -214,7 +214,8 @@ Postgres（托管分层）/R2、迁移预检、body/rate/storage caps、SSRF 防
 
 **显式阻塞项**：[Issue #11](https://github.com/zhuabo001/loop-platform-zhb/issues/11)
 ——Day 8–10 report/reclaim 竞态防护的多物理连接并发验收（ADR-001 修订记录
-2026-08-11），关闭前不得进入真实 Postgres。
+2026-08-11）；[Issue #72](https://github.com/zhuabo001/loop-platform-zhb/issues/72)
+——Artifact 快照绑定与配置切换的多连接行锁验收。两项关闭前不得进入真实 Postgres。
 
 ## Phase 7 — 高阶能力（按需）
 

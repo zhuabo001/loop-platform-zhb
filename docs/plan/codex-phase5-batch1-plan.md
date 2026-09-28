@@ -156,7 +156,7 @@ Batch 2 将 binding plan 接入既有 Report 事务，并实现最终同步、30
 - AD3：生产 Report 忽略新增 Artifact 字段，终态行为与 Phase 4 一致。
 - AD4：生产启动不创建 BlobStore、不启动 watcher；Daemon 不声明新 capability、不发送同步请求。
 
-并发验收使用 PGlite 真实事务、可控交错 hook 和故障注入；此证据不替代 #11 要求的多物理连接 Postgres 并发验证。
+并发验收使用 PGlite 真实事务、可控交错 hook 和故障注入；此证据不替代 #11 的 report/reclaim 与 #72 的 Artifact 绑定/配置切换所要求的多物理连接 Postgres 并发验证。
 
 片 5 保留 AC6 中不同 session 争抢同一 base revision 的场景，并补齐以下同幂等键/会话并发子场景，不新增或减少原 AM/AP/AB/AC/AD 测试编组编号：
 
