@@ -151,6 +151,8 @@ describe("special-key fidelity across the whole chain", () => {
     artifacts: null,
     transcript: null,
     progress: { step: 1, label: "working", at: "2026-08-30T23:59:30.000Z" },
+    artifactSnapshotId: null,
+    artifactSyncError: null,
   };
   const BOTH_KEYS = ["__proto__", "keep"];
 

@@ -23,9 +23,21 @@
  * their columns additively (ADR-003 has the full deferral map).
  */
 import { sql } from "drizzle-orm";
-import { boolean, check, doublePrecision, index, integer, jsonb, pgTable, text, uniqueIndex } from "drizzle-orm/pg-core";
+import {
+  boolean,
+  check,
+  doublePrecision,
+  index,
+  integer,
+  jsonb,
+  pgTable,
+  primaryKey,
+  text,
+  uniqueIndex,
+} from "drizzle-orm/pg-core";
 
 import {
+  ARTIFACT_ERROR_CODES,
   CODING_AGENTS,
   LEASE_STATES,
   RUN_OUTCOMES,
@@ -34,7 +46,13 @@ import {
   RUN_STATUSES,
   TASK_FILE_SYNC_ERRORS,
 } from "@loopzhb/protocol";
-import type { JsonObject, RunArtifact, TranscriptStep } from "@loopzhb/protocol";
+import type {
+  ArtifactManifestEntry,
+  CommitArtifactSyncResponse,
+  JsonObject,
+  RunArtifact,
+  TranscriptStep,
+} from "@loopzhb/protocol";
 
 // ---- shared storage shapes ----
 //
@@ -179,6 +197,30 @@ export const loops = pgTable(
     /** Why the last task-file sync failed (TS-only enum from the protocol's
      *  TASK_FILE_SYNC_ERRORS single source). Null after a successful sync. */
     taskFileSyncError: text("task_file_sync_error", { enum: [...TASK_FILE_SYNC_ERRORS] }),
+    /** Phase 5 (ADR-010 决策 8): the machine-side artifact directory. Null =
+     *  not configured (every pre-Phase-5 loop). The server NEVER resolves this
+     *  path — relative/absolute semantics are the daemon's (workdir-based). */
+    artifactDir: text("artifact_dir"),
+    /** Monotonic artifact-config generation: +1 per effective set/change/clear,
+     *  never reset, int32-capped (the store layer rejects at REVISION_INT32_MAX).
+     *  Sessions and manifests capture it; a stale generation can neither commit
+     *  nor bind (决策 8/9). */
+    artifactConfigRevision: integer("artifact_config_revision").notNull().default(0),
+    /** The committed manifest generation `artifactManifestId` names (0 = none). */
+    artifactManifestRevision: integer("artifact_manifest_revision").notNull().default(0),
+    /** Current manifest pointer (artifact_manifests.id — no FK, by convention).
+     *  KEPT across config changes; staleness is computed from the config
+     *  generation at read time, never by nulling the pointer (决策 8). */
+    artifactManifestId: text("artifact_manifest_id"),
+    /** Last artifact sync ATTEMPT (ISO) — set on success AND failure (the
+     *  taskFileSyncAttemptedAt precedent); cleared on config change (决策 8). */
+    artifactSyncAttemptedAt: text("artifact_sync_attempted_at"),
+    /** Last SUCCESSFUL artifact sync commit (ISO); cleared on config change. */
+    artifactSyncSucceededAt: text("artifact_sync_succeeded_at"),
+    /** Stable classification of the last sync failure (TS-only enum from the
+     *  protocol's ARTIFACT_ERROR_CODES single source — the taskFileSyncError
+     *  precedent). Null after a successful sync. */
+    artifactSyncError: text("artifact_sync_error", { enum: [...ARTIFACT_ERROR_CODES] }),
     createdAt: text("created_at").notNull(),
     updatedAt: text("updated_at").notNull(),
     /** The unified optimistic-concurrency token (review SPEC-1/SPEC-3,
@@ -244,6 +286,16 @@ export const runs = pgTable(
     /** Slimmed execution trace. Null for workflow-only runs (no agent). */
     transcript: jsonb("transcript").$type<TranscriptStep[]>(),
     progress: jsonb("progress").$type<RunProgressRow>(),
+    /** Phase 5: the immutable artifact snapshot bound at final report
+     *  (artifact_manifests.id — no FK, by convention). Null = unbound.
+     *  Batch 1 delivers the binding plan + persistence only; the production
+     *  report transaction consumes it in Batch 2 (ADR-010 决策 16). */
+    artifactSnapshotId: text("artifact_snapshot_id"),
+    /** Phase 5: why the snapshot could not be bound / synced. FREE-FORM text
+     *  (the wire report field is a free-form string — Batch 2 defines the
+     *  value set); slice 2 seeds it with the binding-plan rejection literals.
+     *  Never affects the run's outcome. */
+    artifactSyncError: text("artifact_sync_error"),
   },
   (t) => [
     index("runs_loop_idx").on(t.loopId),
@@ -321,5 +373,108 @@ export type NewRun = typeof runs.$inferInsert;
 export type RunLeaseRow = typeof runLeases.$inferSelect;
 export type NewRunLease = typeof runLeases.$inferInsert;
 
+// ---- Phase 5 artifact sync (ADR-010) ----
+//
+// Three tables: pending sync sessions, immutable committed manifests (the
+// snapshot store — a manifest id doubles as a Run's artifactSnapshotId), and
+// verified blob metadata. NO foreign keys per the file-header convention: the
+// attribution chain (namespace/machine/loop) is validated inside the
+// ArtifactHome write transactions (slice 4), not by the DB. Batch 1 keeps
+// these tables reachable only through internal modules wired by tests —
+// no production route or composition touches them (决策 16).
+
+/** Pending/committed prepare sessions (ADR-010 决策 9). The idempotency key is
+ *  (namespaceId, machineId, requestId) — same key + same canonical payload
+ *  fingerprint reuses the session; same key + a different payload is a
+ *  conflict, never a silent rewrite. */
+export const artifactSyncSessions = pgTable(
+  "artifact_sync_sessions",
+  {
+    /** The prepare response's syncId — minted by the server's ID factory
+     *  (slice 4), NOT content-addressed. */
+    id: text("id").primaryKey(),
+    /** Storage namespace from the trusted attribution resolver (决策 7) —
+     *  wire input never carries it. */
+    namespaceId: text("namespace_id").notNull(),
+    machineId: text("machine_id").notNull(),
+    loopId: text("loop_id").notNull(),
+    /** Client idempotency key. NOT part of the payload fingerprint (决策 6). */
+    requestId: text("request_id").notNull(),
+    /** The artifact config generation this session negotiated under. */
+    configRevision: integer("config_revision").notNull(),
+    /** The manifest revision this sync bases on (0 = no base, first sync). */
+    baseManifestRevision: integer("base_manifest_revision").notNull(),
+    /** The canonical (validated + path-ordered) COMPLETE manifest as the
+     *  shared policy normalized it — commit inserts it verbatim. */
+    normalizedManifest: jsonb("normalized_manifest").$type<ArtifactManifestEntry[]>().notNull(),
+    /** SHA-256 over the canonical prepare payload sans requestId (决策 6). */
+    payloadFingerprint: text("payload_fingerprint").notNull(),
+    /** Every hash negotiated for upload across this session's prepares. */
+    negotiatedHashes: jsonb("negotiated_hashes").$type<string[]>().notNull(),
+    createdAt: text("created_at").notNull(),
+    /** Pending expiry = createdAt + 1h, writer-computed from the injected
+     *  Clock (决策 9). A committed receipt does NOT expire with it. */
+    expiresAt: text("expires_at").notNull(),
+    /** The fixed commit receipt (决策 11); non-null IS the committed marker.
+     *  Replayed verbatim to commit retries — same session, same snapshot. */
+    receipt: jsonb("receipt").$type<CommitArtifactSyncResponse>(),
+  },
+  (t) => [uniqueIndex("artifact_sync_sessions_request_idx").on(t.namespaceId, t.machineId, t.requestId)],
+);
+
+/** Immutable committed manifests — the snapshot store (决策 11/12). The id IS
+ *  the Run's artifactSnapshotId; there is deliberately no separate snapshot
+ *  table. */
+export const artifactManifests = pgTable(
+  "artifact_manifests",
+  {
+    /** Immutable, minted by the server's ID factory — NOT content-addressed:
+     *  two sessions committing identical content still get distinct ids. */
+    id: text("id").primaryKey(),
+    namespaceId: text("namespace_id").notNull(),
+    machineId: text("machine_id").notNull(),
+    loopId: text("loop_id").notNull(),
+    /** The config generation this manifest committed under — the staleness
+     *  input (stale ⇔ ≠ the loop's current artifactConfigRevision). */
+    configRevision: integer("config_revision").notNull(),
+    /** Per-loop monotonic generation (决策 11): the unique index below is the
+     *  DB half of the arbitration; the commit transaction's re-check is the
+     *  other. */
+    manifestRevision: integer("manifest_revision").notNull(),
+    /** The COMPLETE file view (bounded JSONB array, plan §2): a path absent
+     *  from the next committed manifest is deleted from the view. */
+    entries: jsonb("entries").$type<ArtifactManifestEntry[]>().notNull(),
+    fileCount: integer("file_count").notNull(),
+    /** Sum over paths (the same content under N paths counts N×). ≤ 256 MiB
+     *  by policy, so int32 suffices. */
+    totalBytes: integer("total_bytes").notNull(),
+    committedAt: text("committed_at").notNull(),
+  },
+  (t) => [uniqueIndex("artifact_manifests_loop_revision_idx").on(t.loopId, t.manifestRevision)],
+);
+
+/** Verified blob metadata (决策 10/12). Recorded ONLY after the BlobStore
+ *  publish succeeds; a row without its file means the file was lost out of
+ *  band (commit refuses the incomplete snapshot; prepare demands re-upload). */
+export const artifactBlobs = pgTable(
+  "artifact_blobs",
+  {
+    namespaceId: text("namespace_id").notNull(),
+    hash: text("hash").notNull(),
+    /** The VERIFIED actual byte count (the byte stream is the only truth —
+     *  declared sizes are never trusted). ≤ 10 MiB by policy. */
+    size: integer("size").notNull(),
+    verifiedAt: text("verified_at").notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.namespaceId, t.hash], name: "artifact_blobs_pkey" })],
+);
+
+export type ArtifactSyncSessionRow = typeof artifactSyncSessions.$inferSelect;
+export type NewArtifactSyncSession = typeof artifactSyncSessions.$inferInsert;
+export type ArtifactManifestRow = typeof artifactManifests.$inferSelect;
+export type NewArtifactManifest = typeof artifactManifests.$inferInsert;
+export type ArtifactBlobRow = typeof artifactBlobs.$inferSelect;
+export type NewArtifactBlob = typeof artifactBlobs.$inferInsert;
+
 /** Drizzle table bag (single schema object shared by the db handle). */
-export const businessSchema = { machines, loops, runs, runLeases };
+export const businessSchema = { machines, loops, runs, runLeases, artifactSyncSessions, artifactManifests, artifactBlobs };

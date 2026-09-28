@@ -147,7 +147,7 @@ describe("M: Phase 4 migration and schema", () => {
     };
 
     // Simulate the production upgrade: close, reopen the file database, run
-    // the production migration runner (0003 applies).
+    // the production migration runner (0003–0005 apply).
     await closeDb(handle);
     handles.splice(handles.indexOf(handle), 1);
     const upgraded = await createDb({ dataDir: handle.dataDir! });
@@ -347,13 +347,14 @@ describe("M: Phase 4 migration and schema", () => {
     const [after] = await handle.db.select().from(loops);
     expect(after).toEqual(before);
 
-    // Migration journal has exactly five entries (0000–0004), applied once
+    // Migration journal has exactly six entries (0000–0005), applied once
     // each — 0004 is the additive loops.revision OCC column (review
-    // SPEC-1/SPEC-3 fix; ADR-003 additive-column discipline).
+    // SPEC-1/SPEC-3 fix; ADR-003 additive-column discipline); 0005 is the
+    // Phase 5 artifact-sync schema (ADR-010, Batch 1 slice 2).
     const journal = await handle.client.query<{ count: string }>(
       'SELECT COUNT(*) AS count FROM "drizzle"."__drizzle_migrations"',
     );
-    expect(Number(journal.rows[0]!.count)).toBe(5);
+    expect(Number(journal.rows[0]!.count)).toBe(6);
 
     // Exactly one completion CHECK exists.
     const checks = await handle.client.query<{ count: string }>(

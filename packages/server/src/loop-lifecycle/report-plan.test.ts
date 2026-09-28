@@ -68,6 +68,8 @@ function baseRun(overrides: Partial<Run> = {}): Run {
     artifacts: null,
     transcript: null,
     progress: { step: 1, label: "working", at: "2026-08-30T23:59:30.000Z" },
+    artifactSnapshotId: null,
+    artifactSyncError: null,
     ...overrides,
   };
 }
