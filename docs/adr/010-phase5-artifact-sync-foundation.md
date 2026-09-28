@@ -120,3 +120,7 @@ wire 错误形状复用 `apiErrorSchema` `{error, code?}`；错误文本不是�
 - **绑定身份核对（#69）**：`planArtifactSnapshotBinding` 新增 `manifest.id === snapshotId` 核对，失配归入既有字面量 `snapshot_not_committed`——引用 ID 没有已提交 manifest 的证据（查不到与查到的不是同一行，对绑定者等价），值集不扩。bind 计划写入已验证的 `manifest.id`，不再直采独立的 `snapshotId` 输入。
 - **machine 归属链补全（#70）**：`cross_machine` 检查纳入 `loop.machineId`——无外键模型下，manifest / run / loop / 可信归属四方 machineId 必须传递相等，Loop 行不作为可信输入豁免。
 - **绑定落库的配置代际守卫（#71）**：bind 计划携带解析时观测的 `guardConfigRevision`；`applyArtifactBindingPlan` 在同一 UPDATE 语句内以子查询复验 `loops.artifact_config_revision`（单语句 CAS，与 `updateArtifactConfig` 的 revision 守卫同级原子性）。代际在 plan→apply 之间前进则守卫零行、抛 `ArtifactBindingGuardLostError`，调用方重解析后重计划（自然转为 `stale_config_generation` 记录）。`record_error` 不加代际守卫：五类拒绝字面量均代际稳定（`cross_*` 与 `snapshot_not_committed` 与代际无关，`stale_config_generation` 单调），配置前进不会证伪已记录的拒绝。
+
+### 2026-09-28（片 2 三轨复审 Round 2 修复：#71）
+
+- **绑定与配置更新的行级互斥**：上述普通子查询仅看见语句开始时的 Loop 快照，不能阻止另一事务在绑定语句执行期间提交新配置。bind 的代际子查询改用 `FOR UPDATE` 锁定 Loop 行，锁持续到独立调用的语句提交或调用方 Report 事务提交；配置写入 `UPDATE loops` 与其互斥。若配置先提交，绑定读取更新后的代际并守卫失败；若绑定先取得锁，配置等待绑定提交。`record_error` 仍不锁 Loop，因其不绑定快照。

@@ -51,8 +51,8 @@ export type ArtifactBindingPlan =
   | { kind: "skip" }
   /** Bind the verified manifest id; touches ONLY the artifact column.
    *  `guardConfigRevision` is the loop's config generation observed at plan
-   *  time — apply re-verifies it against the LIVE row in the same UPDATE
-   *  statement, so a generation that moved in between can never land (#71). */
+   *  time — apply locks and re-verifies the LIVE loop row in the same UPDATE
+   *  statement, so a concurrent config write cannot pass the guard (#71). */
   | { kind: "bind"; runWrites: { artifactSnapshotId: string }; guardConfigRevision: number }
   /** Record the stable rejection; NEVER changes the run's outcome. */
   | { kind: "record_error"; reason: ArtifactBindingRejection; runWrites: { artifactSnapshotId: null; artifactSyncError: string } };
@@ -133,11 +133,12 @@ export class ArtifactBindingGuardLostError extends Error {
 /**
  * Persist a binding plan. `skip` writes NOTHING. Otherwise a guarded run
  * UPDATE keyed on the resolved (id, phase) — the runs-table CAS convention
- * (store/report.ts writeRun). A `bind` additionally re-verifies the loop's
- * CURRENT config generation in the same statement (single-statement CAS, the
- * same atomicity grade as updateArtifactConfig's revision guard): a
- * generation that moved between plan and apply matches zero rows, so a
- * stale-generation snapshot never lands (#71). `record_error` carries NO
+ * (store/report.ts writeRun). A `bind` additionally locks the loop row with
+ * FOR UPDATE and re-verifies its CURRENT config generation in the same
+ * statement. A concurrent config write either commits before the lock is
+ * acquired (the guard then loses) or waits until this statement/transaction
+ * commits. A plain scalar read would only see the statement's MVCC snapshot
+ * and could admit an overlapping config change (#71). `record_error` carries NO
  * generation guard — every rejection literal is generation-stable (cross_* /
  * snapshot_not_committed are generation-independent; stale_config_generation
  * is monotone), so a config bump can never falsify a recorded rejection.
@@ -150,7 +151,7 @@ export async function applyArtifactBindingPlan(db: Db, run: Run, plan: ArtifactB
   if (plan.kind === "skip") return;
   const generationGuard =
     plan.kind === "bind"
-      ? sql`(${db.select({ generation: loops.artifactConfigRevision }).from(loops).where(eq(loops.id, run.loopId))}) = ${plan.guardConfigRevision}`
+      ? sql`(${db.select({ generation: loops.artifactConfigRevision }).from(loops).where(eq(loops.id, run.loopId)).for("update")}) = ${plan.guardConfigRevision}`
       : undefined;
   const updated = await db
     .update(runs)
