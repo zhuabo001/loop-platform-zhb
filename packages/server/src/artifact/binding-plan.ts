@@ -18,10 +18,10 @@
  * `planArtifactSnapshotBinding` inside `runReportTx` and lets that
  * transaction's CAS/rollback driver absorb the guard-lost throw.
  */
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 
 import type { Db } from "../db/index.js";
-import { runs, type ArtifactManifestRow, type Loop, type Run } from "../db/schema.js";
+import { loops, runs, type ArtifactManifestRow, type Loop, type Run } from "../db/schema.js";
 
 /** Why a snapshot reference was refused — the value-set seed for the
  *  free-form `runs.artifactSyncError` column (Batch 2 owns the final
@@ -49,8 +49,11 @@ export type ArtifactBindingPlan =
   /** Nothing to write (no snapshot referenced, or the run is not in a
    *  bindable phase). */
   | { kind: "skip" }
-  /** Bind the snapshot; touches ONLY the artifact column. */
-  | { kind: "bind"; runWrites: { artifactSnapshotId: string } }
+  /** Bind the verified manifest id; touches ONLY the artifact column.
+   *  `guardConfigRevision` is the loop's config generation observed at plan
+   *  time — apply re-verifies it against the LIVE row in the same UPDATE
+   *  statement, so a generation that moved in between can never land (#71). */
+  | { kind: "bind"; runWrites: { artifactSnapshotId: string }; guardConfigRevision: number }
   /** Record the stable rejection; NEVER changes the run's outcome. */
   | { kind: "record_error"; reason: ArtifactBindingRejection; runWrites: { artifactSnapshotId: null; artifactSyncError: string } };
 
@@ -105,13 +108,21 @@ export function planArtifactSnapshotBinding(input: ArtifactBindingInput): Artifa
   if (manifest.loopId !== run.loopId || run.loopId !== loop.id) return reject("cross_loop");
   if (manifest.configRevision !== loop.artifactConfigRevision) return reject("stale_config_generation");
   // Write the VERIFIED manifest id (post-check it equals snapshotId) — the
-  // run never carries an id that only the caller asserted (#69).
-  return { kind: "bind", runWrites: { artifactSnapshotId: manifest.id } };
+  // run never carries an id that only the caller asserted (#69) — and carry
+  // the observed generation for the apply-time guard (#71).
+  return {
+    kind: "bind",
+    runWrites: { artifactSnapshotId: manifest.id },
+    guardConfigRevision: loop.artifactConfigRevision,
+  };
 }
 
-/** The guarded run write observed zero rows — the run's phase moved between
- *  the caller's resolve and this write. In Batch 2 the report transaction's
- *  own CAS/rollback driver absorbs this throw; slice-2 callers re-resolve. */
+/** The guarded run write observed zero rows — the run's phase moved, or (for
+ *  a bind) the loop's config generation moved, between the caller's resolve
+ *  and this write. In Batch 2 the report transaction's own CAS/rollback
+ *  driver absorbs this throw; slice-2 callers re-resolve and re-plan (a
+ *  generation bump turns the bind into the stable stale_config_generation
+ *  rejection). */
 export class ArtifactBindingGuardLostError extends Error {
   constructor(readonly runId: string) {
     super(`artifact binding guard lost for run ${runId}`);
@@ -122,17 +133,29 @@ export class ArtifactBindingGuardLostError extends Error {
 /**
  * Persist a binding plan. `skip` writes NOTHING. Otherwise a guarded run
  * UPDATE keyed on the resolved (id, phase) — the runs-table CAS convention
- * (store/report.ts writeRun). Accepts a Db OR a transaction handle (the
- * runs.ts `tx: Db` precedent): slice-2 tests wrap it in `db.transaction`,
- * Batch 2 embeds it in the report transaction. A zero-row guard throws
- * ArtifactBindingGuardLostError — never a partial write.
+ * (store/report.ts writeRun). A `bind` additionally re-verifies the loop's
+ * CURRENT config generation in the same statement (single-statement CAS, the
+ * same atomicity grade as updateArtifactConfig's revision guard): a
+ * generation that moved between plan and apply matches zero rows, so a
+ * stale-generation snapshot never lands (#71). `record_error` carries NO
+ * generation guard — every rejection literal is generation-stable (cross_* /
+ * snapshot_not_committed are generation-independent; stale_config_generation
+ * is monotone), so a config bump can never falsify a recorded rejection.
+ * Accepts a Db OR a transaction handle (the runs.ts `tx: Db` precedent):
+ * slice-2 tests wrap it in `db.transaction`, Batch 2 embeds it in the report
+ * transaction. A zero-row guard throws ArtifactBindingGuardLostError —
+ * never a partial write.
  */
 export async function applyArtifactBindingPlan(db: Db, run: Run, plan: ArtifactBindingPlan): Promise<void> {
   if (plan.kind === "skip") return;
+  const generationGuard =
+    plan.kind === "bind"
+      ? sql`(${db.select({ generation: loops.artifactConfigRevision }).from(loops).where(eq(loops.id, run.loopId))}) = ${plan.guardConfigRevision}`
+      : undefined;
   const updated = await db
     .update(runs)
     .set(plan.runWrites)
-    .where(and(eq(runs.id, run.id), eq(runs.phase, run.phase)))
+    .where(and(eq(runs.id, run.id), eq(runs.phase, run.phase), generationGuard))
     .returning({ id: runs.id });
   if (updated.length !== 1) throw new ArtifactBindingGuardLostError(run.id);
 }

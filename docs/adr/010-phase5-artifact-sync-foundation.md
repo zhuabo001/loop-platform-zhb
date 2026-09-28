@@ -114,3 +114,9 @@ wire 错误形状复用 `apiErrorSchema` `{error, code?}`；错误文本不是�
 - **revision 上界耗尽的稳定分类**：内部字面量 `config_revision_exhausted`（本片配置事务；镜像 schedule 域 `schedule_revision_exhausted` 先例）与 `manifest_revision_exhausted`（片 4 commit 路径预声明）。二者在 Batch 1 无路由可达，**wire 映射推迟到 Batch 2 路由接线时裁决**；稳定拒绝（结果联合、不抛异常、零写入）即本批契约。配置 planner 求值序钉死为 validate → noop → exhaustion：等值命令在 int32 上界仍是 noop（零写入优先），非法值即使与存储值相等也拒绝。
 - **配置更新无 completed-loop 限制**：镜像 `updateTaskFile`（运维重定向）而非 `updateGoal`（完成冻结语义）——决策 8 未列完成态限制，此处记录为有意的默认。
 - **快照绑定的内部分类字面量**（`runs.artifact_sync_error` 自由文本列的值集种子，Batch 2 拥有最终分类法）：`snapshot_not_committed` / `cross_namespace` / `cross_machine` / `cross_loop` / `stale_config_generation`。绑定资格为 `run.phase === "running"`：canceled/superseded 不绑定；**reclaimed（terminal-grace 唤醒报告）路径在本层保守排除**，Batch 2 把 binding plan 接入 report 事务的 reconcile 分支时须显式裁决是否放行。
+
+### 2026-09-28（片 2 三轨复审 Round 1 修复：#69/#70/#71）
+
+- **绑定身份核对（#69）**：`planArtifactSnapshotBinding` 新增 `manifest.id === snapshotId` 核对，失配归入既有字面量 `snapshot_not_committed`——引用 ID 没有已提交 manifest 的证据（查不到与查到的不是同一行，对绑定者等价），值集不扩。bind 计划写入已验证的 `manifest.id`，不再直采独立的 `snapshotId` 输入。
+- **machine 归属链补全（#70）**：`cross_machine` 检查纳入 `loop.machineId`——无外键模型下，manifest / run / loop / 可信归属四方 machineId 必须传递相等，Loop 行不作为可信输入豁免。
+- **绑定落库的配置代际守卫（#71）**：bind 计划携带解析时观测的 `guardConfigRevision`；`applyArtifactBindingPlan` 在同一 UPDATE 语句内以子查询复验 `loops.artifact_config_revision`（单语句 CAS，与 `updateArtifactConfig` 的 revision 守卫同级原子性）。代际在 plan→apply 之间前进则守卫零行、抛 `ArtifactBindingGuardLostError`，调用方重解析后重计划（自然转为 `stale_config_generation` 记录）。`record_error` 不加代际守卫：五类拒绝字面量均代际稳定（`cross_*` 与 `snapshot_not_committed` 与代际无关，`stale_config_generation` 单调），配置前进不会证伪已记录的拒绝。

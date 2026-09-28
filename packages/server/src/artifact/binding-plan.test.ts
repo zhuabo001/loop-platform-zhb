@@ -27,12 +27,14 @@ import {
   type Loop,
   type Run,
 } from "../db/schema.js";
+import { FakeClock } from "../testkit/index.js";
 import {
   applyArtifactBindingPlan,
   ArtifactBindingGuardLostError,
   planArtifactSnapshotBinding,
   type ArtifactBindingInput,
 } from "./binding-plan.js";
+import { updateArtifactConfig } from "./config.js";
 
 const NOW = "2026-09-28T00:00:00.000Z";
 const HASH = "a".repeat(64);
@@ -160,9 +162,13 @@ describe("plan (pure): the fixed evaluation order", () => {
     });
   });
 
-  it("a fully consistent reference binds — runWrites is EXACTLY the artifact column", () => {
+  it("a fully consistent reference binds the VERIFIED manifest id — runWrites is EXACTLY the artifact column", () => {
     const plan = planArtifactSnapshotBinding(input());
-    expect(plan).toEqual({ kind: "bind", runWrites: { artifactSnapshotId: "amf-1" } });
+    expect(plan).toEqual({
+      kind: "bind",
+      runWrites: { artifactSnapshotId: "amf-1" },
+      guardConfigRevision: 2, // the loop generation the apply-time guard re-verifies (#71)
+    });
     if (plan.kind === "bind") expect(Object.keys(plan.runWrites)).toEqual(["artifactSnapshotId"]);
   });
 
@@ -186,7 +192,10 @@ describe("persistence (real PGlite)", () => {
     handles.push(h);
     db = h.db;
     await db.insert(machines).values({ id: "m-1", name: "", tokenHash: "deadbeef", createdAt: NOW });
-    await db.insert(loops).values({ id: "loop-1", machineId: "m-1", createdAt: NOW, updatedAt: NOW });
+    // loop-1's artifactConfigRevision matches the baseLoop()/baseManifest()
+    // generation (2): the bind apply-guard re-verifies it against the LIVE
+    // row (#71), so the seeded row must carry the same generation.
+    await db.insert(loops).values({ id: "loop-1", machineId: "m-1", artifactConfigRevision: 2, createdAt: NOW, updatedAt: NOW });
     await db.insert(loops).values({ id: "loop-2", machineId: "m-2", createdAt: NOW, updatedAt: NOW });
     await db.insert(runs).values(baseRun({ outcome: "exec", message: "wrapped up" }));
   }
@@ -309,6 +318,68 @@ describe("persistence (real PGlite)", () => {
     const after = await getRun();
     expect(after.artifactSnapshotId).toBeNull();
     expect(after.phase).toBe("done");
+  });
+
+  it("a config generation bump between plan and apply refuses the stale-generation bind; re-planning records stale_config_generation (#71)", async () => {
+    await fresh();
+    await db.insert(artifactManifests).values(baseManifest());
+    const before = await getRun();
+    const loopRow = (await db.select().from(loops).where(eq(loops.id, "loop-1")))[0]!;
+    const found = (await db.select().from(artifactManifests).where(eq(artifactManifests.id, "amf-1")))[0]!;
+    const plan = planArtifactSnapshotBinding(input({ run: before, loop: loopRow, manifest: found }));
+    expect(plan.kind).toBe("bind");
+
+    // The REAL config write path moves the loop to generation 3 in between
+    // (the exact interleave from the review: plan at N → commit N+1 → apply).
+    const moved = await updateArtifactConfig({ db, clock: new FakeClock() }, "loop-1", { artifactDir: "/data/moved" });
+    expect(moved).toMatchObject({ ok: true, outcome: "changed" });
+
+    // The stale plan NEVER lands: the in-statement generation guard matches
+    // zero rows — no partial write either.
+    await expect(applyArtifactBindingPlan(db, before, plan)).rejects.toBeInstanceOf(ArtifactBindingGuardLostError);
+    const after = await getRun();
+    expect(after.artifactSnapshotId).toBeNull();
+    expect(after.artifactSyncError).toBeNull();
+
+    // The recovery path: re-resolve, re-plan — the bind has become the
+    // stable stale_config_generation rejection on the new generation.
+    const loopAfter = (await db.select().from(loops).where(eq(loops.id, "loop-1")))[0]!;
+    expect(loopAfter.artifactConfigRevision).toBe(3);
+    const replanned = planArtifactSnapshotBinding(input({ run: after, loop: loopAfter, manifest: found }));
+    expect(replanned).toMatchObject({ kind: "record_error", reason: "stale_config_generation" });
+  });
+
+  it("record_error is generation-stable — a config bump never falsifies a recorded rejection (#71)", async () => {
+    await fresh();
+    await db.insert(artifactManifests).values(baseManifest({ machineId: "m-2" }));
+    const before = await getRun();
+    const loopRow = (await db.select().from(loops).where(eq(loops.id, "loop-1")))[0]!;
+    const found = (await db.select().from(artifactManifests).where(eq(artifactManifests.id, "amf-1")))[0]!;
+    const plan = planArtifactSnapshotBinding(input({ run: before, loop: loopRow, manifest: found }));
+    expect(plan).toMatchObject({ kind: "record_error", reason: "cross_machine" });
+
+    await updateArtifactConfig({ db, clock: new FakeClock() }, "loop-1", { artifactDir: "/data/moved" });
+
+    // cross_machine stays TRUE on the new generation, so the record lands
+    // without a generation guard (only bind is generation-sensitive).
+    await applyArtifactBindingPlan(db, before, plan);
+    const after = await getRun();
+    expect(after.artifactSnapshotId).toBeNull();
+    expect(after.artifactSyncError).toBe("cross_machine");
+  });
+
+  it("a missing loop row fails the bind guard CLOSED — no FK means the write never assumes the chain (#71)", async () => {
+    await fresh();
+    await db.insert(artifactManifests).values(baseManifest());
+    const before = await getRun();
+    const loopRow = (await db.select().from(loops).where(eq(loops.id, "loop-1")))[0]!;
+    const plan = planArtifactSnapshotBinding(input({ run: before, loop: loopRow }));
+    expect(plan.kind).toBe("bind");
+    await db.delete(loops).where(eq(loops.id, "loop-1")); // out-of-band damage
+    await expect(applyArtifactBindingPlan(db, before, plan)).rejects.toBeInstanceOf(ArtifactBindingGuardLostError);
+    const after = await getRun();
+    expect(after.artifactSnapshotId).toBeNull();
+    expect(after.artifactSyncError).toBeNull();
   });
 
   it("the plan applies inside a caller-owned transaction (the Batch 2 report-tx seam)", async () => {
