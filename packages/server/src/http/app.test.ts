@@ -784,8 +784,7 @@ describe("unified error surface", () => {
   });
 });
 
-describe("the taxonomy pin (review STD-5) — the adapter's full (status, code) set, fake-driven", () => {
-  // 413 stays pinned by the 2 MiB body-cap tests above (route-independent
+describe("the taxonomy pin (review STD-5) — the adapter's full (status, code) set, fake-driven", () => {  // 413 stays pinned by the 2 MiB body-cap tests above (route-independent
   // middleware); every OTHER (status, code) pair the adapter can emit is
   // driven below through fully fake narrow interfaces and pinned as a
   // literal set — a new code or a drifting status turns THIS test red.
@@ -985,5 +984,35 @@ describe("the taxonomy pin (review STD-5) — the adapter's full (status, code) 
     expect([RUN_CAPABILITY_INVALID_CODE, LOOP_COMPLETED_CODE, LOOP_NOT_COMPLETED_CODE].sort()).toEqual(
       ["loop_completed", "loop_not_completed", "run_capability_invalid"],
     );
+  });
+});
+
+describe("AD1: artifact routes are NOT mounted (Phase 5 Batch 1 dormancy, ADR-010 决策 16)", () => {
+  // The probed paths are Batch 2's PLANNED artifact routes; when Batch 2
+  // mounts them it must rewrite this guard with the final paths. Until then
+  // every artifact surface must be indistinguishable from an unknown path.
+  const PROBES: ReadonlyArray<readonly [string, string]> = [
+    ["PATCH", "/api/loops/loop-1/artifact-dir"], // artifact config management
+    ["POST", "/api/machine/sync"], // prepare
+    ["POST", "/api/machine/sync/sync-1/commit"], // commit
+    ["PUT", `/api/machine/blob/${"a".repeat(64)}`], // blob upload
+    ["GET", "/api/loops/loop-1/artifact/files"], // current-view file list
+    ["GET", "/api/loops/loop-1/artifact/files/download?path=a.txt"], // file download
+    ["GET", "/api/loops/loop-1/artifact/snapshots"], // snapshot list
+    ["GET", "/api/loops/loop-1/artifact/snapshots/snap-1"], // snapshot detail
+    ["GET", "/api/loops/loop-1/artifact/snapshots/snap-1/diff"], // snapshot diff
+    ["GET", "/api/machine/sync"], // wrong-method control: no half-mount
+  ];
+
+  it("every artifact probe returns the flat 404, byte-identical to an unknown path", async () => {
+    await fresh();
+    const unknown = await app.request("/nope");
+    await expectJsonError(unknown, 404, { error: "not found" });
+    const canonicalBody = await (await app.request("/nope")).text();
+    for (const [method, path] of PROBES) {
+      const res = await app.request(path, { method });
+      expect(res.status, `${method} ${path}`).toBe(404);
+      expect(await res.text(), `${method} ${path}`).toBe(canonicalBody);
+    }
   });
 });
