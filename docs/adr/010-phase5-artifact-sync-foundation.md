@@ -17,7 +17,7 @@ Phase 5 要为 Loop 增加 Artifact 目录同步：Daemon 持续单向上传文�
 
 ### 2. 路径与条目校验域
 
-Manifest 条目固定为 `{path, hash, size}`。`path` 必须是规范 POSIX 相对路径：拒绝绝对路径、盘符、反斜杠、空路径段、精确 `.`/`..` 段、NUL 与未配对代理项（非法 Unicode）；不做 URL 解码、大小写折叠或 Unicode 归一化，值逐字保留。拒绝重复路径及 `a` 与 `a/b` 这类文件/目录冲突（两种 wire 序都拒绝）。`hash` 是 64 位小写十六进制 SHA-256；`size` 是非负安全整数；同一 hash 声明不同 size 整单拒绝。schema 层只钉形状（`z.string()`/`z.number()`），值域规则单一来源在共享 policy——Daemon 与 Server 必须对同一份 manifest 产出同一套失败分类，不允许 zod issue 与 policy failure 两条分类路径并存。
+Manifest 条目固定为 `{path, hash, size}`。`path` 必须是规范 POSIX 相对路径：拒绝绝对路径、盘符、反斜杠、空路径段、精确 `.`/`..` 段、NUL 与未配对代理项（非法 Unicode）；不做 URL 解码、大小写折叠或 Unicode 归一化，值逐字保留。拒绝重复路径及 `a` 与 `a/b` 这类文件/目录冲突（两种 wire 序都拒绝）。`hash` 是 64 位小写十六进制 SHA-256；`size` 是非负安全整数；同一 hash 声明不同 size 整单拒绝。schema 层只钉 typeof 形状：`path`/`hash` 为 `z.string()`，`size` 为 typeof-number 检查而**不是** `z.number()`——Zod 4 在 schema 层拒绝非有限数，wire 上的 `1e400`（JSON 解析为 Infinity）会在 schema 处死亡，而 Daemon 直接调 policy 得到 `size_invalid`，同一缺陷两条分类路径（片 1 复审 A1 发现，已修）。值域规则单一来源在共享 policy——Daemon 与 Server 必须对同一份 manifest 产出同一套失败分类，不允许 zod issue 与 policy failure 两条分类路径并存。
 
 ### 3. 上限常量（含边界值）
 
@@ -100,3 +100,9 @@ wire 错误形状复用 `apiErrorSchema` `{error, code?}`；错误文本不是�
 - 9 码错误分类与重试约定冻结后，Daemon 的重试/重新协商行为可以脱离实现先行测试。
 - 休眠边界（决策 16）使本批可以安全合入主干：生产行为与 Phase 4 逐字节一致由 AD1–AD4 可执行证据支撑。
 - 已知限制延续 Batch 1 计划：只验证 namespace 隔离，未实现用户认证与生产 Team 归属；历史快照、过期 session 与孤立 Blob 的累计磁盘治理留 Phase 6。
+
+## 修订记录
+
+### 2026-09-28（片 1 三轨复审 Round 1 修复）
+
+- **决策 2 措辞修正（A1）**：原文「schema 层只钉形状（`z.string()`/`z.number()`）」改为 typeof 形状——`size` 不得用 `z.number()`（Zod 4 在 schema 层拒绝非有限数，会让 wire `1e400` 在 Server 死于 zod issue、在 Daemon 死于 policy `size_invalid`，违反本决策自身的单一分类要求）。决策语义（值域单一来源在共享 policy）不变，实现措辞对齐。

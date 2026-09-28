@@ -8,13 +8,17 @@
  * contract. 镜像形状 ≠ 已支持语义.
  *
  * Shape only — value domains are deliberately NOT pinned at the schema layer
- * (hash stays `z.string()`, size stays `z.number()`). The same manifest must
- * validate identically on the daemon (local pre-classification) and on the
- * server (defensive layer) with ONE failure-classification path, and that
+ * (hash stays `z.string()`, size is a TYPEOF-number check). The same manifest
+ * must validate identically on the daemon (local pre-classification) and on
+ * the server (defensive layer) with ONE failure-classification path, and that
  * value policy lives in artifact-policy.ts (ADR-002 决策 4 的窄例外). A
  * schema-level regex would hand the same defect two different classifications
- * (a zod issue vs a policy failure). Same discipline as tokens.ts: shape
- * filtering is mint/write-side only, never reader-side.
+ * (a zod issue vs a policy failure). So would `z.number()`: Zod 4 rejects
+ * non-finite numbers at the schema layer, so a wire `1e400` (JSON-parses to
+ * Infinity) would die as a zod issue on the server while the daemon's direct
+ * policy call classifies it `size_invalid` (slice-1 review A1). Same
+ * discipline as tokens.ts: shape filtering is mint/write-side only, never
+ * reader-side.
  */
 import { z } from "zod";
 
@@ -27,7 +31,12 @@ import { z } from "zod";
 export const artifactManifestEntrySchema = z.object({
   path: z.string(),
   hash: z.string(),
-  size: z.number(),
+  /** typeof-number ONLY — never `z.number()`: Zod 4 rejects non-finite
+   *  numbers, which would fork the failure classification (a zod issue on the
+   *  server's schema→policy path vs `size_invalid` from the daemon's direct
+   *  policy call). Infinity/NaN pass here and are classified ONCE, by
+   *  artifact-policy's `size_invalid` (slice-1 review A1). */
+  size: z.custom<number>((value) => typeof value === "number"),
 });
 export type ArtifactManifestEntry = z.infer<typeof artifactManifestEntrySchema>;
 

@@ -99,6 +99,20 @@ describe("schema pins SHAPE only — the value domain stays in artifact-policy",
       expect(artifactManifestEntrySchema.parse({ path: "a", hash: HASH_A, size }).size).toBe(size);
     }
   });
+
+  it("a NON-FINITE size still parses (typeof-number only — slice-1 review A1)", () => {
+    // Zod 4's z.number() rejects Infinity/NaN at the schema layer, which would
+    // fork the failure classification (zod issue here vs size_invalid in the
+    // shared policy). The schema admits any typeof-number; the policy rejects.
+    const infinity = artifactManifestEntrySchema.parse({ path: "a", hash: HASH_A, size: Number.POSITIVE_INFINITY });
+    expect(infinity.size).toBe(Number.POSITIVE_INFINITY);
+    expect(Number.isNaN(artifactManifestEntrySchema.parse({ path: "a", hash: HASH_A, size: Number.NaN }).size)).toBe(
+      true,
+    );
+    // A non-number still fails at the schema layer — that IS shape.
+    expect(() => artifactManifestEntrySchema.parse({ path: "a", hash: HASH_A, size: "1" })).toThrow();
+    expect(() => artifactManifestEntrySchema.parse({ path: "a", hash: HASH_A })).toThrow();
+  });
 });
 
 describe("poll additive fields (Phase 5, ADR-010)", () => {

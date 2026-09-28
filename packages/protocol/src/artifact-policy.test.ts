@@ -219,6 +219,37 @@ describe("AP8: bounded raw-text JSON parsing (8 MiB over the RAW text)", () => {
   });
 });
 
+describe("A1 (slice-1 review): ONE classification path from raw text to policy", () => {
+  // The frozen pipeline is cap-on-raw → strip → validate(schema) → policy →
+  // fingerprint. A legal JSON number like 1e400 parses to Infinity; the entry
+  // schema must ADMIT it (typeof-number only) so the shared policy classifies
+  // it — otherwise the server's schema→policy path dies on a zod issue while
+  // the daemon's direct policy call yields size_invalid (two paths, ADR-010
+  // 决策 2 forbids exactly that).
+  const OVERFLOW_RAW =
+    `{"requestId":"r","loopId":"l","configRevision":1,"baseManifestRevision":0,` +
+    `"entries":[{"path":"a","hash":"${HASH_A}","size":1e400}]}`;
+
+  it("1e400 survives bounded parse AND the entry schema, then policy classifies size_invalid", () => {
+    const parsed = parseBoundedJsonText(OVERFLOW_RAW, ARTIFACT_PREPARE_REQUEST_MAX_UTF8_BYTES);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) throw new Error("unreachable");
+    const request = prepareArtifactSyncRequestSchema.parse(parsed.value); // must NOT throw
+    expect(request.entries[0]!.size).toBe(Number.POSITIVE_INFINITY);
+    expect(normalizeManifestEntries(request.entries)).toMatchObject({ ok: false, failure: "size_invalid", index: 0 });
+  });
+
+  it("the wire path and the daemon's direct policy call classify IDENTICALLY", () => {
+    const wireValue = parseBoundedJsonText(OVERFLOW_RAW, ARTIFACT_PREPARE_REQUEST_MAX_UTF8_BYTES);
+    if (!wireValue.ok) throw new Error("unreachable");
+    const viaWire = normalizeManifestEntries(prepareArtifactSyncRequestSchema.parse(wireValue.value).entries);
+    const viaDaemon = normalizeManifestEntries([entry("a", HASH_A, Number.POSITIVE_INFINITY)]);
+    expect(viaWire).toMatchObject({ ok: false, failure: "size_invalid" });
+    expect(viaDaemon).toMatchObject({ ok: false, failure: "size_invalid" });
+    expect(viaWire).toEqual(viaDaemon);
+  });
+});
+
 describe("AP9: never-sync VCS / dependency / worktree / cache rules", () => {
   it("excludes VCS and dependency directories at ANY depth", () => {
     for (const path of [
