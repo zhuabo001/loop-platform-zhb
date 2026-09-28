@@ -1,7 +1,14 @@
 import { describe, expect, it } from "vitest";
 
 import type { ArtifactAttribution, ArtifactAttributionResolver } from "./attribution.js";
-import type { BlobKey, BlobStore, BlobStoreFailure } from "./blob-store.js";
+import type {
+  BlobKey,
+  BlobPresenceFailure,
+  BlobReadFailure,
+  BlobStore,
+  BlobStoreFailure,
+  BlobStreamChunk,
+} from "./blob-store.js";
 
 /**
  * Compile-level evidence for the slice-1 contract freeze: the two internal
@@ -54,6 +61,46 @@ describe("artifact internal contracts (frozen in Batch 1 slice 1)", () => {
       }
     }
     expect(failures).toHaveLength(5);
+  });
+
+  it("pins the per-method failure sets (slice-1 review S1)", () => {
+    // has(): a symlink/special file parked at the blob path is an ANOMALY
+    // (not_regular_file), never a clean "missing" — that would route it onto
+    // the re-upload path. content_mismatch is a write-side failure only.
+    const presence: readonly BlobPresenceFailure[] = ["invalid_key", "not_regular_file", "storage_error"];
+    expect(presence).toHaveLength(3);
+    // read() opening failures: everything except content_mismatch (reading
+    // never re-verifies content; the write path already did).
+    const readFailures: readonly BlobReadFailure[] = [
+      "invalid_key",
+      "blob_missing",
+      "not_regular_file",
+      "storage_error",
+    ];
+    expect(readFailures).toHaveLength(4);
+  });
+
+  it("a MID-STREAM storage failure is a terminal stream element, never a throw (S1)", async () => {
+    // Fake stream: two good chunks, then the disk fails mid-read. The
+    // consumer classifies the failure by branching on the union — no
+    // try/catch around the iteration. Once {ok:false} arrives the stream is
+    // over (terminal element).
+    async function* failingStream(): AsyncIterable<BlobStreamChunk> {
+      yield { ok: true, chunk: new Uint8Array([1, 2]) };
+      yield { ok: true, chunk: new Uint8Array([3]) };
+      yield { ok: false, failure: "storage_error", cause: new Error("EIO") };
+    }
+    const received: number[] = [];
+    let terminal: string | null = null;
+    for await (const element of failingStream()) {
+      if (element.ok) received.push(...element.chunk);
+      else terminal = element.failure;
+    }
+    expect(received).toEqual([1, 2, 3]);
+    expect(terminal).toBe("storage_error");
+    // Type-level pin: only storage_error can occur mid-stream.
+    const bad: Extract<BlobStreamChunk, { ok: false }> = { ok: false, failure: "storage_error" };
+    expect(bad.failure).toBe("storage_error");
   });
 
   it("the attribution union discriminates ok from attribution_missing", () => {

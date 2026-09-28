@@ -79,7 +79,7 @@ wire 错误形状复用 `apiErrorSchema` `{error, code?}`；错误文本不是�
 
 ### 14. BlobStore 内部接口契约
 
-服务端内部接口（`packages/server/src/artifact/blob-store.ts`），本批只冻结不实现。方法：`writeVerified`（已验证写入）、`has`（存在性检查）、`read`（读取）；无删除、无历史 GC。失败走结果联合（`invalid_key`/`content_mismatch`/`blob_missing`/`not_regular_file`/`storage_error`）而非异常——Blob 缺失与内容不符是正常流程分支。写入语义：流式统计真实字节并计算 SHA-256 与协商值比对、超限短路 `content_mismatch`；独占临时文件 → fsync → 原子发布；并发/重复上传不暴露半文件且仍验证字节；只有发布成功后才记录 Blob 元数据。存储键是安全的 `(namespaceId, hash)` 形状，manifest 路径不映射为磁盘路径；拒绝 symlink 与非普通文件。`has` 不把存储错误吞成 missing（否则污染 commit 的重传分类）。内存与本地 adapter 共享同一契约测试（片 3）。
+服务端内部接口（`packages/server/src/artifact/blob-store.ts`），本批只冻结不实现。方法：`writeVerified`（已验证写入）、`has`（存在性检查）、`read`（读取）；无删除、无历史 GC。失败走结果联合（`invalid_key`/`content_mismatch`/`blob_missing`/`not_regular_file`/`storage_error`）而非异常——Blob 缺失与内容不符是正常流程分支。写入语义：流式统计真实字节并计算 SHA-256 与协商值比对、超限短路 `content_mismatch`；独占临时文件 → fsync → 原子发布；并发/重复上传不暴露半文件且仍验证字节；只有发布成功后才记录 Blob 元数据。存储键是安全的 `(namespaceId, hash)` 形状，manifest 路径不映射为磁盘路径；拒绝 symlink 与非普通文件。`has` 不把存储错误吞成 missing（否则污染 commit 的重传分类）；blob 路径上的 symlink/特殊文件是**异常**而非缺失，分类 `not_regular_file`（归入 `BlobPresenceFailure`），不得报告为干净的 `present:false` 走上重传路径。`read` 的失败通道分两阶段：打开期失败（`invalid_key`/`blob_missing`/`not_regular_file`/`storage_error`）走 `BlobReadResult` 结果联合；打开后流式读取中途的 I/O 失败以流内**终止元素** `{ok:false, failure:"storage_error"}` 表达——迭代器不得为 I/O 失败抛异常，消费端不做 try/catch 即可分类。片 3 的共享契约测试必须覆盖读取中途 I/O 故障与 `has`/`read` 遇 symlink/特殊文件两类场景。内存与本地 adapter 共享同一契约测试（片 3）。
 
 ### 15. 可信归属解析器接口契约
 
@@ -106,3 +106,4 @@ wire 错误形状复用 `apiErrorSchema` `{error, code?}`；错误文本不是�
 ### 2026-09-28（片 1 三轨复审 Round 1 修复）
 
 - **决策 2 措辞修正（A1）**：原文「schema 层只钉形状（`z.string()`/`z.number()`）」改为 typeof 形状——`size` 不得用 `z.number()`（Zod 4 在 schema 层拒绝非有限数，会让 wire `1e400` 在 Server 死于 zod issue、在 Daemon 死于 policy `size_invalid`，违反本决策自身的单一分类要求）。决策语义（值域单一来源在共享 policy）不变，实现措辞对齐。
+- **决策 14 细化（S1）**：明确 `read` 的两阶段失败通道与 `has` 对 symlink/特殊文件的分类（见决策 14 正文）。接口冻结时尚无 adapter 依赖旧措辞，属实现前修正而非行为变更。
