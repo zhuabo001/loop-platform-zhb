@@ -85,7 +85,15 @@ export function createMemoryBlobStore(options?: { faults?: MemoryBlobStoreFaults
         expectedSize: input.expectedSize,
         bytes: input.bytes,
         onChunk: async (chunk) => {
-          collected.push(chunk);
+          // Copy on ARRIVAL (#75): a source may legally reuse ONE buffer
+          // across yields — storing the reference and copying only after the
+          // hash matched would let the source's later mutations rewrite bytes
+          // the digest already covered (verified [A B], stored [B B]). The
+          // owned copy freezes exactly what verification hashed. Never use
+          // `chunk.slice()`: a Buffer-typed chunk's slice() returns a VIEW.
+          const owned = new Uint8Array(chunk.byteLength);
+          owned.set(chunk);
+          collected.push(owned);
         },
       });
       if (!verified.ok) return verified;
@@ -99,8 +107,8 @@ export function createMemoryBlobStore(options?: { faults?: MemoryBlobStoreFaults
       // concurrent same-key writes cannot both observe absence (JS is
       // single-threaded here). Never introduce an await into this section.
       const published = !blobs.has(k);
-      // Copy on store: the caller may reuse its source buffers — a stored
-      // blob must be immune to later mutation.
+      // The collected chunks are already OWNED copies (copied on arrival —
+      // see onChunk above); assemble the single stored buffer from them.
       const bytes = new Uint8Array(verified.size);
       let off = 0;
       for (const c of collected) {

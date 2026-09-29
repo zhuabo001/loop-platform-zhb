@@ -323,5 +323,30 @@ export function runBlobStoreContractSuite(
         expect(counter.pulled).toBe(0);
       }
     });
+
+    it("stores exactly the bytes the hash covered even when the source REUSES one buffer across yields (#75)", async () => {
+      const { store } = await harness();
+      // A contract-legal hostile source: the SAME buffer object yielded twice,
+      // mutated between yields. Verification hashes [0x41, 0x42] (the content
+      // AT EACH YIELD); an adapter retaining the reference would store
+      // [0x42, 0x42] — verified bytes and stored bytes diverging.
+      const reused = new Uint8Array([0x41]);
+      async function* reusingSource(): AsyncIterable<Uint8Array> {
+        yield reused;
+        reused[0] = 0x42;
+        yield reused;
+      }
+      const asYielded = new Uint8Array([0x41, 0x42]);
+      const key = { namespaceId: NS, hash: sha256Hex(asYielded) };
+      expect(await store.writeVerified({ ...key, expectedSize: 2, bytes: reusingSource() })).toEqual({
+        ok: true,
+        size: 2,
+        published: true,
+      });
+      const rd = await store.read(key);
+      expect(rd.ok).toBe(true);
+      if (!rd.ok) throw new Error("unreachable");
+      expect(okBytes(await collect(rd.bytes)).equals(Buffer.from(asYielded))).toBe(true);
+    });
   });
 }
