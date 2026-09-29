@@ -348,5 +348,17 @@ export function runBlobStoreContractSuite(
       if (!rd.ok) throw new Error("unreachable");
       expect(okBytes(await collect(rd.bytes)).equals(Buffer.from(asYielded))).toBe(true);
     });
+
+    it("lets a caller close a successful read without starting iteration (#74)", async () => {
+      const { store } = await harness();
+      const bytes = new TextEncoder().encode("unconsumed read");
+      const key = { namespaceId: NS, hash: sha256Hex(bytes) };
+      expect(await store.writeVerified({ ...key, expectedSize: bytes.length, bytes: chunkedSource(bytes, 3) })).toMatchObject({ ok: true });
+      const rd = await store.read(key);
+      expect(rd.ok).toBe(true);
+      if (!rd.ok) throw new Error("unreachable");
+      await rd.close();
+      await rd.close(); // idempotent even when the stream was never started
+    });
   });
 }

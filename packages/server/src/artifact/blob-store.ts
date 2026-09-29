@@ -63,7 +63,15 @@ export type BlobStreamChunk =
   | { ok: false; failure: "storage_error"; cause?: unknown };
 
 export type BlobReadResult =
-  | { ok: true; bytes: AsyncIterable<BlobStreamChunk>; size: number }
+  | {
+      ok: true;
+      bytes: AsyncIterable<BlobStreamChunk>;
+      size: number;
+      /** Release a read that will not be iterated. Idempotent; iteration also
+       *  closes automatically on EOF, failure, or early return. Do not start
+       *  iterating `bytes` after an explicit close. */
+      close(): Promise<void>;
+    }
   | { ok: false; failure: BlobReadFailure; cause?: unknown };
 
 export interface BlobStore {
@@ -100,6 +108,9 @@ export interface BlobStore {
    * union; a failure WHILE STREAMING arrives as a terminal
    * `{ok:false, failure:"storage_error"}` stream element (see
    * `BlobStreamChunk`) — the iterator never throws for an I/O failure.
+   * A successful result owns an open read resource. Consumers must either
+   * iterate `bytes` to completion/early return or call `close()` if they do
+   * not start iteration (or abandon it before the first `next()`).
    */
   read(key: BlobKey): Promise<BlobReadResult>;
 }

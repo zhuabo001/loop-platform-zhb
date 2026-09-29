@@ -13,14 +13,14 @@
  */
 import { createHash } from "node:crypto";
 import { createReadStream, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import fs, { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { runBlobStoreContractSuite, type BlobStoreHarness } from "../testkit/blob-store-contract.js";
-import type { BlobKey } from "./blob-store.js";
+import type { BlobKey, BlobReadResult, BlobStore } from "./blob-store.js";
 import { createLocalBlobStore } from "./blob-store-local.js";
 
 let seq = 0;
@@ -48,6 +48,26 @@ function patternBytes(size: number): Uint8Array {
   const bytes = new Uint8Array(size);
   for (let i = 0; i < size; i += 1) bytes[i] = (i * 17 + 3) & 0xff;
   return bytes;
+}
+
+/** Capture the real FileHandle from the adapter's read-open and observe the
+ * close path without changing the production adapter or using process-wide
+ * fd counts (which can include unrelated work). */
+async function readWithTrackedClose(store: BlobStore, key: BlobKey): Promise<{
+  result: Extract<BlobReadResult, { ok: true }>;
+  closeSpy: ReturnType<typeof vi.spyOn>;
+}> {
+  const openSpy = vi.spyOn(fs, "open");
+  try {
+    const result = await store.read(key);
+    if (!result.ok) throw new Error(`expected readable blob, got ${result.failure}`);
+    const opened = openSpy.mock.results.at(-1)?.value as Promise<fs.FileHandle> | undefined;
+    if (!opened) throw new Error("read did not open a FileHandle");
+    const handle = await opened;
+    return { result, closeSpy: vi.spyOn(handle, "close") };
+  } finally {
+    openSpy.mockRestore();
+  }
 }
 
 /** A chunk stream that serves the real file and then THROWS after `after`
@@ -291,6 +311,23 @@ describe("local BlobStore specifics", () => {
     expect(await store.has(keyB)).toEqual({ ok: true, present: true });
   });
 
+  it("a namespace symlink to a directory OUTSIDE root is refused on has/read (#73)", async () => {
+    const rootDir = await tmpRoot();
+    const outsideRoot = await tmpRoot();
+    const bytes = new TextEncoder().encode("outside root content");
+    const key: BlobKey = { namespaceId: NS, hash: sha256Hex(bytes) };
+    writeFileSync(path.join(outsideRoot, key.hash), bytes);
+    symlinkSync(outsideRoot, path.join(rootDir, NS), "dir");
+    const store = createLocalBlobStore({ rootDir });
+    const present = await store.has(key);
+    expect(present.ok).toBe(false);
+    if (!present.ok) expect(present.failure).toBe("storage_error");
+    const read = await store.read(key);
+    expect(read.ok).toBe(false);
+    if (!read.ok) expect(read.failure).toBe("storage_error");
+    expect(readFileSync(path.join(outsideRoot, key.hash)).equals(Buffer.from(bytes))).toBe(true);
+  });
+
   it("a returned read stream stays bound to the inode verified at open time — a later path swap cannot redirect it (#74)", async () => {
     const rootDir = await tmpRoot();
     const store = createLocalBlobStore({ rootDir });
@@ -315,6 +352,69 @@ describe("local BlobStore specifics", () => {
       if (element.ok) parts.push(element.chunk);
     }
     expect(Buffer.concat(parts.map((c) => Buffer.from(c))).equals(Buffer.from(bytes))).toBe(true);
+  });
+
+  it("a read returned before a symlink swap never follows the swapped target (#74)", async () => {
+    const rootDir = await tmpRoot();
+    const outsideRoot = await tmpRoot();
+    const bytes = new TextEncoder().encode("original blob bytes");
+    const key: BlobKey = { namespaceId: NS, hash: sha256Hex(bytes) };
+    const store = createLocalBlobStore({ rootDir });
+    expect(await store.writeVerified({ ...key, expectedSize: bytes.length, bytes: chunks(bytes, 4) })).toMatchObject({ ok: true });
+    const rd = await store.read(key);
+    expect(rd.ok).toBe(true);
+    if (!rd.ok) throw new Error("unreachable");
+    const outside = path.join(outsideRoot, "secret");
+    writeFileSync(outside, "different outside bytes");
+    const p = path.join(rootDir, NS, key.hash);
+    await rm(p);
+    symlinkSync(outside, p);
+    const parts: Uint8Array[] = [];
+    for await (const element of rd.bytes) {
+      expect(element.ok).toBe(true);
+      if (element.ok) parts.push(element.chunk);
+    }
+    expect(rd.size).toBe(bytes.length);
+    expect(Buffer.concat(parts.map((part) => Buffer.from(part))).equals(Buffer.from(bytes))).toBe(true);
+  });
+
+  it("read releases its handle on EOF, mid-stream failure, early break, and explicit close before iteration (#74)", async () => {
+    const rootDir = await tmpRoot();
+    const bytes = patternBytes(130 * 1024);
+    const key: BlobKey = { namespaceId: NS, hash: sha256Hex(bytes) };
+    const store = createLocalBlobStore({ rootDir });
+    expect(await store.writeVerified({ ...key, expectedSize: bytes.length, bytes: chunks(bytes, 4096) })).toMatchObject({ ok: true });
+
+    const eof = await readWithTrackedClose(store, key);
+    for await (const element of eof.result.bytes) expect(element.ok).toBe(true);
+    expect(eof.closeSpy).toHaveBeenCalledTimes(1);
+    await eof.result.close();
+    expect(eof.closeSpy).toHaveBeenCalledTimes(1);
+
+    const early = await readWithTrackedClose(store, key);
+    for await (const element of early.result.bytes) {
+      expect(element.ok).toBe(true);
+      break;
+    }
+    expect(early.closeSpy).toHaveBeenCalledTimes(1);
+
+    const untouched = await readWithTrackedClose(store, key);
+    await untouched.result.close();
+    await untouched.result.close();
+    expect(untouched.closeSpy).toHaveBeenCalledTimes(1);
+
+    const failing = createLocalBlobStore({
+      rootDir,
+      io: { streamChunksImpl: () => (async function* () {
+        yield new Uint8Array([1]);
+        throw new Error("injected read fault");
+      })() },
+    });
+    const midFault = await readWithTrackedClose(failing, key);
+    const elements = [];
+    for await (const element of midFault.result.bytes) elements.push(element);
+    expect(elements.at(-1)).toMatchObject({ ok: false, failure: "storage_error" });
+    expect(midFault.closeSpy).toHaveBeenCalledTimes(1);
   });
 
   it("two concurrent same-key writes publish exactly once and leave no residue (adapter-level AB5 smoke)", async () => {

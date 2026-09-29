@@ -132,7 +132,12 @@ export function createMemoryBlobStore(options?: { faults?: MemoryBlobStoreFaults
       if (notRegular.has(k)) return { ok: false, failure: "not_regular_file" };
       const bytes = blobs.get(k);
       if (bytes === undefined) return { ok: false, failure: "blob_missing" };
-      return { ok: true, size: bytes.byteLength, bytes: streamStored(bytes, failReadAfter.get(k)) };
+      return {
+        ok: true,
+        size: bytes.byteLength,
+        bytes: streamStored(bytes, failReadAfter.get(k)),
+        close: async () => {}, // No physical handle; preserve the shared read contract.
+      };
     },
   };
 }

@@ -32,9 +32,8 @@
  * window), fstats that handle for the real size, and the returned bytes
  * read from THAT handle — a path swap after read() returns cannot redirect
  * the stream onto different bytes. The handle is closed when the stream
- * completes, fails, or the consumer breaks out; an `ok: true` result whose
- * stream is never iterated leaks the fd, so callers MUST drain or break the
- * iteration (the contract's consumers always drain).
+ * completes, fails, or the consumer breaks out. A caller that never starts
+ * iteration releases the handle through the successful result's `close()`.
  *
  * Batch 1 wires this module from TESTS ONLY — no production composition
  * (决策 16).
@@ -60,7 +59,10 @@ import { isLegalExpectedSize, verifyByteStream } from "./blob-store-verify.js";
 export interface LocalBlobStoreOptions {
   /** The storage root. Construction has ZERO fs side effects; the root is
    *  never symlink-checked itself — macOS tmpdirs legitimately traverse a
-   *  symlink (`/var` → `/private/var`). */
+   *  symlink (`/var` → `/private/var`). The directory must be exclusively
+   *  writable by the server's trusted operator/process: Node's path APIs
+   *  cannot make the namespace lstat + later child open an atomic openat
+   *  walk against a concurrent writer in this root (ADR-010, #73). */
   rootDir: string;
   io?: {
     /** TEST-ONLY seam (the bounded-read `openImpl` precedent): replaces the
@@ -89,7 +91,10 @@ function isValidKey(key: BlobKey): boolean {
  *  `<root>/<ns>` (out-of-band tampering) would be FOLLOWED by every path
  *  syscall underneath it, escaping the namespace or the root (#73: the write
  *  path had this guard, has/read did not). Classified storage_error —
- *  not_regular_file is typed for the blob target only. Returns the refusal,
+ *  not_regular_file is typed for the blob target only. This rejects a PARKED
+ *  link; it is not an atomic directory-fd walk against a concurrent writer
+ *  in rootDir (that writer is outside the adapter trust boundary, ADR-010).
+ *  Returns the refusal,
  *  or null when the dir is real. THROWS ENOENT when the namespace does not
  *  exist — has/read map that to absent/missing, write never reaches it
  *  (mkdir ran first). */
@@ -124,6 +129,7 @@ async function* streamBlob(
   handle: fs.FileHandle,
   path: string,
   impl: ((path: string) => AsyncIterable<Uint8Array> | undefined) | undefined,
+  close: () => Promise<void>,
 ): AsyncIterable<BlobStreamChunk> {
   try {
     const stream = impl?.(path) ?? defaultStreamChunks(handle);
@@ -131,7 +137,7 @@ async function* streamBlob(
   } catch (cause) {
     yield { ok: false, failure: "storage_error", cause };
   } finally {
-    await handle.close().catch(() => {});
+    await close();
   }
 }
 
@@ -283,9 +289,14 @@ export function createLocalBlobStore(options: LocalBlobStoreOptions): BlobStore 
         if (errorCode(cause) === "ELOOP") return { ok: false, failure: "not_regular_file" };
         return { ok: false, failure: "storage_error", cause };
       }
-      // streamBlob takes handle ownership — an ok:true read holds the fd
-      // until the stream is drained or broken (see the module header).
-      return { ok: true, size, bytes: streamBlob(handle, p, streamChunksImpl) };
+      // streamBlob releases the handle after iteration; close() also lets a
+      // caller abandon an unstarted stream without leaking its fd (#74).
+      let closePromise: Promise<void> | undefined;
+      const close = (): Promise<void> => {
+        closePromise ??= handle.close().catch(() => {});
+        return closePromise;
+      };
+      return { ok: true, size, bytes: streamBlob(handle, p, streamChunksImpl, close), close };
     },
   };
 }
