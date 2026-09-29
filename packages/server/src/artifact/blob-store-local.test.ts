@@ -220,7 +220,7 @@ describe("local BlobStore specifics", () => {
     expect(await readdir(rootDir)).toEqual([]);
   });
 
-  it("refuses to write when the namespace dir is a symlink (storage_error), while a symlinked ROOT works fine", async () => {
+  it("refuses ALL three methods when the namespace dir is a symlink (storage_error), while a symlinked ROOT works fine", async () => {
     const rootDir = await tmpRoot();
     const store = createLocalBlobStore({ rootDir });
     const bytes = new TextEncoder().encode("guarded namespace");
@@ -238,6 +238,16 @@ describe("local BlobStore specifics", () => {
     // Nothing at all landed through the symlink (the guard fires before the
     // tmp file is even opened).
     expect(await readdir(elsewhere)).toEqual([]);
+    // has/read refuse too (#73) — NEVER a clean present:false/blob_missing
+    // that would route the key onto the re-upload path.
+    const h = await store.has(key);
+    expect(h.ok).toBe(false);
+    if (h.ok) throw new Error("unreachable");
+    expect(h.failure).toBe("storage_error");
+    const r = await store.read(key);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error("unreachable");
+    expect(r.failure).toBe("storage_error");
     // A symlinked ROOT is a legitimate deployment shape (macOS tmpdir:
     // /var → /private/var) and must work untouched.
     const realRoot = await tmpRoot();
@@ -252,6 +262,59 @@ describe("local BlobStore specifics", () => {
     expect(await aliasStore.has(key)).toEqual({ ok: true, present: true });
     // The blob physically landed in the real root.
     expect(readFileSync(path.join(realRoot, NS, key.hash)).equals(Buffer.from(bytes))).toBe(true);
+  });
+
+  it("a symlinked namespace is never followed on has/read — no cross-namespace reads (#73)", async () => {
+    const rootDir = await tmpRoot();
+    const store = createLocalBlobStore({ rootDir });
+    const bytes = new TextEncoder().encode("namespace B content");
+    const keyB: BlobKey = { namespaceId: "ns-b", hash: sha256Hex(bytes) };
+    expect(await store.writeVerified({ ...keyB, expectedSize: bytes.byteLength, bytes: chunks(bytes, 4) })).toEqual({
+      ok: true,
+      size: bytes.byteLength,
+      published: true,
+    });
+    // Park ns-a as a symlink to ns-b: without the guard, has/read of
+    // (ns-a, B's hash) would follow the link and serve B's blob under A's
+    // namespace — a cross-namespace isolation break needing no race.
+    symlinkSync(path.join(rootDir, "ns-b"), path.join(rootDir, "ns-a"), "dir");
+    const viaA: BlobKey = { namespaceId: "ns-a", hash: keyB.hash };
+    const h = await store.has(viaA);
+    expect(h.ok).toBe(false);
+    if (h.ok) throw new Error("unreachable");
+    expect(h.failure).toBe("storage_error");
+    const r = await store.read(viaA);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error("unreachable");
+    expect(r.failure).toBe("storage_error");
+    // The real namespace is unaffected.
+    expect(await store.has(keyB)).toEqual({ ok: true, present: true });
+  });
+
+  it("a returned read stream stays bound to the inode verified at open time — a later path swap cannot redirect it (#74)", async () => {
+    const rootDir = await tmpRoot();
+    const store = createLocalBlobStore({ rootDir });
+    const bytes = new TextEncoder().encode("original inode content");
+    const key: BlobKey = { namespaceId: NS, hash: sha256Hex(bytes) };
+    expect(
+      await store.writeVerified({ ...key, expectedSize: bytes.byteLength, bytes: chunks(bytes, 5) }),
+    ).toEqual({ ok: true, size: bytes.byteLength, published: true });
+    const rd = await store.read(key);
+    expect(rd.ok).toBe(true);
+    if (!rd.ok) throw new Error("unreachable");
+    expect(rd.size).toBe(bytes.byteLength);
+    // Swap the PATH's target AFTER read() returned: a new inode with
+    // different bytes takes over the name. A path-reopening stream would
+    // serve the swapped bytes; the fd-bound stream serves the ORIGINAL inode.
+    const p = path.join(rootDir, NS, key.hash);
+    await rm(p);
+    writeFileSync(p, "swapped-in other bytes");
+    const parts: Uint8Array[] = [];
+    for await (const element of rd.bytes) {
+      expect(element.ok).toBe(true);
+      if (element.ok) parts.push(element.chunk);
+    }
+    expect(Buffer.concat(parts.map((c) => Buffer.from(c))).equals(Buffer.from(bytes))).toBe(true);
   });
 
   it("two concurrent same-key writes publish exactly once and leave no residue (adapter-level AB5 smoke)", async () => {
