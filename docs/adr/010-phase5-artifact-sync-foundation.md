@@ -134,3 +134,10 @@ wire 错误形状复用 `apiErrorSchema` `{error, code?}`；错误文本不是�
 - **nsDir symlink 守卫**：写路径拒绝 symlink 形态的 namespace 目录（`storage_error`——经它落盘会逃逸存储根）；存储根本身永不查 symlink（macOS tmpdir 经 `/var→/private/var` 合法穿越）。
 - **fsync 粒度与停止边界**：决策 14 的 fsync 指 blob 文件本身；不做目录 fsync（目录项崩溃丢失恰好是 AB8「元数据在、文件无」这一架构已容忍的场景，prepare 要求重传、commit 拒绝不完整快照）；崩溃遗留临时文件的全局清理维持权威计划的停止边界（本批不做，残留惰性无害由测试钉住）。
 - **共享契约套件的落点与故障注入缝**：套件居 `src/testkit/blob-store-contract.ts`（`tsconfig.build.json` 只排除 `*.test.ts` 与 `src/testkit/**`——放 `src/artifact/` 会进 dist 且引用 devDependency vitest）；memory adapter 的 fault 集合与 local adapter 的 `io.streamChunksImpl` 均为 TEST-ONLY 缝（config.ts `hooks.afterResolve` 与 daemon bounded-read `openImpl` 先例），生产装配不构造任何 adapter（决策 16，AD4 钉住）。
+
+### 2026-09-29（片 3 三轨复审 Round 1 修复：#73/#74/#75/#76）
+
+- **内存 adapter 到达即拷贝（#75）**：原实现留存 chunk 引用、hash 验证通过后才复制——合法复用同一缓冲的源流可在验证覆盖后改写已哈希字节（验证所见 `[A B]`、落库变 `[B B]`），违反已验证写入且双 adapter 不等价（本地 adapter 逐块即时落盘天然免疫）。改为 `onChunk` 内到达即拷贝（显式 `new Uint8Array` + `set`，不用 `chunk.slice()`——Buffer 型 chunk 的 `slice()` 返回视图）。共享套件新增用例钉死：单缓冲跨 yield 复用源必须存下「哈希覆盖的那版字节」，双 adapter 一致（AB10）。
+- **has/read 的 namespace 目录守卫（#73）**：原实现只对最终 blob 路径 `lstat`，停在 `<root>/<ns>` 的 symlink 会被路径系统调用跟随——跨命名空间读取无需竞态。三方法统一走 `nsDirGuard`（symlink 或非目录归 `storage_error`——`not_regular_file` 类型上专属 blob 目标；namespace 不存在仍是 ENOENT 干净缺席）。rootDir 永不查 symlink 的既有裁决不变。
+- **读流绑定打开期已验证的 fd（#74）**：原实现 `read()` 完成 lstat/open/fstat 后关闭句柄，返回的惰性流再按路径重开——`read()` 返回与开始迭代之间换目标即可改流（symlink 换入则越根读取，普通文件换入则 size 与内容分叉）。改为打开一次（`O_NOFOLLOW` 关掉 lstat→open 的最后一个组件换入窗口，ELOOP 归 `not_regular_file`；非 POSIX 平台缺该常量时退化为 0，lstat 前置检查仍确定性分类）、fstat 同一句柄、流从该 fd 读取；`streamBlob` 持有句柄并在流完成/失败/消费者中断时关闭。`ok:true` 结果若迭代器从未被消费则 fd 由调用方负责（契约消费者总是排空流），已在模块头注释登记。TEST-ONLY 缝 `streamChunksImpl` 保持按路径签名不变——注入故障流仍走 adapter 真实的终止元素归约代码（#66(a) 证据强度不降）。
+- **AD4 daemon 出站守卫补半（#76）**：原守卫只钉静态 identity/capabilities，未来若在出站路径独立加请求仍会通过。新增钉：runtime 实际构造的 poll body 键集精确等于五静态键 + `availableSlots`（`watchDigest` 不发送——协议字段存在但 Batch 1 无消费者）；wire client 一个完整 poll+report 周期的请求目标恰为 `/api/machine/poll` 与 `/api/machine/report` 两个 Phase 1 端点。Batch 2 watcher 接线须显式更新此钉。
