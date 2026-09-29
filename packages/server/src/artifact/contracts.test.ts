@@ -2,10 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import type { ArtifactAttribution, ArtifactAttributionResolver } from "./attribution.js";
 import type {
-  BlobKey,
   BlobPresenceFailure,
   BlobReadFailure,
-  BlobStore,
   BlobStoreFailure,
   BlobStreamChunk,
 } from "./blob-store.js";
@@ -13,23 +11,13 @@ import type {
 /**
  * Compile-level evidence for the slice-1 contract freeze: the two internal
  * interfaces are satisfiable, their result unions discriminate, and the
- * failure literals stay exhaustively switchable. The stubs are THROWING
- * placeholders — not working implementations (the adapters and their shared
- * contract test land in slice 3); they double as the slice 2/3 fake starting
- * point.
+ * failure literals stay exhaustively switchable. Slice 3 replaces the
+ * throwing BlobStore stub with real adapters (blob-store-memory.ts,
+ * blob-store-local.ts) running the ONE shared contract suite
+ * (testkit/blob-store-contract.ts), so that stub is RETIRED here; the
+ * attribution resolver stub remains — its implementation lands with the
+ * ArtifactHome state machine (slice 4+).
  */
-
-const blobStore: BlobStore = {
-  writeVerified() {
-    throw new Error("not implemented");
-  },
-  has() {
-    throw new Error("not implemented");
-  },
-  read() {
-    throw new Error("not implemented");
-  },
-};
 
 const resolver: ArtifactAttributionResolver = {
   resolve() {
@@ -112,9 +100,7 @@ describe("artifact internal contracts (frozen in Batch 1 slice 1)", () => {
     expect(missing.ok).toBe(false);
   });
 
-  it("the stubs satisfy the interfaces (compile-level) and refuse to work", async () => {
-    const key: BlobKey = { namespaceId: "ns-1", hash: "a".repeat(64) };
-    await expect(async () => blobStore.has(key)).rejects.toThrow("not implemented");
+  it("the attribution resolver stub satisfies its interface (compile-level) and refuses to work", async () => {
     await expect(async () => resolver.resolve({ machineId: "m-0123456789abcdef" })).rejects.toThrow("not implemented");
   });
 });
