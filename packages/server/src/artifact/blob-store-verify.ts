@@ -34,6 +34,13 @@ export type VerifiedStream =
   | { ok: true; size: number; digestHex: string }
   | { ok: false; failure: "content_mismatch" | "storage_error"; cause?: unknown };
 
+/** The expectedSize domain: a safe integer within 0..ARTIFACT_FILE_MAX_BYTES.
+ *  Adapters may check this BEFORE any fs side effect; verifyByteStream
+ *  always re-checks it internally (zero source pulls on rejection). */
+export function isLegalExpectedSize(expectedSize: number): boolean {
+  return Number.isSafeInteger(expectedSize) && expectedSize >= 0 && expectedSize <= ARTIFACT_FILE_MAX_BYTES;
+}
+
 export async function verifyByteStream(input: {
   expectedHash: string;
   expectedSize: number;
@@ -43,7 +50,7 @@ export async function verifyByteStream(input: {
   onChunk?: (chunk: Uint8Array) => Promise<void>;
 }): Promise<VerifiedStream> {
   const { expectedHash, expectedSize, bytes, onChunk } = input;
-  if (!Number.isSafeInteger(expectedSize) || expectedSize < 0 || expectedSize > ARTIFACT_FILE_MAX_BYTES) {
+  if (!isLegalExpectedSize(expectedSize)) {
     return { ok: false, failure: "content_mismatch" };
   }
   const hash = createHash("sha256");
