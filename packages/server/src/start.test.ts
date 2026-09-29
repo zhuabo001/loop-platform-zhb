@@ -10,7 +10,7 @@
  *  - a data dir that can't be created fails boot fast;
  *  - the production mint issues shape-valid `rk_` credentials.
  */
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -499,5 +499,20 @@ describe("production mint", () => {
     const tokens = new Set(Array.from({ length: 100 }, () => mintRunCredential()));
     expect(tokens.size).toBe(100);
     for (const t of tokens) expect(isRunTokenShape(t)).toBe(true);
+  });
+});
+
+describe("AD4 artifact-sync dormancy (Phase 5 Batch 1 slice 3)", () => {
+  it("production bootstrap constructs NO BlobStore and starts NO watcher (ADR-010 决策 16)", async () => {
+    const dir = await tmpDataDir();
+    const b = await boot(dir);
+    // The whole assembled graph is exactly these five nodes — there is no
+    // blobStore / artifactHome / watcher property to be reached. A future
+    // batch wiring artifact sync into production must update this pin
+    // deliberately.
+    expect(Object.keys(b).sort()).toEqual(["app", "coordinator", "handle", "scheduler", "sweep"]);
+    // And nothing artifact-shaped landed on disk at boot.
+    const entries = await readdir(dir);
+    expect(entries.filter((e) => /artifact|blob|watch/i.test(e))).toEqual([]);
   });
 });

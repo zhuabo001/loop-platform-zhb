@@ -124,3 +124,13 @@ wire 错误形状复用 `apiErrorSchema` `{error, code?}`；错误文本不是�
 ### 2026-09-28（片 2 三轨复审 Round 2 修复：#71）
 
 - **绑定与配置更新的行级互斥**：上述普通子查询仅看见语句开始时的 Loop 快照，不能阻止另一事务在绑定语句执行期间提交新配置。bind 的代际子查询改用 `FOR UPDATE` 锁定 Loop 行，锁持续到独立调用的语句提交或调用方 Report 事务提交；配置写入 `UPDATE loops` 与其互斥。若配置先提交，绑定读取更新后的代际并守卫失败；若绑定先取得锁，配置等待绑定提交。`record_error` 仍不锁 Loop，因其不绑定快照。
+
+### 2026-09-29（片 3 BlobStore adapter）
+
+- **原子发布的机制对齐**：本地 adapter 用 `link(2)` 实现决策 14 的「原子发布」——EEXIST 即原子 test-and-set，`published` 标志在并发下同 key 恰一个 `true`（rename-always 只能靠发布前 lstat，TOCTOU 竞态下不诚实）。权威计划片 3 行的「fsync 后原子 rename」是机制措辞，§3 规范段的「原子发布」语义不变。异类挂载上的 `EPERM`/`EXDEV` 归 `storage_error` 诚实失败，不做静默 rename fallback（那会破坏 no-clobber 语义）。
+- **源中断的分类**：`writeVerified` 的字节流中途 throw（Batch 2 即 HTTP 请求体断流）归 `storage_error` 而非 `content_mismatch`——后者的 wire 重试类是 terminal，会把瞬时传输故障永久化；前者是 `idempotent_retry`（决策 13 的码表）。干净 EOF 但字节不足仍归 `content_mismatch`（同一字节流重试必然同样短，terminal 正确）。
+- **`expectedSize` 值域纵深**：非 safe integer、负数或超 `ARTIFACT_FILE_MAX_BYTES` 的声明在 adapter 层即归 `content_mismatch` 且零拉取源流——决策 2 的值域纪律延伸到内部接口的 size 参数；决策 14 的契约文本未含此上限，此处登记为实现层防御（`isLegalExpectedSize` 与 `verifyByteStream` 共用同一判定）。
+- **EEXIST 与 symlink 的 lstat 纪律**：发布的 EEXIST 分支与 `has`/`read` 全程 `lstat`（非 `stat`）——悬空 symlink 在 `stat` 下被错分为 ENOENT。EEXIST 命中普通文件即 `published:false`，不复验、不修复既有字节（与 read 不复验同一哲学：写路径已验证过内容寻址）。
+- **nsDir symlink 守卫**：写路径拒绝 symlink 形态的 namespace 目录（`storage_error`——经它落盘会逃逸存储根）；存储根本身永不查 symlink（macOS tmpdir 经 `/var→/private/var` 合法穿越）。
+- **fsync 粒度与停止边界**：决策 14 的 fsync 指 blob 文件本身；不做目录 fsync（目录项崩溃丢失恰好是 AB8「元数据在、文件无」这一架构已容忍的场景，prepare 要求重传、commit 拒绝不完整快照）；崩溃遗留临时文件的全局清理维持权威计划的停止边界（本批不做，残留惰性无害由测试钉住）。
+- **共享契约套件的落点与故障注入缝**：套件居 `src/testkit/blob-store-contract.ts`（`tsconfig.build.json` 只排除 `*.test.ts` 与 `src/testkit/**`——放 `src/artifact/` 会进 dist 且引用 devDependency vitest）；memory adapter 的 fault 集合与 local adapter 的 `io.streamChunksImpl` 均为 TEST-ONLY 缝（config.ts `hooks.afterResolve` 与 daemon bounded-read `openImpl` 先例），生产装配不构造任何 adapter（决策 16，AD4 钉住）。
