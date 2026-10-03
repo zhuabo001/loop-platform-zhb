@@ -50,14 +50,14 @@
 
 `packages/server/src/phase5-batch1-e2e.test.ts`（1 例，单跑 1.85s）——权威计划 L171 段落逐句落地：
 
-1. **真实环境**：一次 `mkdtemp` 临时根；`dataDir` 为根自身（PGlite 库在 `<dataDir>/pgdata`），Blob 根为 `<root>/blobs`；`openMigratedDb({dataDir})` + `createLocalBlobStore({rootDir})`。片 1–5 全部套件为内存 PGlite/内存 store，本文件是本批唯一的磁盘路径。
+1. **真实环境**：一次 `mkdtemp` 临时根；`dataDir` 为根自身（PGlite 库在 `<dataDir>/pgdata`），Blob 根为 `<root>/blobs`；`openMigratedDb({dataDir})` + `createLocalBlobStore({rootDir})`。片 1–5 亦有各自的磁盘触点（AC7 的文件库回执重开、迁移套件的文件库、local store 的重启读取），但**本文件是本批新增、唯一一条全部模块同时落在真实磁盘上的完整跨模块链**。
 2. **seed 四方链**（manifest = run = loop = 可信归属，全部 `m-1`），配置经真实 `updateArtifactConfig` 写路径落地（断言 `outcome:"changed"`，代际 0→1；静默 noop 会失败）。
 3. **prepare → PUT → commit**：按协商 `needHashes` 上传真实多 chunk 字节流（含 4 KiB 二进制），commit 回执逐字 `{artifactSnapshotId:"amf-1", manifestRevision:1}`；manifest 整行 `toEqual`（namespace/machine/loop/代际/entries/按路径 totalBytes/committedAt）；当前视图全字段；成功三元组（attemptedAt/succeededAt/error）。
 4. **binding plan 在测试事务内应用**：`planArtifactSnapshotBinding` 断言 `kind:"bind"`（四方链+代际复验通过），`db.transaction` 内 `applyArtifactBindingPlan` 落 Run `artifactSnapshotId`；blob 字节经 store `read()` 逐元素断言后逐字节等于写入，并与磁盘原始文件比对。
-5. **关库 → 同根重开**：`closeDb` → 同一 `dataDir` 重开（migration 二次执行为幂等 no-op）→ 同一 Blob 根的**新** store 实例（重启后的进程）。
+5. **关库 → 同根重开**：`closeDb` → 同一 `dataDir` 重开（migration 二次执行为幂等 no-op）→ 同一 Blob 根的**新** store 实例。同一测试进程内关库重开并重新创建实例（并非新 OS 进程；权威计划亦只要求关库重开）。
 6. **持久化复验**：manifest 整行、当前视图、Run 引用与同步错误、会话回执、两份 blob 字节——全部逐项相等。
 7. **重试同一 commit**：回执逐字相等、manifest 恰 1 行、会话恰 1 行、`snapshotLoops` 重放前后**逐行相等**（零写入——比只看指针更强的「不创建第二份记录」证据）。
-8. **文件变化再提交**：新会话 `sync-2`（换 requestId）、基础 revision 1；`needHashes` **恰为变更文件的 hash**（未变文件跨重启仍被协商去重，同时证元数据行与真实文件都在）→ 只 PUT 变更内容 → commit `{amf-2, manifestRevision:2}`。
+8. **文件变化再提交**：新会话 `sync-2`（换 requestId）、基础 revision 1；`needHashes` **恰为变更文件的 hash**（未变文件跨关库重开仍被协商去重，同时证元数据行与真实文件都在）→ 只 PUT 变更内容 → commit `{amf-2, manifestRevision:2}`。
 9. **旧快照不变**：`amf-1` 整行不变、旧内容的旧 Blob 字节仍在（内容寻址、无 GC 的容忍边界在真实磁盘上的体现）、当前视图指向 `amf-2` 且不 stale。
 10. **重放旧 commit 不回退指针**：返回旧回执、当前指针仍 `amf-2`/revision 2、再次零写入；真实 Blob 根内恰为三个已发布 blob、无任何 `.tmp-*` 残留。
 
@@ -85,9 +85,9 @@ $ git diff --check   # EXIT=0
 - **AD2**：生产 Create 不持久化 `artifactDir`；Poll 响应无 `watch`/`watchDigest`、claim 条件不变。
 - **AD3**：生产 Report 忽略 `artifactSnapshotId`/`artifactSyncError`，终态行为与 Phase 4 一致。
 - **AD4**：生产启动不构造 BlobStore、不启动 watcher；Daemon capability 精确等值、出站 poll/report 零 artifact-sync 流量。
-- **只由测试接线**：片 6 工作树实测以下 grep 全空——
+- **只由测试接线**（限定为本批 Artifact 功能的 import 与消费）：片 6 工作树按计划 grep 实测全空——
   - 生产代码零 import artifact 模块（`artifact/sync|config|binding-plan|blob-store-local|attribution`，排除 `src/artifact/` 自身与 `*.test.ts`）；
-  - 装配面（`http/`、`coordinator/`、`store/`、`start.ts`）零 artifact 引用；
+  - 装配面（`http/`、`coordinator/`、`store/`、`start.ts`）零本批 Artifact 模块引用；更宽松的大小写不敏感 `artifact` 文本匹配仅命中两处无关行——`start.ts:7`（构建产物 "BUILT artifact" 注释）与 `store/report.ts:100`（Phase 1 既有预声明字段 `artifacts`，从不写入）——均非本批接线；
   - `packages/daemon/src` 零 `artifact-sync`/`artifactSnapshotId`/`artifactSyncError`/`watchDigest` 引用。
 - **片 6 变更面**：`git diff --stat 85e526e..ec0e519` 仅 `phase5-batch1-e2e.test.ts`（+393）；无生产代码改动。
 - **ADR-002 复核确认（片 1 修订，无漂移）**：① protocol 主入口无 `node:` 内建依赖（仅 `./node` 子入口）；② Artifact wire DTO 仍为预声明形状、无生产消费（AD1 + 装配面 grep）；③ 片 3–5 未引入第三个窄例外。

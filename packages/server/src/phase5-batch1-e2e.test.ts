@@ -18,9 +18,11 @@
  *
  * Infrastructure discipline:
  *   - file-backed PGlite (`openMigratedDb({ dataDir })`, `<dataDir>/pgdata`)
- *     + the REAL local BlobStore on a REAL mkdtemp root + a real temp data
- *     dir — the slice 1–5 suites all ran in-memory and this is the batch's
- *     one on-disk path;
+ *     + the REAL local BlobStore on a REAL mkdtemp root — the batch's
+ *     COMPLETE cross-module on-disk chain. Earlier slices each had disk
+ *     touches of their own (AC7's file-backed receipt reopen, the migration
+ *     suites' file databases, the local store's restart read), but none ran
+ *     every module on disk together;
  *   - INTERNAL MODULES ONLY: no HTTP app, no bootstrapServer, no coordinator
  *     or store write path, no watcher. `db/index.ts` (the production DB open
  *     path, precedent fault-injection.test.ts T4) is deliberately used — the
@@ -290,7 +292,8 @@ describe("Phase 5 Batch 1 internal integration acceptance (plan §4 slice 6)", (
 
     // ---- stage 11: REOPEN on the same dataDir (migrations re-run must be a
     // no-op — AM5's idempotence, now across instantiations) + a NEW store
-    // instance over the same blob root (the restarted process).
+    // instance over the same blob root (same-process close/reopen with
+    // freshly constructed handles — not a new OS process).
     const h2 = await openMigratedDb({ dataDir });
     handles.push(h2);
     db = h2.db;
