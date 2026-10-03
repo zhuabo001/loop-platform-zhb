@@ -7,12 +7,17 @@
  *
  * PREPARE negotiates a sync session:
  *  - Fixed evaluation order (决策 13's per-step codes): manifest policy →
- *    attribution → loop scope → configured → config generation → base
- *    revision → idempotency. Validation precedes attribution because a
- *    manifest failure is payload-local and leaks nothing about scope;
- *    generation/base checks precede the idempotency lookup so an
- *    old-generation request is a config/manifest conflict even when its key
- *    would otherwise "reuse" a stale session (AM6's session-generation half).
+ *    attribution → loop scope → committed replay → configured → config
+ *    generation → base revision → pending/new idempotency. Validation
+ *    precedes attribution because a manifest failure is payload-local and
+ *    leaks nothing about scope. The committed replay precedes the
+ *    configured/generation/base checks: a real commit advanced the loop's
+ *    base past the session's, so those checks would misclassify the original
+ *    payload's re-prepare as a conflict and orphan the stored receipt (决策
+ *    9's recovery path). Only a PENDING-or-new key is decided by the current
+ *    generation/base, so an old-generation request is a config/manifest
+ *    conflict even when its key would otherwise "reuse" a stale pending
+ *    session (AM6's session-generation half).
  *  - Idempotency (决策 9): the session key is (namespaceId, machineId,
  *    requestId); the fingerprint (决策 6) covers the canonical payload sans
  *    requestId. Same key + same fingerprint reuses the session — an EXPIRED
@@ -388,14 +393,6 @@ async function prepareOnce(
   // the same leak-free refusal (决策 13: existence never leaks across scope).
   const loop = (await deps.db.select().from(loops).where(eq(loops.id, request.loopId)).limit(1))[0];
   if (!loop || loop.machineId !== attribution.machineId) return { ok: false, failure: "loop_not_found" };
-  // (4) An unconfigured loop never starts a sync (plan §1's dormancy rule).
-  if (loop.artifactDir === null) return { ok: false, failure: "artifact_dir_unconfigured" };
-  // (5)/(6) Generation + base BEFORE the idempotency lookup (决策 6/13): an
-  // old-generation request conflicts even when its key would otherwise reuse
-  // a stale session (which could never commit anyway — PUT/commit re-check
-  // the generation against the CURRENT loop).
-  if (request.configRevision !== loop.artifactConfigRevision) return { ok: false, failure: "config_conflict" };
-  if (request.baseManifestRevision !== loop.artifactManifestRevision) return { ok: false, failure: "manifest_conflict" };
 
   const fingerprint = preparePayloadFingerprint({
     loopId: request.loopId,
@@ -405,6 +402,33 @@ async function prepareOnce(
   });
   const key: SessionKey = { namespaceId: attribution.namespaceId, machineId: attribution.machineId, requestId: request.requestId };
   const existing = (await deps.db.select().from(artifactSyncSessions).where(sessionKeyWhere(key)).limit(1))[0] ?? null;
+
+  // 决策 9's committed replay precedes the configured/generation/base checks:
+  // a REAL commit advanced the loop's base (and possibly generation) past the
+  // session's, so those checks would misclassify the original payload's
+  // re-prepare as a conflict and make the stored receipt unrecoverable
+  // through prepare. Same key + same fingerprint + a receipt returns the
+  // original session verbatim (needHashes is empty — the receipt is recovered
+  // by re-committing this session, which replays it). A different fingerprint
+  // NEVER replays (the fingerprint is the payload contract — the planner's
+  // conflict branch below decides that case).
+  if (existing !== null && existing.payloadFingerprint === fingerprint && existing.receipt !== null) {
+    return {
+      ok: true,
+      outcome: "committed",
+      response: { syncId: existing.id, needHashes: [], expiresAt: existing.expiresAt },
+    };
+  }
+
+  // (4) An unconfigured loop never starts a sync (plan §1's dormancy rule).
+  if (loop.artifactDir === null) return { ok: false, failure: "artifact_dir_unconfigured" };
+  // (5)/(6) Generation + base BEFORE the pending/new idempotency decision
+  // (决策 6/13): an old-generation request conflicts even when its key would
+  // otherwise reuse a stale PENDING session (which could never commit anyway
+  // — PUT/commit re-check the generation against the CURRENT loop).
+  if (request.configRevision !== loop.artifactConfigRevision) return { ok: false, failure: "config_conflict" };
+  if (request.baseManifestRevision !== loop.artifactManifestRevision) return { ok: false, failure: "manifest_conflict" };
+
   // TEST-ONLY interleaving seam (slice 5 fires a REAL competing write here).
   await deps.hooks?.afterResolve?.("prepare", request.loopId);
 

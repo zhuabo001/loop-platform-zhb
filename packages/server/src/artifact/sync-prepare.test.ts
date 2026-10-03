@@ -13,7 +13,8 @@
  *                 (a concurrent same-key insert never leaks an exception).
  *                 Scope/guards — attribution_missing, leak-free
  *                 loop_not_found, artifact_dir_unconfigured, config/base
- *                 checks BEFORE the idempotency lookup (AM6 prepare leg).
+ *                 checks deciding PENDING/NEW keys only (a committed replay
+ *                 precedes them — 决策 9's recovery path), AM6 prepare leg.
  *                 AB8 prepare half — a metadata row without its file still
  *                 demands re-upload; a has() failure is storage_error.
  *                 prepare writes NOTHING to the current view (loops row
@@ -32,13 +33,19 @@ import {
 import { preparePayloadFingerprint } from "@loopzhb/protocol/node";
 
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
-import { artifactBlobs, artifactSyncSessions, type ArtifactSyncSessionRow } from "../db/schema.js";
+import { artifactBlobs, artifactSyncSessions, loops, type ArtifactSyncSessionRow } from "../db/schema.js";
 import { FakeClock, seedLoop, seedMachine, snapshotLoops } from "../testkit/index.js";
 import type { ArtifactAttributionResolver } from "./attribution.js";
 import { createMemoryBlobStore, type MemoryBlobStoreFaults } from "./blob-store-memory.js";
 import type { BlobStore } from "./blob-store.js";
 import { updateArtifactConfig } from "./config.js";
-import { planPrepareSession, prepareArtifactSync, type ArtifactHomeDeps } from "./sync.js";
+import {
+  commitArtifactSync,
+  planPrepareSession,
+  prepareArtifactSync,
+  putArtifactBlob,
+  type ArtifactHomeDeps,
+} from "./sync.js";
 
 // ---- shared fixture helpers ----
 
@@ -139,6 +146,7 @@ describe("prepare (real PGlite)", () => {
   let store: BlobStore;
   let deps: ArtifactHomeDeps;
   let syncSeq = 0;
+  let manifestSeq = 0;
 
   afterEach(async () => {
     await Promise.all(handles.splice(0).map((h) => closeDb(h).catch(() => {})));
@@ -150,12 +158,13 @@ describe("prepare (real PGlite)", () => {
     db = h.db;
     clock = new FakeClock();
     syncSeq = 0; // deterministic ids per test
+    manifestSeq = 0;
     store = createMemoryBlobStore({ faults: options.faults });
     await seedMachine(db, "m-1");
     deps = {
       db,
       clock,
-      ids: { syncId: () => `sync-${++syncSeq}`, manifestId: () => "amf-unused-in-prepare" },
+      ids: { syncId: () => `sync-${++syncSeq}`, manifestId: () => `amf-${++manifestSeq}` },
       blobStore: store,
       attribution: staticAttribution({ "m-1": "ns-1" }),
       hooks: options.hooks,
@@ -316,26 +325,55 @@ describe("prepare (real PGlite)", () => {
     expect(conflict).toEqual({ ok: false, failure: "manifest_conflict" });
   });
 
-  it("AC8: re-preparing a committed key returns the original session — receipt replay stays with commit", async () => {
+  it("AC8/决策 9: re-preparing a committed key replays the original session — even after the REAL commit advanced the base (S4-2)", async () => {
     await fresh();
     await seedConfiguredLoop();
     const first = await prepareArtifactSync(deps, { machineId: "m-1" }, makeRequest());
     if (!first.ok) throw new Error("first prepare must succeed");
     const syncId = first.response.syncId;
-    await db
-      .update(artifactSyncSessions)
-      .set({ receipt: { artifactSnapshotId: "amf-1", manifestRevision: 1 } })
-      .where(eq(artifactSyncSessions.id, syncId));
-    const stored = (await sessions())[0]!;
-    expect(stored.receipt).toEqual({ artifactSnapshotId: "amf-1", manifestRevision: 1 });
 
-    // Even past the pending TTL: a committed receipt never expires (决策 9).
+    // A REAL commit — PUT both blobs, then commit. The loop's base advances
+    // to 1, so the original request (base 0) would fail the base check if it
+    // ever reached it: the stored receipt must replay BEFORE that check.
+    for (const content of [CONTENT_A, CONTENT_B]) {
+      const bytes = bytesOf(content);
+      const uploaded = await putArtifactBlob(deps, { machineId: "m-1" }, {
+        syncId,
+        hash: hashOf(content),
+        bytes: (async function* () {
+          yield bytes;
+        })(),
+      });
+      if (!uploaded.ok) throw new Error(`put fixture must succeed: ${JSON.stringify(uploaded)}`);
+    }
+    const committed = await commitArtifactSync(deps, { machineId: "m-1" }, { syncId });
+    if (!committed.ok) throw new Error(`commit fixture must succeed: ${JSON.stringify(committed)}`);
+    expect((await db.select().from(loops).where(eq(loops.id, "loop-1")))[0]!.artifactManifestRevision).toBe(1);
+
+    // A different payload on the committed key NEVER replays — the
+    // fingerprint is the payload contract (an honest new base reaches the
+    // planner, which conflicts).
+    const different = await prepareArtifactSync(
+      deps,
+      { machineId: "m-1" },
+      makeRequest({ baseManifestRevision: 1, entries: [{ path: "c.txt", hash: HASH_C, size: 3 }] }),
+    );
+    expect(different).toEqual({ ok: false, failure: "manifest_conflict" });
+
+    // The generation moves AND the pending TTL lapses — the original
+    // payload's replay still precedes every one of those checks.
+    await updateArtifactConfig({ db, clock }, "loop-1", { artifactDir: "/data-2" });
     clock.advance(ARTIFACT_SYNC_SESSION_TTL_MILLIS * 2);
-    const result = await prepareArtifactSync(deps, { machineId: "m-1" }, makeRequest());
-    expect(result).toEqual({
+    const replay = await prepareArtifactSync(deps, { machineId: "m-1" }, makeRequest());
+    expect(replay).toEqual({
       ok: true,
       outcome: "committed",
-      response: { syncId, needHashes: [], expiresAt: stored.expiresAt },
+      response: { syncId, needHashes: [], expiresAt: first.response.expiresAt },
+    });
+    // …and the receipt itself is recovered by re-committing that session.
+    await expect(commitArtifactSync(deps, { machineId: "m-1" }, { syncId })).resolves.toEqual({
+      ok: true,
+      receipt: committed.receipt,
     });
   });
 
