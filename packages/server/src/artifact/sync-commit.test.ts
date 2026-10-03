@@ -27,11 +27,18 @@
  *                 unique-violation RaceLost bound).
  *  AC4 matrix:    fault injection at EVERY commit-tx step (guarded loop
  *                 UPDATE → manifest INSERT → throw-only seam → receipt
- *                 UPDATE): a throw propagates RAW with no retry and zero
- *                 partial writes (each step's predecessor provably rolled
- *                 back); a zero-row guard result is a guard loss — the
- *                 bounded re-run converges, a persistent loss fails closed
- *                 as RaceLost.
+ *                 UPDATE). Throws split by classification (A5-1 Round 1):
+ *                 an IDENTIFIED recoverable storage failure (SQLSTATE
+ *                 08/53/57/58 classes, walked along the cause chain) lands
+ *                 as the stable storage_error result — zero partial writes,
+ *                 a best-effort stamp, no re-run, and the SAME session's
+ *                 retry converges once the fault lifts; an UNCLASSIFIED
+ *                 throw (uncoded, or a coded non-recoverable class) keeps
+ *                 the raw-throw boundary with zero partial writes and no
+ *                 stamp (each step's predecessor provably rolled back); a
+ *                 zero-row guard result is a guard loss — the bounded
+ *                 re-run converges, a persistent loss fails closed as
+ *                 RaceLost.
  */
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
@@ -835,10 +842,18 @@ describe("commit (real PGlite + memory BlobStore)", () => {
   // throw rolls back EVERYTHING; (d) a PERSISTENT 23505 fails closed as
   // RaceLost after exactly two attempts; the pre-write loop-vanish loses the
   // guard and re-resolves. The rows below inject at (c), (d) and (f)
-  // themselves. Every zero-write assertion is the same triple: snapshotLoops
-  // byte-identical + no manifest row + the session receipt null.
+  // themselves, split by failure classification (A5-1 Round 1): an
+  // UNCLASSIFIED throw (an uncoded Error, or a SQLSTATE outside the
+  // recoverable classes) keeps the raw-throw boundary — no retry, zero
+  // partial writes, NO stamp; an IDENTIFIED recoverable storage failure
+  // (SQLSTATE 08/53/57/58) lands as the stable storage_error result — zero
+  // partial writes, a best-effort stamp, no re-run, and the same session's
+  // retry converges once the fault lifts. Every zero-partial-write assertion
+  // is the same triple: the pointer unmoved + no manifest row + the session
+  // receipt null (the raw rows also assert the loop row byte-identical — no
+  // stamp lands there).
 
-  it("AC4: the guarded loop UPDATE throwing aborts the whole transaction — raw propagation, NO retry, zero partial writes", async () => {
+  it("AC4: an UNCLASSIFIED throw at the guarded loop UPDATE keeps the raw-throw boundary — aborts the whole transaction, NO retry, zero partial writes, no stamp", async () => {
     await fresh();
     await seedConfiguredLoop();
     const syncId = await negotiate({ entries: [] }); // negotiated BEFORE the fault deps swap
@@ -906,7 +921,7 @@ describe("commit (real PGlite + memory BlobStore)", () => {
     expect((await db.select().from(artifactSyncSessions).where(eq(artifactSyncSessions.id, syncId)))[0]!.receipt).toBeNull();
   });
 
-  it("AC4: the manifest INSERT throwing rolls back the guarded loop UPDATE that preceded it", async () => {
+  it("AC4: an UNCLASSIFIED throw at the manifest INSERT rolls back the guarded loop UPDATE that preceded it (raw-throw boundary)", async () => {
     await fresh();
     await seedConfiguredLoop();
     const syncId = await negotiate({ entries: [] });
@@ -968,7 +983,7 @@ describe("commit (real PGlite + memory BlobStore)", () => {
     expect([after.artifactManifestId, after.artifactManifestRevision]).toEqual([result.receipt.artifactSnapshotId, 1]);
   });
 
-  it("AC4: the receipt UPDATE throwing rolls back the manifest insert that preceded it", async () => {
+  it("AC4: an UNCLASSIFIED throw at the receipt UPDATE rolls back the manifest insert that preceded it (raw-throw boundary)", async () => {
     await fresh();
     await seedConfiguredLoop();
     const syncId = await negotiate({ entries: [] });
@@ -1013,6 +1028,130 @@ describe("commit (real PGlite + memory BlobStore)", () => {
     expect((await db.select().from(artifactSyncSessions).where(eq(artifactSyncSessions.id, syncId)))[0]!.receipt).toEqual(
       result.receipt,
     );
+  });
+
+  it("AC4: a RECOVERABLE storage failure (SQLSTATE 58xxx) at the guarded loop UPDATE lands as the stable storage_error — zero partial writes, a best-effort stamp, and the same session's retry converges (A5-1)", async () => {
+    await fresh();
+    await seedConfiguredLoop();
+    const syncId = await negotiate({ entries: [] });
+    const revisionBefore = (await getLoop()).revision;
+
+    let seamCalls = 0;
+    let fired = 0;
+    const cause = Object.assign(new Error("injected io error"), { code: "58030" });
+    deps = makeDeps(withTxFault(db, { on: "update-loops", mode: "throw", times: 1, cause }, () => (fired += 1)), {
+      hooks: { afterResolve: () => void (seamCalls += 1) },
+    });
+
+    await expect(commit(syncId)).resolves.toEqual({ ok: false, failure: "storage_error", cause });
+    expect(fired).toBe(1);
+    expect(seamCalls).toBe(1); // a stable domain result — the guard-retry never re-ran
+    // Zero partial writes: no manifest, no receipt, the pointer unmoved…
+    expect(await manifests()).toHaveLength(0);
+    expect((await db.select().from(artifactSyncSessions).where(eq(artifactSyncSessions.id, syncId)))[0]!.receipt).toBeNull();
+    const stamped = await getLoop();
+    expect([stamped.artifactManifestId, stamped.artifactManifestRevision]).toEqual([null, 0]);
+    // …and the best-effort stamp landed (the wire code — bookkeeping, never the result).
+    expect([stamped.artifactSyncAttemptedAt, stamped.artifactSyncSucceededAt, stamped.artifactSyncError]).toEqual([
+      clock.iso(),
+      null,
+      "artifact_storage_error",
+    ]);
+    expect(stamped.revision).toBe(revisionBefore + 1);
+
+    // The fault lifted, the SAME session retried converges (idempotent_retry).
+    // The faulted attempt already minted amf-1 inside its rolled-back tx.
+    deps = makeDeps(db);
+    await expect(commit(syncId)).resolves.toEqual({ ok: true, receipt: { artifactSnapshotId: "amf-2", manifestRevision: 1 } });
+    expect((await manifests()).map((m) => m.id)).toEqual(["amf-2"]);
+    const after = await getLoop();
+    expect([after.artifactSyncAttemptedAt, after.artifactSyncSucceededAt, after.artifactSyncError]).toEqual([
+      clock.iso(),
+      clock.iso(),
+      null,
+    ]);
+    expect(after.revision).toBe(revisionBefore + 2); // the stamp +1, the commit +1
+  });
+
+  it("AC4: a RECOVERABLE storage failure at the manifest INSERT — cause-chain SQLSTATE recognition, the preceding loop UPDATE rolled back (A5-1)", async () => {
+    await fresh();
+    await seedConfiguredLoop();
+    const syncId = await negotiate({ entries: [] });
+    const revisionBefore = (await getLoop()).revision;
+
+    let seamCalls = 0;
+    let fired = 0;
+    // The SQLSTATE sits one level DOWN the cause chain (the driver-wrapped
+    // shape — the reviewer's probe observed `wrapped.cause.code`).
+    const sqlState = Object.assign(new Error("io error"), { code: "58030" });
+    const cause = new Error("pg driver failure", { cause: sqlState });
+    deps = makeDeps(withTxFault(db, { on: "insert-manifests", mode: "throw", times: 1, cause }, () => (fired += 1)), {
+      hooks: { afterResolve: () => void (seamCalls += 1) },
+    });
+
+    await expect(commit(syncId)).resolves.toEqual({ ok: false, failure: "storage_error", cause });
+    expect(fired).toBe(1);
+    expect(seamCalls).toBe(1);
+    // The pointer never moved: the guarded loop UPDATE rolled back WITH the insert.
+    const stamped = await getLoop();
+    expect([stamped.artifactManifestId, stamped.artifactManifestRevision]).toEqual([null, 0]);
+    expect(await manifests()).toHaveLength(0);
+    expect((await db.select().from(artifactSyncSessions).where(eq(artifactSyncSessions.id, syncId)))[0]!.receipt).toBeNull();
+    expect(stamped.artifactSyncError).toBe("artifact_storage_error");
+    expect(stamped.revision).toBe(revisionBefore + 1);
+
+    deps = makeDeps(db);
+    await expect(commit(syncId)).resolves.toEqual({ ok: true, receipt: { artifactSnapshotId: "amf-2", manifestRevision: 1 } });
+  });
+
+  it("AC4: a RECOVERABLE storage failure (SQLSTATE 08xxx) at the receipt UPDATE lands as storage_error — the manifest insert rolled back, the retry converges (A5-1)", async () => {
+    await fresh();
+    await seedConfiguredLoop();
+    const syncId = await negotiate({ entries: [] });
+
+    let seamCalls = 0;
+    let fired = 0;
+    const cause = Object.assign(new Error("injected connection failure"), { code: "08006" });
+    deps = makeDeps(withTxFault(db, { on: "update-sessions", mode: "throw", times: 1, cause }, () => (fired += 1)), {
+      hooks: { afterResolve: () => void (seamCalls += 1) },
+    });
+
+    await expect(commit(syncId)).resolves.toEqual({ ok: false, failure: "storage_error", cause });
+    expect(fired).toBe(1);
+    expect(seamCalls).toBe(1);
+    // No manifest row: the insert rolled back WITH the receipt write.
+    expect(await manifests()).toHaveLength(0);
+    expect((await getLoop()).artifactManifestId).toBeNull();
+    expect((await db.select().from(artifactSyncSessions).where(eq(artifactSyncSessions.id, syncId)))[0]!.receipt).toBeNull();
+    expect((await getLoop()).artifactSyncError).toBe("artifact_storage_error");
+
+    deps = makeDeps(db);
+    const retried = await commit(syncId);
+    if (!retried.ok) throw new Error(`retry must converge: ${JSON.stringify(retried)}`);
+    expect(await manifests()).toHaveLength(1);
+    expect((await db.select().from(artifactSyncSessions).where(eq(artifactSyncSessions.id, syncId)))[0]!.receipt).toEqual(
+      retried.receipt,
+    );
+  });
+
+  it("AC4: a CODED but non-recoverable-class failure (SQLSTATE 23502) keeps the raw-throw boundary — never laundered into the retryable storage class", async () => {
+    await fresh();
+    await seedConfiguredLoop();
+    const syncId = await negotiate({ entries: [] });
+    const loopsBefore = await snapshotLoops(db);
+
+    let seamCalls = 0;
+    let fired = 0;
+    const cause = Object.assign(new Error("injected not-null violation"), { code: "23502" });
+    deps = makeDeps(withTxFault(db, { on: "insert-manifests", mode: "throw", times: 1, cause }, () => (fired += 1)), {
+      hooks: { afterResolve: () => void (seamCalls += 1) },
+    });
+
+    await expect(commit(syncId)).rejects.toThrow("injected not-null violation");
+    expect([fired, seamCalls]).toEqual([1, 1]);
+    expect(await snapshotLoops(db)).toEqual(loopsBefore); // NO stamp — the raw boundary skips bookkeeping
+    expect(await manifests()).toHaveLength(0);
+    expect((await db.select().from(artifactSyncSessions).where(eq(artifactSyncSessions.id, syncId)))[0]!.receipt).toBeNull();
   });
 
   it("AC7: a same-session commit landing between the precheck and the transaction converges — the loser replays the winner's receipt (A4-1)", async () => {

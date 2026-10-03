@@ -131,6 +131,16 @@
  *    guard, zero rows skip silently with NO retry. config_conflict /
  *    session_expired / exhaustion never stamp (no current-generation
  *    attempt exists, or no wire code exists yet — Batch 2 owns the mapping).
+ *  - Failure classification at the transaction boundary (决策 13): an
+ *    IDENTIFIED recoverable storage failure (SQLSTATE classes 08xxx
+ *    connection / 53xxx insufficient resources / 57xxx operator intervention
+ *    / 58xxx system-I/O, walked along the driver cause chain) rolls the whole
+ *    transaction back and lands as the stable storage_error result with a
+ *    best-effort stamp — the SAME session retried after the fault converges.
+ *    Guard losses keep the bounded re-run, 23505 its defensive guard-loss
+ *    conversion; every UNCODED or unclassified-class error keeps the
+ *    raw-throw boundary — an unrecognized defect is never laundered into the
+ *    retryable storage class.
  *
  * Internal failure literals are finer than the 9 wire codes (决策 13's
  * double layer, the RunCapabilityInvalidError precedent); the Batch 2 route
@@ -782,6 +792,30 @@ function isUniqueViolation(err: unknown): boolean {
   return false;
 }
 
+/** The recoverable Postgres storage-failure classes (决策 13's
+ *  artifact_storage_error / idempotent_retry): 08xxx connection exception,
+ *  53xxx insufficient resources, 57xxx operator intervention, 58xxx
+ *  system/internal I/O. */
+const RECOVERABLE_STORAGE_SQLSTATE_CLASSES = ["08", "53", "57", "58"] as const;
+
+/** Walk the cause chain for an IDENTIFIED recoverable storage failure. The
+ *  classification is deliberately narrow (决策 13): only a string SQLSTATE in
+ *  a recoverable class qualifies — constraint violations, serialization /
+ *  deadlock codes, Node errno strings and every UNCODED error keep the
+ *  raw-throw boundary, because laundering an unrecognized defect into the
+ *  retryable class would loop a permanent failure. */
+function isRecoverableStorageError(err: unknown): boolean {
+  let cur: unknown = err;
+  while (cur !== null && typeof cur === "object") {
+    if ("code" in cur) {
+      const code = (cur as { code: unknown }).code;
+      if (typeof code === "string" && RECOVERABLE_STORAGE_SQLSTATE_CLASSES.some((cls) => code.startsWith(cls))) return true;
+    }
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
 type CommitTxOutcome =
   | { kind: "committed"; receipt: CommitArtifactSyncResponse }
   | {
@@ -876,7 +910,9 @@ async function commitOnce(
   // commit transaction (slice 5 commits a REAL competing write here).
   await deps.hooks?.afterResolve?.("commit", session.id);
 
-  const outcome = await deps.db.transaction(async (tx): Promise<CommitTxOutcome> => {
+  let outcome: CommitTxOutcome;
+  try {
+    outcome = await deps.db.transaction(async (tx): Promise<CommitTxOutcome> => {
     // (a) The SAME observation order as the outer adjudication: the LIVE loop
     // row first, the LIVE session row second. Under READ COMMITTED each
     // statement sees the latest committed state and the competitor's
@@ -956,6 +992,25 @@ async function commitOnce(
       throw err;
     }
   });
+  } catch (err) {
+    // The transaction rolled back WHOLESALE (Postgres guarantees it). Guard
+    // losses and every uncoded/unclassified error keep their existing
+    // boundaries — the bounded re-run and the raw throw. An IDENTIFIED
+    // recoverable storage failure lands as the stable storage_error result
+    // (决策 13's idempotent_retry class — the caller retries the SAME
+    // session) instead of leaking the driver exception.
+    if (!isRecoverableStorageError(err)) throw err;
+    // The failure IS an attempt conclusion (决策 8): stamp it best-effort.
+    // The same storage fault may take the stamp write down too — bookkeeping
+    // never overrides the operation's result — while an UNRELATED
+    // unclassified stamp defect keeps the raw boundary.
+    try {
+      await stampCommitFailure(deps, loop, session, "storage_error", nowIso);
+    } catch (stampErr) {
+      if (!isRecoverableStorageError(stampErr)) throw stampErr;
+    }
+    return { ok: false, failure: "storage_error", cause: err };
+  }
 
   if (outcome.kind === "aborted") {
     // The in-tx re-verification found drift the outer precheck predates. Only
