@@ -5,7 +5,7 @@
  * loop's artifact pointer + sync-attempt triple; Batch 1 wires it from TESTS
  * ONLY — no production route, no composition (决策 16).
  *
- * PREPARE (this commit) negotiates a sync session:
+ * PREPARE negotiates a sync session:
  *  - Fixed evaluation order (决策 13's per-step codes): manifest policy →
  *    attribution → loop scope → configured → config generation → base
  *    revision → idempotency. Validation precedes attribution because a
@@ -31,6 +31,25 @@
  *    (AB8's prepare half), and a has() failure is storage_error — never a
  *    silent "needed" (the frozen BlobStore contract: has never swallows
  *    storage errors).
+ *
+ * PUT uploads one negotiated blob (决策 10): the session (carried by id) is
+ * re-validated on EVERY upload — attribution, existence (unknown OR
+ * cross-attribution is the same leak-free session_not_found), committed
+ * state, pending expiry, and the config generation (checked BOTH before the
+ * byte stream starts and after the publish completes — a generation that
+ * moved mid-upload rejects the PUT; the published-but-unreferenced blob is
+ * the 决策 12 tolerated leftover). Only hashes the session negotiated are
+ * accepted, and the stream is never pulled for an unnegotiated one. The byte
+ * stream is the ONLY source of truth: expectedSize comes from the session's
+ * negotiated manifest entry, never from a declared size. Failures map
+ * verbatim from the BlobStore contract (content_mismatch/storage_error);
+ * invalid_key is unreachable (the hash came from a policy-validated
+ * manifest, the namespace from the trusted resolver) and throws an
+ * invariant violation rather than looping a permanent defect through a
+ * retryable class. A successful publish records the (namespaceId, hash)
+ * metadata row with the VERIFIED size — ON CONFLICT DO NOTHING makes a
+ * duplicate PUT idempotent, and wrong bytes can never be laundered by an
+ * existing blob (writeVerified always re-verifies the stream).
  *  - prepare writes NOTHING to the current view (no loops write). Its one
  *    write path (the session insert) guards on the resolved loop's unified
  *    OCC revision inside the transaction, so a concurrent generation bump
@@ -405,6 +424,111 @@ export async function prepareArtifactSync(
     (err) => err instanceof ArtifactSyncGuardLostError,
     (err) => new ArtifactSyncRaceLostError((err as ArtifactSyncGuardLostError).op, (err as ArtifactSyncGuardLostError).id),
   );
+}
+
+// ---- PUT: verified blob upload (决策 10) ----
+
+export type PutArtifactBlobResult =
+  | { ok: true; size: number; published: boolean }
+  | { ok: false; failure: "storage_error"; cause?: unknown }
+  | {
+      ok: false;
+      failure:
+        | "attribution_missing"
+        | "session_not_found"
+        | "session_expired"
+        | "session_committed"
+        | "loop_not_found"
+        | "config_conflict"
+        | "hash_not_negotiated"
+        | "content_mismatch";
+    };
+
+/** The full internal failure literal set for PUT. `session_not_found` is the
+ *  404-grade leak-free refusal (unknown OR cross-attribution — 决策 13);
+ *  `session_committed` names a client bug no wire code honestly covers yet
+ *  (Batch 2 maps it; the ADR revision log records the literal). */
+export type PutArtifactBlobFailure = Extract<PutArtifactBlobResult, { ok: false }>["failure"];
+
+/** The session as the PUT path consults it. */
+async function findSessionById(db: Db, syncId: string): Promise<ArtifactSyncSessionRow | null> {
+  return (await db.select().from(artifactSyncSessions).where(eq(artifactSyncSessions.id, syncId)).limit(1))[0] ?? null;
+}
+
+/** Upload one negotiated blob. PUT performs NO guarded loop write (the
+ *  metadata row is generation-independent content truth), so it needs no
+ *  guard-retry wrapper — the generation re-check after the publish is what
+ *  keeps an old-generation upload from counting. */
+export async function putArtifactBlob(
+  deps: ArtifactHomeDeps,
+  machine: TrustedMachineIdentity,
+  input: { syncId: string; hash: string; bytes: AsyncIterable<Uint8Array> },
+): Promise<PutArtifactBlobResult> {
+  const attribution = await deps.attribution.resolve(machine);
+  if (!attribution.ok) return { ok: false, failure: "attribution_missing" };
+
+  const session = await findSessionById(deps.db, input.syncId);
+  // Unknown OR cross-attribution: one leak-free refusal (决策 13).
+  if (!session || session.namespaceId !== attribution.namespaceId || session.machineId !== attribution.machineId) {
+    return { ok: false, failure: "session_not_found" };
+  }
+  if (session.receipt !== null) return { ok: false, failure: "session_committed" };
+  if (deps.clock.now().toISOString() >= session.expiresAt) return { ok: false, failure: "session_expired" };
+
+  const loop = (await deps.db.select().from(loops).where(eq(loops.id, session.loopId)).limit(1))[0];
+  if (!loop) return { ok: false, failure: "loop_not_found" };
+  if (loop.machineId !== session.machineId) return { ok: false, failure: "session_not_found" };
+  // Generation check #1 — BEFORE the stream is touched (决策 10: 写入期间和
+  // 完成前都验证会话及配置代际).
+  if (session.configRevision !== loop.artifactConfigRevision) return { ok: false, failure: "config_conflict" };
+
+  // Only negotiated hashes are accepted — and the stream is NEVER pulled for
+  // an unnegotiated one.
+  if (!session.negotiatedHashes.includes(input.hash)) return { ok: false, failure: "hash_not_negotiated" };
+  // The expected size comes from the session's negotiated manifest entry —
+  // never from a declared size or Content-Length (决策 10). Every negotiated
+  // hash has an entry (negotiatedHashes is derived from the manifest), and
+  // the policy's hash_size_mismatch rule makes the size unambiguous.
+  const entry = session.normalizedManifest.find((e) => e.hash === input.hash);
+  if (!entry) {
+    throw new ArtifactSyncInvariantError(`session ${session.id} negotiated hash ${input.hash} with no manifest entry`);
+  }
+
+  await deps.hooks?.afterResolve?.("put", session.id);
+
+  const written = await deps.blobStore.writeVerified({
+    namespaceId: session.namespaceId,
+    hash: input.hash,
+    expectedSize: entry.size,
+    bytes: input.bytes,
+  });
+  if (!written.ok) {
+    if (written.failure === "invalid_key") {
+      // Unreachable: the hash came from a policy-validated manifest and the
+      // namespace from the trusted resolver. Throw rather than looping a
+      // permanent defect through the retryable storage_error class.
+      throw new ArtifactSyncInvariantError(`blob store rejected a negotiated key ${session.namespaceId}/${input.hash}`);
+    }
+    if (written.failure === "content_mismatch") return { ok: false, failure: "content_mismatch" };
+    return { ok: false, failure: "storage_error", cause: written.cause };
+  }
+
+  // Generation check #2 — AFTER the publish completes. A generation that
+  // moved mid-upload rejects the PUT; the published-but-unreferenced blob is
+  // the 决策 12 tolerated leftover (never delete shared blobs to fake a
+  // filesystem rollback).
+  const current = (await deps.db.select().from(loops).where(eq(loops.id, session.loopId)).limit(1))[0];
+  if (!current) return { ok: false, failure: "loop_not_found" };
+  if (current.artifactConfigRevision !== session.configRevision) return { ok: false, failure: "config_conflict" };
+
+  // Record the metadata row ONLY after the publish succeeded (schema contract
+  // on artifact_blobs). ON CONFLICT DO NOTHING makes a duplicate PUT
+  // idempotent (AB4): the verified size is identical for identical content.
+  await deps.db
+    .insert(artifactBlobs)
+    .values({ namespaceId: session.namespaceId, hash: input.hash, size: written.size, verifiedAt: deps.clock.now().toISOString() })
+    .onConflictDoNothing();
+  return { ok: true, size: written.size, published: written.published };
 }
 
 // ---- snapshot read (AC10 / binding loader) ----
