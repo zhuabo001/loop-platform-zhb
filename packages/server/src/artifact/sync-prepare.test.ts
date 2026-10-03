@@ -325,7 +325,7 @@ describe("prepare (real PGlite)", () => {
     expect(conflict).toEqual({ ok: false, failure: "manifest_conflict" });
   });
 
-  it("AC8/决策 9: re-preparing a committed key replays the original session — even after the REAL commit advanced the base (S4-2)", async () => {
+  it("AC8/决策 9: re-preparing a committed key replays the original session — across the REAL base advance, a config bump, an artifactDir removal and the TTL, with the pointer untouched (S4-2)", async () => {
     await fresh();
     await seedConfiguredLoop();
     const first = await prepareArtifactSync(deps, { machineId: "m-1" }, makeRequest());
@@ -364,6 +364,18 @@ describe("prepare (real PGlite)", () => {
     // payload's replay still precedes every one of those checks.
     await updateArtifactConfig({ db, clock }, "loop-1", { artifactDir: "/data-2" });
     clock.advance(ARTIFACT_SYNC_SESSION_TTL_MILLIS * 2);
+    const pointerTriple = async () =>
+      (
+        await db
+          .select({
+            artifactManifestId: loops.artifactManifestId,
+            artifactManifestRevision: loops.artifactManifestRevision,
+            revision: loops.revision,
+          })
+          .from(loops)
+          .where(eq(loops.id, "loop-1"))
+      )[0]!;
+    const pointerBeforeReplay = await pointerTriple();
     const replay = await prepareArtifactSync(deps, { machineId: "m-1" }, makeRequest());
     expect(replay).toEqual({
       ok: true,
@@ -375,6 +387,26 @@ describe("prepare (real PGlite)", () => {
       ok: true,
       receipt: committed.receipt,
     });
+    // The replay moved NOTHING: the pointer, the base and even the unified
+    // OCC revision are item-equal before and after (direct invariance
+    // assertion — a replay is a READ of the stored receipt, never a write).
+    expect(await pointerTriple()).toEqual(pointerBeforeReplay);
+
+    // The replay also precedes artifact_dir_unconfigured: REMOVING the
+    // artifactDir entirely still returns the original session, and the
+    // receipt stays recoverable through commit.
+    await updateArtifactConfig({ db, clock }, "loop-1", { artifactDir: null });
+    const pointerBeforeClearReplay = await pointerTriple();
+    await expect(prepareArtifactSync(deps, { machineId: "m-1" }, makeRequest())).resolves.toEqual({
+      ok: true,
+      outcome: "committed",
+      response: { syncId, needHashes: [], expiresAt: first.response.expiresAt },
+    });
+    await expect(commitArtifactSync(deps, { machineId: "m-1" }, { syncId })).resolves.toEqual({
+      ok: true,
+      receipt: committed.receipt,
+    });
+    expect(await pointerTriple()).toEqual(pointerBeforeClearReplay);
   });
 
   it("manifest policy failure → manifest_invalid carrying the policy reason — zero session rows, zero view writes", async () => {
