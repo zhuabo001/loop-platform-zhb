@@ -85,12 +85,31 @@
  *    launders a lying size past writeVerified, so a manifest's totalBytes
  *    always matches verified content truth), a has() failure is
  *    storage_error (never a silent "missing").
- *  - ONE transaction then re-verifies the LIVE session row FIRST (a winner's
- *    receipt replays verbatim — same-session concurrent commits converge to
- *    ONE receipt; the pending TTL is re-checked against a fresh clock read;
- *    the attribution association is re-verified), then re-checks the LIVE
- *    loop row against the SESSION's generation/base/exhaustion plus the
- *    loop↔session association (决策 11's 事务内重新检查), lands the guarded
+ *  - Adjudication observes the (loop, session) pair LOOP-FIRST, SESSION-
+ *    SECOND — out-of-tx (a scope probe reads the session for its loopId,
+ *    then the loop, then ONE bounded session re-read decides) and inside the
+ *    commit transaction alike. The observation order is what keeps the two
+ *    reads consistent: a competitor's commit advances the loop's base AND
+ *    writes the session's receipt ATOMICALLY (one transaction), the loop's
+ *    generations are monotonic, and a receipt is write-once — so a session
+ *    read placed AFTER the loop read can never observe "the base advanced
+ *    past this session, yet no receipt exists". An advanced base alongside a
+ *    null receipt therefore always came from a DIFFERENT session (a real
+ *    manifest_conflict), while a completed same-session winner's receipt is
+ *    always observed and replayed. The reverse order was the A4-1 Round-2
+ *    defect: session read → competitor commit → loop read produced a bogus
+ *    manifest_conflict that also stamped its wire code over the winner's
+ *    success triple. READ COMMITTED suffices — no row locks are added, so
+ *    prepare's FOR UPDATE stays the module's only lock and no lock ordering
+ *    arises. (PGlite evidence; the real multi-physical-connection
+ *    verification stays #11/#72 scope.)
+ *  - ONE transaction then re-observes the LIVE pair in the same order and
+ *    decides receipt-FIRST (a winner's receipt replays verbatim — same-
+ *    session concurrent commits converge to ONE receipt; the pending TTL is
+ *    re-checked against a fresh clock read; the attribution association is
+ *    re-verified), then re-checks the LIVE loop row against the SESSION's
+ *    generation/base/exhaustion plus the loop↔session association (决策
+ *    11's 事务内重新检查), lands the guarded
  *    loop UPDATE FIRST (the row lock serializes concurrent commits, making
  *    the (loopId, manifestRevision) unique violation unreachable for a
  *    correct race — a defensive cause-chain conversion still maps it to a
@@ -770,13 +789,30 @@ async function commitOnce(
   const attribution = await deps.attribution.resolve(machine);
   if (!attribution.ok) return { ok: false, failure: "attribution_missing" };
 
-  const session = await findSessionById(deps.db, input.syncId);
+  const probe = await findSessionById(deps.db, input.syncId);
   // Unknown OR cross-attribution: one leak-free refusal (决策 13) — a receipt
   // is never replayed across scope either.
-  if (!session || session.namespaceId !== attribution.namespaceId || session.machineId !== attribution.machineId) {
+  if (!probe || probe.namespaceId !== attribution.namespaceId || probe.machineId !== attribution.machineId) {
     return { ok: false, failure: "session_not_found" };
   }
-  const loop = (await deps.db.select().from(loops).where(eq(loops.id, session.loopId)).limit(1))[0];
+
+  // The adjudicating pair is observed LOOP-FIRST, SESSION-SECOND (A4-1 Round
+  // 2). A competitor's commit advances the loop's base AND writes the
+  // session's receipt ATOMICALLY (one transaction), the loop's generations
+  // only move forward, and a receipt is write-once — so the session read
+  // placed AFTER the loop read can never observe "the base advanced past this
+  // session, yet no receipt exists": an advanced base with a null receipt
+  // always came from a DIFFERENT session (a real manifest_conflict), while a
+  // completed same-session winner's receipt is always seen and replayed
+  // below. The reverse order was the Round-2 defect — session read →
+  // competitor commit → loop read produced a bogus conflict whose stamp also
+  // overwrote the winner's success triple. The re-read is the bounded
+  // re-evaluation: exactly ONE fresh session read, taken after the loop
+  // observation, decides — no fixed extra checkpoint, no window moved.
+  const loop = (await deps.db.select().from(loops).where(eq(loops.id, probe.loopId)).limit(1))[0];
+  const session = await findSessionById(deps.db, probe.id);
+  if (!session) throw new ArtifactSyncGuardLostError("commit", probe.id); // vanished mid-flight: re-resolve
+
   if (!loop) {
     // The receipt is self-contained and already attribution-gated: it replays
     // even across an out-of-band loop deletion (AC7's restart recovery must
@@ -833,13 +869,16 @@ async function commitOnce(
   await deps.hooks?.afterResolve?.("commit", session.id);
 
   const outcome = await deps.db.transaction(async (tx): Promise<CommitTxOutcome> => {
-    // (a) 决策 11's in-transaction re-verification — the SESSION first: the
-    // outer precheck's snapshot was stale the moment it was read, so the LIVE
-    // session row decides. A winner's receipt replays VERBATIM (a same-session
-    // concurrent commit converges to ONE receipt — AC7; the pre-fix shape
-    // fell through to a base conflict instead), the pending TTL is re-checked
-    // against a FRESH clock read, and the attribution association is
-    // re-verified against the live row.
+    // (a) The SAME observation order as the outer adjudication: the LIVE loop
+    // row first, the LIVE session row second. Under READ COMMITTED each
+    // statement sees the latest committed state and the competitor's
+    // base-advance + receipt-write commit ATOMICALLY, so the session read
+    // placed after the loop read observes every completed same-session
+    // winner's receipt — the two-read window is closed by the atomicity
+    // invariant, no row locks needed (prepare's FOR UPDATE stays the module's
+    // only lock). The DECISION order stays receipt-first regardless.
+    const live = (await tx.select().from(loops).where(eq(loops.id, session.loopId)).limit(1))[0];
+    if (!live) throw new ArtifactSyncGuardLostError("commit", session.id); // vanished mid-flight: roll back, re-resolve
     const liveSession = (
       await tx.select().from(artifactSyncSessions).where(eq(artifactSyncSessions.id, session.id)).limit(1)
     )[0];
@@ -851,8 +890,6 @@ async function commitOnce(
     }
     // (b) The LIVE loop row against the SESSION's generation/base — any drift
     // since prepare is caught here regardless of what the outer resolve saw.
-    const live = (await tx.select().from(loops).where(eq(loops.id, liveSession.loopId)).limit(1))[0];
-    if (!live) throw new ArtifactSyncGuardLostError("commit", session.id); // vanished mid-flight: roll back, re-resolve
     if (live.machineId !== liveSession.machineId) return { kind: "aborted", failure: "session_not_found" };
     if (live.artifactConfigRevision !== liveSession.configRevision) return { kind: "aborted", failure: "config_conflict" };
     if (live.artifactManifestRevision !== liveSession.baseManifestRevision) return { kind: "aborted", failure: "manifest_conflict" };

@@ -11,10 +11,14 @@
  *                 blob_missing / storage_error keep the old view and stamp
  *                 the wire code, an in-tx failure rolls back EVERYTHING;
  *                 AC7 receipt replay (repeat, restart, no pointer regress,
- *                 survives config bumps and TTL); the transaction re-verifies
- *                 the LIVE session first — a same-session winner's receipt
- *                 replays verbatim (convergence), the pending TTL is
- *                 re-checked against a fresh clock, the loop↔session
+ *                 survives config bumps and TTL); commit adjudication
+ *                 observes the (loop, session) pair LOOP-FIRST, SESSION-
+ *                 SECOND, so a same-session winner landing between the two
+ *                 out-of-tx reads is replayed — never a bogus conflict
+ *                 stamped over the winner's success (A4-1 Round 2); the
+ *                 transaction re-observes the LIVE pair in the same order
+ *                 and decides receipt-first (convergence), the pending TTL
+ *                 is re-checked against a fresh clock, the loop↔session
  *                 attribution association is re-verified (A4-1); AC10
  *                 snapshot immutability and binding through the slice-2
  *                 plan/apply with REAL committed manifests; AM6
@@ -699,6 +703,79 @@ describe("commit (real PGlite + memory BlobStore)", () => {
     expect(await manifests()).toHaveLength(1); // exactly ONE snapshot
     const after = await getLoop();
     expect([after.artifactManifestId, after.artifactManifestRevision]).toEqual(["amf-1", 1]);
+  });
+
+  it("AC7: a same-session commit landing BETWEEN the outer session probe and the loop read converges — the observation order closes the two-read window (A4-1 Round 2)", async () => {
+    await fresh();
+    await seedConfiguredLoop();
+    const syncId = await negotiate();
+    await put(syncId, CONTENT_A);
+    await put(syncId, CONTENT_B);
+    const before = await getLoop();
+
+    let winnerReceipt: unknown = null;
+    let fired = 0;
+    // A Db wrapper that fires a REAL same-session winner commit after the
+    // loser's FIRST artifact_sync_sessions read returns its rows (unmodified —
+    // the probe never fabricates rows or receipts, and the winner runs on
+    // hook-free UNWRAPPED deps). The loser's loop read then observes the
+    // winner's advanced base — the Round-2 window: pre-fix, the precheck
+    // adjudicated on (stale session, fresh loop) and returned a bogus
+    // manifest_conflict whose stamp ALSO overwrote the winner's success
+    // triple; post-fix, the adjudicating session read placed AFTER the loop
+    // observation sees the winner's receipt and replays it.
+    let armed = true;
+    const raced: Db = new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop !== "select") {
+          const value = Reflect.get(target, prop, receiver);
+          return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+        }
+        return (...args: unknown[]) => {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const select = (target.select as (...a: unknown[]) => any)(...args);
+          const from = select.from.bind(select);
+          select.from = (table: unknown) => {
+            const query = from(table);
+            if (table === artifactSyncSessions && armed) {
+              const limit = query.limit.bind(query);
+              query.limit = (n: number) =>
+                (async () => {
+                  const rows = await limit(n);
+                  if (armed) {
+                    armed = false;
+                    fired += 1;
+                    const winner = await commitArtifactSync(makeDeps(db), { machineId: "m-1" }, { syncId });
+                    if (!winner.ok) throw new Error(`winner fixture must succeed: ${JSON.stringify(winner)}`);
+                    winnerReceipt = winner.receipt;
+                  }
+                  return rows;
+                })();
+            }
+            return query;
+          };
+          return select;
+        };
+      },
+    });
+
+    const loser = await commitArtifactSync({ ...deps, db: raced }, { machineId: "m-1" }, { syncId });
+
+    // Converged: both sides return the SAME receipt …
+    expect(loser).toEqual({ ok: true, receipt: winnerReceipt });
+    expect(fired).toBe(1); // the race fired exactly once, on the probe read
+    // … exactly ONE snapshot and ONE manifest-revision increment …
+    expect(await manifests()).toHaveLength(1);
+    const after = await getLoop();
+    expect(after.artifactManifestId).toBe("amf-1");
+    expect(after.artifactManifestRevision).toBe(before.artifactManifestRevision + 1);
+    // … and the winner's success state was NOT overwritten by a bogus failure
+    // stamp: the error field stays null (the Round-2 over-write evidence).
+    expect([after.artifactSyncAttemptedAt, after.artifactSyncSucceededAt, after.artifactSyncError]).toEqual([
+      clock.iso(),
+      clock.iso(),
+      null,
+    ]);
   });
 
   it("the pending TTL is re-checked INSIDE the commit transaction — a clock advance past expiresAt aborts with zero writes (A4-1)", async () => {
