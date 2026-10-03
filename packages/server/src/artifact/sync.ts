@@ -655,11 +655,19 @@ export async function putArtifactBlob(
 
   // Record the metadata row ONLY after the publish succeeded (schema contract
   // on artifact_blobs). ON CONFLICT DO NOTHING makes a duplicate PUT
-  // idempotent (AB4): the verified size is identical for identical content.
-  await deps.db
-    .insert(artifactBlobs)
-    .values({ namespaceId: currentSession.namespaceId, hash: input.hash, size: written.size, verifiedAt: deps.clock.now().toISOString() })
-    .onConflictDoNothing();
+  // idempotent (AB4): the verified size is identical for identical content. A
+  // driver failure here is a storage_error, never a raw throw (AB7): the
+  // published blob stays as the 决策 12 tolerated unreferenced leftover and
+  // the SAME put retried converges — writeVerified reports published:false
+  // and this registration lands.
+  try {
+    await deps.db
+      .insert(artifactBlobs)
+      .values({ namespaceId: currentSession.namespaceId, hash: input.hash, size: written.size, verifiedAt: deps.clock.now().toISOString() })
+      .onConflictDoNothing();
+  } catch (cause) {
+    return { ok: false, failure: "storage_error", cause };
+  }
   return { ok: true, size: written.size, published: written.published };
 }
 

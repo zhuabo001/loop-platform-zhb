@@ -13,6 +13,11 @@
  *  AB6  unnegotiated hash → hash_not_negotiated with the stream NEVER
  *       pulled; unknown OR cross-attribution session → one leak-free
  *       session_not_found.
+ *  AB7  a mid-upload source fault → storage_error with nothing published and
+ *       no row; a blob-row registration failure AFTER a successful publish →
+ *       storage_error (never a raw driver throw), the published blob left
+ *       unreferenced (决策 12), and the SAME put retried converges
+ *       (published:false, exactly one row).
  *  Session state: expired → session_expired; committed →
  *       session_committed; a generation bump before OR DURING the upload →
  *       config_conflict (the mid-upload case leaves a published but
@@ -90,6 +95,40 @@ function countingStream(content: string): { stream: AsyncIterable<Uint8Array>; p
     })(),
     pulled: () => n,
   };
+}
+
+/** A Db wrapper whose FIRST artifact_blobs insert rejects at await time with
+ *  the given cause — a driver-level failure (ON CONFLICT DO NOTHING means no
+ *  natural constraint failure can ever reach this insert). One-shot: the
+ *  retried PUT passes through. The race-wrap precedent is sync-commit.test.ts's
+ *  select/from/limit Proxy; here the intercepted chain is
+ *  insert→values→onConflictDoNothing. */
+function withBlobInsertFault(db: Db, cause: Error, fired: () => void): Db {
+  let armed = true;
+  return new Proxy(db, {
+    get(target, prop, receiver) {
+      if (prop !== "insert") {
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+      }
+      return (table: unknown) => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const builder = (target.insert as (t: unknown) => any)(table);
+        if (table !== artifactBlobs) return builder;
+        const values = builder.values.bind(builder);
+        builder.values = (...args: unknown[]) => {
+          const query = values(...args);
+          if (armed) {
+            armed = false;
+            fired();
+            query.onConflictDoNothing = () => Promise.reject(cause);
+          }
+          return query;
+        };
+        return builder;
+      };
+    },
+  });
 }
 
 describe("PUT (real PGlite + memory BlobStore)", () => {
@@ -412,5 +451,54 @@ describe("PUT (real PGlite + memory BlobStore)", () => {
 
     await expect(put(syncId, CONTENT_A)).rejects.toBeInstanceOf(ArtifactSyncInvariantError);
     expect(await blobRows()).toHaveLength(0);
+  });
+
+  it("AB7: a source stream throwing MID-UPLOAD classifies storage_error — nothing published, no row, and the correct bytes still land", async () => {
+    await fresh();
+    await seedConfiguredLoop();
+    const syncId = await negotiate();
+    const loopsBefore = await snapshotLoops(db);
+
+    // The transport-reset shape (the contract suite's throwingSource case at
+    // PUT level): the source throws after the first chunk and verifyByteStream
+    // classifies the interruption.
+    const bytes = (async function* () {
+      yield bytesOf(CONTENT_A.slice(0, 1));
+      throw new Error("transport reset");
+    })();
+    const failed = await putArtifactBlob(deps, { machineId: "m-1" }, { syncId, hash: HASH_A, bytes });
+    expect(failed).toMatchObject({ ok: false, failure: "storage_error" });
+    expect(await storedBytes("ns-1", HASH_A)).toBeNull(); // nothing published
+    expect(await blobRows()).toHaveLength(0);
+    expect(await snapshotLoops(db)).toEqual(loopsBefore); // a failed PUT never stamps the view
+
+    // A failed PUT never poisons the session: the correct bytes still land.
+    await expect(put(syncId, CONTENT_A)).resolves.toEqual({ ok: true, size: 3, published: true });
+    expect(await blobRows()).toHaveLength(1);
+  });
+
+  it("AB7: a blob-row INSERT failure AFTER a successful publish returns storage_error — the blob stays published but unreferenced, no row, and the same PUT retried converges", async () => {
+    await fresh();
+    await seedConfiguredLoop();
+    const syncId = await negotiate();
+    const loopsBefore = await snapshotLoops(db);
+
+    let fired = 0;
+    const cause = new Error("injected driver failure");
+    deps = { ...deps, db: withBlobInsertFault(db, cause, () => (fired += 1)) };
+
+    const failed = await put(syncId, CONTENT_A);
+    expect(failed).toEqual({ ok: false, failure: "storage_error", cause });
+    expect(fired).toBe(1); // the injected fault really fired (no air-passing test)
+    // The publish is NOT rolled back (决策 12 tolerated leftover), but no
+    // metadata row landed and the current view is byte-identical.
+    expect((await storedBytes("ns-1", HASH_A))?.equals(Buffer.from(CONTENT_A))).toBe(true);
+    expect(await blobRows()).toHaveLength(0);
+    expect(await snapshotLoops(db)).toEqual(loopsBefore);
+
+    // The SAME put retried converges: writeVerified reports published:false
+    // and the registration lands — exactly one row.
+    await expect(put(syncId, CONTENT_A)).resolves.toEqual({ ok: true, size: 3, published: false });
+    expect(await blobRows()).toMatchObject([{ namespaceId: "ns-1", hash: HASH_A, size: 3 }]);
   });
 });
