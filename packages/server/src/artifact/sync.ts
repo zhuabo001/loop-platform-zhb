@@ -31,6 +31,12 @@
  *    (AB8's prepare half), and a has() failure is storage_error — never a
  *    silent "needed" (the frozen BlobStore contract: has never swallows
  *    storage errors).
+ *  - prepare writes NOTHING to the current view (no loops write). Its one
+ *    write path (the session insert) guards on the resolved loop's unified
+ *    OCC revision inside the transaction, so a concurrent generation bump
+ *    loses the guard and the bounded re-run re-plans on fresh state — the
+ *    write path is race-safe, not single-thread-only (withGuardRetry: exactly
+ *    one re-run, then ArtifactSyncRaceLostError).
  *
  * PUT uploads one negotiated blob (决策 10): the session (carried by id) is
  * re-validated on EVERY upload — attribution, existence (unknown OR
@@ -50,24 +56,58 @@
  * metadata row with the VERIFIED size — ON CONFLICT DO NOTHING makes a
  * duplicate PUT idempotent, and wrong bytes can never be laundered by an
  * existing blob (writeVerified always re-verifies the stream).
- *  - prepare writes NOTHING to the current view (no loops write). Its one
- *    write path (the session insert) guards on the resolved loop's unified
- *    OCC revision inside the transaction, so a concurrent generation bump
- *    loses the guard and the bounded re-run re-plans on fresh state — the
- *    write path is race-safe, not single-thread-only (withGuardRetry: exactly
- *    one re-run, then ArtifactSyncRaceLostError).
+ *
+ * COMMIT (决策 11/12) turns a fully-uploaded session into an immutable
+ * manifest + a fixed receipt:
+ *  - The receipt replay precedes everything after the scope checks: a stored
+ *    receipt is returned VERBATIM (AC7 — no new snapshot, no revision bump,
+ *    no pointer touch), it never expires, and it survives config generation
+ *    changes and even an out-of-band loop deletion (attribution-gated).
+ *  - Precheck order (session-anchored, so drift since PREPARE is caught
+ *    regardless of any intermediate loop write): receipt → expired →
+ *    config generation → base revision → manifest-revision exhaustion.
+ *  - Blob completeness is verified BEFORE the transaction: every negotiated
+ *    hash needs a metadata row AND a present file — a row without its file
+ *    is blob_missing (AB8, the resume class), a has() failure is
+ *    storage_error (never a silent "missing").
+ *  - ONE transaction then re-checks the LIVE loop row against the SESSION's
+ *    generation/base/exhaustion (决策 11's 事务内重新检查), lands the guarded
+ *    loop UPDATE FIRST (the row lock serializes concurrent commits, making
+ *    the (loopId, manifestRevision) unique violation unreachable for a
+ *    correct race — a defensive cause-chain conversion still maps it to a
+ *    guard loss), inserts the immutable manifest (fresh ID-factory id, so
+ *    identical content from two sessions is two snapshots), fires the
+ *    throw-only insideCommitTx seam, and writes the receipt behind a
+ *    `receipt IS NULL` guard — a same-session concurrent commit loses the
+ *    guard, rolls back EVERYTHING (no orphan manifest, no pointer move),
+ *    and its bounded re-run replays the winner's receipt (AC7 convergence).
+ *  - The guarded UPDATE re-baselines on the IN-TX row: a competitor that
+ *    bumped only the OCC revision (an unrelated domain write) does NOT
+ *    block a commit — the session-anchored re-checks carry the semantic
+ *    guards, the revision predicate closes the select→update window.
+ *  - Sync-attempt stamping (the loops triple, wire-code values): the success
+ *    stamp rides the in-tx guarded UPDATE; failure stamps
+ *    (manifest_conflict / blob_missing / storage_error) are a best-effort
+ *    post-failure UPDATE guarded on (id, resolved revision, session
+ *    generation) — the generation predicate is AM6's 旧代请求不能更新新代状态
+ *    guard, zero rows skip silently with NO retry. config_conflict /
+ *    session_expired / exhaustion never stamp (no current-generation
+ *    attempt exists, or no wire code exists yet — Batch 2 owns the mapping).
  *
  * Internal failure literals are finer than the 9 wire codes (决策 13's
  * double layer, the RunCapabilityInvalidError precedent); the Batch 2 route
- * layer owns the mapping. `artifact_dir_unconfigured` and the 404-grade
- * `loop_not_found` have no wire code yet — recorded in the ADR revision log.
+ * layer owns the mapping. `artifact_dir_unconfigured`, the 404-grade
+ * `loop_not_found`/`session_not_found` and `session_committed` have no wire
+ * code yet — recorded in the ADR revision log.
  */
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, isNull, sql } from "drizzle-orm";
 
 import {
   ARTIFACT_SYNC_SESSION_TTL_MILLIS,
   normalizeManifestEntries,
+  type ArtifactErrorCode,
   type ArtifactManifestFailure,
+  type CommitArtifactSyncResponse,
   type NormalizedManifestEntry,
   type PrepareArtifactSyncRequest,
   type PrepareArtifactSyncResponse,
@@ -83,8 +123,10 @@ import {
   type ArtifactManifestRow,
   type ArtifactSyncSessionRow,
   type Loop,
+  type NewArtifactManifest,
   type NewArtifactSyncSession,
 } from "../db/schema.js";
+import { REVISION_INT32_MAX } from "../schedule/transition.js";
 import { withGuardRetry } from "../store/guard-retry.js";
 import type { Clock } from "../time.js";
 import type { ArtifactAttributionResolver, TrustedMachineIdentity } from "./attribution.js";
@@ -529,6 +571,278 @@ export async function putArtifactBlob(
     .values({ namespaceId: session.namespaceId, hash: input.hash, size: written.size, verifiedAt: deps.clock.now().toISOString() })
     .onConflictDoNothing();
   return { ok: true, size: written.size, published: written.published };
+}
+
+// ---- commit: pure precheck planner ----
+
+export type CommitPrecheck =
+  | { kind: "receipt" }
+  | { kind: "expired" }
+  | { kind: "config_conflict" }
+  | { kind: "manifest_conflict" }
+  | { kind: "exhausted" }
+  | { kind: "proceed" };
+
+/** The commit precheck over the session row and the loop's current
+ *  generations. Fixed order (决策 11/13): a stored RECEIPT replays first — it
+ *  never expires and stays readable across config generations; an expired
+ *  pending session rejects before the generation checks (both are the
+ *  renegotiate class, but expiry is the honest cause); then the SESSION's
+ *  captured generation and base are compared against the loop's CURRENT
+ *  values (session-anchored, so drift since prepare is caught regardless of
+ *  intermediate loop writes); exhaustion is checked last — it only matters
+ *  when a commit would otherwise proceed. The adapter gates scope
+ *  (attribution, cross-machine) BEFORE this planner runs. */
+export function planCommitPrecheck(input: {
+  session: Pick<ArtifactSyncSessionRow, "receipt" | "expiresAt" | "configRevision" | "baseManifestRevision">;
+  loop: Pick<Loop, "artifactConfigRevision" | "artifactManifestRevision">;
+  nowIso: string;
+}): CommitPrecheck {
+  const { session, loop, nowIso } = input;
+  if (session.receipt !== null) return { kind: "receipt" };
+  if (nowIso >= session.expiresAt) return { kind: "expired" };
+  if (session.configRevision !== loop.artifactConfigRevision) return { kind: "config_conflict" };
+  if (session.baseManifestRevision !== loop.artifactManifestRevision) return { kind: "manifest_conflict" };
+  if (loop.artifactManifestRevision >= REVISION_INT32_MAX) return { kind: "exhausted" };
+  return { kind: "proceed" };
+}
+
+// ---- commit: DB adapter ----
+
+export type CommitArtifactSyncResult =
+  | { ok: true; receipt: CommitArtifactSyncResponse }
+  | { ok: false; failure: "storage_error"; cause?: unknown }
+  | {
+      ok: false;
+      failure:
+        | "attribution_missing"
+        | "session_not_found"
+        | "session_expired"
+        | "loop_not_found"
+        | "config_conflict"
+        | "manifest_conflict"
+        | "blob_missing"
+        | "manifest_revision_exhausted";
+    };
+
+/** The full internal failure literal set for commit. `manifest_revision_exhausted`
+ *  is the slice-2 pre-declared literal (ADR revision log): a stable rejection
+ *  — result union, zero writes, never thrown; its wire mapping is Batch 2's. */
+export type CommitArtifactSyncFailure = Extract<CommitArtifactSyncResult, { ok: false }>["failure"];
+
+/** The internal failures that stamp the loop's sync-attempt triple, mapped to
+ *  their WIRE code (loops.artifactSyncError's enum is ARTIFACT_ERROR_CODES —
+ *  the double layer of 决策 13). */
+const COMMIT_STAMPED_FAILURES = {
+  manifest_conflict: "artifact_manifest_conflict",
+  blob_missing: "artifact_blob_missing",
+  storage_error: "artifact_storage_error",
+} as const satisfies Record<string, ArtifactErrorCode>;
+type CommitStampedFailure = keyof typeof COMMIT_STAMPED_FAILURES;
+
+/** Best-effort failure stamp (决策 8's 同步尝试状态): guarded on (id, the
+ *  resolved OCC revision, the SESSION's config generation) — the generation
+ *  predicate is AM6's 旧代请求不能更新新代状态 guard, so an old-generation
+ *  failure can never overwrite the new generation's state. Zero rows (a
+ *  fresher writer won) skip silently with NO retry — the triple is
+ *  bookkeeping, never the operation's result. */
+async function stampCommitFailure(
+  deps: ArtifactHomeDeps,
+  loop: Loop,
+  session: ArtifactSyncSessionRow,
+  failure: CommitStampedFailure,
+  nowIso: string,
+): Promise<void> {
+  await deps.db
+    .update(loops)
+    .set({
+      artifactSyncAttemptedAt: nowIso,
+      artifactSyncError: COMMIT_STAMPED_FAILURES[failure],
+      updatedAt: nowIso,
+      revision: sql`${loops.revision} + 1`,
+    })
+    .where(
+      and(
+        eq(loops.id, loop.id),
+        eq(loops.revision, loop.revision),
+        eq(loops.artifactConfigRevision, session.configRevision),
+      ),
+    );
+}
+
+/** Walk the drizzle error cause chain for a Postgres unique violation
+ *  (23505) — the defensive conversion for the (loopId, manifestRevision)
+ *  unique index (the guarded loop UPDATE's row lock makes it unreachable for
+ *  a correct race; the conversion keeps a contract breach on the bounded
+ *  retry path instead of leaking a driver exception). */
+function isUniqueViolation(err: unknown): boolean {
+  let cur: unknown = err;
+  while (cur !== null && typeof cur === "object") {
+    if ("code" in cur && (cur as { code: unknown }).code === "23505") return true;
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+type CommitTxOutcome =
+  | { kind: "committed"; receipt: CommitArtifactSyncResponse }
+  | { kind: "aborted"; failure: "config_conflict" | "manifest_conflict" | "manifest_revision_exhausted" };
+
+async function commitOnce(
+  deps: ArtifactHomeDeps,
+  machine: TrustedMachineIdentity,
+  input: { syncId: string },
+): Promise<CommitArtifactSyncResult> {
+  const attribution = await deps.attribution.resolve(machine);
+  if (!attribution.ok) return { ok: false, failure: "attribution_missing" };
+
+  const session = await findSessionById(deps.db, input.syncId);
+  // Unknown OR cross-attribution: one leak-free refusal (决策 13) — a receipt
+  // is never replayed across scope either.
+  if (!session || session.namespaceId !== attribution.namespaceId || session.machineId !== attribution.machineId) {
+    return { ok: false, failure: "session_not_found" };
+  }
+  const loop = (await deps.db.select().from(loops).where(eq(loops.id, session.loopId)).limit(1))[0];
+  if (!loop) {
+    // The receipt is self-contained and already attribution-gated: it replays
+    // even across an out-of-band loop deletion (AC7's restart recovery must
+    // never depend on unrelated state).
+    return session.receipt !== null ? { ok: true, receipt: session.receipt } : { ok: false, failure: "loop_not_found" };
+  }
+  if (loop.machineId !== session.machineId) return { ok: false, failure: "session_not_found" };
+
+  const nowIso = deps.clock.now().toISOString();
+  const precheck = planCommitPrecheck({ session, loop, nowIso });
+  if (precheck.kind === "receipt") return { ok: true, receipt: session.receipt! };
+  if (precheck.kind === "expired") return { ok: false, failure: "session_expired" };
+  if (precheck.kind === "config_conflict") return { ok: false, failure: "config_conflict" }; // never stamps
+  if (precheck.kind === "exhausted") return { ok: false, failure: "manifest_revision_exhausted" }; // zero writes, never stamps
+  if (precheck.kind === "manifest_conflict") {
+    await stampCommitFailure(deps, loop, session, "manifest_conflict", nowIso);
+    return { ok: false, failure: "manifest_conflict" };
+  }
+
+  // Blob completeness BEFORE the transaction (决策 11/12): every negotiated
+  // hash needs a metadata row AND a present file.
+  for (const hash of session.negotiatedHashes) {
+    const row = (
+      await deps.db
+        .select({ hash: artifactBlobs.hash })
+        .from(artifactBlobs)
+        .where(and(eq(artifactBlobs.namespaceId, session.namespaceId), eq(artifactBlobs.hash, hash)))
+        .limit(1)
+    )[0];
+    if (row) {
+      const presence = await deps.blobStore.has({ namespaceId: session.namespaceId, hash });
+      if (!presence.ok) {
+        await stampCommitFailure(deps, loop, session, "storage_error", nowIso);
+        return { ok: false, failure: "storage_error", cause: presence.cause };
+      }
+      if (presence.present) continue;
+    }
+    // No row, or a row whose file is gone (AB8): the snapshot is incomplete —
+    // commit refuses (resume class: re-upload, then retry the same commit).
+    await stampCommitFailure(deps, loop, session, "blob_missing", nowIso);
+    return { ok: false, failure: "blob_missing" };
+  }
+
+  // TEST-ONLY interleaving seam — fires between the resolve/precheck and the
+  // commit transaction (slice 5 commits a REAL competing write here).
+  await deps.hooks?.afterResolve?.("commit", session.id);
+
+  const outcome = await deps.db.transaction(async (tx): Promise<CommitTxOutcome> => {
+    // (a) 决策 11's in-transaction re-check: the LIVE row against the
+    // SESSION's generation/base — any drift since prepare is caught here
+    // regardless of what the outer resolve saw.
+    const live = (await tx.select().from(loops).where(eq(loops.id, loop.id)).limit(1))[0];
+    if (!live) throw new ArtifactSyncGuardLostError("commit", session.id); // vanished mid-flight: roll back, re-resolve
+    if (live.artifactConfigRevision !== session.configRevision) return { kind: "aborted", failure: "config_conflict" };
+    if (live.artifactManifestRevision !== session.baseManifestRevision) return { kind: "aborted", failure: "manifest_conflict" };
+    if (live.artifactManifestRevision >= REVISION_INT32_MAX) return { kind: "aborted", failure: "manifest_revision_exhausted" };
+
+    const manifestRevision = live.artifactManifestRevision + 1;
+    const manifestId = deps.ids.manifestId();
+    const receipt: CommitArtifactSyncResponse = { artifactSnapshotId: manifestId, manifestRevision };
+    try {
+      // (b) The guarded loop UPDATE lands FIRST: pointer + manifestRevision +
+      // the SUCCESS stamp + the unified OCC bump, guarded on the in-tx row's
+      // revision (the predicate is re-evaluated under the row lock — a
+      // competitor in the select→update window loses the guard).
+      const updated = await tx
+        .update(loops)
+        .set({
+          artifactManifestId: manifestId,
+          artifactManifestRevision: manifestRevision,
+          artifactSyncAttemptedAt: nowIso,
+          artifactSyncSucceededAt: nowIso,
+          artifactSyncError: null,
+          updatedAt: nowIso,
+          revision: sql`${loops.revision} + 1`,
+        })
+        .where(and(eq(loops.id, loop.id), eq(loops.revision, live.revision)))
+        .returning({ id: loops.id });
+      if (updated.length !== 1) throw new ArtifactSyncGuardLostError("commit", session.id);
+      // (c) The immutable manifest — fresh ID-factory id (决策 12: identical
+      // content from two sessions is still two snapshots).
+      await tx.insert(artifactManifests).values({
+        id: manifestId,
+        namespaceId: session.namespaceId,
+        machineId: session.machineId,
+        loopId: session.loopId,
+        configRevision: session.configRevision,
+        manifestRevision,
+        entries: session.normalizedManifest,
+        fileCount: session.normalizedManifest.length,
+        totalBytes: session.normalizedManifest.reduce((sum, entry) => sum + entry.size, 0),
+        committedAt: nowIso,
+      } satisfies NewArtifactManifest);
+      // (d) The throw-only seam (AC3: any failure here rolls back EVERYTHING).
+      await deps.hooks?.insideCommitTx?.(session.id);
+      // (e) The receipt behind a receipt-IS-NULL guard: a same-session
+      // concurrent commit loses here, rolls back its loop update AND manifest
+      // insert, and its bounded re-run replays the winner's receipt.
+      const marked = await tx
+        .update(artifactSyncSessions)
+        .set({ receipt })
+        .where(and(eq(artifactSyncSessions.id, session.id), isNull(artifactSyncSessions.receipt)))
+        .returning({ id: artifactSyncSessions.id });
+      if (marked.length !== 1) throw new ArtifactSyncGuardLostError("commit", session.id);
+      return { kind: "committed", receipt };
+    } catch (err) {
+      if (isUniqueViolation(err)) throw new ArtifactSyncGuardLostError("commit", session.id);
+      throw err;
+    }
+  });
+
+  if (outcome.kind === "aborted") {
+    // The in-tx re-check found drift the outer precheck predates. Only
+    // manifest_conflict stamps (base competition IS an attempt conclusion);
+    // config_conflict/exhausted never stamp.
+    if (outcome.failure === "manifest_conflict") {
+      await stampCommitFailure(deps, loop, session, "manifest_conflict", nowIso);
+    }
+    return { ok: false, failure: outcome.failure };
+  }
+  return { ok: true, receipt: outcome.receipt };
+}
+
+/**
+ * Commit a fully-uploaded session (ADR-010 决策 11/12). See the module header
+ * for the receipt/precheck/completeness/transaction contract. The bounded
+ * re-run (withGuardRetry — exactly once, then ArtifactSyncRaceLostError)
+ * covers the guard losses: the loop CAS, the receipt guard, the defensive
+ * unique-violation conversion.
+ */
+export async function commitArtifactSync(
+  deps: ArtifactHomeDeps,
+  machine: TrustedMachineIdentity,
+  input: { syncId: string },
+): Promise<CommitArtifactSyncResult> {
+  return withGuardRetry(
+    () => commitOnce(deps, machine, input),
+    (err) => err instanceof ArtifactSyncGuardLostError,
+    (err) => new ArtifactSyncRaceLostError((err as ArtifactSyncGuardLostError).op, (err as ArtifactSyncGuardLostError).id),
+  );
 }
 
 // ---- snapshot read (AC10 / binding loader) ----
