@@ -79,8 +79,12 @@
  *    hash needs a metadata row AND a present file — a row without its file
  *    is blob_missing (AB8, the resume class), a has() failure is
  *    storage_error (never a silent "missing").
- *  - ONE transaction then re-checks the LIVE loop row against the SESSION's
- *    generation/base/exhaustion (决策 11's 事务内重新检查), lands the guarded
+ *  - ONE transaction then re-verifies the LIVE session row FIRST (a winner's
+ *    receipt replays verbatim — same-session concurrent commits converge to
+ *    ONE receipt; the pending TTL is re-checked against a fresh clock read;
+ *    the attribution association is re-verified), then re-checks the LIVE
+ *    loop row against the SESSION's generation/base/exhaustion plus the
+ *    loop↔session association (决策 11's 事务内重新检查), lands the guarded
  *    loop UPDATE FIRST (the row lock serializes concurrent commits, making
  *    the (loopId, manifestRevision) unique violation unreachable for a
  *    correct race — a defensive cause-chain conversion still maps it to a
@@ -741,7 +745,10 @@ function isUniqueViolation(err: unknown): boolean {
 
 type CommitTxOutcome =
   | { kind: "committed"; receipt: CommitArtifactSyncResponse }
-  | { kind: "aborted"; failure: "config_conflict" | "manifest_conflict" | "manifest_revision_exhausted" };
+  | {
+      kind: "aborted";
+      failure: "session_not_found" | "session_expired" | "config_conflict" | "manifest_conflict" | "manifest_revision_exhausted";
+    };
 
 async function commitOnce(
   deps: ArtifactHomeDeps,
@@ -806,20 +813,36 @@ async function commitOnce(
   await deps.hooks?.afterResolve?.("commit", session.id);
 
   const outcome = await deps.db.transaction(async (tx): Promise<CommitTxOutcome> => {
-    // (a) 决策 11's in-transaction re-check: the LIVE row against the
-    // SESSION's generation/base — any drift since prepare is caught here
-    // regardless of what the outer resolve saw.
-    const live = (await tx.select().from(loops).where(eq(loops.id, loop.id)).limit(1))[0];
+    // (a) 决策 11's in-transaction re-verification — the SESSION first: the
+    // outer precheck's snapshot was stale the moment it was read, so the LIVE
+    // session row decides. A winner's receipt replays VERBATIM (a same-session
+    // concurrent commit converges to ONE receipt — AC7; the pre-fix shape
+    // fell through to a base conflict instead), the pending TTL is re-checked
+    // against a FRESH clock read, and the attribution association is
+    // re-verified against the live row.
+    const liveSession = (
+      await tx.select().from(artifactSyncSessions).where(eq(artifactSyncSessions.id, session.id)).limit(1)
+    )[0];
+    if (!liveSession) throw new ArtifactSyncGuardLostError("commit", session.id); // vanished mid-flight: roll back, re-resolve
+    if (liveSession.receipt !== null) return { kind: "committed", receipt: liveSession.receipt };
+    if (deps.clock.now().toISOString() >= liveSession.expiresAt) return { kind: "aborted", failure: "session_expired" };
+    if (liveSession.namespaceId !== attribution.namespaceId || liveSession.machineId !== attribution.machineId) {
+      return { kind: "aborted", failure: "session_not_found" };
+    }
+    // (b) The LIVE loop row against the SESSION's generation/base — any drift
+    // since prepare is caught here regardless of what the outer resolve saw.
+    const live = (await tx.select().from(loops).where(eq(loops.id, liveSession.loopId)).limit(1))[0];
     if (!live) throw new ArtifactSyncGuardLostError("commit", session.id); // vanished mid-flight: roll back, re-resolve
-    if (live.artifactConfigRevision !== session.configRevision) return { kind: "aborted", failure: "config_conflict" };
-    if (live.artifactManifestRevision !== session.baseManifestRevision) return { kind: "aborted", failure: "manifest_conflict" };
+    if (live.machineId !== liveSession.machineId) return { kind: "aborted", failure: "session_not_found" };
+    if (live.artifactConfigRevision !== liveSession.configRevision) return { kind: "aborted", failure: "config_conflict" };
+    if (live.artifactManifestRevision !== liveSession.baseManifestRevision) return { kind: "aborted", failure: "manifest_conflict" };
     if (live.artifactManifestRevision >= REVISION_INT32_MAX) return { kind: "aborted", failure: "manifest_revision_exhausted" };
 
     const manifestRevision = live.artifactManifestRevision + 1;
     const manifestId = deps.ids.manifestId();
     const receipt: CommitArtifactSyncResponse = { artifactSnapshotId: manifestId, manifestRevision };
     try {
-      // (b) The guarded loop UPDATE lands FIRST: pointer + manifestRevision +
+      // (c) The guarded loop UPDATE lands FIRST: pointer + manifestRevision +
       // the SUCCESS stamp + the unified OCC bump, guarded on the in-tx row's
       // revision (the predicate is re-evaluated under the row lock — a
       // competitor in the select→update window loses the guard).
@@ -834,26 +857,26 @@ async function commitOnce(
           updatedAt: nowIso,
           revision: sql`${loops.revision} + 1`,
         })
-        .where(and(eq(loops.id, loop.id), eq(loops.revision, live.revision)))
+        .where(and(eq(loops.id, live.id), eq(loops.revision, live.revision)))
         .returning({ id: loops.id });
       if (updated.length !== 1) throw new ArtifactSyncGuardLostError("commit", session.id);
-      // (c) The immutable manifest — fresh ID-factory id (决策 12: identical
+      // (d) The immutable manifest — fresh ID-factory id (决策 12: identical
       // content from two sessions is still two snapshots).
       await tx.insert(artifactManifests).values({
         id: manifestId,
-        namespaceId: session.namespaceId,
-        machineId: session.machineId,
-        loopId: session.loopId,
-        configRevision: session.configRevision,
+        namespaceId: liveSession.namespaceId,
+        machineId: liveSession.machineId,
+        loopId: liveSession.loopId,
+        configRevision: liveSession.configRevision,
         manifestRevision,
-        entries: session.normalizedManifest,
-        fileCount: session.normalizedManifest.length,
-        totalBytes: session.normalizedManifest.reduce((sum, entry) => sum + entry.size, 0),
+        entries: liveSession.normalizedManifest,
+        fileCount: liveSession.normalizedManifest.length,
+        totalBytes: liveSession.normalizedManifest.reduce((sum, entry) => sum + entry.size, 0),
         committedAt: nowIso,
       } satisfies NewArtifactManifest);
-      // (d) The throw-only seam (AC3: any failure here rolls back EVERYTHING).
+      // (e) The throw-only seam (AC3: any failure here rolls back EVERYTHING).
       await deps.hooks?.insideCommitTx?.(session.id);
-      // (e) The receipt behind a receipt-IS-NULL guard: a same-session
+      // (f) The receipt behind a receipt-IS-NULL guard: a same-session
       // concurrent commit loses here, rolls back its loop update AND manifest
       // insert, and its bounded re-run replays the winner's receipt.
       const marked = await tx
@@ -870,9 +893,9 @@ async function commitOnce(
   });
 
   if (outcome.kind === "aborted") {
-    // The in-tx re-check found drift the outer precheck predates. Only
+    // The in-tx re-verification found drift the outer precheck predates. Only
     // manifest_conflict stamps (base competition IS an attempt conclusion);
-    // config_conflict/exhausted never stamp.
+    // session_not_found/session_expired/config_conflict/exhausted never stamp.
     if (outcome.failure === "manifest_conflict") {
       await stampCommitFailure(deps, loop, session, "manifest_conflict", nowIso);
     }

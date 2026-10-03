@@ -11,11 +11,16 @@
  *                 blob_missing / storage_error keep the old view and stamp
  *                 the wire code, an in-tx failure rolls back EVERYTHING;
  *                 AC7 receipt replay (repeat, restart, no pointer regress,
- *                 survives config bumps and TTL); AC10 snapshot immutability
- *                 and binding through the slice-2 plan/apply with REAL
- *                 committed manifests; AM6 old-generation refusal incl. the
- *                 generation-guarded failure stamp; the bounded guard-retry
- *                 (loop-vanish retry, unique-violation RaceLost bound).
+ *                 survives config bumps and TTL); the transaction re-verifies
+ *                 the LIVE session first — a same-session winner's receipt
+ *                 replays verbatim (convergence), the pending TTL is
+ *                 re-checked against a fresh clock, the loop↔session
+ *                 attribution association is re-verified (A4-1); AC10
+ *                 snapshot immutability and binding through the slice-2
+ *                 plan/apply with REAL committed manifests; AM6
+ *                 old-generation refusal incl. the generation-guarded failure
+ *                 stamp; the bounded guard-retry (loop-vanish retry,
+ *                 unique-violation RaceLost bound).
  */
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
@@ -605,6 +610,84 @@ describe("commit (real PGlite + memory BlobStore)", () => {
     const after = await getLoop();
     expect([after.artifactManifestId, after.artifactManifestRevision]).toEqual([null, 0]); // both attempts rolled back
     expect((await manifests()).map((m) => m.id)).toEqual(["amf-orphan"]);
+  });
+
+  it("AC7: a same-session commit landing between the precheck and the transaction converges — the loser replays the winner's receipt (A4-1)", async () => {
+    await fresh();
+    await seedConfiguredLoop();
+    const syncId = await negotiate();
+    await put(syncId, CONTENT_A);
+    await put(syncId, CONTENT_B);
+
+    let competitorCalls = 0;
+    let winnerReceipt: unknown = null;
+    const hooks: ArtifactHomeDeps["hooks"] = {
+      afterResolve: async (op) => {
+        if (op !== "commit") return;
+        competitorCalls += 1;
+        if (competitorCalls > 1) return;
+        // The winner commits the SAME session between the loser's precheck
+        // and its transaction (hook-free deps — no recursion).
+        const winner = await commitArtifactSync(makeDeps(db), { machineId: "m-1" }, { syncId });
+        if (!winner.ok) throw new Error(`winner fixture must succeed: ${JSON.stringify(winner)}`);
+        winnerReceipt = winner.receipt;
+      },
+    };
+    deps = makeDeps(db, { hooks });
+
+    const loser = await commit(syncId);
+    // Converged: the loser's in-tx session re-verification sees the winner's
+    // receipt and replays it verbatim — NOT a manifest_conflict (the pre-fix
+    // shape: the base check predated the receipt guard).
+    expect(loser).toEqual({ ok: true, receipt: winnerReceipt });
+    expect(competitorCalls).toBe(1); // convergence needed no retry
+    expect(await manifests()).toHaveLength(1); // exactly ONE snapshot
+    const after = await getLoop();
+    expect([after.artifactManifestId, after.artifactManifestRevision]).toEqual(["amf-1", 1]);
+  });
+
+  it("the pending TTL is re-checked INSIDE the commit transaction — a clock advance past expiresAt aborts with zero writes (A4-1)", async () => {
+    await fresh();
+    await seedConfiguredLoop();
+    const syncId = await negotiate({ entries: [] });
+    const loopsBefore = await snapshotLoops(db);
+    deps = makeDeps(db, {
+      hooks: {
+        afterResolve: (op) => {
+          // now == expiresAt — the EXCLUSIVE bound makes the session expired
+          // between the outer precheck and the transaction.
+          if (op === "commit") clock.advance(ARTIFACT_SYNC_SESSION_TTL_MILLIS);
+        },
+      },
+    });
+
+    await expect(commit(syncId)).resolves.toEqual({ ok: false, failure: "session_expired" });
+    expect(await snapshotLoops(db)).toEqual(loopsBefore); // expired never stamps
+    expect(await manifests()).toHaveLength(0);
+    expect((await db.select().from(artifactSyncSessions).where(eq(artifactSyncSessions.id, syncId)))[0]!.receipt).toBeNull();
+  });
+
+  it("the loop↔session attribution association is re-verified INSIDE the commit transaction — a mid-flight migration is the leak-free session_not_found (A4-1)", async () => {
+    await fresh();
+    await seedConfiguredLoop();
+    const syncId = await negotiate({ entries: [] });
+    deps = makeDeps(db, {
+      hooks: {
+        afterResolve: async (op) => {
+          if (op !== "commit") return;
+          // An out-of-band machine migration lands between the outer resolve
+          // (which saw m-1) and the transaction.
+          await db.update(loops).set({ machineId: "m-2" }).where(eq(loops.id, "loop-1"));
+        },
+      },
+    });
+
+    await expect(commit(syncId)).resolves.toEqual({ ok: false, failure: "session_not_found" });
+    // Zero commit writes: the loop carries only the competitor's migration.
+    const after = await getLoop();
+    expect(after.machineId).toBe("m-2");
+    expect([after.artifactManifestId, after.artifactManifestRevision, after.artifactSyncAttemptedAt]).toEqual([null, 0, null]);
+    expect(await manifests()).toHaveLength(0);
   });
 
   it("a competitor that bumps ONLY the unified OCC revision (an unrelated domain write) does NOT block the commit", async () => {
