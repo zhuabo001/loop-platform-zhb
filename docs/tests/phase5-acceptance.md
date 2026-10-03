@@ -95,10 +95,14 @@ $ git diff --check   # EXIT=0
 
 ## 复审与 Issue 收口
 
-- 片 6 收口三轨复审：进行中（轮次与固定范围在复审完成后补录）。
-- 既有 Issue：#72、#11 为 Phase 6 blocker（roadmap 指针在位）；#56、#61 留给 Phase 5 后续批次（#56 认证层加固、#61 验收环境防回归）；Batch 1 各片复审 Issue（#66–#82）全部核销关闭。
+- 片 6 收口三轨复审 Round 1（固定范围 `546703f...5929fe2`；审查记录 `docs/handoff/codex-handoff-phase5-batch1-slice6-code-review.md`，当批物流、按约定不入库）：三轨零阻断——标准 0 违例、规格 0 验收缺项（权威计划 L171 链逐项满足）、对抗 0 项 P2 及以上（独立磁盘探针 1/1 通过：模拟 COMMIT 确认丢失后关库重开同根，原 session 取回原快照与 revision，整行断言，磁盘字节一致）。
+- Round 1 唯一发现为一项 P3 非阻断证据措辞（三处）→ 修复提交 `6cc78fe`（注释与文档 only，零断言变更）。2026-10-03 定点复核（`5929fe2...0ffa7c7`）判定该项**核销关闭，片 6 无剩余审查项**；`0ffa7c7`（仓库工作规约 AGENTS.md「输出风格」一节入库）单独识别，不计作 P3 修复。
+- 修复后五门复跑（`6cc78fe`，日志 `/tmp/slice6-p3-gates.log`）：protocol 248 / daemon 535 + 7 skipped / server 810 + 3 skipped，全 EXIT=0；`db:check` 无 drift。收口提交（roadmap 状态块、本节与结论、计划头终态）为文档-only，不改动代码或测试。
+- 既有 Issue：#72、#11 为 Phase 6 blocker（roadmap 指针在位）；#56、#61 留给 Phase 5 后续批次（#56 认证层加固、#61 验收环境防回归）；Batch 1 各片复审 Issue（#66–#82）全部核销关闭。上述 P3 未创建 Issue，无远程状态需要变更。
 
 ## 结论
 
-Batch 1 全部编组（AM/AP/AB/AC 与 AD）与内部集成验收通过，五道质量门全绿；生产仍运行
-Phase 4 行为（AD1–AD4 在测）。收口三轨复审完成后在此补最终结论。
+Batch 1 全部编组（AM/AP/AB/AC 与 AD）与内部集成验收通过，五道质量门全绿；收口三轨复审
+Round 1 零阻断，唯一 P3 证据措辞项经定点复核核销关闭；生产仍运行 Phase 4 行为（AD1–AD4 在测）。
+**Batch 1 完成（2026-10-03）**，批次 PR #68 已转待合入；Batch 2（watcher、持续同步、Run 快照与
+文件视图）与 Batch 3（认证）另行规划。
