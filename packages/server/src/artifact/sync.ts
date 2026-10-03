@@ -134,13 +134,16 @@
  *  - Failure classification at the transaction boundary (决策 13): an
  *    IDENTIFIED recoverable storage failure (SQLSTATE classes 08xxx
  *    connection / 53xxx insufficient resources / 57xxx operator intervention
- *    / 58xxx system-I/O, walked along the driver cause chain) rolls the whole
- *    transaction back and lands as the stable storage_error result with a
- *    best-effort stamp — the SAME session retried after the fault converges.
- *    Guard losses keep the bounded re-run, 23505 its defensive guard-loss
- *    conversion; every UNCODED or unclassified-class error keeps the
- *    raw-throw boundary — an unrecognized defect is never laundered into the
- *    retryable storage class.
+ *    / 58xxx system-I/O, walked along the driver cause chain) lands as the
+ *    stable storage_error result with a best-effort stamp — the SAME session
+ *    retried after the fault converges. A statement failure aborts the
+ *    transaction and rolls back every statement; the ONE shape that is not a
+ *    rollback is a lost COMMIT acknowledgement (an 08xxx surfacing after the
+ *    server committed) — the retry then replays the landed commit's stored
+ *    receipt, so convergence holds either way. Guard losses keep the bounded
+ *    re-run, 23505 its defensive guard-loss conversion; every UNCODED or
+ *    unclassified-class error keeps the raw-throw boundary — an unrecognized
+ *    defect is never laundered into the retryable storage class.
  *
  * Internal failure literals are finer than the 9 wire codes (决策 13's
  * double layer, the RunCapabilityInvalidError precedent); the Batch 2 route
@@ -993,12 +996,19 @@ async function commitOnce(
     }
   });
   } catch (err) {
-    // The transaction rolled back WHOLESALE (Postgres guarantees it). Guard
-    // losses and every uncoded/unclassified error keep their existing
-    // boundaries — the bounded re-run and the raw throw. An IDENTIFIED
-    // recoverable storage failure lands as the stable storage_error result
-    // (决策 13's idempotent_retry class — the caller retries the SAME
-    // session) instead of leaking the driver exception.
+    // A failure INSIDE the transaction aborts it and rolls back every
+    // statement — that much Postgres guarantees. The loss of a COMMIT
+    // ACKNOWLEDGEMENT is the one shape that is NOT a rollback: an 08xxx
+    // surfacing around commit can postdate a server-side commit, so this
+    // failure and a committed transaction can coexist. The stable
+    // storage_error result stays safe either way, because the SAME session
+    // retried converges: a landed commit replays its stored receipt verbatim
+    // (no new snapshot, no revision bump, no pointer regress), a rolled-back
+    // attempt simply re-runs on fresh state. Guard losses and every
+    // uncoded/unclassified error keep their existing boundaries — the
+    // bounded re-run and the raw throw. An IDENTIFIED recoverable storage
+    // failure lands as the stable storage_error result (决策 13's
+    // idempotent_retry class) instead of leaking the driver exception.
     if (!isRecoverableStorageError(err)) throw err;
     // The failure IS an attempt conclusion (决策 8): stamp it best-effort.
     // The same storage fault may take the stamp write down too — bookkeeping
