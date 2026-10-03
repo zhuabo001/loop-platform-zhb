@@ -410,11 +410,15 @@ describe("slice-5 concurrency acceptance (real PGlite + memory BlobStore)", () =
    *  v1 report's content-bearing loop write — in BOTH directions. Forward
    *  (writer lands at the commit seam): the commit's in-tx live read
    *  re-baselines on the fresh revision and lands with ZERO guard loss.
-   *  Reverse (the commit lands in the writer's resolve/write window): the
-   *  writer's own pre-snapshot guard loses, its bounded re-run converges,
-   *  and neither write set is lost. The report transaction's INTERNAL
-   *  snapshot→guard window is unreachable on PGlite's single connection —
-   *  real multi-connection overlap stays with #72/#11. */
+   *  Reverse (the commit lands in the writer's resolve/write window) the two
+   *  writers converge DIFFERENTLY: the claim guards on its PRE-transaction
+   *  snapshot revision, so its guard loses once and its bounded re-run
+   *  converges; the report's write transaction takes its coherent snapshot
+   *  AFTER the commit landed, so its guarded write matches on the FIRST
+   *  attempt — no guard loss at all. Neither direction loses a write set.
+   *  The report transaction's INTERNAL snapshot→guard window is unreachable
+   *  on PGlite's single connection — real multi-connection overlap stays
+   *  with #72/#11. */
   describe("AC9: unified loop OCC vs the real claim/report writers", () => {
     it("a real claim landing at the commit seam (bump-only) does not block the commit — re-baseline, zero guard loss", async () => {
       await fresh();

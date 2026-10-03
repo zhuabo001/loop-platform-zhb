@@ -93,11 +93,11 @@ Blob 完备性在事务外检查：所有协商 hash 都须有元数据行，已
 
 任一步失败，数据库写入整体回滚。Loop UPDATE 取得的行锁串行化并发提交；session 回执守卫保证写入一次。CAS 或回执守卫丢失时有界重跑，读取胜方回执；manifest 唯一冲突 `23505` 也转换到同一守卫重试路径。只影响统一 OCC revision 的无关域写入可通过重读继续提交，业务守卫始终以 session 的配置代际和 base 为依据。
 
-回滚矩阵按事务步骤钉定：guarded UPDATE、manifest 插入、回执写入任一步的驱动级失败都原始传播、不重试、零部分写入（前序步骤随之回滚）；守卫零行丢失经恰一次有界重跑收敛，持续丢失以 `ArtifactSyncRaceLostError` 失败关闭。统一 OCC 与调度/Report 真实写方的双向交错已钉：无关域写（claim 的 bump-only、report 的终态写）落在 commit 缝前时，commit 以事务内 live 行重定基线零重跑落地；commit 落在写方的解析—写窗口时，由写方既有守卫丢失与有界重跑收敛，双写集互不丢失。该证据来自 PGlite 单连接，不替代 [#11](https://github.com/zhuabo001/loop-platform-zhb/issues/11)/[#72](https://github.com/zhuabo001/loop-platform-zhb/issues/72) 的真实多物理连接验证。
+回滚矩阵按事务步骤钉定：guarded UPDATE、manifest 插入、回执写入任一步失败，事务整体回滚、零部分写入（前序步骤随之回滚）。失败按识别分类：已识别的可恢复存储故障（SQLSTATE 08xxx 连接 / 53xxx 资源不足 / 57xxx 操作干预 / 58xxx 系统 I/O，沿驱动 cause 链识别）归稳定 `storage_error` 结果（决策 13 的 idempotent_retry），不走守卫重跑，故障消除后同一 session 原样重试收敛；无码或未识别类的错误保留原始抛出边界——不把未知异常兜底成可重试失败，约束违例与序列化/死锁码也不归此类。守卫零行丢失经恰一次有界重跑收敛，持续丢失以 `ArtifactSyncRaceLostError` 失败关闭。统一 OCC 与调度/Report 真实写方的双向交错已钉：无关域写（claim 的 bump-only、report 的终态写）落在 commit 缝前时，commit 以事务内 live 行重定基线零重跑落地；commit 落在 claim 的解析—写窗口时，claim 的事务前快照守卫丢失一次、有界重跑收敛；落在 report 的解析—写窗口时，report 写事务的快照取得于 commit 之后，守卫不丢失直接落地。两个方向双写集互不丢失。该证据来自 PGlite 单连接，不替代 [#11](https://github.com/zhuabo001/loop-platform-zhb/issues/11)/[#72](https://github.com/zhuabo001/loop-platform-zhb/issues/72) 的真实多物理连接验证。
 
 #### 同步尝试状态
 
-成功状态随 guarded Loop UPDATE 原子写入：`attemptedAt=succeededAt=提交时刻`，`error=null`。commit 失败仅对 `manifest_conflict`、`blob_missing`、`storage_error` 记录尝试，错误值使用对应 wire 码。失败记录采用 best-effort UPDATE，以 Loop id、观测 revision 和 session 配置代际为守卫；零行静默跳过、不重试，防止旧请求覆盖较新状态。真竞态下败方的失败记录携带事务外观测的陈旧 revision，胜方已提交时守卫零行——胜方的成功三元组不被败方的失败打账覆盖。
+成功状态随 guarded Loop UPDATE 原子写入：`attemptedAt=succeededAt=提交时刻`，`error=null`。commit 失败仅对 `manifest_conflict`、`blob_missing`、`storage_error` 记录尝试，错误值使用对应 wire 码。失败记录采用 best-effort UPDATE，以 Loop id、观测 revision 和 session 配置代际为守卫；零行静默跳过、不重试，防止旧请求覆盖较新状态。真竞态下败方的失败记录携带事务外观测的陈旧 revision：已验证窗口是胜方提交晚于败方的 Loop 观测，此时守卫零行——胜方的成功三元组不被败方的失败打账覆盖；若胜方在败方观测之前已提交，败方基于新鲜观测裁决出的冲突是真实结论，其打账合法落库（打账只更新 attemptedAt/error/revision，不改写胜方的 succeededAt 与指针）。事务内已识别存储故障归 `storage_error` 时同样按此规则 best-effort 打账；同一存储故障可能使打账本身失败，账目从不改变操作结果。
 
 `config_conflict`、`session_expired`、`attribution_missing`、`session_not_found`、`manifest_revision_exhausted` 不记录失败尝试。prepare/PUT 失败尚未终结同步尝试，也不记录该状态。
 
@@ -211,3 +211,4 @@ bind 计划携带解析时的 `guardConfigRevision`。落库的 Run UPDATE 守�
 - 决策 10/11 明确 PUT 完成前全量复验、commit 事务内复验、回执守卫及同步尝试记录规则；commit 裁决观测序统一为 Loop→session，避免同 session 成功被误判为 base 冲突。关联：[#79](https://github.com/zhuabo001/loop-platform-zhb/issues/79)、[#80](https://github.com/zhuabo001/loop-platform-zhb/issues/80)。
 - 决策 9/11 明确去重与完备性检查使用已验证 size，保证容量统计与实际内容一致。关联：[#81](https://github.com/zhuabo001/loop-platform-zhb/issues/81)。
 - 决策 10 明确元数据登记失败归 `storage_error` 结果联合；决策 11 钉定 commit 回滚矩阵（任一步失败整体回滚、守卫丢失恰一次重跑、持续丢失失败关闭）、真竞态下败方失败打账因陈旧 revision 守卫零行跳过，以及统一 OCC 与 claim/report 真实写方的双向交错收敛。片 5 并发/交错/故障注入验收的 PGlite 证据不替代 #11/#72。
+- 决策 11 修正 commit 回滚矩阵的驱动失败分类：已识别的可恢复存储故障（SQLSTATE 08/53/57/58 类）在事务整体回滚后归稳定 `storage_error` 结果并 best-effort 打账，无码或未识别类错误保留原始抛出边界；同步限定真竞态零行打账的已验证窗口（胜方提交晚于败方观测），并区分 AC9 反向交错的收敛路径——claim 守卫丢失一次后有界重跑，report 写事务快照后至、守卫不丢失直接落地。来源：片 5 Round 1 三轨审查记录（A5-1）。
