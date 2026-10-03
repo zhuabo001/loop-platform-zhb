@@ -37,10 +37,24 @@ import { eq } from "drizzle-orm";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { type PrepareArtifactSyncRequest } from "@loopzhb/protocol";
+import { sha256 } from "@loopzhb/protocol/node";
 
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
-import { artifactBlobs, artifactManifests, artifactSyncSessions, loops, type ArtifactBlobRow, type ArtifactManifestRow, type Loop } from "../db/schema.js";
-import { FakeClock, seedLoop, seedMachine } from "../testkit/index.js";
+import {
+  artifactBlobs,
+  artifactManifests,
+  artifactSyncSessions,
+  loops,
+  runLeases,
+  runs,
+  type ArtifactBlobRow,
+  type ArtifactManifestRow,
+  type Loop,
+} from "../db/schema.js";
+import { createRunCoordinator } from "../coordinator/index.js";
+import { executeReportTx } from "../store/report.js";
+import { claimRunWithLeaseTx } from "../store/runs.js";
+import { FakeClock, makeTestFactories, seedLease, seedLoop, seedMachine, seedRun, testDeps } from "../testkit/index.js";
 import type { ArtifactAttributionResolver } from "./attribution.js";
 import { createMemoryBlobStore } from "./blob-store-memory.js";
 import type { BlobStore } from "./blob-store.js";
@@ -389,5 +403,187 @@ describe("slice-5 concurrency acceptance (real PGlite + memory BlobStore)", () =
     expect(await blobRows()).toMatchObject([{ namespaceId: "ns-1", hash: HASH_A, size: 3 }]);
     expect(await blobRows()).toHaveLength(1);
     expect((await storedBytes("ns-1", HASH_A))?.equals(Buffer.from(CONTENT_A))).toBe(true);
+  });
+
+  /** AC9: the unified loop OCC token arbitrates the artifact commit against
+   *  the REAL scheduler/report writers — the claim's bump-only CAS and the
+   *  v1 report's content-bearing loop write — in BOTH directions. Forward
+   *  (writer lands at the commit seam): the commit's in-tx live read
+   *  re-baselines on the fresh revision and lands with ZERO guard loss.
+   *  Reverse (the commit lands in the writer's resolve/write window): the
+   *  writer's own pre-snapshot guard loses, its bounded re-run converges,
+   *  and neither write set is lost. The report transaction's INTERNAL
+   *  snapshot→guard window is unreachable on PGlite's single connection —
+   *  real multi-connection overlap stays with #72/#11. */
+  describe("AC9: unified loop OCC vs the real claim/report writers", () => {
+    it("a real claim landing at the commit seam (bump-only) does not block the commit — re-baseline, zero guard loss", async () => {
+      await fresh();
+      await seedConfiguredLoop();
+      const syncId = await negotiate();
+      await put(syncId, CONTENT_A);
+      await seedRun(db, { id: "run-1", machineId: "m-1", phase: "pending" });
+      const revisionBefore = (await getLoop()).revision;
+
+      let seamCalls = 0;
+      let claimLanded = false;
+      const hooks: ArtifactHomeDeps["hooks"] = {
+        afterResolve: async (op) => {
+          if (op !== "commit") return;
+          seamCalls += 1;
+          if (seamCalls > 1) return;
+          // A REAL claim commits between the commit's precheck and its
+          // transaction: run → running, lease minted, the loop's unified
+          // revision bumped WITHOUT touching the artifact columns.
+          const claimed = await claimRunWithLeaseTx(
+            { db, clock, ...makeTestFactories() },
+            { runId: "run-1", loopId: "loop-1", machineId: "m-1", role: "exec" },
+          );
+          if (!claimed) throw new Error("claim fixture must succeed");
+          claimLanded = true;
+        },
+      };
+      deps = makeDeps(db, { hooks });
+
+      const result = await commit(syncId);
+      if (!result.ok) throw new Error(`commit must land: ${JSON.stringify(result)}`);
+      expect(claimLanded).toBe(true);
+      expect(seamCalls).toBe(1); // the in-tx live read re-baselined — NO guard loss, no re-run
+      const after = await getLoop();
+      expect(after.revision).toBe(revisionBefore + 2); // claim +1, commit +1 — no lost update either way
+      expect(after.artifactManifestId).toBe(result.receipt.artifactSnapshotId);
+      expect(after.artifactManifestRevision).toBe(1);
+      expect((await db.select().from(runs).where(eq(runs.id, "run-1")))[0]!.phase).toBe("running");
+      expect(await db.select().from(runLeases)).toHaveLength(1);
+    });
+
+    it("a real v1 report landing at the commit seam (content-bearing) — the commit lands and BOTH write sets survive", async () => {
+      await fresh();
+      await seedConfiguredLoop();
+      const syncId = await negotiate();
+      await put(syncId, CONTENT_A);
+      const token = "rk_ac9_forward";
+      await seedRun(db, { id: "run-1", machineId: "m-1", phase: "running" });
+      await seedLease(db, { tokenHash: sha256(token), runId: "run-1", machineId: "m-1", terminalProtocolVersion: 1 });
+      const revisionBefore = (await getLoop()).revision;
+
+      let seamCalls = 0;
+      const hooks: ArtifactHomeDeps["hooks"] = {
+        afterResolve: async (op) => {
+          if (op !== "commit") return;
+          seamCalls += 1;
+          if (seamCalls > 1) return;
+          // A REAL v1 success report commits between the commit's precheck
+          // and its transaction: run finalized, lease retired, and the
+          // content-bearing loop write (taskFile columns) + revision bump.
+          const reported = await executeReportTx(
+            { db, clock },
+            {
+              tokenHash: sha256(token),
+              body: { ok: true, terminal: { kind: "report", status: "resolved", message: "shipped" }, taskFileContent: "spec v2" },
+            },
+          );
+          expect(reported).toEqual({ ok: true });
+        },
+      };
+      deps = makeDeps(db, { hooks });
+
+      const result = await commit(syncId);
+      if (!result.ok) throw new Error(`commit must land: ${JSON.stringify(result)}`);
+      expect(seamCalls).toBe(1);
+      const after = await getLoop();
+      expect(after.revision).toBe(revisionBefore + 2); // report +1, commit +1
+      // The report's content write survives…
+      expect(after.taskFileContent).toBe("spec v2");
+      expect(after.taskFileSyncedAt).toBe(clock.iso());
+      // …and so does the artifact pointer.
+      expect(after.artifactManifestId).toBe(result.receipt.artifactSnapshotId);
+      expect((await db.select().from(runs).where(eq(runs.id, "run-1")))[0]!).toMatchObject({ phase: "done", outcome: "exec" });
+      expect(await db.select().from(runLeases)).toHaveLength(0); // the lease retired
+    });
+
+    it("a real artifact commit landing in the claim's resolve/write window loses the claim's guard once — the bounded re-run converges with both effects", async () => {
+      await fresh();
+      await seedConfiguredLoop();
+      const syncId = await negotiate();
+      await put(syncId, CONTENT_A);
+      await seedRun(db, { id: "run-1", machineId: "m-1", phase: "pending" });
+      const revisionBefore = (await getLoop()).revision;
+      let committedSnapshotId: string | null = null;
+
+      let hookCalls = 0;
+      const claimed = await claimRunWithLeaseTx(
+        {
+          db,
+          clock,
+          ...makeTestFactories(),
+          hooks: {
+            afterClaimLoopResolve: async () => {
+              hookCalls += 1;
+              if (hookCalls > 1) return;
+              // The commit lands between the claim's loop resolve and its
+              // write transaction (hook-free deps — no recursion).
+              const committed = await commitArtifactSync(makeDeps(db), { machineId: "m-1" }, { syncId });
+              if (!committed.ok) throw new Error(`commit fixture must succeed: ${JSON.stringify(committed)}`);
+              committedSnapshotId = committed.receipt.artifactSnapshotId;
+            },
+          },
+        },
+        { runId: "run-1", loopId: "loop-1", machineId: "m-1", role: "exec" },
+      );
+
+      expect(claimed).toBeDefined();
+      expect(hookCalls).toBe(2); // the pre-snapshot guard lost ONCE; the bounded re-run re-resolved and landed
+      const after = await getLoop();
+      expect(after.revision).toBe(revisionBefore + 2); // commit +1, claim +1
+      // The claim's bump-only CAS never touched the artifact columns…
+      expect(after.artifactManifestId).toBe(committedSnapshotId);
+      expect(after.artifactSyncSucceededAt).toBe(clock.iso());
+      // …and the claim's own effects landed.
+      expect((await db.select().from(runs).where(eq(runs.id, "run-1")))[0]!.phase).toBe("running");
+      expect(await db.select().from(runLeases)).toHaveLength(1);
+    });
+
+    it("a real artifact commit landing in the report's resolve/write window (coordinator seam) — the report finalizes on the post-commit snapshot", async () => {
+      await fresh();
+      await seedConfiguredLoop();
+      const syncId = await negotiate();
+      await put(syncId, CONTENT_A);
+      const token = "rk_ac9_reverse";
+      await seedRun(db, { id: "run-1", machineId: "m-1", phase: "running" });
+      await seedLease(db, { tokenHash: sha256(token), runId: "run-1", machineId: "m-1", terminalProtocolVersion: 1 });
+      const revisionBefore = (await getLoop()).revision;
+
+      let hookCalls = 0;
+      const coordinator = createRunCoordinator(
+        testDeps(db, clock, {
+          hooks: {
+            afterReportResolve: async () => {
+              hookCalls += 1;
+              if (hookCalls > 1) return;
+              // The commit lands between the report's read-side lease resolve
+              // and its write transaction — the write tx's coherent snapshot
+              // then postdates the commit, so the guarded loop write lands
+              // WITHOUT a CAS loss.
+              const committed = await commitArtifactSync(makeDeps(db), { machineId: "m-1" }, { syncId });
+              if (!committed.ok) throw new Error(`commit fixture must succeed: ${JSON.stringify(committed)}`);
+            },
+          },
+        }),
+      );
+
+      const reported = await coordinator.report(token, {
+        ok: true,
+        terminal: { kind: "report", status: "resolved", message: "shipped" },
+        taskFileContent: "spec v2",
+      });
+      expect(reported).toEqual({ ok: true });
+      expect(hookCalls).toBe(1); // no guard loss: the snapshot already included the commit
+      const after = await getLoop();
+      expect(after.revision).toBe(revisionBefore + 2); // commit +1, report +1
+      expect(after.artifactManifestId).not.toBeNull();
+      expect(after.taskFileContent).toBe("spec v2");
+      expect((await db.select().from(runs).where(eq(runs.id, "run-1")))[0]!).toMatchObject({ phase: "done", outcome: "exec" });
+      expect(await db.select().from(runLeases)).toHaveLength(0);
+    });
   });
 });
