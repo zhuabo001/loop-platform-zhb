@@ -32,7 +32,10 @@
  *    now < expiresAt (writer-computed from the injected Clock, 决策 9). A
  *    committed receipt never expires.
  *  - needHashes = the negotiated hashes without a verified blob BEHIND their
- *    metadata row: a row whose file is missing still demands re-upload
+ *    metadata row: a row whose VERIFIED size contradicts the negotiated
+ *    entry does not back this session (the declared size was never verified —
+ *    the upload is re-demanded, and writeVerified re-checks the bytes against
+ *    the manifest), a row whose file is missing still demands re-upload
  *    (AB8's prepare half), and a has() failure is storage_error — never a
  *    silent "needed" (the frozen BlobStore contract: has never swallows
  *    storage errors).
@@ -76,8 +79,11 @@
  *    regardless of any intermediate loop write): receipt → expired →
  *    config generation → base revision → manifest-revision exhaustion.
  *  - Blob completeness is verified BEFORE the transaction: every negotiated
- *    hash needs a metadata row AND a present file — a row without its file
- *    is blob_missing (AB8, the resume class), a has() failure is
+ *    hash needs a metadata row whose VERIFIED size matches the negotiated
+ *    entry AND a present file — a missing/contradicting row or a row without
+ *    its file is blob_missing (AB8, the resume class; the dedup path never
+ *    launders a lying size past writeVerified, so a manifest's totalBytes
+ *    always matches verified content truth), a has() failure is
  *    storage_error (never a silent "missing").
  *  - ONE transaction then re-verifies the LIVE session row FIRST (a winner's
  *    receipt replays verbatim — same-session concurrent commits converge to
@@ -273,31 +279,37 @@ function expiryFromIso(nowIso: string): string {
 }
 
 /** needHashes = negotiated hashes without a verified blob BEHIND the metadata
- *  row. No row → needed (no store call required). A row whose FILE is gone →
+ *  row. No row → needed (no store call required). A row whose VERIFIED size
+ *  contradicts the negotiated entry → still needed (the declared size was
+ *  never verified; writeVerified re-checks the bytes against the manifest —
+ *  the dedup path never launders a lying size). A row whose FILE is gone →
  *  still needed (AB8: prepare re-negotiates the missing blob; commit refuses
  *  the incomplete snapshot). A has() failure → storage_error, never a silent
  *  "needed". */
 async function computeNeedHashes(
   deps: ArtifactHomeDeps,
   namespaceId: string,
-  hashes: readonly string[],
+  entries: readonly NormalizedManifestEntry[],
 ): Promise<{ ok: true; need: string[] } | { ok: false; cause?: unknown }> {
   const need: string[] = [];
-  for (const hash of hashes) {
+  const seen = new Set<string>();
+  for (const entry of entries) {
+    if (seen.has(entry.hash)) continue; // one negotiation per hash (policy dedups)
+    seen.add(entry.hash);
     const row = (
       await deps.db
-        .select({ hash: artifactBlobs.hash })
+        .select({ size: artifactBlobs.size })
         .from(artifactBlobs)
-        .where(and(eq(artifactBlobs.namespaceId, namespaceId), eq(artifactBlobs.hash, hash)))
+        .where(and(eq(artifactBlobs.namespaceId, namespaceId), eq(artifactBlobs.hash, entry.hash)))
         .limit(1)
     )[0];
-    if (!row) {
-      need.push(hash);
+    if (!row || row.size !== entry.size) {
+      need.push(entry.hash);
       continue;
     }
-    const presence = await deps.blobStore.has({ namespaceId, hash });
+    const presence = await deps.blobStore.has({ namespaceId, hash: entry.hash });
     if (!presence.ok) return { ok: false, cause: presence.cause };
-    if (!presence.present) need.push(hash);
+    if (!presence.present) need.push(entry.hash);
   }
   return { ok: true, need };
 }
@@ -472,7 +484,7 @@ async function prepareOnce(
   // 决策 9: 重复 prepare 可重新计算缺失 Blob. (The fingerprint covers the
   // entries, so same-fingerprint reuse always re-derives the SAME hash set —
   // the stored negotiatedHashes never change on reuse.)
-  const need = await computeNeedHashes(deps, session.namespaceId, session.negotiatedHashes);
+  const need = await computeNeedHashes(deps, session.namespaceId, session.normalizedManifest);
   if (!need.ok) return { ok: false, failure: "storage_error", cause: need.cause };
   return {
     ok: true,
@@ -785,16 +797,22 @@ async function commitOnce(
   }
 
   // Blob completeness BEFORE the transaction (决策 11/12): every negotiated
-  // hash needs a metadata row AND a present file.
+  // hash needs a metadata row whose VERIFIED size matches the negotiated
+  // entry AND a present file.
+  const sizeByHash = new Map(session.normalizedManifest.map((entry) => [entry.hash, entry.size]));
   for (const hash of session.negotiatedHashes) {
+    const expectedSize = sizeByHash.get(hash);
+    if (expectedSize === undefined) {
+      throw new ArtifactSyncInvariantError(`session ${session.id} negotiated hash ${hash} with no manifest entry`);
+    }
     const row = (
       await deps.db
-        .select({ hash: artifactBlobs.hash })
+        .select({ size: artifactBlobs.size })
         .from(artifactBlobs)
         .where(and(eq(artifactBlobs.namespaceId, session.namespaceId), eq(artifactBlobs.hash, hash)))
         .limit(1)
     )[0];
-    if (row) {
+    if (row && row.size === expectedSize) {
       const presence = await deps.blobStore.has({ namespaceId: session.namespaceId, hash });
       if (!presence.ok) {
         await stampCommitFailure(deps, loop, session, "storage_error", nowIso);
@@ -802,8 +820,10 @@ async function commitOnce(
       }
       if (presence.present) continue;
     }
-    // No row, or a row whose file is gone (AB8): the snapshot is incomplete —
-    // commit refuses (resume class: re-upload, then retry the same commit).
+    // No row, a row whose verified size contradicts the negotiated entry (the
+    // dedup path never launders a lying size past writeVerified), or a row
+    // whose file is gone (AB8): the snapshot is incomplete — commit refuses
+    // (resume class: re-upload, then retry the same commit).
     await stampCommitFailure(deps, loop, session, "blob_missing", nowIso);
     return { ok: false, failure: "blob_missing" };
   }

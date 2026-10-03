@@ -1,7 +1,7 @@
 /**
  * AC1/AC2/AC3/AC7/AC10 (+ AM6 session-generation commit leg + AB8 commit half
- * + manifest_revision_exhausted) — ArtifactHome commit (ADR-010 决策 11/12,
- * Phase 5 Batch 1 slice 4):
+ * + A4-3 verified-size reuse + manifest_revision_exhausted) — ArtifactHome
+ * commit (ADR-010 决策 11/12, Phase 5 Batch 1 slice 4):
  *
  *  plan (pure):   planCommitPrecheck's fixed order — receipt → expired →
  *                 config → base → exhausted → proceed.
@@ -351,6 +351,61 @@ describe("commit (real PGlite + memory BlobStore)", () => {
     await expect(commit(syncId)).resolves.toEqual({ ok: false, failure: "blob_missing" });
     expect((await getLoop()).artifactSyncError).toBe("artifact_blob_missing");
     expect(await manifests()).toHaveLength(0);
+  });
+
+  it("A4-3: a negotiated size contradicting the verified blob is never reused — prepare re-demands the hash, PUT re-verifies, commit refuses (cross-session)", async () => {
+    await fresh();
+    await seedConfiguredLoop();
+    // Session 1 uploads aaa (3 bytes, declared 3) and commits for real.
+    const s1 = await negotiate({ entries: [{ path: "a.txt", hash: HASH_A, size: 3 }] });
+    await put(s1, CONTENT_A);
+    expect((await commit(s1)).ok).toBe(true);
+
+    // Session 2 declares the SAME hash with a LYING size 0. The verified row
+    // (size 3) does not back the negotiated entry — prepare re-demands the
+    // hash instead of reporting needHashes=[] (the pre-fix shape, which let
+    // the commit land totalBytes 0 over a 3-byte blob).
+    const second = await prepareArtifactSync(
+      deps,
+      { machineId: "m-1" },
+      makeRequest({ requestId: "req-2", baseManifestRevision: 1, entries: [{ path: "a.txt", hash: HASH_A, size: 0 }] }),
+    );
+    expect(second).toMatchObject({ ok: true, response: { needHashes: [HASH_A] } });
+    if (!second.ok) throw new Error("unreachable");
+
+    // The dedup path never launders the lie: PUT re-verifies the bytes
+    // against the DECLARED size 0 (overrun → content_mismatch).
+    const reupload = await putArtifactBlob(deps, { machineId: "m-1" }, {
+      syncId: second.response.syncId,
+      hash: HASH_A,
+      bytes: (async function* () {
+        yield bytesOf(CONTENT_A);
+      })(),
+    });
+    expect(reupload).toEqual({ ok: false, failure: "content_mismatch" });
+
+    // Commit refuses the inconsistent snapshot — the old view stands and the
+    // wire code stamps (the blob AS NEGOTIATED is missing).
+    const refused = await commit(second.response.syncId);
+    expect(refused).toEqual({ ok: false, failure: "blob_missing" });
+    const afterRefusal = await getLoop();
+    expect([afterRefusal.artifactManifestId, afterRefusal.artifactManifestRevision]).toEqual(["amf-1", 1]);
+    expect(afterRefusal.artifactSyncError).toBe("artifact_blob_missing");
+    expect(await manifests()).toHaveLength(1); // only session 1's snapshot
+
+    // An honest re-declaration (size 3) dedups cleanly — nothing to upload,
+    // the commit lands, and the manifest's totalBytes matches verified truth.
+    const third = await prepareArtifactSync(
+      deps,
+      { machineId: "m-1" },
+      makeRequest({ requestId: "req-3", baseManifestRevision: 1, entries: [{ path: "a.txt", hash: HASH_A, size: 3 }] }),
+    );
+    expect(third).toMatchObject({ ok: true, response: { needHashes: [] } });
+    if (!third.ok) throw new Error("unreachable");
+    const c3 = await commit(third.response.syncId);
+    expect(c3).toEqual({ ok: true, receipt: { artifactSnapshotId: "amf-2", manifestRevision: 2 } });
+    expect(await readArtifactSnapshot(db, "amf-2")).toMatchObject({ fileCount: 1, totalBytes: 3 });
+    expect((await getLoop()).artifactSyncError).toBeNull(); // the success stamp cleared the refusal
   });
 
   it("AC3: a failure INSIDE the commit transaction rolls back everything — no manifest, no receipt, no pointer, no stamp", async () => {
