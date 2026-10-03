@@ -222,7 +222,7 @@ pnpm --filter @loopzhb/server db:check
 git diff --check
 ```
 
-最终增加 Phase 5 E2E，并记录固定提交、运行环境、命令与证据。#11 仍是 Phase 6 真实 Postgres 阻塞项，PGlite 测试不能替代多物理连接并发验证。
+最终增加 Phase 5 E2E，并记录固定提交、运行环境、命令与证据。#11（report/reclaim）与 #72（Artifact 绑定/配置切换）是 Phase 6 真实 Postgres 阻塞项，PGlite 测试不能替代多物理连接并发验证。
 
 Batch 3 的认证升级顺序固定为：备份数据 → 暂停并 drain Daemon/Server → migration → 离线认领旧数据 → 配置 GitHub OAuth/canonical origin → 启动同时启用管理面认证并关闭自注册的 Server → 验证未知凭据零写拒绝及既有机器凭据可用 → 恢复既有机器调度。Batch 4 部署后再开放新机器 connect，并复验 poll 不能绕过 connect 注册。新旧 Server/Daemon 组合必须测试；新版 Daemon 对旧 Server 忽略缺失的 Artifact 配置。
 

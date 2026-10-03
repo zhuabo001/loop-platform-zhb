@@ -11,6 +11,13 @@
  */
 import { createHash } from "node:crypto";
 
+import {
+  canonicalPreparePayloadString,
+  canonicalWatchConfigString,
+  type NormalizedPreparePayload,
+} from "./artifact-policy.js";
+import type { ArtifactWatchItem } from "./artifact.js";
+
 export function sha256(s: string): string {
   return createHash("sha256").update(s).digest("hex");
 }
@@ -18,4 +25,21 @@ export function sha256(s: string): string {
 /** Derive the stable machine id from its device token (`m-<sha256(token)[:16]>`). */
 export function machineIdFromToken(token: string): string {
   return `m-${sha256(token).slice(0, 16)}`;
+}
+
+// ---- artifact sync fingerprints (ADR-010 决策 6) ----
+
+/** The session idempotency fingerprint: sha256 over the canonical prepare
+ *  payload (everything except `requestId`). Same key + same fingerprint ⇒
+ *  reuse the session; same key + different fingerprint ⇒ conflict. The
+ *  canonicalization itself is pure and lives in the main entry; the hash
+ *  composition lives here because sha256 needs node:crypto. */
+export function preparePayloadFingerprint(payload: NormalizedPreparePayload): string {
+  return sha256(canonicalPreparePayloadString(payload));
+}
+
+/** The watch-configuration digest echoed in poll as `watchDigest`: sha256
+ *  over the canonical watch set (config only, never file content). */
+export function watchConfigDigest(items: readonly ArtifactWatchItem[]): string {
+  return sha256(canonicalWatchConfigString(items));
 }

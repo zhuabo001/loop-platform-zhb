@@ -12,3 +12,5 @@ export * from "./report.js";
 export * from "./errors.js";
 export * from "./admin.js";
 export * from "./terminal-policy.js";
+export * from "./artifact.js";
+export * from "./artifact-policy.js";

@@ -127,6 +127,16 @@ export const reportRequestSchema = z.object({
   cost: costReportSchema.optional(),
   /** Total agent invocations — sent only when > 1 (transient-failure resume). */
   attempts: z.number().int().positive().optional(),
+  /** Phase 5 (ADR-010): the immutable artifact manifest id to bind as this
+   *  run's snapshot. Batch 1 does NOT consume it — parse but ignore (ADR-002
+   *  决策 6); Batch 2 binds it inside the report transaction. */
+  artifactSnapshotId: z.string().optional(),
+  /** Phase 5: the daemon's stable sync-error classification when the final
+   *  snapshot could not be produced — the run's own outcome is unaffected.
+   *  Batch 1 does NOT consume it. Free-form string on purpose: the
+   *  classification value set is Batch 2's to define, and pinning an enum
+   *  here would freeze the wrong place. */
+  artifactSyncError: z.string().optional(),
 });
 export type ReportRequest = z.infer<typeof reportRequestSchema>;
 

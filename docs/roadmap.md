@@ -205,6 +205,23 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
 
 环境与验收维护项：[Issue #61](https://github.com/zhuabo001/loop-platform-zhb/issues/61)——运行时 preload 环境隔离的明确防回归证据与验收环境记录；不重新打开已收口的 Phase4。
 
+### 状态
+
+- **Batch 1 — Artifact 领域、协议与存储基础：已完成**（2026-10-03，分支 `feat/phase5-batch1-dev`，ADR-010 与 ADR-002 修订；权威计划 `docs/plan/codex-phase5-batch1-plan.md`；验收证据 `docs/tests/phase5-acceptance.md`）
+  - 契约冻结：Artifact DTO、`artifact-sync-v1` capability、tolerant-reader 增量、canonical 顺序无关指纹、9 码错误与重试分类、8 MiB 有界解析。
+  - 数据模型：迁移 `0005` 前滚（Phase 4 `0000–0004` 冻结 fixture 无损升级）、配置事务与快照绑定计划、唯一键与 revision 规则。
+  - BlobStore：内存/本地双 adapter 共享契约；独占临时文件、流式验证、fsync 后 `link(2)` 原子发布、symlink/特殊文件拒绝。
+  - ArtifactHome 状态机：prepare/PUT/commit、Loop CAS、requestId 幂等与固定回执、当前视图与不可变快照读取；并发、交错与故障注入验收（AC4–AC6/AC9、AB5/AB7）。
+  - 生产休眠：AD1–AD4 全部在测——Artifact 路由未挂载、Create/Poll 行为不变、Report 忽略新字段、启动不构造 BlobStore、Daemon 不发同步请求。
+  - 收口：内部集成链（文件型 PGlite + 本地 BlobStore 的真实磁盘路径）与五道质量门全绿；收口三轨复审零阻断，唯一 P3 证据措辞项经定点复核核销。
+  - 批次 PR #68（分支 `feat/phase5-batch1-dev`）已于 2026-10-03 转待合入；Batch 2（watcher、持续同步、Run 快照与文件视图）与 Batch 3（认证）另行规划。
+
+### 右移项
+
+- [Issue #11](https://github.com/zhuabo001/loop-platform-zhb/issues/11) / [Issue #72](https://github.com/zhuabo001/loop-platform-zhb/issues/72)：Phase 6 阻塞项（真实 Postgres 多物理连接并发验收），指针见 Phase 6 节。
+- [Issue #56](https://github.com/zhuabo001/loop-platform-zhb/issues/56)：Phase 5 认证层加固（状态变更路由同源意图校验、`Content-Type` 门禁、拒绝空体）——随团队与认证层（Batch 3）处理。
+- [Issue #61](https://github.com/zhuabo001/loop-platform-zhb/issues/61)：运行时 preload 环境隔离的防回归证据与验收环境记录——随 Phase 5 后续批次处理。
+
 ## Phase 6 — 生产硬化（独立阶段）
 
 Postgres（托管分层）/R2、迁移预检、body/rate/storage caps、SSRF 防护、GC、
@@ -214,7 +231,8 @@ Postgres（托管分层）/R2、迁移预检、body/rate/storage caps、SSRF 防
 
 **显式阻塞项**：[Issue #11](https://github.com/zhuabo001/loop-platform-zhb/issues/11)
 ——Day 8–10 report/reclaim 竞态防护的多物理连接并发验收（ADR-001 修订记录
-2026-08-11），关闭前不得进入真实 Postgres。
+2026-08-11）；[Issue #72](https://github.com/zhuabo001/loop-platform-zhb/issues/72)
+——Artifact 快照绑定与配置切换的多连接行锁验收。两项关闭前不得进入真实 Postgres。
 
 ## Phase 7 — 高阶能力（按需）
 

@@ -38,6 +38,13 @@ const loopBase: Loop = {
   completionReason: null,
   taskFileSyncAttemptedAt: null,
   taskFileSyncError: null,
+  artifactDir: null,
+  artifactConfigRevision: 0,
+  artifactManifestRevision: 0,
+  artifactManifestId: null,
+  artifactSyncAttemptedAt: null,
+  artifactSyncSucceededAt: null,
+  artifactSyncError: null,
   revision: 0,
   createdAt: "2026-07-01T00:00:00.000Z",
   updatedAt: "2026-07-01T00:00:00.000Z",
@@ -62,6 +69,8 @@ const runBase: Run = {
   artifacts: null,
   transcript: null,
   progress: null,
+  artifactSnapshotId: null,
+  artifactSyncError: null,
 };
 
 describe("buildExecTask", () => {

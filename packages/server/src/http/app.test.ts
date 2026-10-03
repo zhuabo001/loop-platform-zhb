@@ -37,7 +37,7 @@ import { ScheduleRevisionExhaustedError, ScheduleValidationError, createSchedule
 import { CapabilityDeclarationInvalidError } from "../store/machines.js";
 import type { LifecycleAdmin } from "../loop-lifecycle/admin.js";
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
-import { machines } from "../db/schema.js";
+import { loops, machines } from "../db/schema.js";
 import { createOwnerControl, type OwnerControl } from "../owner/index.js";
 import {
   FakeClock,
@@ -784,8 +784,7 @@ describe("unified error surface", () => {
   });
 });
 
-describe("the taxonomy pin (review STD-5) — the adapter's full (status, code) set, fake-driven", () => {
-  // 413 stays pinned by the 2 MiB body-cap tests above (route-independent
+describe("the taxonomy pin (review STD-5) — the adapter's full (status, code) set, fake-driven", () => {  // 413 stays pinned by the 2 MiB body-cap tests above (route-independent
   // middleware); every OTHER (status, code) pair the adapter can emit is
   // driven below through fully fake narrow interfaces and pinned as a
   // literal set — a new code or a drifting status turns THIS test red.
@@ -985,5 +984,77 @@ describe("the taxonomy pin (review STD-5) — the adapter's full (status, code) 
     expect([RUN_CAPABILITY_INVALID_CODE, LOOP_COMPLETED_CODE, LOOP_NOT_COMPLETED_CODE].sort()).toEqual(
       ["loop_completed", "loop_not_completed", "run_capability_invalid"],
     );
+  });
+});
+
+describe("AD1: artifact routes are NOT mounted (Phase 5 Batch 1 dormancy, ADR-010 决策 16)", () => {
+  // The probed paths are Batch 2's PLANNED artifact routes; when Batch 2
+  // mounts them it must rewrite this guard with the final paths. Until then
+  // every artifact surface must be indistinguishable from an unknown path.
+  const PROBES: ReadonlyArray<readonly [string, string]> = [
+    ["PATCH", "/api/loops/loop-1/artifact-dir"], // artifact config management
+    ["POST", "/api/machine/sync"], // prepare
+    ["POST", "/api/machine/sync/sync-1/commit"], // commit
+    ["PUT", `/api/machine/blob/${"a".repeat(64)}`], // blob upload
+    ["GET", "/api/loops/loop-1/artifact/files"], // current-view file list
+    ["GET", "/api/loops/loop-1/artifact/files/download?path=a.txt"], // file download
+    ["GET", "/api/loops/loop-1/artifact/snapshots"], // snapshot list
+    ["GET", "/api/loops/loop-1/artifact/snapshots/snap-1"], // snapshot detail
+    ["GET", "/api/loops/loop-1/artifact/snapshots/snap-1/diff"], // snapshot diff
+    ["GET", "/api/machine/sync"], // wrong-method control: no half-mount
+  ];
+
+  it("every artifact probe returns the flat 404, byte-identical to an unknown path", async () => {
+    await fresh();
+    const unknown = await app.request("/nope");
+    await expectJsonError(unknown, 404, { error: "not found" });
+    const canonicalBody = await (await app.request("/nope")).text();
+    for (const [method, path] of PROBES) {
+      const res = await app.request(path, { method });
+      expect(res.status, `${method} ${path}`).toBe(404);
+      expect(await res.text(), `${method} ${path}`).toBe(canonicalBody);
+    }
+  });
+});
+
+describe("AD2(a): production Create never persists artifact config (ADR-010 决策 16)", () => {
+  // The wire DTO ACCEPTS artifactDir (slice 1, tolerant shape) but the
+  // production create path must NOT persist it — the column exists (slice 2)
+  // and stays dormant until the Batch 2 PATCH route opens. The insert
+  // mapping (admin/index.ts) enumerates columns explicitly; this guard fails
+  // loudly if artifactDir ever slips into it.
+  it("201 with artifactDir in the body — the row keeps it null and the response never emits it", async () => {
+    await fresh();
+    await seedMachine(db, MACHINE_ID);
+    const res = await createLoopReq({
+      machineId: MACHINE_ID,
+      taskFile: "/home/dev/TASK.md",
+      artifactDir: "/home/dev/project/dist",
+    });
+    expect(res.status).toBe(201);
+    const parsed = createLoopResponseSchema.parse(await res.json());
+    expect(parsed.loop).not.toHaveProperty("artifactDir");
+
+    const [row] = await db.select().from(loops);
+    expect(row.artifactDir).toBeNull();
+    expect(row.artifactConfigRevision).toBe(0);
+    expect(row.artifactManifestRevision).toBe(0);
+    expect(row.artifactManifestId).toBeNull();
+    expect([row.artifactSyncAttemptedAt, row.artifactSyncSucceededAt, row.artifactSyncError]).toEqual([
+      null,
+      null,
+      null,
+    ]);
+  });
+
+  it("400 for an explicit artifactDir: null — creation accepts absence, never an explicit clear", async () => {
+    await fresh();
+    await seedMachine(db, MACHINE_ID);
+    // createLoopRequestSchema is optional-but-not-nullable (clearing is the
+    // Batch 2 PATCH route's required-nullable shape, not creation's).
+    await expectJsonError(await createLoopReq({ machineId: MACHINE_ID, taskFile: "/t/TASK.md", artifactDir: null }), 400, {
+      error: "invalid request",
+    });
+    expect(await snapshotLoops(db)).toEqual([]);
   });
 });

@@ -23,7 +23,15 @@ describe("runMigrations", () => {
     const { rows } = await h.client.query<{ tablename: string }>(
       "select tablename from pg_tables where schemaname = 'public' order by tablename",
     );
-    expect(rows.map((r) => r.tablename)).toEqual(["loops", "machines", "run_leases", "runs"]);
+    expect(rows.map((r) => r.tablename)).toEqual([
+      "artifact_blobs",
+      "artifact_manifests",
+      "artifact_sync_sessions",
+      "loops",
+      "machines",
+      "run_leases",
+      "runs",
+    ]);
   });
 
   it("is idempotent — a second run is a no-op (the migrator tracks applied ids)", async () => {
@@ -41,6 +49,8 @@ describe("runMigrations", () => {
     // index definition must not slip through (db:check only guards
     // schema.ts↔snapshot, not snapshot↔committed-SQL).
     const expected: Record<string, string> = {
+      artifact_manifests_loop_revision_idx: "USING btree (loop_id, manifest_revision)",
+      artifact_sync_sessions_request_idx: "USING btree (namespace_id, machine_id, request_id)",
       loops_active_schedule_idx: "USING btree (id)",
       loops_machine_idx: "USING btree (machine_id)",
       run_leases_loop_idx: "USING btree (loop_id)",

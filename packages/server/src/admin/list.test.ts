@@ -228,10 +228,14 @@ describe("observation projections stay in lockstep with the wire DTOs", () => {
     expect(Object.keys(machineSummaryColumns).sort()).toEqual(Object.keys(machineSummarySchema.shape).sort());
     // lastRun and nextFireAt are computed fields with no backing columns.
     // Batch 2 opted the Phase 4 loop fields into the projection (ADR-009
-    // 决策 11's dormancy ended), so the lockstep is again exact.
+    // 决策 11's dormancy ended). Phase 5: artifactDir is DECLARED in the DTO
+    // but dormant through Batch 1 (ADR-010 决策 16) — the column lands in
+    // slice 2 and the projection opts in when the field opens; remove it
+    // from this set then.
+    const DORMANT_PHASE5_LOOP_FIELDS = ["artifactDir"];
     expect(Object.keys(loopSummaryColumns).sort()).toEqual(
       Object.keys(loopSummarySchema.shape)
-        .filter((k) => k !== "lastRun" && k !== "nextFireAt")
+        .filter((k) => k !== "lastRun" && k !== "nextFireAt" && !DORMANT_PHASE5_LOOP_FIELDS.includes(k))
         .sort(),
     );
     expect(Object.keys(runSummaryColumns).sort()).toEqual(Object.keys(runSummarySchema.shape).sort());

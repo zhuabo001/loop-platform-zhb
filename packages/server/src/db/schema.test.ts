@@ -2,6 +2,7 @@ import { and, eq } from "drizzle-orm";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  ARTIFACT_ERROR_CODES,
   CODING_AGENTS,
   LEASE_STATES,
   RUN_OUTCOMES,
@@ -64,6 +65,15 @@ describe("enum pins — the DB can never drift from the protocol single source",
     expect(loops.agent.enumValues).toEqual([...CODING_AGENTS]);
     expect(runLeases.role.enumValues).toEqual([...RUN_ROLES]);
     expect(runLeases.state.enumValues).toEqual([...LEASE_STATES]);
+  });
+
+  it("loops.artifactSyncError mirrors ARTIFACT_ERROR_CODES (runs.artifactSyncError stays free-form)", () => {
+    expect(loops.artifactSyncError.enumValues).toEqual([...ARTIFACT_ERROR_CODES]);
+    // runs.artifactSyncError deliberately has NO enum: the wire report field
+    // is a free-form string whose value set is Batch 2's to define (protocol
+    // report.ts) — pinning an enum here would freeze the wrong place. (Drizzle
+    // assigns enumValues unconditionally, so a non-enum column reads undefined.)
+    expect(runs.artifactSyncError.enumValues).toBeUndefined();
   });
 });
 

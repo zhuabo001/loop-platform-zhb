@@ -94,3 +94,57 @@ The versioned contract, captured in the RunLease at claim time, that determines 
 Report follows Phase 3 semantics (v0) or consumes the Terminal Journal's terminal command, state,
 and Task File sync result (v1).
 _Avoid_: API version, negotiation handshake
+
+**Artifact Home**:
+The single owner of a Loop's artifact synchronization: it negotiates a manifest, accepts verified
+blob uploads, commits one immutable snapshot, and serves the current view and snapshots.
+_Avoid_: Artifact service, sync API
+
+**Artifact Manifest**:
+The complete `{path, hash, size}` list a sync declares for a Loop's artifact directory; a path
+absent from the next committed manifest is a deletion.
+_Avoid_: File list, delta, diff
+
+**Artifact Snapshot**:
+The immutable committed manifest identified by its manifest ID, which doubles as a Run's
+`artifactSnapshotId`; a Run's final report may reference at most one.
+_Avoid_: Version, revision, backup
+
+**Manifest Revision**:
+The Loop-scoped monotone counter a committed snapshot advances by exactly one.
+_Avoid_: Version, build number, config generation
+
+**Config Generation**:
+The monotone `artifactConfigRevision` counter of a Loop's artifact-directory configuration; a
+change keeps the last manifest pointer and marks the view stale by generation.
+_Avoid_: Config version, epoch
+
+**Sync Session**:
+One prepare negotiation keyed by trusted namespace, Machine, and client requestId, with a
+canonical payload fingerprint; it expires while pending and becomes a fixed receipt at commit.
+_Avoid_: Upload session, transaction, job
+
+**Blob**:
+Content-addressed bytes stored under one storage namespace and SHA-256 hash; manifest paths never
+map to disk paths.
+_Avoid_: File, object, upload
+
+**BlobStore**:
+The server-internal storage contract of verified write, presence, and read; this batch has no
+deletion or garbage collection.
+_Avoid_: Filesystem, storage backend
+
+**Storage Namespace**:
+The artifact isolation boundary derived only from trusted Machine attribution; wire input can
+never name one.
+_Avoid_: Team id, tenant, bucket, prefix
+
+**Never-sync**:
+The shared path rules that the daemon and the server both exclude, so the two sides never
+disagree about what may sync.
+_Avoid_: Ignore list, blacklist
+
+**Snapshot Binding**:
+The guarded link between a Run and a committed manifest whose identity chain and config
+generation were verified at write time.
+_Avoid_: Snapshot attach, reference update

@@ -84,3 +84,18 @@ server 与 daemon 是两个独立部署的进程，唯一耦合点是 HTTP wire 
      规则。普通 server 侧裁剪策略（caps/clipText）仍不进入 protocol 主 schema，
      也不得在 daemon/server 各复制一套规则。该模块保持纯函数、无 Node 专属
      依赖，主入口的浏览器可 bundle 性不变。
+- 2026-09-28（Phase 5 Batch 1，ADR-010）：两处具体化，均不改变
+  additive/tolerant-reader 纪律本身：
+  1. **artifact policy 是决策 4「裁剪策略不进 protocol」的第二个窄例外**：
+     `artifact-policy.ts` 子模块（主入口 re-export）承载 manifest 条目校验
+     （路径/hash/size 值域）、容量上限、never-sync 规则表、canonical 规范化
+     与 8 MiB 有界解析，因为 Daemon（扫描时的本地预分类）与 Server（防御层
+     收口）必须对同一份 manifest 执行**同一套**规则、产出同一套失败分类，
+     两份拷贝必然漂移。该模块保持纯函数、无 I/O、无 Node 内建依赖；SHA-256
+     组合函数在 `./node` 子入口，主入口的浏览器可 bundle 性不变。
+     `artifactDir` 的 workdir/jail 规则是 Server 单侧 policy，不进入本包
+     （ADR-010 决策 8）。
+  2. **artifact wire DTO 是决策 6「镜像形状 ≠ 已支持语义」的具体化**：
+     watch/prepare/commit/`artifactDir`/Run 快照字段在 Batch 1 预声明形状，
+     但没有任何生产路由消费（ADR-010 决策 16 的休眠边界）；开放顺序由
+     Batch 2 计划固定。

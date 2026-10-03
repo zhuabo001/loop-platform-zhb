@@ -18,11 +18,20 @@ import {
   runSummarySchema,
   triggerRunRequestSchema,
   triggerRunResponseSchema,
+  updateArtifactDirRequestSchema,
+  updateArtifactDirResponseSchema,
   updateGoalRequestSchema,
   updateGoalResponseSchema,
   updateTaskFileRequestSchema,
   updateTaskFileResponseSchema,
 } from "./admin.js";
+import {
+  artifactManifestEntrySchema,
+  artifactWatchItemSchema,
+  commitArtifactSyncResponseSchema,
+  prepareArtifactSyncRequestSchema,
+  prepareArtifactSyncResponseSchema,
+} from "./artifact.js";
 import {
   deliveryLoopSchema,
   deliverySchema,
@@ -158,6 +167,27 @@ const CASES: ReadonlyArray<readonly [string, z.ZodTypeAny, Record<string, unknow
   ["updateTaskFileResponseSchema", updateTaskFileResponseSchema, { loop: { ...MINIMAL_LOOP_SUMMARY } }],
   ["reopenLoopRequestSchema", reopenLoopRequestSchema, {}],
   ["reopenLoopResponseSchema", reopenLoopResponseSchema, { loop: { ...MINIMAL_LOOP_SUMMARY } }],
+  // Phase 5 additions (ADR-010): artifact sync DTOs + the declared-but-
+  // dormant artifact-dir management DTOs.
+  ["artifactManifestEntrySchema", artifactManifestEntrySchema, { path: "a/b.txt", hash: "h", size: 1 }],
+  [
+    "artifactWatchItemSchema",
+    artifactWatchItemSchema,
+    { loopId: "l", artifactDir: "d", workdir: null, roots: [], configRevision: 0 },
+  ],
+  [
+    "prepareArtifactSyncRequestSchema",
+    prepareArtifactSyncRequestSchema,
+    { requestId: "r", loopId: "l", configRevision: 0, baseManifestRevision: 0, entries: [] },
+  ],
+  [
+    "prepareArtifactSyncResponseSchema",
+    prepareArtifactSyncResponseSchema,
+    { syncId: "s", needHashes: [], expiresAt: "t" },
+  ],
+  ["commitArtifactSyncResponseSchema", commitArtifactSyncResponseSchema, { artifactSnapshotId: "m", manifestRevision: 1 }],
+  ["updateArtifactDirRequestSchema", updateArtifactDirRequestSchema, { artifactDir: null }],
+  ["updateArtifactDirResponseSchema", updateArtifactDirResponseSchema, { loop: { ...MINIMAL_LOOP_SUMMARY } }],
 ];
 
 describe("tolerant reader: EVERY exported object schema strips unknown keys", () => {
@@ -172,6 +202,6 @@ describe("tolerant reader: EVERY exported object schema strips unknown keys", ()
   it("covers every object schema — adding a new one requires a row here", () => {
     // Guard against a FUTURE schema silently escaping this suite: the case list
     // is reviewed whenever a schema is added (CI review checklist, ADR-002).
-    expect(CASES.length).toBe(34);
+    expect(CASES.length).toBe(41);
   });
 });

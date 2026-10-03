@@ -150,18 +150,23 @@ describe("Phase 4 Batch 2 deterministic E2E: production daemon + fake Claude, tw
         return { status: res.status, body: JSON.parse(text) };
       };
 
-      // 3. The production daemon CLI with the fake Claude binary. The
-      //    per-start control root is discovered by glob diff (the daemon
-      //    mints it inside the inherited TMPDIR before the first poll).
+      // 3. The production daemon CLI with the fake Claude binary. The daemon
+      //    gets a PRIVATE TMPDIR (the slice4-secret-e2e precedent): its
+      //    per-start control/scratch roots mint there, so the root audit
+      //    below is immune to OTHER e2e files' daemons sharing the system
+      //    tmpdir (vitest runs files on 2 workers — a shared-tmpdir glob
+      //    diff raced phase4-batch3-e2e's daemon and flaked red).
       //    CLAUDE_CONFIG_DIR is pinned to an EMPTY temp fixture: a
       //    deterministic test must never read the developer's real
       //    ~/.claude/settings.json through the daemon's provider bootstrap
       //    (plan `codex-fix-claude-runner-plan` §5.5).
+      const daemonTmp = await mkdtemp(path.join(tmpdir(), `loopzhb-b2e2e-daemon-tmp-${process.pid}-`));
+      tempDirs.push(daemonTmp);
       const controlRootsBefore = new Set(
-        readdirSync(tmpdir()).filter((n) => n.startsWith("loopzhb-control-")),
+        readdirSync(daemonTmp).filter((n) => n.startsWith("loopzhb-control-")),
       );
       const scratchRootsBefore = new Set(
-        readdirSync(tmpdir()).filter((n) => n.startsWith("loopzhb-runs-")),
+        readdirSync(daemonTmp).filter((n) => n.startsWith("loopzhb-runs-")),
       );
       const fakeClaudeConfigDir = await mkdtemp(path.join(tmpdir(), `loopzhb-b2e2e-claude-config-${process.pid}-`));
       tempDirs.push(fakeClaudeConfigDir);
@@ -169,6 +174,7 @@ describe("Phase 4 Batch 2 deterministic E2E: production daemon + fake Claude, tw
       const daemon = spawn(process.execPath, [path.join(__dirname, "../../daemon/dist/cli.js")], {
         env: {
           ...process.env,
+          TMPDIR: daemonTmp,
           LOOPZHB_SERVER_URL: baseUrl,
           LOOPZHB_MACHINE_CREDENTIAL: TOKEN,
           LOOPZHB_ALLOWED_ROOTS: JSON.stringify([allowedRoot]),
@@ -209,9 +215,9 @@ describe("Phase 4 Batch 2 deterministic E2E: production daemon + fake Claude, tw
         // 5. Control-root audit: exactly one NEW root, 0700, with the static
         //    0500 wrapper and its 0400 ESM marker — and none of the daemon's
         //    secrets inside any file (ADR-009 修订 8).
-        const newRoots = readdirSync(tmpdir())
+        const newRoots = readdirSync(daemonTmp)
           .filter((n) => n.startsWith("loopzhb-control-") && !controlRootsBefore.has(n))
-          .map((n) => path.join(tmpdir(), n));
+          .map((n) => path.join(daemonTmp, n));
         expect(newRoots).toHaveLength(1);
         // The daemon realpaths the mkdtemp base (macOS /var → /private/var):
         // compare paths in canonical form.
@@ -225,9 +231,9 @@ describe("Phase 4 Batch 2 deterministic E2E: production daemon + fake Claude, tw
         expect(wrapperSource).not.toContain(TOKEN);
         expect(wrapperSource).not.toContain(FAKE_PROVIDER_KEY);
         expect(wrapperSource).not.toContain(baseUrl);
-        const newScratchRoots = readdirSync(tmpdir())
+        const newScratchRoots = readdirSync(daemonTmp)
           .filter((n) => n.startsWith("loopzhb-runs-") && !scratchRootsBefore.has(n))
-          .map((n) => path.join(tmpdir(), n));
+          .map((n) => path.join(daemonTmp, n));
         expect(newScratchRoots).toHaveLength(1);
         const scratchRoot = await realpath(newScratchRoots[0]!);
         expect(await modeOf(scratchRoot)).toBe(0o700);
