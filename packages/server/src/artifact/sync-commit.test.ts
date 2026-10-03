@@ -25,6 +25,13 @@
  *                 old-generation refusal incl. the generation-guarded failure
  *                 stamp; the bounded guard-retry (loop-vanish retry,
  *                 unique-violation RaceLost bound).
+ *  AC4 matrix:    fault injection at EVERY commit-tx step (guarded loop
+ *                 UPDATE → manifest INSERT → throw-only seam → receipt
+ *                 UPDATE): a throw propagates RAW with no retry and zero
+ *                 partial writes (each step's predecessor provably rolled
+ *                 back); a zero-row guard result is a guard loss — the
+ *                 bounded re-run converges, a persistent loss fails closed
+ *                 as RaceLost.
  */
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
@@ -103,6 +110,88 @@ function staticAttribution(map: Record<string, string>): ArtifactAttributionReso
       );
     },
   };
+}
+
+interface TxFault {
+  on: "update-loops" | "insert-manifests" | "update-sessions";
+  mode: "throw" | "zero-rows";
+  times: number;
+  cause: Error;
+}
+
+/** A Db wrapper that injects a fault into ONE step of the commit transaction
+ *  (the AC4 rollback matrix). The tx handed to db.transaction's callback is
+ *  proxied; the targeted table's update/insert builder is poisoned so that
+ *  AWAITING it either rejects with the given cause ("throw" — a driver
+ *  failure) or resolves to zero rows ("zero-rows" — the guarded write's loss
+ *  branch, exercising the real GuardLost path without importing the
+ *  unexported class). `times` bounds how many attempts are hit (the bounded
+ *  re-run re-enters the transaction); selects and every other table pass
+ *  through untouched. The interception relies on drizzle's chaining shape
+ *  (0.45, verified against node_modules): update's set() AND insert's
+ *  values() BOTH return a NEW PgUpdateBase/PgInsertBase — the poison must
+ *  land on THAT object (whose where/returning then return `this`), never on
+ *  the builder tx.update()/tx.insert() itself returns. Each commit-tx step
+ *  is the only writer of its table inside the transaction, so the table
+ *  alone identifies the step. */
+function withTxFault(db: Db, fault: TxFault, fired: () => void): Db {
+  let hits = 0;
+  const table = fault.on === "update-loops" ? loops : fault.on === "insert-manifests" ? artifactManifests : artifactSyncSessions;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const poison = (query: any) => {
+    query.then =
+      fault.mode === "throw"
+        ? // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (onFulfilled?: any, onRejected?: any) => Promise.reject(fault.cause).then(onFulfilled, onRejected)
+        : // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (onFulfilled?: any, onRejected?: any) => Promise.resolve([]).then(onFulfilled, onRejected);
+  };
+  return new Proxy(db, {
+    get(target, prop, receiver) {
+      if (prop !== "transaction") {
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+      }
+      return (callback: (tx: unknown) => Promise<unknown>) =>
+        (target.transaction as (cb: (tx: unknown) => Promise<unknown>) => Promise<unknown>).call(target, (tx) =>
+          callback(
+            new Proxy(tx as object, {
+              get(txTarget, txProp, txReceiver) {
+                const value = Reflect.get(txTarget, txProp, txReceiver);
+                if (typeof value !== "function") return value;
+                const isTarget =
+                  (fault.on === "insert-manifests" && txProp === "insert") || (fault.on !== "insert-manifests" && txProp === "update");
+                if (!isTarget) return (value as (...a: unknown[]) => unknown).bind(txTarget);
+                return (t: unknown) => {
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                  const builder = (value as (...a: unknown[]) => any).call(txTarget, t);
+                  if (t !== table || hits >= fault.times) return builder;
+                  hits += 1;
+                  fired();
+                  if (fault.on === "insert-manifests") {
+                    const values = builder.values.bind(builder);
+                    builder.values = (...args: unknown[]) => {
+                      const query = values(...args);
+                      poison(query);
+                      return query;
+                    };
+                    return builder;
+                  }
+                  // update: set() returns the real PgUpdateBase — poison THAT.
+                  const set = builder.set.bind(builder);
+                  builder.set = (...args: unknown[]) => {
+                    const query = set(...args);
+                    poison(query);
+                    return query;
+                  };
+                  return builder;
+                };
+              },
+            }),
+          ),
+        );
+    },
+  });
 }
 
 describe("planCommitPrecheck (pure)", () => {
@@ -738,6 +827,192 @@ describe("commit (real PGlite + memory BlobStore)", () => {
     const after = await getLoop();
     expect([after.artifactManifestId, after.artifactManifestRevision]).toEqual([null, 0]); // both attempts rolled back
     expect((await manifests()).map((m) => m.id)).toEqual(["amf-orphan"]);
+  });
+
+  // ---- AC4 rollback matrix: fault injection at EVERY commit-tx step ----
+  // Steps: (c) guarded loop UPDATE → (d) manifest INSERT → (e) throw-only seam
+  // → (f) receipt UPDATE. Rows already pinned above: (e) the insideCommitTx
+  // throw rolls back EVERYTHING; (d) a PERSISTENT 23505 fails closed as
+  // RaceLost after exactly two attempts; the pre-write loop-vanish loses the
+  // guard and re-resolves. The rows below inject at (c), (d) and (f)
+  // themselves. Every zero-write assertion is the same triple: snapshotLoops
+  // byte-identical + no manifest row + the session receipt null.
+
+  it("AC4: the guarded loop UPDATE throwing aborts the whole transaction — raw propagation, NO retry, zero partial writes", async () => {
+    await fresh();
+    await seedConfiguredLoop();
+    const syncId = await negotiate({ entries: [] }); // negotiated BEFORE the fault deps swap
+    const loopsBefore = await snapshotLoops(db);
+
+    let seamCalls = 0;
+    let fired = 0;
+    const cause = new Error("injected loop-update failure");
+    deps = makeDeps(withTxFault(db, { on: "update-loops", mode: "throw", times: 1, cause }, () => (fired += 1)), {
+      hooks: { afterResolve: () => void (seamCalls += 1) },
+    });
+
+    await expect(commit(syncId)).rejects.toThrow("injected loop-update failure");
+    expect(fired).toBe(1); // the injected fault really fired (no air-passing test)
+    expect(seamCalls).toBe(1); // a raw driver failure is NOT a guard loss — no re-run
+    expect(await snapshotLoops(db)).toEqual(loopsBefore);
+    expect(await manifests()).toHaveLength(0);
+    expect((await db.select().from(artifactSyncSessions).where(eq(artifactSyncSessions.id, syncId)))[0]!.receipt).toBeNull();
+  });
+
+  it("AC4: the guarded loop UPDATE matching zero rows is a guard loss — the bounded re-run converges with exactly one manifest and one revision bump", async () => {
+    await fresh();
+    await seedConfiguredLoop();
+    const syncId = await negotiate({ entries: [] });
+    const revisionBefore = (await getLoop()).revision;
+
+    let seamCalls = 0;
+    let fired = 0;
+    deps = makeDeps(
+      withTxFault(db, { on: "update-loops", mode: "zero-rows", times: 1, cause: new Error("unused") }, () => (fired += 1)),
+      { hooks: { afterResolve: () => void (seamCalls += 1) } },
+    );
+
+    const result = await commit(syncId);
+    if (!result.ok) throw new Error(`commit must converge: ${JSON.stringify(result)}`);
+    expect(fired).toBe(1); // attempt 1's guard lost…
+    expect(seamCalls).toBe(2); // …and the bounded re-run ran exactly once
+    expect(await manifests()).toHaveLength(1);
+    const after = await getLoop();
+    expect(after.artifactManifestId).toBe(result.receipt.artifactSnapshotId);
+    expect(after.artifactManifestRevision).toBe(1);
+    expect(after.revision).toBe(revisionBefore + 1); // attempt 1's writes rolled back wholesale
+    expect((await db.select().from(artifactSyncSessions).where(eq(artifactSyncSessions.id, syncId)))[0]!.receipt).toEqual(
+      result.receipt,
+    );
+  });
+
+  it("AC4: a persistent loop-guard loss fails closed as ArtifactSyncRaceLostError after exactly two attempts", async () => {
+    await fresh();
+    await seedConfiguredLoop();
+    const syncId = await negotiate({ entries: [] });
+    const loopsBefore = await snapshotLoops(db);
+
+    let seamCalls = 0;
+    let fired = 0;
+    deps = makeDeps(
+      withTxFault(db, { on: "update-loops", mode: "zero-rows", times: 2, cause: new Error("unused") }, () => (fired += 1)),
+      { hooks: { afterResolve: () => void (seamCalls += 1) } },
+    );
+
+    await expect(commit(syncId)).rejects.toBeInstanceOf(ArtifactSyncRaceLostError);
+    expect([fired, seamCalls]).toEqual([2, 2]); // the initial attempt + ONE re-run, both losing
+    expect(await snapshotLoops(db)).toEqual(loopsBefore); // both attempts rolled back
+    expect(await manifests()).toHaveLength(0);
+    expect((await db.select().from(artifactSyncSessions).where(eq(artifactSyncSessions.id, syncId)))[0]!.receipt).toBeNull();
+  });
+
+  it("AC4: the manifest INSERT throwing rolls back the guarded loop UPDATE that preceded it", async () => {
+    await fresh();
+    await seedConfiguredLoop();
+    const syncId = await negotiate({ entries: [] });
+    const loopsBefore = await snapshotLoops(db);
+
+    let seamCalls = 0;
+    let fired = 0;
+    deps = makeDeps(
+      withTxFault(db, { on: "insert-manifests", mode: "throw", times: 1, cause: new Error("injected manifest-insert failure") }, () => (fired += 1)),
+      { hooks: { afterResolve: () => void (seamCalls += 1) } },
+    );
+
+    await expect(commit(syncId)).rejects.toThrow("injected manifest-insert failure");
+    expect(fired).toBe(1);
+    expect(seamCalls).toBe(1);
+    // The pointer never moved: the guarded loop UPDATE rolled back WITH the insert.
+    expect(await snapshotLoops(db)).toEqual(loopsBefore);
+    expect(await manifests()).toHaveLength(0);
+    expect((await db.select().from(artifactSyncSessions).where(eq(artifactSyncSessions.id, syncId)))[0]!.receipt).toBeNull();
+  });
+
+  it("AC4: a TRANSIENT 23505 on the manifest insert converges on the bounded re-run", async () => {
+    await fresh();
+    await seedConfiguredLoop();
+    let seamCalls = 0;
+    const hooks: ArtifactHomeDeps["hooks"] = {
+      afterResolve: async (op) => {
+        if (op !== "commit") return;
+        seamCalls += 1;
+        if (seamCalls === 2) {
+          // The out-of-band damage is repaired before the re-run's attempt.
+          await db.delete(artifactManifests).where(eq(artifactManifests.id, "amf-orphan"));
+        }
+      },
+    };
+    const syncId = await negotiate({ entries: [] }); // negotiated BEFORE the hook-bearing deps swap
+    deps = makeDeps(db, { hooks });
+    // The same out-of-band damage as the persistent-collision bound above —
+    // but only for the FIRST attempt.
+    await db.insert(artifactManifests).values({
+      id: "amf-orphan",
+      namespaceId: "ns-1",
+      machineId: "m-1",
+      loopId: "loop-1",
+      configRevision: 0,
+      manifestRevision: 1,
+      entries: [],
+      fileCount: 0,
+      totalBytes: 0,
+      committedAt: clock.iso(),
+    });
+
+    const result = await commit(syncId);
+    if (!result.ok) throw new Error(`commit must converge: ${JSON.stringify(result)}`);
+    expect(seamCalls).toBe(2); // 23505 → guard loss → exactly one re-run
+    expect(result.receipt.manifestRevision).toBe(1);
+    expect((await manifests()).map((m) => m.id)).toEqual([result.receipt.artifactSnapshotId]); // the orphan is gone
+    const after = await getLoop();
+    expect([after.artifactManifestId, after.artifactManifestRevision]).toEqual([result.receipt.artifactSnapshotId, 1]);
+  });
+
+  it("AC4: the receipt UPDATE throwing rolls back the manifest insert that preceded it", async () => {
+    await fresh();
+    await seedConfiguredLoop();
+    const syncId = await negotiate({ entries: [] });
+    const loopsBefore = await snapshotLoops(db);
+
+    let seamCalls = 0;
+    let fired = 0;
+    deps = makeDeps(
+      withTxFault(db, { on: "update-sessions", mode: "throw", times: 1, cause: new Error("injected receipt-write failure") }, () => (fired += 1)),
+      { hooks: { afterResolve: () => void (seamCalls += 1) } },
+    );
+
+    await expect(commit(syncId)).rejects.toThrow("injected receipt-write failure");
+    expect(fired).toBe(1);
+    expect(seamCalls).toBe(1);
+    // No manifest row: the insert rolled back WITH the receipt write.
+    expect(await manifests()).toHaveLength(0);
+    expect(await snapshotLoops(db)).toEqual(loopsBefore);
+    expect((await db.select().from(artifactSyncSessions).where(eq(artifactSyncSessions.id, syncId)))[0]!.receipt).toBeNull();
+  });
+
+  it("AC4: the receipt guard matching zero rows is a guard loss — the re-run converges and stores the receipt", async () => {
+    await fresh();
+    await seedConfiguredLoop();
+    const syncId = await negotiate({ entries: [] });
+    const revisionBefore = (await getLoop()).revision;
+
+    let seamCalls = 0;
+    let fired = 0;
+    deps = makeDeps(
+      withTxFault(db, { on: "update-sessions", mode: "zero-rows", times: 1, cause: new Error("unused") }, () => (fired += 1)),
+      { hooks: { afterResolve: () => void (seamCalls += 1) } },
+    );
+
+    const result = await commit(syncId);
+    if (!result.ok) throw new Error(`commit must converge: ${JSON.stringify(result)}`);
+    expect(fired).toBe(1); // attempt 1's receipt guard lost…
+    expect(seamCalls).toBe(2); // …the bounded re-run ran exactly once…
+    expect(await manifests()).toHaveLength(1); // …and attempt 1's manifest rolled back
+    const after = await getLoop();
+    expect(after.revision).toBe(revisionBefore + 1);
+    expect((await db.select().from(artifactSyncSessions).where(eq(artifactSyncSessions.id, syncId)))[0]!.receipt).toEqual(
+      result.receipt,
+    );
   });
 
   it("AC7: a same-session commit landing between the precheck and the transaction converges — the loser replays the winner's receipt (A4-1)", async () => {
