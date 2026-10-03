@@ -32,11 +32,12 @@
  *    silent "needed" (the frozen BlobStore contract: has never swallows
  *    storage errors).
  *  - prepare writes NOTHING to the current view (no loops write). Its one
- *    write path (the session insert) guards on the resolved loop's unified
- *    OCC revision inside the transaction, so a concurrent generation bump
- *    loses the guard and the bounded re-run re-plans on fresh state — the
- *    write path is race-safe, not single-thread-only (withGuardRetry: exactly
- *    one re-run, then ArtifactSyncRaceLostError).
+ *    write path (the session insert) locks the resolved loop's row FOR
+ *    UPDATE inside the transaction and re-verifies the observed unified OCC
+ *    revision under the lock, so a concurrent generation bump loses the
+ *    guard and the bounded re-run re-plans on fresh state — the write path
+ *    is race-safe, not single-thread-only (withGuardRetry: exactly one
+ *    re-run, then ArtifactSyncRaceLostError).
  *
  * PUT uploads one negotiated blob (决策 10): the session (carried by id) is
  * re-validated on EVERY upload — attribution, existence (unknown OR
@@ -290,14 +291,17 @@ async function computeNeedHashes(
 }
 
 /** The session insert — the ONLY write prepare performs, and it touches no
- *  current-view state. The transaction first re-checks the resolved loop's
- *  unified OCC revision: a concurrent loops write (a config bump, a claim,
- *  anything) between the outer resolve and this tx loses the guard, rolls
- *  back, and the bounded re-run re-plans on fresh state. The insert itself
- *  arbitrates the (namespaceId, machineId, requestId) unique key with
- *  ON CONFLICT DO NOTHING: a concurrent same-key prepare won — re-read the
- *  winner INSIDE the tx and let the caller's planner decide, so the unique
- *  violation never escapes as an exception. */
+ *  current-view state. The transaction first locks the resolved loop's row
+ *  FOR UPDATE and re-verifies the observed OCC revision UNDER the lock
+ *  (ADR-009: snapshot-derived writes hold the row's write access; a lockless
+ *  SELECT would leave a real multi-connection SELECT→INSERT window where a
+ *  config write commits unguarded): a concurrent loops write between the
+ *  outer resolve and this tx loses the guard, rolls back, and the bounded
+ *  re-run re-plans on fresh state. The insert itself arbitrates the
+ *  (namespaceId, machineId, requestId) unique key with ON CONFLICT DO
+ *  NOTHING: a concurrent same-key prepare won — re-read the winner INSIDE the
+ *  tx and let the caller's planner decide, so the unique violation never
+ *  escapes as an exception. */
 async function insertSessionGuarded(
   deps: ArtifactHomeDeps,
   loop: Loop,
@@ -322,12 +326,19 @@ async function insertSessionGuarded(
     expiresAt: expiryFromIso(nowIso),
   };
   return deps.db.transaction(async (tx) => {
-    const still = await tx
-      .select({ id: loops.id })
-      .from(loops)
-      .where(and(eq(loops.id, loop.id), eq(loops.revision, loop.revision)))
-      .limit(1);
-    if (still.length !== 1) throw new ArtifactSyncGuardLostError("prepare", loop.id);
+    // ADR-009 L138/L145: a write derived from the loop's decision snapshot
+    // must hold the row's write access for the observed revision. A plain
+    // in-tx SELECT takes no lock — under READ COMMITTED a concurrent loops
+    // write (a config bump, a claim, anything) could commit in the
+    // SELECT→INSERT window without losing any guard. Lock the row FOR UPDATE
+    // (the binding-plan.ts Round-2 precedent) and re-verify the revision
+    // UNDER the lock: a concurrent writer either committed first (the locked
+    // re-read observes the new revision → guard loss → bounded re-run) or
+    // blocks until this tx ends. A row lock never modifies the current view.
+    const locked = await tx.select({ revision: loops.revision }).from(loops).where(eq(loops.id, loop.id)).for("update");
+    if (locked.length !== 1 || locked[0]!.revision !== loop.revision) {
+      throw new ArtifactSyncGuardLostError("prepare", loop.id);
+    }
     const inserted = await tx.insert(artifactSyncSessions).values(row).onConflictDoNothing().returning();
     if (inserted.length === 1) return { session: inserted[0]!, created: true };
     const winner = (await tx.select().from(artifactSyncSessions).where(sessionKeyWhere(key)).limit(1))[0];
