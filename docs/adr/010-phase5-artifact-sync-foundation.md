@@ -17,7 +17,9 @@ Phase 5 要为 Loop 增加 Artifact 目录同步：Daemon 持续单向上传文�
 
 ### 2. 路径与条目校验域
 
-Manifest 条目固定为 `{path, hash, size}`。`path` 必须是规范 POSIX 相对路径：拒绝绝对路径、盘符、反斜杠、空路径段、精确 `.`/`..` 段、NUL 与未配对代理项（非法 Unicode）；不做 URL 解码、大小写折叠或 Unicode 归一化，值逐字保留。拒绝重复路径及 `a` 与 `a/b` 这类文件/目录冲突（两种 wire 序都拒绝）。`hash` 是 64 位小写十六进制 SHA-256；`size` 是非负安全整数；同一 hash 声明不同 size 整单拒绝。schema 层只钉 typeof 形状：`path`/`hash` 为 `z.string()`，`size` 为 typeof-number 检查而**不是** `z.number()`——Zod 4 在 schema 层拒绝非有限数，wire 上的 `1e400`（JSON 解析为 Infinity）会在 schema 处死亡，而 Daemon 直接调 policy 得到 `size_invalid`，同一缺陷两条分类路径（片 1 复审 A1 发现，已修）。值域规则单一来源在共享 policy——Daemon 与 Server 必须对同一份 manifest 产出同一套失败分类，不允许 zod issue 与 policy failure 两条分类路径并存。
+Manifest 条目固定为 `{path, hash, size}`。`path` 必须是规范 POSIX 相对路径：拒绝绝对路径、盘符、反斜杠、空路径段、精确 `.`/`..` 段、NUL 与未配对代理项（非法 Unicode）；不做 URL 解码、大小写折叠或 Unicode 归一化，值逐字保留。拒绝重复路径及 `a` 与 `a/b` 这类文件/目录冲突，两种 wire 序都拒绝。`hash` 是 64 位小写十六进制 SHA-256；`size` 是非负安全整数；同一 hash 声明不同 size 整单拒绝。
+
+schema 层只检查 typeof 形状：`path`/`hash` 为 `z.string()`，`size` 使用 typeof-number 检查。Zod 4 的 `z.number()` 会提前拒绝非有限数，使 wire 上的 `1e400`（JSON 解析为 Infinity）无法进入共享 policy。值域规则统一由共享 policy 执行，使 Daemon 与 Server 对同一份 manifest 产出相同的失败分类。
 
 ### 3. 上限常量（含边界值）
 
@@ -41,23 +43,67 @@ Manifest 条目固定为 `{path, hash, size}`。`path` 必须是规范 POSIX 相
 
 ### 8. 配置代际与过期
 
-`artifactConfigRevision` 单调递增：等值更新零写入，有效 set/change/clear 递增代际。修改或移除 `artifactDir` 后**保留**最后成功的 manifest 指针与 manifest revision，读取时按配置代际计算过期状态；新配置的首次成功提交才替换当前视图。配置变化清除上一代的同步尝试状态，旧代请求不能更新新代状态。`artifactDir` 的 workdir-相对/绝对路径规则是 Server 单侧 policy（相对路径基于显式 workdir 解析，无 workdir 时必须是绝对路径），不进入共享 policy；Server 不解析机器上的文件系统路径。
+`artifactConfigRevision` 单调递增：等值更新零写入，有效 set/change/clear 递增代际。修改或移除 `artifactDir` 后保留最后成功的 manifest 指针与 manifest revision，读取时按配置代际计算过期状态；新配置的首次成功提交才替换当前视图。配置变化清除上一代的同步尝试状态，旧代请求不能更新新代状态。
+
+`artifactDir` 的 workdir-相对/绝对路径规则是 Server 单侧 policy：相对路径基于显式 workdir 解析，无 workdir 时必须是绝对路径。该规则不进入共享 policy，Server 不解析机器上的文件系统路径。配置更新允许用于 completed Loop，沿用 `updateTaskFile` 的运维重定向语义。
+
+配置 planner 的求值序固定为 validate → noop → exhaustion。等值合法命令在 int32 上界仍为 noop；非法值即使与存储值相等也拒绝。有效变更遇上界返回 `config_revision_exhausted`，零写入。
 
 ### 9. prepare 幂等与 requestId
 
-SyncSession 以 `(namespaceId, machineId, requestId)` 为唯一键。同键同规范化载荷（决策 6 指纹相同）复用会话并可重新计算缺失 Blob、更新协商 hash 集合；同键不同载荷返回 `artifact_manifest_conflict`。重复 prepare 不改变当前视图。pending session 默认有效 1 小时，由注入的 Clock 判定，过期后须重新协商；已提交回执不因 pending 有效期失效。
+SyncSession 以 `(namespaceId, machineId, requestId)` 为唯一键。同键同规范化载荷（决策 6 指纹相同）复用会话并重新计算缺失 Blob；协商 hash 集合由规范化 manifest 决定。同键不同载荷返回 `artifact_manifest_conflict`。重复 prepare 不改变当前 manifest 指针、manifest revision 或 Loop 统一 revision。
+
+prepare 的求值序固定为：manifest policy → 可信归属 → Loop 作用域 → 已提交重放 → 已配置 → 配置代际 → base revision → pending/新建幂等裁决。同键、同指纹且已有回执时，返回原 session，`needHashes` 为空；调用 commit 可恢复原回执。该重放先于已配置/代际/base 检查，因此配置变更或移除、base 推进、pending TTL 到期均不阻断重放。同键异载荷不进入重放分支。pending/新建会话仍须通过当前配置代际与 base 检查；配置或 base 变化后携带新载荷重新协商，必须使用新 requestId。
+
+pending 默认有效 1 小时，`now < expiresAt` 时可用，由注入的 Clock 判定。过期后须重新 prepare；同指纹且仍满足当前配置/base 的会话可原位续约，保留 syncId。续约写入以 `id AND receipt IS NULL AND expiresAt = 观测值` 为守卫，使并发续约收敛。已提交回执不因 pending 有效期失效。
+
+新会话插入事务先以 `SELECT … FOR UPDATE` 锁定 Loop 行，在锁下复验解析时观测的统一 OCC revision，再插入 session。行锁覆盖检查到插入的窗口，与并发配置写入互斥，遵守 ADR-009 基于 Loop 决策快照写入时的 revision 守卫要求；该事务不改变当前文件视图。
+
+prepare 的缺失 Blob 判断同时检查元数据中的已验证 size 与文件存在性。声明 size 与已验证 size 不一致时，重新要求上传，防止跨 session 去重绕过字节验证。
 
 ### 10. PUT 验证语义
 
-PUT 只接受当前归属会话已协商的 hash（经 `X-Artifact-Sync-Id` 头携带会话）。以流方式统计真实字节数并计算 SHA-256，不信任声明 size 或 Content-Length——真实字节流是唯一事实来源。写入期间和完成前都验证会话及配置代际。重复 PUT 仍检查上传字节：错误内容不能因目标 Blob 已存在而被接受。失败只清理本次临时文件，不改变当前 manifest。实际字节与协商不符是稳定分类 `artifact_content_mismatch`。
+PUT 只接受当前归属会话已协商的 hash，经 `X-Artifact-Sync-Id` 头携带会话。以流方式统计真实字节数并计算 SHA-256，不信任声明 size 或 Content-Length。重复 PUT 仍检查上传字节；实际 hash/size 与协商不符返回 `artifact_content_mismatch`。
+
+上传前验证可信归属、session 与 Loop 的关联、pending 状态、TTL 和配置代际。Blob 发布完成后、登记元数据前，重新解析可信归属并重读 session 与 Loop，使用新鲜时钟复验 TTL。归属缺失返回 `attribution_missing`；归属或 machine 关联失配返回 `session_not_found`；会话已提交返回 `session_committed`；TTL 到期返回 `session_expired`；Loop 缺失返回 `loop_not_found`；配置漂移返回 `config_conflict`。
+
+失败只清理本次临时文件，不改变当前 manifest。完成前复验失败时不登记 Blob 元数据；已经发布的 Blob 可以成为未引用内容，按决策 12 保留。hash 与 namespace 已由 policy 和可信归属校验，BlobStore 若返回 `invalid_key`，视为不变量违例并抛 `ArtifactSyncInvariantError`，避免将永久契约缺陷归入可重试的存储错误。
 
 ### 11. 原子提交边界
 
-commit 先确认所有协商 Blob 已验证且实际存在，再在一个数据库事务里重新检查会话归属、配置 revision、base manifest revision 和 Loop CAS，然后插入完整不可变 manifest、递增 manifest revision、更新 Loop 当前指针/成功状态，并将 session 标记为 committed、保存固定回执。任一步失败，数据库写入整体回滚。相同 session 重复 commit 返回原回执：不生成新快照、不递增 revision、不让当前指针回退；配置变化后仍允许经归属验证读取该历史回执。每个新 session 成功提交生成新快照，即使内容相同。
+ArtifactHome（`packages/server/src/artifact/sync.ts`）统一负责 prepare/PUT/commit 同步写入，本批仅测试接线（决策 16）。相同 session 重复 commit 返回固定回执，不生成新快照、不递增 revision、不让当前指针回退。历史回执经归属验证可跨配置代际和重启读取；Loop 被带外删除后也可读取已有回执。每个新 session 成功提交生成新快照，即使内容相同。
+
+#### 观测顺序与裁决顺序
+
+事务外先读 session 作作用域探针，取得 loopId 与归属，再读 Loop，最后重读一次 session 作裁决。事务内同样先读 LIVE Loop，再读 LIVE session。现行裁决读序统一为 Loop→session。
+
+回执判断在作用域门控之后优先于 pending 的 TTL、配置代际、base 和耗尽检查。事务内 pending TTL 使用新鲜 Clock；重新核对 namespace/machine 与 Loop↔session 关联，随后检查会话锚定的配置代际、base manifest revision 和 int32 上界。manifest revision 耗尽返回 `manifest_revision_exhausted`，零写入。
+
+该读序依赖三个不变量：会话归属及载荷不变，Loop 代际/base 单调递增，base 推进与一次性回执写入在同一事务提交。READ COMMITTED 下，若 Loop 读已看到同 session 成功提交，随后的 session 读就能看到回执；若竞争者在末次 session 读后提交，后续 Loop CAS 会丢失守卫并触发整体回滚及有界重读。这样不会把同 session 的成功误判为 base 冲突，无须额外 SELECT 行锁。
+
+#### 完备性与原子写入
+
+Blob 完备性在事务外检查：所有协商 hash 都须有元数据行，已验证 size 与 manifest 声明一致，文件实际存在。行缺失、size 不符或文件缺失归 `blob_missing`；`has` 的异常归 `storage_error`，不得当作缺失。同 hash 多路径按路径数累加真实 size，manifest 的 `totalBytes` 等于已验证内容的实际总量。
+
+单事务内完成复验后，按以下顺序写入：
+
+1. guarded Loop UPDATE：以事务内观测的统一 revision 为守卫，更新当前指针、manifest revision、成功状态及统一 revision。
+2. 插入完整不可变 manifest，由 ID factory 生成新 ID。
+3. 以 `receipt IS NULL` 为守卫写入固定 session 回执。
+
+任一步失败，数据库写入整体回滚。Loop UPDATE 取得的行锁串行化并发提交；session 回执守卫保证写入一次。CAS 或回执守卫丢失时有界重跑，读取胜方回执；manifest 唯一冲突 `23505` 也转换到同一守卫重试路径。只影响统一 OCC revision 的无关域写入可通过重读继续提交，业务守卫始终以 session 的配置代际和 base 为依据。
+
+#### 同步尝试状态
+
+成功状态随 guarded Loop UPDATE 原子写入：`attemptedAt=succeededAt=提交时刻`，`error=null`。commit 失败仅对 `manifest_conflict`、`blob_missing`、`storage_error` 记录尝试，错误值使用对应 wire 码。失败记录采用 best-effort UPDATE，以 Loop id、观测 revision 和 session 配置代际为守卫；零行静默跳过、不重试，防止旧请求覆盖较新状态。
+
+`config_conflict`、`session_expired`、`attribution_missing`、`session_not_found`、`manifest_revision_exhausted` 不记录失败尝试。prepare/PUT 失败尚未终结同步尝试，也不记录该状态。
 
 ### 12. 快照语义与未引用 Blob 边界
 
-不可变 manifest ID 即 Run 的 `artifactSnapshotId`，由 ArtifactHome 注入的 ID factory 铸造，**不是内容哈希**——内容相同的不同 session 提交生成不同快照；不另建快照表。文件发布成功而数据库事务失败时允许留下未引用 Blob，不能通过删除共享 Blob 模拟文件系统回滚；元数据存在但文件丢失时，prepare 要求重传，commit 拒绝不完整快照。历史 Blob、过期 session 与孤立 Blob 的累计磁盘治理属于 Phase 6，本批不宣称其占用有界。
+不可变 manifest ID 即 Run 的 `artifactSnapshotId`，由 ArtifactHome 注入的 ID factory 铸造。内容相同的不同 session 提交生成不同快照，不另建快照表。
+
+文件发布成功而数据库事务失败时允许留下未引用 Blob，不能通过删除共享 Blob 模拟文件系统回滚；元数据存在但文件丢失时，prepare 要求重传，commit 拒绝不完整快照。历史 Blob、过期 session 与孤立 Blob 的累计磁盘治理属于 Phase 6，本批不宣称其占用有界。崩溃遗留临时文件的全局清理也不属于本批。
 
 ### 13. 错误分类、HTTP 映射与重试约定
 
@@ -77,21 +123,61 @@ wire 错误形状复用 `apiErrorSchema` `{error, code?}`；错误文本不是�
 
 从未存在或跨归属的会话/Blob 一律无码平 404——存在性不跨 scope 泄漏（同既有 404 约定）。请求级传输错误沿用既有约定：原始体超限 → 413（bodyLimit）、JSON 畸形 → 400 无码、机器凭证无效 → 401。重试类定义：`idempotent_retry` 可原样有界重试；`resume` 补传缺失 Blob 后原样重试；`renegotiate` 从 prepare 重新协商；`terminal` 同请求必败，须先修复成因。码→重试类映射以 `ARTIFACT_ERROR_RETRY_CLASS` 常量表机器可核对地固定在 protocol。HTTP 映射固定后即为契约（同 ADR-009 修订 2026-09-01 决策 6），Batch 2 以 taxonomy pin 测试钉死。
 
+内部失败字面量细于 wire 码。`config_revision_exhausted`、`manifest_revision_exhausted`、`artifact_dir_unconfigured`、`session_committed` 的 wire 映射留 Batch 2 路由接线时裁决；其中耗尽分类在本批为稳定结果联合、零写入。`loop_not_found`/`session_not_found` 沿用不存在与跨归属统一 404 的规则，避免泄漏存在性。
+
 ### 14. BlobStore 内部接口契约
 
-服务端内部接口（`packages/server/src/artifact/blob-store.ts`），本批只冻结不实现。方法：`writeVerified`（已验证写入）、`has`（存在性检查）、`read`（读取）；无删除、无历史 GC。失败走结果联合（`invalid_key`/`content_mismatch`/`blob_missing`/`not_regular_file`/`storage_error`）而非异常——Blob 缺失与内容不符是正常流程分支。写入语义：流式统计真实字节并计算 SHA-256 与协商值比对、超限短路 `content_mismatch`；独占临时文件 → fsync → 原子发布；并发/重复上传不暴露半文件且仍验证字节；只有发布成功后才记录 Blob 元数据。存储键是安全的 `(namespaceId, hash)` 形状，manifest 路径不映射为磁盘路径；拒绝 symlink 与非普通文件。`has` 不把存储错误吞成 missing（否则污染 commit 的重传分类）；blob 路径上的 symlink/特殊文件是**异常**而非缺失，分类 `not_regular_file`（归入 `BlobPresenceFailure`），不得报告为干净的 `present:false` 走上重传路径。`read` 的失败通道分两阶段：打开期失败（`invalid_key`/`blob_missing`/`not_regular_file`/`storage_error`）走 `BlobReadResult` 结果联合；打开后流式读取中途的 I/O 失败以流内**终止元素** `{ok:false, failure:"storage_error"}` 表达——迭代器不得为 I/O 失败抛异常，消费端不做 try/catch 即可分类。片 3 的共享契约测试必须覆盖读取中途 I/O 故障与 `has`/`read` 遇 symlink/特殊文件两类场景。内存与本地 adapter 共享同一契约测试（片 3）。
+服务端内部接口位于 `packages/server/src/artifact/blob-store.ts`，由片 1 冻结、片 3 实现。方法为 `writeVerified`、`has`、`read`；无删除、无历史 GC。预期失败使用结果联合：`invalid_key`/`content_mismatch`/`blob_missing`/`not_regular_file`/`storage_error`。内存与本地 adapter 遵守同一契约。
+
+#### 已验证写入与发布
+
+`writeVerified` 流式统计真实字节并计算 SHA-256，与协商值比对。`expectedSize` 必须是 0 到 `ARTIFACT_FILE_MAX_BYTES` 之间的安全整数；非法声明返回 `content_mismatch`，不拉取源流。超限、hash/size 不符或干净 EOF 字节不足归 `content_mismatch`；源流中途抛错归 `storage_error`，使瞬时传输故障可按决策 13 重试。adapter 留存的字节必须与哈希覆盖的字节一致；内存 adapter 在 chunk 到达时复制，允许源流复用缓冲区，Buffer 也不得通过返回视图的 `slice()` 留存。
+
+本地 adapter 使用独占临时文件 → 文件 fsync → 关闭句柄 → 原子发布。并发或重复上传仍验证字节，不暴露半文件。发布使用 `link(2)`，保留既有目标；同 key 并发发布仅一方返回 `published:true`。EEXIST 分支对最终目标 `lstat`：普通文件返回 `published:false`，不复验或修复既有字节；symlink/特殊文件拒绝。`EPERM`/`EXDEV` 等失败归 `storage_error`，不退回会覆盖目标的 rename。只有发布与决策 10 的完成前复验均成功后，才登记元数据。
+
+fsync 只覆盖 Blob 文件，不做目录 fsync。目录项崩溃丢失由决策 12 的缺失文件恢复语义处理。
+
+#### 路径检查与部署信任边界
+
+存储键为安全的 `(namespaceId, hash)`，manifest 路径不映射为磁盘路径。三方法均拒绝 symlink 或非目录形式的 namespace 目录，归 `storage_error`；namespace 不存在按干净缺失处理。最终 Blob 目标使用 `lstat`，symlink（包括悬空 symlink）或特殊文件归 `not_regular_file`。`has` 不得将上述异常或存储错误报告为 `present:false`。
+
+存储根自身允许可信 symlink，例如 macOS `/var`。生产接线前提是存储根仅由 Server 的可信运行身份/运维写入，不授予不可信本地进程写权限。路径式 namespace 检查只防御已停放的 symlink，无法保证检查与子路径操作之间的 namespace 并发替换隔离；同 UID 恶意进程可改动该根的部署形态不在本 adapter 的对抗保证内。如需抵御该对手，应改用支持目录 fd 相对打开的存储实现，并在生产接线前另作 ADR。
+
+#### 读取与资源所有权
+
+`read` 的打开期失败走 `BlobReadResult` 联合。成功结果包含真实 size、字节流和幂等 `close()`。本地 adapter 打开一次，以 `fstat` 验证该 fd，流始终从同一 fd 读取，防止打开后按路径重开造成内容替换。打开使用 `O_NOFOLLOW`，ELOOP 归 `not_regular_file`；平台缺少该常量时 flags 退化为 0，保留前置 `lstat` 检查，该退化不提供相同的最终路径组件竞态防护。
+
+打开后 I/O 失败通过流内终止元素 `{ok:false, failure:"storage_error"}` 返回，迭代器不为 I/O 失败抛异常。正常 EOF、流故障、消费者提前停止均自动关闭句柄；若成功结果未开始迭代，调用方必须显式 `close()`，关闭后不再迭代。内存 adapter 提供同形态的无资源 `close()`。
 
 ### 15. 可信归属解析器接口契约
 
-服务端内部接口（`packages/server/src/artifact/attribution.ts`），本批只冻结不实现。`resolve(machine: TrustedMachineIdentity): Promise<ArtifactAttribution>`：输入是 store 已从 Bearer 凭证解析出的可信 Machine 身份（永非 wire 输入）；异步（生产 Team 归属需要查库）；缺失归属是预期域结果（联合返回 `{ok:false, failure:"attribution_missing"}`），不抛异常。每次操作重新解析，不从请求缓存。接口的输入/输出、职责与失败语义即决策 7 与本文；TSDoc 与本文不得矛盾，漂移时以本文为准并同步修订。
+服务端内部接口（`packages/server/src/artifact/attribution.ts`），片 1 冻结契约，生产 Team 接线仍留后续认证批次。`resolve(machine: TrustedMachineIdentity): Promise<ArtifactAttribution>`：输入是 store 已从 Bearer 凭证解析出的可信 Machine 身份（永非 wire 输入）；异步（生产 Team 归属需要查库）；缺失归属是预期域结果（联合返回 `{ok:false, failure:"attribution_missing"}`），不抛异常。每次操作重新解析，不从请求缓存。接口的输入/输出、职责与失败语义即决策 7 与本文；TSDoc 与本文不得矛盾，漂移时以本文为准并同步修订。
 
 ### 16. Batch 1 休眠边界
 
-本批不挂载任何 Artifact HTTP 路由、不启动 watcher、Daemon 不声明 `artifact-sync-v1`、Report 不消费 `artifactSnapshotId`/`artifactSyncError`、Run claim 条件不变、旧 Loop 默认未配置 Artifact 目录且不开始上传、生产装配不构造 BlobStore。可执行证据为 AD1–AD4 休眠守卫（路由 404 探测、Create/Poll/Report 行为不变、启动装配无 BlobStore/watcher），分别随片 1/2/3/4 挂载，片 6 汇总核对。
+本批不挂载任何 Artifact HTTP 路由、不启动 watcher、Daemon 不声明 `artifact-sync-v1`、Report 不消费 `artifactSnapshotId`/`artifactSyncError`、Run claim 条件不变、旧 Loop 默认未配置 Artifact 目录且不开始上传、生产装配不构造 BlobStore。
+
+Daemon 的 poll 出站体仅包含既有五个静态字段与 `availableSlots`，不发送 `watchDigest`；poll/report 请求仅使用 `/api/machine/poll` 与 `/api/machine/report`。Batch 2 watcher 接线时须显式更新该边界。AD1–AD4 休眠守卫覆盖路由、Create/Poll/Report、出站请求及启动装配，长期验收要求以 Batch 1 计划为准。
 
 ### 17. 共享 policy 的 ADR-002 窄例外记录
 
 `artifact-policy.ts` 是 ADR-002 决策 4「裁剪策略不进 protocol」的第二个记录在案窄例外（第一个是 terminal-policy.ts）：manifest 条目校验、容量上限、never-sync 规则、canonical 规范化与有界解析必须由 Daemon（扫描本地预分类）与 Server（防御层收口）逐字一致地执行，两份拷贝必然漂移，故单一来源放 protocol 包。模块保持纯函数、无 I/O、无 Node 内建依赖，主入口浏览器可 bundle 性不变。ADR-002 修订记录同步登记。
+
+### 18. 持久化形状与仲裁键
+
+模型使用 `artifact_sync_sessions`、`artifact_manifests`、`artifact_blobs` 三张表，Loop 保存配置、当前 manifest 指针与同步尝试状态，Run 保存快照绑定与同步错误。migration `0005` 前滚，沿用无外键、无新 CHECK、ISO text 时间戳和 jsonb 规范化 manifest/回执的仓库纪律；revision 非负、单调和上界由写路径保证。
+
+唯一键作为仲裁依据：session `(namespaceId, machineId, requestId)`、manifest `(loopId, manifestRevision)`、Blob 复合主键 `(namespaceId, hash)`。
+
+### 19. Run 快照绑定与配置互斥
+
+绑定仅适用于 `run.phase === "running"`；canceled/superseded 不绑定，reclaimed（terminal-grace 唤醒报告）路径在本层保守排除。Batch 2 将 binding plan 接入 Report 事务的 reconcile 分支时，须显式裁决 reclaimed 是否放行。
+
+绑定必须确认已提交 manifest 的 `id === snapshotId`，namespace 匹配可信归属，manifest / Run / Loop / 可信归属四方 machineId 相等，manifest / Run / Loop 的 Loop ID 一致，manifest 配置代际等于当前 Loop 代际。写入已验证的 `manifest.id`。内部拒绝分类为 `snapshot_not_committed` / `cross_namespace` / `cross_machine` / `cross_loop` / `stale_config_generation`；Batch 2 拥有最终接线分类法。
+
+bind 计划携带解析时的 `guardConfigRevision`。落库的 Run UPDATE 守卫 Run `(id, phase)`，并在同一语句的代际子查询中以 `FOR UPDATE` 锁定 Loop 行、复验当前代际。锁持续到该语句或外层 Report 事务提交，与配置 UPDATE 互斥：配置先提交时绑定看到新代际并守卫失败；绑定先取得锁时配置等待绑定提交。普通无锁子查询的语句快照不足以保证此互斥。
+
+守卫零行抛 `ArtifactBindingGuardLostError`，调用方须重解析、重计划；代际前进后转为 `stale_config_generation`。`record_error` 仍守卫 Run `(id, phase)`，但不锁 Loop、不加代际守卫：`cross_*` 与 `snapshot_not_committed` 不受配置代际影响，`stale_config_generation` 在代际单调递增下仍成立。
 
 ## 后果
 
@@ -100,74 +186,25 @@ wire 错误形状复用 `apiErrorSchema` `{error, code?}`；错误文本不是�
 - 9 码错误分类与重试约定冻结后，Daemon 的重试/重新协商行为可以脱离实现先行测试。
 - 休眠边界（决策 16）使本批可以安全合入主干：生产行为与 Phase 4 逐字节一致由 AD1–AD4 可执行证据支撑。
 - 已知限制延续 Batch 1 计划：只验证 namespace 隔离，未实现用户认证与生产 Team 归属；历史快照、过期 session 与孤立 Blob 的累计磁盘治理留 Phase 6。
+- 内存与本地 BlobStore adapter 共用契约套件，测试工具置于 `src/testkit/`，不进入生产构建。测试注入的故障与交错接口不参与生产装配：`hooks.afterResolve` 在事务外允许竞争写入，PUT 在字节流 await 处交错，`hooks.insideCommitTx` 仅用于抛错验证回滚，事务内不等待竞争事务。
+- PGlite 单连接证据不替代真实 PostgreSQL 多物理连接重叠验证；验证范围仍由 [#11](https://github.com/zhuabo001/loop-platform-zhb/issues/11) 与 [#72](https://github.com/zhuabo001/loop-platform-zhb/issues/72) 跟踪。
 
 ## 修订记录
 
-### 2026-09-28（片 1 三轨复审 Round 1 修复）
+以下仅记录决策变化及理由；正文表达现行契约。修复过程、测试结果和核销状态由 GitHub Issues 与 handoff 审查记录保存。
 
-- **决策 2 措辞修正（A1）**：原文「schema 层只钉形状（`z.string()`/`z.number()`）」改为 typeof 形状——`size` 不得用 `z.number()`（Zod 4 在 schema 层拒绝非有限数，会让 wire `1e400` 在 Server 死于 zod issue、在 Daemon 死于 policy `size_invalid`，违反本决策自身的单一分类要求）。决策语义（值域单一来源在共享 policy）不变，实现措辞对齐。
-- **决策 14 细化（S1）**：明确 `read` 的两阶段失败通道与 `has` 对 symlink/特殊文件的分类（见决策 14 正文）。接口冻结时尚无 adapter 依赖旧措辞，属实现前修正而非行为变更。
+### 2026-09-28
 
-### 2026-09-28（片 2 模型与迁移）
+- 决策 2/14 明确 schema 只检查 typeof 形状、读取的两阶段失败通道及异常文件分类，保证跨端分类与 adapter 契约一致。
+- 决策 8/18 补充配置求值序、revision 上界、completed Loop 配置语义及持久化仲裁键；决策 19 补充绑定身份链与配置行锁，保证绑定对象可验证且与配置更新互斥。关联：[#69](https://github.com/zhuabo001/loop-platform-zhb/issues/69)、[#70](https://github.com/zhuabo001/loop-platform-zhb/issues/70)、[#71](https://github.com/zhuabo001/loop-platform-zhb/issues/71)。
 
-- **schema 落定（决策 8/9/11/12 的持久化形状）**：`loops` 增 7 列、`runs` 增 2 列、新表 3 张（`artifact_sync_sessions` / `artifact_manifests` / `artifact_blobs`），migration `0005` 前滚；沿用既有纪律：无外键、无新 CHECK（revision 非负/单调/上界是写路径纪律，同 `goalRevision`/`scheduleRevision`）、ISO text 时间戳、jsonb 存规范化 manifest 与回执。唯一键即声明的仲裁面：session `(namespaceId, machineId, requestId)`、manifest `(loopId, manifestRevision)`、blob 复合主键 `(namespaceId, hash)`。
-- **revision 上界耗尽的稳定分类**：内部字面量 `config_revision_exhausted`（本片配置事务；镜像 schedule 域 `schedule_revision_exhausted` 先例）与 `manifest_revision_exhausted`（片 4 commit 路径预声明）。二者在 Batch 1 无路由可达，**wire 映射推迟到 Batch 2 路由接线时裁决**；稳定拒绝（结果联合、不抛异常、零写入）即本批契约。配置 planner 求值序钉死为 validate → noop → exhaustion：等值命令在 int32 上界仍是 noop（零写入优先），非法值即使与存储值相等也拒绝。
-- **配置更新无 completed-loop 限制**：镜像 `updateTaskFile`（运维重定向）而非 `updateGoal`（完成冻结语义）——决策 8 未列完成态限制，此处记录为有意的默认。
-- **快照绑定的内部分类字面量**（`runs.artifact_sync_error` 自由文本列的值集种子，Batch 2 拥有最终分类法）：`snapshot_not_committed` / `cross_namespace` / `cross_machine` / `cross_loop` / `stale_config_generation`。绑定资格为 `run.phase === "running"`：canceled/superseded 不绑定；**reclaimed（terminal-grace 唤醒报告）路径在本层保守排除**，Batch 2 把 binding plan 接入 report 事务的 reconcile 分支时须显式裁决是否放行。
+### 2026-09-29
 
-### 2026-09-28（片 2 三轨复审 Round 1 修复：#69/#70/#71）
+- 决策 12/14 明确不覆盖目标的原子发布、源中断分类、size 防御、fsync 范围与字节所有权，保证发布结果和已验证内容一致。关联：[#75](https://github.com/zhuabo001/loop-platform-zhb/issues/75)。
+- 决策 14 明确 namespace 目录检查的部署信任边界，以及同 fd 读取与显式关闭责任，限定隔离保证并使未消费的读取结果可释放资源。关联：[#73](https://github.com/zhuabo001/loop-platform-zhb/issues/73)、[#74](https://github.com/zhuabo001/loop-platform-zhb/issues/74)。
 
-- **绑定身份核对（#69）**：`planArtifactSnapshotBinding` 新增 `manifest.id === snapshotId` 核对，失配归入既有字面量 `snapshot_not_committed`——引用 ID 没有已提交 manifest 的证据（查不到与查到的不是同一行，对绑定者等价），值集不扩。bind 计划写入已验证的 `manifest.id`，不再直采独立的 `snapshotId` 输入。
-- **machine 归属链补全（#70）**：`cross_machine` 检查纳入 `loop.machineId`——无外键模型下，manifest / run / loop / 可信归属四方 machineId 必须传递相等，Loop 行不作为可信输入豁免。
-- **绑定落库的配置代际守卫（#71）**：bind 计划携带解析时观测的 `guardConfigRevision`；`applyArtifactBindingPlan` 在同一 UPDATE 语句内以子查询复验 `loops.artifact_config_revision`（单语句 CAS，与 `updateArtifactConfig` 的 revision 守卫同级原子性）。代际在 plan→apply 之间前进则守卫零行、抛 `ArtifactBindingGuardLostError`，调用方重解析后重计划（自然转为 `stale_config_generation` 记录）。`record_error` 不加代际守卫：五类拒绝字面量均代际稳定（`cross_*` 与 `snapshot_not_committed` 与代际无关，`stale_config_generation` 单调），配置前进不会证伪已记录的拒绝。
+### 2026-10-03
 
-### 2026-09-28（片 2 三轨复审 Round 2 修复：#71）
-
-- **绑定与配置更新的行级互斥**：上述普通子查询仅看见语句开始时的 Loop 快照，不能阻止另一事务在绑定语句执行期间提交新配置。bind 的代际子查询改用 `FOR UPDATE` 锁定 Loop 行，锁持续到独立调用的语句提交或调用方 Report 事务提交；配置写入 `UPDATE loops` 与其互斥。若配置先提交，绑定读取更新后的代际并守卫失败；若绑定先取得锁，配置等待绑定提交。`record_error` 仍不锁 Loop，因其不绑定快照。
-
-### 2026-09-29（片 3 BlobStore adapter）
-
-- **原子发布的机制对齐**：本地 adapter 用 `link(2)` 实现决策 14 的「原子发布」——EEXIST 即原子 test-and-set，`published` 标志在并发下同 key 恰一个 `true`（rename-always 只能靠发布前 lstat，TOCTOU 竞态下不诚实）。权威计划片 3 行的「fsync 后原子 rename」是机制措辞，§3 规范段的「原子发布」语义不变。异类挂载上的 `EPERM`/`EXDEV` 归 `storage_error` 诚实失败，不做静默 rename fallback（那会破坏 no-clobber 语义）。
-- **源中断的分类**：`writeVerified` 的字节流中途 throw（Batch 2 即 HTTP 请求体断流）归 `storage_error` 而非 `content_mismatch`——后者的 wire 重试类是 terminal，会把瞬时传输故障永久化；前者是 `idempotent_retry`（决策 13 的码表）。干净 EOF 但字节不足仍归 `content_mismatch`（同一字节流重试必然同样短，terminal 正确）。
-- **`expectedSize` 值域纵深**：非 safe integer、负数或超 `ARTIFACT_FILE_MAX_BYTES` 的声明在 adapter 层即归 `content_mismatch` 且零拉取源流——决策 2 的值域纪律延伸到内部接口的 size 参数；决策 14 的契约文本未含此上限，此处登记为实现层防御（`isLegalExpectedSize` 与 `verifyByteStream` 共用同一判定）。
-- **EEXIST 与 symlink 的 lstat 纪律**：发布的 EEXIST 分支与 `has`/`read` 全程 `lstat`（非 `stat`）——悬空 symlink 在 `stat` 下被错分为 ENOENT。EEXIST 命中普通文件即 `published:false`，不复验、不修复既有字节（与 read 不复验同一哲学：写路径已验证过内容寻址）。
-- **nsDir symlink 守卫**：写路径拒绝 symlink 形态的 namespace 目录（`storage_error`——经它落盘会逃逸存储根）；存储根本身永不查 symlink（macOS tmpdir 经 `/var→/private/var` 合法穿越）。
-- **fsync 粒度与停止边界**：决策 14 的 fsync 指 blob 文件本身；不做目录 fsync（目录项崩溃丢失恰好是 AB8「元数据在、文件无」这一架构已容忍的场景，prepare 要求重传、commit 拒绝不完整快照）；崩溃遗留临时文件的全局清理维持权威计划的停止边界（本批不做，残留惰性无害由测试钉住）。
-- **共享契约套件的落点与故障注入缝**：套件居 `src/testkit/blob-store-contract.ts`（`tsconfig.build.json` 只排除 `*.test.ts` 与 `src/testkit/**`——放 `src/artifact/` 会进 dist 且引用 devDependency vitest）；memory adapter 的 fault 集合与 local adapter 的 `io.streamChunksImpl` 均为 TEST-ONLY 缝（config.ts `hooks.afterResolve` 与 daemon bounded-read `openImpl` 先例），生产装配不构造任何 adapter（决策 16，AD4 钉住）。
-
-### 2026-09-29（片 3 三轨复审 Round 1 修复：#73/#74/#75/#76）
-
-- **内存 adapter 到达即拷贝（#75）**：原实现留存 chunk 引用、hash 验证通过后才复制——合法复用同一缓冲的源流可在验证覆盖后改写已哈希字节（验证所见 `[A B]`、落库变 `[B B]`），违反已验证写入且双 adapter 不等价（本地 adapter 逐块即时落盘天然免疫）。改为 `onChunk` 内到达即拷贝（显式 `new Uint8Array` + `set`，不用 `chunk.slice()`——Buffer 型 chunk 的 `slice()` 返回视图）。共享套件新增用例钉死：单缓冲跨 yield 复用源必须存下「哈希覆盖的那版字节」，双 adapter 一致（AB10）。
-- **has/read 的 namespace 目录守卫（#73）**：原实现只对最终 blob 路径 `lstat`，停在 `<root>/<ns>` 的 symlink 会被路径系统调用跟随——跨命名空间读取无需竞态。三方法统一走 `nsDirGuard`（symlink 或非目录归 `storage_error`——`not_regular_file` 类型上专属 blob 目标；namespace 不存在仍是 ENOENT 干净缺席）。rootDir 永不查 symlink 的既有裁决不变。
-- **读流绑定打开期已验证的 fd（#74）**：原实现 `read()` 完成 lstat/open/fstat 后关闭句柄，返回的惰性流再按路径重开——`read()` 返回与开始迭代之间换目标即可改流（symlink 换入则越根读取，普通文件换入则 size 与内容分叉）。改为打开一次（`O_NOFOLLOW` 关掉 lstat→open 的最后一个组件换入窗口，ELOOP 归 `not_regular_file`；非 POSIX 平台缺该常量时退化为 0，lstat 前置检查仍确定性分类）、fstat 同一句柄、流从该 fd 读取；`streamBlob` 持有句柄并在流完成/失败/消费者中断时关闭。`ok:true` 结果若迭代器从未被消费则 fd 由调用方负责（契约消费者总是排空流），已在模块头注释登记。TEST-ONLY 缝 `streamChunksImpl` 保持按路径签名不变——注入故障流仍走 adapter 真实的终止元素归约代码（#66(a) 证据强度不降）。
-- **AD4 daemon 出站守卫补半（#76）**：原守卫只钉静态 identity/capabilities，未来若在出站路径独立加请求仍会通过。新增钉：runtime 实际构造的 poll body 键集精确等于五静态键 + `availableSlots`（`watchDigest` 不发送——协议字段存在但 Batch 1 无消费者）；wire client 一个完整 poll+report 周期的请求目标恰为 `/api/machine/poll` 与 `/api/machine/report` 两个 Phase 1 端点。Batch 2 watcher 接线须显式更新此钉。
-
-### 2026-09-29（片 3 二轮复审修复：#73/#74/#76）
-
-- **namespace 目录并发替换的信任边界（#73）**：`nsDirGuard` 防御已停放的目录 symlink（包括指向其他 namespace 与存储根外），不是原子 `openat` 路径遍历。本实现使用的 Node [`fsPromises.open(path, flags)`](https://nodejs.org/download/release/latest-jod/docs/api/fs.html#fspromisesopenpath-flags-mode) 只接受路径、不接受目录 fd；若不可信进程拥有存储根目录写权限，可在检查与子路径操作间替换 namespace，路径式 `has/read/write` 无法保证隔离。生产接线的前提是存储根仅由 Server 的可信运行身份/运维写入，不授予其他本地进程该目录的写权限；同 UID 恶意进程可改动该根的部署形态不在本 adapter 的对抗保证内。rootDir 自身可经可信 symlink（例如 macOS `/var`），这一边界不变。新增根外静态 symlink 用例钉住适配器承诺的拒绝行为；如未来需要抵御可并发修改存储根的本地对手，须引入支持目录 fd 相对打开的存储实现，并在生产接线前另作 ADR。
-- **成功读取结果的资源所有权（#74）**：为保持打开期错误走 `BlobReadResult` 联合、流从同一经 `fstat` 验证的 fd 读取，`read()` 仍在返回前打开文件。成功结果新增幂等 `close()`；正常 EOF、流故障、消费者提前停止会自动调用同一关闭路径，若未开始迭代则调用方必须显式 `close()`。内存 adapter 提供无资源的同形态方法。此接口责任代替上版“必须排空，否则无释放入口”的不完整约定。
-- **AD4 同路出站钉（#76）**：将拆开的 runtime stub 与手调 wire client 断言合为同一 `createDaemonRuntime`→`createMachineClient`→注入 `fetchImpl` 的 poll/dispatch/report 周期；记录并断言运行时真实发出的目标与 poll 请求体，同时钉住 `globalThis.fetch` 零调用，防止 runtime 绕开注入客户端独立出站。不靠两个互不相连的测试片段推断零 Artifact 请求。
-
-### 2026-10-03（片 4 ArtifactHome 状态机）
-
-- **ArtifactHome 模块与内部字面量集**：`src/artifact/sync.ts` 是 prepare/PUT/commit 的唯一写方（仅测试接线，决策 16）。内部失败字面量细于 9 个 wire 码（决策 13 双层设计）；wire 映射暂缓到 Batch 2 路由接线的字面量：`artifact_dir_unconfigured`（prepare，未配置 loop 不开始上传）、404 级 `loop_not_found`/`session_not_found`（从未存在或跨归属同一拒绝，存在性不跨 scope 泄漏）、`session_committed`（对已提交会话的 PUT 属客户端缺陷，9 码无诚实归属）。
-- **prepare 固定求值序**：manifest policy → 归属 → loop 作用域 → 已提交重放 → 已配置 → 配置代际 → base revision → pending/新建幂等裁决。已提交重放（同键+同指纹+回执）先于已配置/代际/base 检查：真实 commit 会把 loop base 推进过会话值，原载荷重放若先过这些检查会被误判为冲突、stored 回执无法经 prepare 恢复（决策 9 恢复路径，见 Round 1 修复 S4-2）。只有 pending/新建键由当前代际/base 裁决——旧代请求即使键可复用陈旧 pending 会话也先判 config/manifest 冲突（该会话本就过不了 PUT/commit 的代际复检）。配置冲突后的重新协商必须铸造新 requestId——同键异载荷恒为冲突（决策 6/9 的刻意设计，防止携带过期 base 的重发复用旧会话）。
-- **过期语义**：pending 有效期是排他上界（`now < expiresAt` 可用）；过期 pending 同指纹原位续约（同 syncId；续约写 `WHERE id AND receipt IS NULL AND expiresAt = 观测值` 使并发续约收敛到同一响应）；已提交回执永不过期。
-- **commit 事务结构与仲裁**：回执重放在作用域检查之后最优先（跨代际、跨重启、甚至 loop 被带外删除后仍经归属门控可读）。blob 完备性（元数据行 + 文件双查）在事务外：行缺或文件缺归 `blob_missing`（AB8，`has` 失败归 `storage_error`，永不静默当缺失）。单事务内：对 LIVE loop 行做会话锚定的代际/base/耗尽量复检（决策 11 的事务内重新检查）→ guarded loop UPDATE 先行（行锁串行化并发 commit，使 `(loopId, manifestRevision)` 唯一冲突在正确竞态下不可达；仍保留 23505 因链到 guard loss 的防御转换）→ 插入不可变 manifest（ID factory 新 id，同内容两会话两快照）→ `insideCommitTx` 只抛错缝 → receipt 写入带 `receipt IS NULL` 守卫（同 session 并发 commit 败方整体回滚、有界重跑重放胜方回执，AC7 收敛单快照）。guarded UPDATE 以事务内读到的 revision 为守卫基线：只动 OCC revision 的无关域写入不阻塞 commit，语义守卫由会话锚定复检承担。
-- **同步尝试打账规则**：成功账随事务内 guarded UPDATE 落（`attemptedAt=succeededAt=提交时刻`、`error=null`）；失败账仅 `manifest_conflict`/`blob_missing`/`storage_error` 三类，值为 WIRE 码（`loops.artifactSyncError` 枚举即 `ARTIFACT_ERROR_CODES`），best-effort `UPDATE … WHERE id AND revision = 观测值 AND artifactConfigRevision = 会话代际`——代际谓词即 AM6「旧代请求不能更新新代状态」守卫，零行静默跳过、不重试（打账是簿记，不是操作结果）。`config_conflict`/`session_expired`/`attribution_missing`/`session_not_found` 与 `manifest_revision_exhausted` 不打账（无当前代尝试，或 Batch 2 前尚无 wire 码）；prepare/PUT 失败不打账（尝试未终结）。
-- **PUT 的 invalid_key 是不变量违例**：hash 来自 policy 校验过的 manifest、namespace 来自可信归属解析——走到 `invalid_key` 即契约破坏，抛 `ArtifactSyncInvariantError`，不归 `storage_error`（避免把永久缺陷挂上 `idempotent_retry` 无限重试）。
-- **片 5 接缝预留**：`hooks.afterResolve(op, id)` 在 resolve 与写之间（事务外，PGlite 单连接的真实交错点）；PUT 的交错点在字节流 await 处（测试流中途让出即真实交错）；`hooks.insideCommitTx` 只允许抛错验证回滚（事务内不等待另一笔竞争事务）。
-
-### 2026-10-03（片 4 三轨复审 Round 1 修复：S4-1/S4-2/A4-1/A4-2/A4-3）
-
-- **prepare INSERT 的 Loop 行锁（S4-1）**：会话插入事务先 `SELECT … FOR UPDATE` 锁定 Loop 行，并在锁下复验观测到的统一 OCC revision（binding-plan Round-2 同一先例）。原先的无锁 SELECT 在真实多连接的 SELECT→INSERT 窗口内会让并发配置写入不受 GuardLost 约束，违反 ADR-009 L138/L145「基于 Loop 决策快照的写事务须取得对应 revision 写权限」。行锁不改动当前视图，prepare 的零视图写入承诺不变；多物理连接重叠证明仍归 #11/#72 的验证边界。
-- **已提交 prepare 重放先于代际/base（S4-2）**：见上方求值序条目的更正。同键+同指纹+回执 ⇒ 原样返回原 session（needHashes 为空，回执经 commit 重放恢复）；同键异指纹永不重放，仍由 planner 判稳定冲突。回归测试改用真实 prepare→PUT→commit 推进 base 后重放（原测试手工填 receipt、不推进 base，掩盖了正常路径），并钉住升代+过 TTL 后仍可重放。
-- **commit 事务内先复验 session（A4-1）**：事务内先重读 LIVE session 行——胜方回执逐字重放（同 session 并发 commit 收敛为单回执单快照，修复前败方落 manifest_conflict）、pending TTL 以事务内新鲜时钟复检（session_expired）、namespace/machine 归属关联复验（404 级 session_not_found）；之后才重读 LIVE loop 行做 loop↔session 关联 + 代际/base/耗尽量检查。新增 abort 字面量（session_not_found/session_expired）均不打账，与 precheck 同名结局一致。
-- **PUT 完成前全量复验（A4-2）**：发布完成后重新解析可信归属并重读 session + loop——归属映射中途切换或 loop 关联断开归 session_not_found，会话中途被提交归 session_committed，TTL 中途到期归 session_expired，代际中途漂移归 config_conflict。拒绝时遗留已发布但未引用的 Blob（决策 12 容忍），不删共享 Blob 模拟回滚，不登记元数据行。
-- **已验证 size 参与复用校验（A4-3）**：prepare 的 needHashes 与 commit 的完备性检查都比较协商条目 size 与元数据行的已验证 size；不一致的行不支撑本会话——prepare 重新要求上传（PUT 以声明 size 复检字节，诚实报 content_mismatch），commit 以 blob_missing 拒绝（协商意义上的 blob 缺失）并打 wire 码。manifest 的 totalBytes 从此恒等于已验证内容真实总量。同 digest ⇒ 同内容 ⇒ 同 size，故跨 session 的 size 不一致恒为客户端虚报：该 requestId 下的会话无法经去重路径洗白，过期后由新 requestId 诚实重报。
-
-### 2026-10-03（片 4 三轨复审 Round 2 修复：A4-1 剩余窗口 + S4-2/A4-3 验收补齐）
-
-- **commit 裁决读序：loop 先、session 后（A4-1 Round 2，#79）**。Round 1 的事务内复验封住了 afterResolve 之后的窗口，但事务外裁决仍按 session→loop 顺序读：同 session 胜方 commit 落在两读之间时，败方用（旧 session：无回执，新 loop：base 已推进）的不一致快照裁决出伪 manifest_conflict，且失败打账用它刚观测到的提交后 revision 命中当前行，把胜者的成功三元组覆盖上 artifact_manifest_conflict。修复不改决策序（receipt 仍最先裁决），只把**观测序**统一为 loop→session：事务外为「作用域探针读 session（取 loopId/归属）→ 读 loop → 有界重读一次 session 裁决」；事务内同样先读 LIVE loop 再读 LIVE session。保护依据（替代加锁）：竞品 commit 的 base 推进与回执写入在**同一事务**原子落库、loop 代际/base 单调递增、回执写一次——故放在 loop 读之后的 session 读永远不可能看到「base 已越过本 session 却无回执」；该组合恒为**其他** session 的真实 base 冲突，而已完成的同 session 胜方回执必被观测并重放。这不是新增固定检查点平移窗口：线性化点落在末次 session 读，之后的竞品 commit 合法地排在本操作之后。READ COMMITTED 足够，未引入新行锁，prepare 的 FOR UPDATE 仍是模块唯一锁，不存在锁序问题。回归：真实 session读→loop读 间竞争 commit（Db 包装在首个 session 查询返回真实行后让胜方完整提交）收敛为双方同回执、单 manifest、单次 revision 递增、成功错误字段保持 null；并已反证该测试在修复前代码上失败。PGlite 证据不冒领 #11/#72 的真实多物理连接验证。
-- **S4-2 验收补齐（#78）**：committed 重放回归补两类断言——移除 artifactDir（null）后 prepare 仍返回原已提交 session、commit 仍恢复原回执（重放先于 artifact_dir_unconfigured）；重放前后 loop 的 artifactManifestId/artifactManifestRevision/统一 OCC revision 逐项相等（重放是纯读，不碰当前视图）。
-- **A4-3 验收补齐（#81）**：补声明 size **大于**已验证 size（5 对 3）的跨 session 复用回归（prepare 重新要求上传 → PUT 对协商 size 诚实报 content_mismatch → commit blob_missing 且旧视图不动）；补同 hash 多路径成功提交的 totalBytes = 已验证 size × 路径数（3×2=6）断言。
+- 决策 9 明确已提交重放优先于当前配置/base 检查、pending 原位续约及 prepare 插入行锁，保证历史请求可恢复且新会话写入遵守 OCC。关联：[#77](https://github.com/zhuabo001/loop-platform-zhb/issues/77)、[#78](https://github.com/zhuabo001/loop-platform-zhb/issues/78)。
+- 决策 10/11 明确 PUT 完成前全量复验、commit 事务内复验、回执守卫及同步尝试记录规则；commit 裁决观测序统一为 Loop→session，避免同 session 成功被误判为 base 冲突。关联：[#79](https://github.com/zhuabo001/loop-platform-zhb/issues/79)、[#80](https://github.com/zhuabo001/loop-platform-zhb/issues/80)。
+- 决策 9/11 明确去重与完备性检查使用已验证 size，保证容量统计与实际内容一致。关联：[#81](https://github.com/zhuabo001/loop-platform-zhb/issues/81)。
