@@ -18,6 +18,11 @@
  *       config_conflict (the mid-upload case leaves a published but
  *       unreferenced blob — the 决策 12 tolerated leftover — and NO
  *       metadata row).
+ *  Completion re-verification (A4-2): after the publish the attribution is
+ *       re-resolved and the session + loop re-read — a mid-stream TTL lapse
+ *       (session_expired), namespace remap or association break (the
+ *       leak-free session_not_found) or commit (session_committed) rejects
+ *       with the blob left unreferenced and no metadata row.
  *  Failure outcomes write NOTHING to the current view (AC3's PUT leg).
  */
 import { createHash } from "node:crypto";
@@ -301,6 +306,80 @@ describe("PUT (real PGlite + memory BlobStore)", () => {
     const after = await snapshotLoops(db);
     expect(after).toHaveLength(1);
     expect(after[0]!.artifactConfigRevision).toBe(loopsBefore[0]!.artifactConfigRevision + 1);
+  });
+
+  it("A4-2: a TTL lapse DURING the upload rejects the PUT — session_expired, the published blob stays unreferenced, no row", async () => {
+    await fresh();
+    await seedConfiguredLoop();
+    const syncId = await negotiate();
+
+    // The byte stream IS the interleaving seam: the clock reaches expiresAt
+    // (the EXCLUSIVE bound) after the last chunk but before the completion
+    // re-verification.
+    const bytes = (async function* () {
+      yield bytesOf(CONTENT_A);
+      clock.advance(ARTIFACT_SYNC_SESSION_TTL_MILLIS);
+    })();
+    await expect(putArtifactBlob(deps, { machineId: "m-1" }, { syncId, hash: HASH_A, bytes })).resolves.toEqual({
+      ok: false,
+      failure: "session_expired",
+    });
+    expect((await storedBytes("ns-1", HASH_A))?.equals(Buffer.from(CONTENT_A))).toBe(true); // leftover tolerated
+    expect(await blobRows()).toHaveLength(0);
+  });
+
+  it("A4-2: an attribution remap DURING the upload revokes the session — the leak-free session_not_found, no row", async () => {
+    const map: Record<string, string> = { "m-1": "ns-1" };
+    await fresh({ attributionMap: map });
+    await seedConfiguredLoop();
+    const syncId = await negotiate();
+
+    const bytes = (async function* () {
+      yield bytesOf(CONTENT_A);
+      map["m-1"] = "ns-2"; // the trusted mapping moved mid-stream
+    })();
+    await expect(putArtifactBlob(deps, { machineId: "m-1" }, { syncId, hash: HASH_A, bytes })).resolves.toEqual({
+      ok: false,
+      failure: "session_not_found",
+    });
+    expect((await storedBytes("ns-1", HASH_A))?.equals(Buffer.from(CONTENT_A))).toBe(true);
+    expect(await blobRows()).toHaveLength(0);
+  });
+
+  it("A4-2: a session committed DURING the upload rejects the PUT — session_committed, no row", async () => {
+    await fresh();
+    await seedConfiguredLoop();
+    const syncId = await negotiate();
+
+    const bytes = (async function* () {
+      yield bytesOf(CONTENT_A);
+      // A winning commit landed mid-stream.
+      await db
+        .update(artifactSyncSessions)
+        .set({ receipt: { artifactSnapshotId: "amf-winner", manifestRevision: 1 } })
+        .where(eq(artifactSyncSessions.id, syncId));
+    })();
+    await expect(putArtifactBlob(deps, { machineId: "m-1" }, { syncId, hash: HASH_A, bytes })).resolves.toEqual({
+      ok: false,
+      failure: "session_committed",
+    });
+    expect(await blobRows()).toHaveLength(0);
+  });
+
+  it("A4-2: a loop↔session association break DURING the upload is the leak-free session_not_found, no row", async () => {
+    await fresh();
+    await seedConfiguredLoop();
+    const syncId = await negotiate();
+
+    const bytes = (async function* () {
+      yield bytesOf(CONTENT_A);
+      await db.update(loops).set({ machineId: "m-2" }).where(eq(loops.id, "loop-1")); // out-of-band migration
+    })();
+    await expect(putArtifactBlob(deps, { machineId: "m-1" }, { syncId, hash: HASH_A, bytes })).resolves.toEqual({
+      ok: false,
+      failure: "session_not_found",
+    });
+    expect(await blobRows()).toHaveLength(0);
   });
 
   it("a deleted loop mid-session is loop_not_found", async () => {

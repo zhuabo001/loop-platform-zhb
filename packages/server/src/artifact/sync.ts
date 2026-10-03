@@ -47,21 +47,24 @@
  * PUT uploads one negotiated blob (决策 10): the session (carried by id) is
  * re-validated on EVERY upload — attribution, existence (unknown OR
  * cross-attribution is the same leak-free session_not_found), committed
- * state, pending expiry, and the config generation (checked BOTH before the
- * byte stream starts and after the publish completes — a generation that
- * moved mid-upload rejects the PUT; the published-but-unreferenced blob is
- * the 决策 12 tolerated leftover). Only hashes the session negotiated are
- * accepted, and the stream is never pulled for an unnegotiated one. The byte
- * stream is the ONLY source of truth: expectedSize comes from the session's
- * negotiated manifest entry, never from a declared size. Failures map
- * verbatim from the BlobStore contract (content_mismatch/storage_error);
- * invalid_key is unreachable (the hash came from a policy-validated
- * manifest, the namespace from the trusted resolver) and throws an
- * invariant violation rather than looping a permanent defect through a
- * retryable class. A successful publish records the (namespaceId, hash)
- * metadata row with the VERIFIED size — ON CONFLICT DO NOTHING makes a
- * duplicate PUT idempotent, and wrong bytes can never be laundered by an
- * existing blob (writeVerified always re-verifies the stream).
+ * state, pending expiry, and the config generation. The whole set is checked
+ * BEFORE the byte stream starts AND re-verified after the publish completes
+ * (the publish takes real time: the attribution is re-resolved and the
+ * session + loop re-read before the upload counts) — a generation that moved
+ * mid-upload, a lapsed TTL, a committed session or an attribution remap all
+ * reject the PUT; the published-but-unreferenced blob is the 决策 12
+ * tolerated leftover. Only hashes the session negotiated are accepted, and
+ * the stream is never pulled for an unnegotiated one. The byte stream is the
+ * ONLY source of truth: expectedSize comes from the session's negotiated
+ * manifest entry, never from a declared size. Failures map verbatim from the
+ * BlobStore contract (content_mismatch/storage_error); invalid_key is
+ * unreachable (the hash came from a policy-validated manifest, the namespace
+ * from the trusted resolver) and throws an invariant violation rather than
+ * looping a permanent defect through a retryable class. A successful publish
+ * records the (namespaceId, hash) metadata row with the VERIFIED size —
+ * ON CONFLICT DO NOTHING makes a duplicate PUT idempotent, and wrong bytes
+ * can never be laundered by an existing blob (writeVerified always
+ * re-verifies the stream).
  *
  * COMMIT (决策 11/12) turns a fully-uploaded session into an immutable
  * manifest + a fixed receipt:
@@ -590,20 +593,37 @@ export async function putArtifactBlob(
     return { ok: false, failure: "storage_error", cause: written.cause };
   }
 
-  // Generation check #2 — AFTER the publish completes. A generation that
-  // moved mid-upload rejects the PUT; the published-but-unreferenced blob is
-  // the 决策 12 tolerated leftover (never delete shared blobs to fake a
-  // filesystem rollback).
-  const current = (await deps.db.select().from(loops).where(eq(loops.id, session.loopId)).limit(1))[0];
+  // Completion re-verification (决策 10: 写入期间和完成前都验证会话及配置代际):
+  // the publish took real time, so EVERYTHING the pre-stream checks vouched
+  // for is re-derived before the upload counts — the trusted attribution (a
+  // namespace remap mid-stream revokes the session), the session's
+  // committed/expired state, the loop's existence and its attribution
+  // association, and the config generation. A refusal leaves the published
+  // blob unreferenced — the 决策 12 tolerated leftover (never delete shared
+  // blobs to fake a filesystem rollback) — and records NO metadata row.
+  const attributionNow = await deps.attribution.resolve(machine);
+  if (!attributionNow.ok) return { ok: false, failure: "attribution_missing" };
+  const currentSession = await findSessionById(deps.db, session.id);
+  if (
+    !currentSession ||
+    currentSession.namespaceId !== attributionNow.namespaceId ||
+    currentSession.machineId !== attributionNow.machineId
+  ) {
+    return { ok: false, failure: "session_not_found" };
+  }
+  if (currentSession.receipt !== null) return { ok: false, failure: "session_committed" };
+  if (deps.clock.now().toISOString() >= currentSession.expiresAt) return { ok: false, failure: "session_expired" };
+  const current = (await deps.db.select().from(loops).where(eq(loops.id, currentSession.loopId)).limit(1))[0];
   if (!current) return { ok: false, failure: "loop_not_found" };
-  if (current.artifactConfigRevision !== session.configRevision) return { ok: false, failure: "config_conflict" };
+  if (current.machineId !== currentSession.machineId) return { ok: false, failure: "session_not_found" };
+  if (current.artifactConfigRevision !== currentSession.configRevision) return { ok: false, failure: "config_conflict" };
 
   // Record the metadata row ONLY after the publish succeeded (schema contract
   // on artifact_blobs). ON CONFLICT DO NOTHING makes a duplicate PUT
   // idempotent (AB4): the verified size is identical for identical content.
   await deps.db
     .insert(artifactBlobs)
-    .values({ namespaceId: session.namespaceId, hash: input.hash, size: written.size, verifiedAt: deps.clock.now().toISOString() })
+    .values({ namespaceId: currentSession.namespaceId, hash: input.hash, size: written.size, verifiedAt: deps.clock.now().toISOString() })
     .onConflictDoNothing();
   return { ok: true, size: written.size, published: written.published };
 }
