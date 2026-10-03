@@ -1,6 +1,6 @@
 # Phase 5 Batch 1 开发计划：Artifact 领域、协议与存储基础
 
-- 状态：计划已裁决，待实现
+- 状态：内部验收完成，待收口三轨复审
 - 基线：`7681058`
 - 目标分支：`feat/phase5-batch1-dev`
 - 上位计划：[`codex-phase5-dev-roadmap.md`](codex-phase5-dev-roadmap.md)
