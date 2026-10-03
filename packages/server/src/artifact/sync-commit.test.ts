@@ -412,6 +412,75 @@ describe("commit (real PGlite + memory BlobStore)", () => {
     expect((await getLoop()).artifactSyncError).toBeNull(); // the success stamp cleared the refusal
   });
 
+  it("A4-3: a declared size LARGER than the verified blob is never reused either — prepare re-demands, PUT re-verifies, commit refuses", async () => {
+    await fresh();
+    await seedConfiguredLoop();
+    // Session 1 uploads aaa (3 bytes, declared 3) and commits for real.
+    const s1 = await negotiate({ entries: [{ path: "a.txt", hash: HASH_A, size: 3 }] });
+    await put(s1, CONTENT_A);
+    expect((await commit(s1)).ok).toBe(true);
+
+    // Session 2 declares the SAME hash with a LYING size 5 (the verified row
+    // says 3). The contradiction runs the OTHER direction than the size-0
+    // case: the row still does not back the negotiated entry.
+    const second = await prepareArtifactSync(
+      deps,
+      { machineId: "m-1" },
+      makeRequest({ requestId: "req-2", baseManifestRevision: 1, entries: [{ path: "a.txt", hash: HASH_A, size: 5 }] }),
+    );
+    expect(second).toMatchObject({ ok: true, response: { needHashes: [HASH_A] } });
+    if (!second.ok) throw new Error("unreachable");
+
+    // PUT re-verifies the stream against the negotiated size 5: the honest
+    // 3-byte content is a SHORTFALL → content_mismatch (never laundered).
+    const reupload = await putArtifactBlob(deps, { machineId: "m-1" }, {
+      syncId: second.response.syncId,
+      hash: HASH_A,
+      bytes: (async function* () {
+        yield bytesOf(CONTENT_A);
+      })(),
+    });
+    expect(reupload).toEqual({ ok: false, failure: "content_mismatch" });
+
+    // Commit refuses the incomplete snapshot — the old view stands, stamped.
+    const refused = await commit(second.response.syncId);
+    expect(refused).toEqual({ ok: false, failure: "blob_missing" });
+    const after = await getLoop();
+    expect([after.artifactManifestId, after.artifactManifestRevision]).toEqual(["amf-1", 1]);
+    expect(after.artifactSyncError).toBe("artifact_blob_missing");
+    expect(await manifests()).toHaveLength(1); // only session 1's snapshot
+  });
+
+  it("A4-3: one verified blob backing MULTIPLE paths commits with totalBytes = verified size × path count", async () => {
+    await fresh();
+    await seedConfiguredLoop();
+    // a.txt and dir/a-copy.txt carry the SAME content: one negotiation (the
+    // hash dedups), one upload — but TWO manifest entries, and the
+    // capacity accounting accumulates per PATH.
+    const prepared = await prepareArtifactSync(
+      deps,
+      { machineId: "m-1" },
+      makeRequest({
+        entries: [
+          { path: "a.txt", hash: HASH_A, size: 3 },
+          { path: "dir/a-copy.txt", hash: HASH_A, size: 3 },
+        ],
+      }),
+    );
+    expect(prepared).toMatchObject({ ok: true, response: { needHashes: [HASH_A] } });
+    if (!prepared.ok) throw new Error("unreachable");
+    await put(prepared.response.syncId, CONTENT_A);
+
+    const committed = await commit(prepared.response.syncId);
+    expect(committed).toEqual({ ok: true, receipt: { artifactSnapshotId: "amf-1", manifestRevision: 1 } });
+    const manifest = await readArtifactSnapshot(db, "amf-1");
+    expect(manifest).toMatchObject({ fileCount: 2, totalBytes: 6 }); // 3 verified bytes × 2 paths
+    expect(manifest!.entries).toEqual([
+      { path: "a.txt", hash: HASH_A, size: 3 },
+      { path: "dir/a-copy.txt", hash: HASH_A, size: 3 },
+    ]);
+  });
+
   it("AC3: a failure INSIDE the commit transaction rolls back everything — no manifest, no receipt, no pointer, no stamp", async () => {
     await fresh();
     await seedConfiguredLoop();
