@@ -520,3 +520,95 @@ describe("report: race + transaction integrity", () => {
     expect((await snapshotLeases(db))[0]).toMatchObject({ state: "terminal-grace" });
   });
 });
+
+describe("AD3: report ignores the Phase 5 artifact fields (ADR-010 决策 16)", () => {
+  it("an ok report carrying artifactSnapshotId/artifactSyncError finalizes exactly as Phase 4 — the fields never persist", async () => {
+    await fresh();
+    const token = await seedActiveRun();
+    const result = await coordinator.report(token, {
+      ok: true,
+      durationMs: 42,
+      artifactSnapshotId: "amf-1",
+      artifactSyncError: "artifact_storage_error",
+    });
+    expect(result).toEqual({ ok: true });
+    const run = (await snapshotRuns(db))[0]!;
+    expect(run).toMatchObject({
+      phase: "done",
+      outcome: "exec",
+      durationMs: 42,
+      artifactSnapshotId: null,
+      artifactSyncError: null,
+      ts: clock.iso(),
+    });
+    expect(await snapshotLeases(db)).toEqual([]);
+  });
+
+  it("a failure report carrying the fields is byte-identical in effect to a fieldless failure", async () => {
+    await fresh();
+    // Paired on ONE database (the missing-error fallback precedent above).
+    await seedRun(db, { id: "run-bare", machineId, phase: "running" });
+    await seedLease(db, { tokenHash: sha256("rk_bare"), runId: "run-bare", machineId });
+    await seedRun(db, { id: "run-fields", machineId, phase: "running" });
+    await seedLease(db, { tokenHash: sha256("rk_fields"), runId: "run-fields", machineId });
+
+    await coordinator.report("rk_bare", { ok: false });
+    await coordinator.report("rk_fields", {
+      ok: false,
+      artifactSnapshotId: "amf-9",
+      artifactSyncError: "artifact_blob_missing",
+    });
+
+    const all = await snapshotRuns(db);
+    const bare = all.find((r) => r.id === "run-bare")!;
+    const withFields = all.find((r) => r.id === "run-fields")!;
+    expect(withFields).toMatchObject({ phase: "error", outcome: "error", error: GENERIC_RUN_ERROR });
+    // The ONLY difference between the two rows is the id.
+    expect({ ...withFields, id: bare.id }).toEqual(bare);
+  });
+
+  it("a swept-run reconcile carrying the fields keeps T5 behavior and never persists them", async () => {
+    await fresh();
+    const token = await seedSweptRun();
+    const result = await coordinator.report(token, {
+      ok: true,
+      artifactSnapshotId: "amf-1",
+      artifactSyncError: "artifact_storage_error",
+    });
+    expect(result).toEqual({ ok: true, reconciled: true }); // T5's wake-report marker, unchanged
+    const run = (await snapshotRuns(db))[0]!;
+    expect(run).toMatchObject({ phase: "done", outcome: "exec", artifactSnapshotId: null, artifactSyncError: null });
+    expect(await snapshotLeases(db)).toEqual([]);
+  });
+
+  it("a second report carrying the fields gets the unified 401 with zero side effects", async () => {
+    await fresh();
+    const token = await seedActiveRun();
+    await coordinator.report(token, { ok: true, artifactSnapshotId: "amf-1", artifactSyncError: "x" });
+    const runsBefore = await snapshotRuns(db);
+    const loopsBefore = await snapshotLoops(db);
+    await expect(
+      coordinator.report(token, { ok: true, artifactSnapshotId: "amf-2", artifactSyncError: "y" }),
+    ).rejects.toMatchObject({ name: "RunCapabilityInvalidError" });
+    expect(await snapshotRuns(db)).toEqual(runsBefore);
+    expect(await snapshotLoops(db)).toEqual(loopsBefore);
+  });
+
+  it("unit pin: the report write-set never carries the artifact keys", () => {
+    const ws = buildReportWriteSet(
+      { ok: true, artifactSnapshotId: "amf-1", artifactSyncError: "artifact_storage_error" },
+      {} as unknown as Run,
+      "2026-07-29T00:00:00.000Z",
+    );
+    expect(Object.keys(ws).sort()).toEqual([
+      "durationMs",
+      "error",
+      "message",
+      "outcome",
+      "phase",
+      "progress",
+      "sessionId",
+      "ts",
+    ]);
+  });
+});
