@@ -532,6 +532,32 @@ describe("AH6/AH8: the prepare → PUT → commit flow and its refusals", () => 
     });
     expect(ownerRes.status).toBe(200);
   });
+
+  it("a commit whose base drifted under a committed competitor is 409 artifact_manifest_conflict", async () => {
+    await fresh();
+    await configuredLoop();
+    const staleId = await negotiate(); // base 0
+    const winnerId = await negotiate(0, HASH_A, CONTENT_A.length, "req-2"); // base 0, a second session
+    const put = await machineReq(`/api/machine/blob/${HASH_A}`, {
+      method: "PUT",
+      headers: { [ARTIFACT_SYNC_ID_HEADER]: winnerId },
+      body: CONTENT_A,
+    });
+    expect(put.status).toBe(200);
+    const won = await machineReq(`/api/machine/sync/${winnerId}/commit`, { method: "POST" });
+    expect(won.status).toBe(200); // the loop's base advanced to 1
+
+    await expectJson(await machineReq(`/api/machine/sync/${staleId}/commit`, { method: "POST" }), 409, {
+      error: "artifact manifest conflict",
+      code: "artifact_manifest_conflict",
+    });
+    // The refusal is an attempt conclusion (决策 8): the failure lands in the
+    // attempt triple while the winner's snapshot and success stamp survive.
+    const after = await loopRow();
+    expect(after.artifactSyncError).toBe("artifact_manifest_conflict");
+    expect(after.artifactManifestRevision).toBe(1);
+    expect(after.artifactSyncSucceededAt).not.toBeNull();
+  });
 });
 
 describe("AH10: POST /api/machine/loops/:id/artifact-sync-error", () => {
