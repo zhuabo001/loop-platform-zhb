@@ -13,6 +13,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   apiErrorSchema,
+  ARTIFACT_SYNC_ID_HEADER,
   cancelRunResponseSchema,
   createLoopResponseSchema,
   deliverySchema,
@@ -48,8 +49,11 @@ import {
   seedRun,
   snapshotLoops,
   snapshotRuns,
+  staticAttribution,
   testDeps,
 } from "../testkit/index.js";
+import { createArtifactApi, type ArtifactApi } from "../artifact/api.js";
+import { createMemoryBlobStore } from "../artifact/blob-store-memory.js";
 import { createRunCoordinator, type RunCoordinator } from "../coordinator/index.js";
 import { createServerApp } from "./app.js";
 
@@ -309,6 +313,8 @@ describe("POST /api/loops", () => {
         taskFileSyncedAt: null,
         taskFileSyncAttemptedAt: null,
         taskFileSyncError: null,
+        // Phase 5 (Batch 2 slice 2): emitted explicitly as null when unconfigured.
+        artifactDir: null,
       },
     });
     expect(await snapshotLoops(db)).toHaveLength(1);
@@ -655,6 +661,7 @@ describe("GET observation surface", () => {
         taskFileSyncedAt: null,
         taskFileSyncAttemptedAt: null,
         taskFileSyncError: null,
+        artifactDir: null,
         lastRun: {
           id: "run-1",
           loopId: "loop-1",
@@ -800,6 +807,19 @@ describe("the taxonomy pin (review STD-5) — the adapter's full (status, code) 
     `409:${LOOP_COMPLETED_CODE}`,
     `409:${LOOP_NOT_COMPLETED_CODE}`,
     "500:-",
+    // Batch 2 slice 2: the artifact taxonomy the mounted routes can emit —
+    // every wire code is reachable through a canned domain failure.
+    "400:artifact_validation_failed",
+    "400:artifact_content_mismatch",
+    "403:artifact_attribution_missing",
+    "409:artifact_config_conflict",
+    "409:artifact_manifest_conflict",
+    "409:artifact_session_expired",
+    "409:artifact_hash_not_negotiated",
+    "409:artifact_session_committed",
+    "409:artifact_blob_missing",
+    "409:artifact_revision_exhausted",
+    "500:artifact_storage_error",
   ];
 
   it("every route branch emits exactly the pinned set", async () => {
@@ -869,7 +889,20 @@ describe("the taxonomy pin (review STD-5) — the adapter's full (status, code) 
       },
     };
 
-    const fake = createServerApp(coordinator, admin, lifecycle, schedule, ownerControl);
+    // A canned artifact facade: each probe sets the failure the NEXT artifact
+    // call returns, so every wire code the mounted routes can emit is driven
+    // through the real mapping and the real route branches.
+    let artifactFailure = "storage_error";
+    const artifacts = {
+      updateConfig: async () => ({ ok: false, failure: artifactFailure }),
+      readMachineLoop: async () => ({ ok: false, failure: artifactFailure }),
+      prepare: async () => ({ ok: false, failure: artifactFailure }),
+      put: async () => ({ ok: false, failure: artifactFailure }),
+      commit: async () => ({ ok: false, failure: artifactFailure }),
+      reportSyncError: async () => ({ ok: false, failure: artifactFailure }),
+    } as unknown as ArtifactApi;
+
+    const fake = createServerApp(coordinator, admin, lifecycle, schedule, ownerControl, undefined, undefined, artifacts);
     const observed = new Set<string>();
     const record = async (res: Response): Promise<void> => {
       const body = (await res.json()) as { code?: string };
@@ -904,6 +937,46 @@ describe("the taxonomy pin (review STD-5) — the adapter's full (status, code) 
     await record(await fake.request("/api/machine/report", { method: "POST", ...bearer("rk_x", { ok: true }) }));
     coordinatorMode = "ok";
     await record(await fake.request("/api/machine/report", { method: "POST", ...bearer("rk_x", { ok: true }) }));
+
+    // artifact routes: drive every canonical failure through the real branches
+    // (the canned facade returns the CURRENT artifactFailure, re-mapped by the
+    // route through the frozen ARTIFACT_FAILURE_HTTP table).
+    const artifactReq = (path: string, init: RequestInit = {}) =>
+      fake.request(path, {
+        ...init,
+        headers: {
+          authorization: `Bearer ${TOKEN}`,
+          "content-type": "application/json",
+          ...((init.headers as Record<string, string>) ?? {}),
+        },
+      });
+    const prepareBody = JSON.stringify({
+      requestId: "r",
+      loopId: "loop-1",
+      configRevision: 0,
+      baseManifestRevision: 0,
+      entries: [],
+    });
+    const blobHeaders = { [ARTIFACT_SYNC_ID_HEADER]: "sync-1" };
+    const probes: ReadonlyArray<readonly [string, () => Response | Promise<Response>]> = [
+      ["manifest_invalid", () => artifactReq("/api/machine/sync", { method: "POST", body: prepareBody })],
+      ["storage_error", () => artifactReq("/api/machine/sync", { method: "POST", body: prepareBody })],
+      ["content_mismatch", () => artifactReq(`/api/machine/blob/${"a".repeat(64)}`, { method: "PUT", headers: blobHeaders, body: "x" })],
+      ["attribution_missing", () => artifactReq("/api/machine/loops/loop-1/artifacts")],
+      ["config_conflict", () => artifactReq("/api/machine/sync/sync-1/commit", { method: "POST" })],
+      ["manifest_conflict", () => artifactReq("/api/machine/sync/sync-1/commit", { method: "POST" })],
+      ["session_expired", () => artifactReq("/api/machine/sync/sync-1/commit", { method: "POST" })],
+      ["blob_missing", () => artifactReq("/api/machine/sync/sync-1/commit", { method: "POST" })],
+      ["manifest_revision_exhausted", () => artifactReq("/api/machine/sync/sync-1/commit", { method: "POST" })],
+      ["hash_not_negotiated", () => artifactReq(`/api/machine/blob/${"a".repeat(64)}`, { method: "PUT", headers: blobHeaders, body: "x" })],
+      ["session_committed", () => artifactReq(`/api/machine/blob/${"a".repeat(64)}`, { method: "PUT", headers: blobHeaders, body: "x" })],
+      ["loop_not_found", () => artifactReq("/api/machine/loops/loop-1/artifacts")],
+      ["artifact_dir_unconfigured", () => artifactReq("/api/machine/loops/loop-1/artifacts")],
+    ];
+    for (const [failure, call] of probes) {
+      artifactFailure = failure;
+      await record(await call());
+    }
 
     // runs list: 404 unknown loop / 200 list
     adminRuns = undefined;
@@ -987,43 +1060,80 @@ describe("the taxonomy pin (review STD-5) — the adapter's full (status, code) 
   });
 });
 
-describe("AD1: artifact routes are NOT mounted (Phase 5 Batch 1 dormancy, ADR-010 决策 16)", () => {
-  // The probed paths are Batch 2's PLANNED artifact routes; when Batch 2
-  // mounts them it must rewrite this guard with the final paths. Until then
-  // every artifact surface must be indistinguishable from an unknown path.
-  const PROBES: ReadonlyArray<readonly [string, string]> = [
-    ["PATCH", "/api/loops/loop-1/artifact-dir"], // artifact config management
-    ["POST", "/api/machine/sync"], // prepare
-    ["POST", "/api/machine/sync/sync-1/commit"], // commit
-    ["PUT", `/api/machine/blob/${"a".repeat(64)}`], // blob upload
-    ["GET", "/api/loops/loop-1/artifact/files"], // current-view file list
-    ["GET", "/api/loops/loop-1/artifact/files/download?path=a.txt"], // file download
-    ["GET", "/api/loops/loop-1/artifact/snapshots"], // snapshot list
-    ["GET", "/api/loops/loop-1/artifact/snapshots/snap-1"], // snapshot detail
-    ["GET", "/api/loops/loop-1/artifact/snapshots/snap-1/diff"], // snapshot diff
-    ["GET", "/api/machine/sync"], // wrong-method control: no half-mount
-  ];
+describe("AD1: the six slice-2 artifact routes are mounted; the slice-7 read routes stay dormant", () => {
+  // Batch 1's dormancy guard, rewritten DELIBERATELY by Batch 2 slice 2: the
+  // machine routes now answer 401 (mounted, real facade) instead of the flat
+  // 404, and the config route parses its frozen DTO. The read routes keep
+  // their flat 404 until slice 7 — that half is the stop-boundary evidence.
+  // The shared `fresh()` fixture wires NO facade; this guard builds its own
+  // app around a REAL createArtifactApi over a memory BlobStore.
+  let artifactApp: ReturnType<typeof createServerApp>;
 
-  it("every artifact probe returns the flat 404, byte-identical to an unknown path", async () => {
+  async function freshWithArtifacts(): Promise<void> {
     await fresh();
-    const unknown = await app.request("/nope");
-    await expectJsonError(unknown, 404, { error: "not found" });
-    const canonicalBody = await (await app.request("/nope")).text();
-    for (const [method, path] of PROBES) {
-      const res = await app.request(path, { method });
+    artifactApp = createServerApp(
+      coordinator,
+      admin,
+      createLifecycleAdmin({ db, clock }),
+      createScheduleAdmin({ db, clock }),
+      ownerControl,
+      undefined,
+      undefined,
+      createArtifactApi({
+        db,
+        clock,
+        ids: { syncId: () => "sync-1", manifestId: () => "amf-1" },
+        blobStore: createMemoryBlobStore(),
+        attribution: staticAttribution({}),
+      }),
+    );
+  }
+
+  it("the mounted routes answer the unified 401 without a credential (never the flat 404)", async () => {
+    await freshWithArtifacts();
+    const probes: ReadonlyArray<readonly [string, string]> = [
+      ["POST", "/api/machine/sync"],
+      ["PUT", `/api/machine/blob/${"a".repeat(64)}`],
+      ["POST", "/api/machine/sync/sync-1/commit"],
+      ["POST", "/api/machine/loops/loop-1/artifact-sync-error"],
+      ["GET", "/api/machine/loops/loop-1/artifacts"],
+    ];
+    for (const [method, path] of probes) {
+      const res = await artifactApp.request(path, { method });
+      await expectJsonError(res, 401, { error: "invalid machine credential" });
+    }
+    // The management route is mounted too: a malformed body is a 400, not 404.
+    const badBody = await artifactApp.request("/api/loops/loop-1/artifact-dir", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: "{",
+    });
+    await expectJsonError(badBody, 400, { error: "invalid request" });
+  });
+
+  it("the four FINAL slice-7 read paths and the wrong-method control stay the flat 404", async () => {
+    await freshWithArtifacts();
+    const canonicalBody = await (await artifactApp.request("/nope")).text();
+    const probes: ReadonlyArray<readonly [string, string]> = [
+      ["GET", "/api/loops/loop-1/artifacts"], // current-view file list
+      ["GET", `/api/loops/loop-1/artifacts/download?snapshotId=amf-1&path=a.txt`], // download
+      ["GET", "/api/loops/loop-1/artifacts/diff?to=amf-1"], // structural diff
+      ["GET", "/api/runs/run-1/artifacts"], // run snapshot view
+      ["GET", "/api/machine/sync"], // wrong-method control: no half-mount
+    ];
+    for (const [method, path] of probes) {
+      const res = await artifactApp.request(path, { method });
       expect(res.status, `${method} ${path}`).toBe(404);
       expect(await res.text(), `${method} ${path}`).toBe(canonicalBody);
     }
   });
 });
 
-describe("AD2(a): production Create never persists artifact config (ADR-010 决策 16)", () => {
-  // The wire DTO ACCEPTS artifactDir (slice 1, tolerant shape) but the
-  // production create path must NOT persist it — the column exists (slice 2)
-  // and stays dormant until the Batch 2 PATCH route opens. The insert
-  // mapping (admin/index.ts) enumerates columns explicitly; this guard fails
-  // loudly if artifactDir ever slips into it.
-  it("201 with artifactDir in the body — the row keeps it null and the response never emits it", async () => {
+describe("AD2(a): create persists artifactDir atomically through the shared planner (Batch 2 slice 2)", () => {
+  // The create path evaluates the initial dir with the SAME planner the PATCH
+  // route uses (one validation rule) and lands it in the SAME INSERT: a
+  // configured loop is born at config generation 1 (0 = never configured).
+  it("201 persists an absolute dir at generation 1 and emits it in the response", async () => {
     await fresh();
     await seedMachine(db, MACHINE_ID);
     const res = await createLoopReq({
@@ -1033,11 +1143,11 @@ describe("AD2(a): production Create never persists artifact config (ADR-010 决�
     });
     expect(res.status).toBe(201);
     const parsed = createLoopResponseSchema.parse(await res.json());
-    expect(parsed.loop).not.toHaveProperty("artifactDir");
+    expect(parsed.loop.artifactDir).toBe("/home/dev/project/dist");
 
     const [row] = await db.select().from(loops);
-    expect(row.artifactDir).toBeNull();
-    expect(row.artifactConfigRevision).toBe(0);
+    expect(row.artifactDir).toBe("/home/dev/project/dist");
+    expect(row.artifactConfigRevision).toBe(1);
     expect(row.artifactManifestRevision).toBe(0);
     expect(row.artifactManifestId).toBeNull();
     expect([row.artifactSyncAttemptedAt, row.artifactSyncSucceededAt, row.artifactSyncError]).toEqual([
@@ -1047,14 +1157,46 @@ describe("AD2(a): production Create never persists artifact config (ADR-010 决�
     ]);
   });
 
-  it("400 for an explicit artifactDir: null — creation accepts absence, never an explicit clear", async () => {
+  it("a relative dir WITH an explicit workdir is legal and persists VERBATIM (no server-side resolution)", async () => {
     await fresh();
     await seedMachine(db, MACHINE_ID);
+    const res = await createLoopReq({
+      machineId: MACHINE_ID,
+      workdir: "/home/dev/project",
+      taskFile: "/home/dev/project/TASK.md",
+      artifactDir: "dist",
+    });
+    expect(res.status).toBe(201);
+    const [row] = await db.select().from(loops);
+    expect(row.artifactDir).toBe("dist");
+    expect(row.artifactConfigRevision).toBe(1);
+  });
+
+  it("a RELATIVE dir without a workdir is a coded 400 and writes ZERO rows (the PATCH classification)", async () => {
+    await fresh();
+    await seedMachine(db, MACHINE_ID);
+    await expectJsonError(
+      await createLoopReq({ machineId: MACHINE_ID, taskFile: "/home/dev/TASK.md", artifactDir: "dist" }),
+      400,
+      { error: "invalid artifact directory", code: "artifact_validation_failed" },
+    );
+    expect(await snapshotLoops(db)).toEqual([]);
+  });
+
+  it("omitting artifactDir keeps null/0; an explicit null is still 400", async () => {
+    await fresh();
+    await seedMachine(db, MACHINE_ID);
+    const res = await createLoopReq({ machineId: MACHINE_ID, taskFile: "/t/TASK.md" });
+    expect(res.status).toBe(201);
+    const [row] = await db.select().from(loops);
+    expect(row.artifactDir).toBeNull();
+    expect(row.artifactConfigRevision).toBe(0);
+
     // createLoopRequestSchema is optional-but-not-nullable (clearing is the
-    // Batch 2 PATCH route's required-nullable shape, not creation's).
+    // PATCH route's required-nullable shape, not creation's).
     await expectJsonError(await createLoopReq({ machineId: MACHINE_ID, taskFile: "/t/TASK.md", artifactDir: null }), 400, {
       error: "invalid request",
     });
-    expect(await snapshotLoops(db)).toEqual([]);
+    expect(await snapshotLoops(db)).toHaveLength(1);
   });
 });

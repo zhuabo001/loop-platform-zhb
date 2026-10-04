@@ -334,6 +334,7 @@ describe("D-group (Batch 3 Dashboard): read model and page model", () => {
       [
         "agent",
         "allowControl",
+        "artifactDir",
         "completedAt",
         "completionReason",
         "createdAt",

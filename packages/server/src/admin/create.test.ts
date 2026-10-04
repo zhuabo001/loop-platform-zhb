@@ -70,6 +70,8 @@ describe("createLoop", () => {
       taskFileSyncedAt: null,
       taskFileSyncAttemptedAt: null,
       taskFileSyncError: null,
+      // Phase 5 (Batch 2 slice 2): emitted explicitly as null when unconfigured.
+      artifactDir: null,
     });
 
     const rows = await snapshotLoops(db);

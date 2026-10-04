@@ -44,22 +44,30 @@ import type { DashboardRoutes } from "../dashboard/routes.js";
 import { DASHBOARD_RUN_PATH } from "../dashboard/routes.js";
 
 import {
+  ARTIFACT_PREPARE_REQUEST_MAX_UTF8_BYTES,
+  ARTIFACT_SYNC_ID_HEADER,
+  artifactSyncErrorReportRequestSchema,
   cancelRunRequestSchema,
   createLoopRequestSchema,
   LOOP_COMPLETED_CODE,
   LOOP_NOT_COMPLETED_CODE,
+  parseBoundedJsonText,
   pollRequestSchema,
+  prepareArtifactSyncRequestSchema,
   reopenLoopRequestSchema,
   reportRequestSchema,
   RUN_CAPABILITY_INVALID_CODE,
   triggerRunRequestSchema,
+  updateArtifactDirRequestSchema,
   updateGoalRequestSchema,
   updateScheduleRequestSchema,
   updateTaskFileRequestSchema,
 } from "@loopzhb/protocol";
 
-import { LoopValidationError } from "../admin/errors.js";
+import { ArtifactDirValidationError, LoopValidationError } from "../admin/errors.js";
 import { LOOP_PATH_CAP, type LoopAdmin } from "../admin/index.js";
+import type { ArtifactApi } from "../artifact/api.js";
+import { mapArtifactFailure, type ArtifactInternalFailure } from "../artifact/error-mapping.js";
 import { InvalidMachineCredentialError, RunCapabilityInvalidError } from "../coordinator/errors.js";
 import type { RunCoordinator } from "../coordinator/index.js";
 import type { Loop } from "../db/schema.js";
@@ -121,6 +129,14 @@ export function createServerApp(
    * has always been, which is why the 11 existing call sites are unchanged.
    */
   dashboard?: DashboardRoutes,
+  /**
+   * The artifact facade (Batch 2 slice 2) — the narrow interface wired by
+   * `bootstrapServer`. ABSENT means the six artifact routes are NOT mounted
+   * (every artifact path stays indistinguishable from an unknown route), so
+   * every pre-existing call site is unchanged and the dormancy guard keeps a
+   * clean control.
+   */
+  artifacts?: ArtifactApi,
 ): Hono {
   const app = new Hono();
 
@@ -257,6 +273,13 @@ export function createServerApp(
         // Fixed classification only — the message embeds user input.
         console.warn("[http] create-loop schedule rejected", err.field);
         return jsonError(c, 400, "invalid request");
+      }
+      if (err instanceof ArtifactDirValidationError) {
+        // The SAME coded 400 the PATCH route emits for the same value
+        // (ADR-010 决策 8): one planner, one classification.
+        console.warn("[http] create-loop artifact dir rejected", err.reason);
+        const mapping = mapArtifactFailure(err.reason);
+        return jsonError(c, mapping.status, mapping.message, mapping.code);
       }
       throw err;
     }
@@ -429,6 +452,181 @@ export function createServerApp(
     if (!loopSummary) return jsonError(c, 404, "not found");
     return c.json({ loop: loopSummary }, 200);
   });
+
+  // ---- Phase 5 artifact routes (Batch 2 slice 2, ADR-010 决策 22) ----
+  // Mounted ONLY when the production facade is wired. Management config needs
+  // no credential (loopback boundary); machine routes verify an EXISTING
+  // machine (never registering) and every domain failure rides the frozen
+  // `ARTIFACT_FAILURE_HTTP` table verbatim.
+  if (artifacts !== undefined) {
+    /** The table entry as a JSON error — the ONE failure shaper. */
+    const artifactError = (c: Context, failure: ArtifactInternalFailure): Response => {
+      const mapping = mapArtifactFailure(failure);
+      return jsonError(c, mapping.status, mapping.message, mapping.code);
+    };
+    /** The unified machine credential gate (the poll precedent). */
+    const credentialOr401 = (c: Context): string | Response => {
+      const token = bearerToken(c);
+      if (token === undefined) return jsonError(c, 401, "invalid machine credential");
+      return token;
+    };
+    /** Drain an unread request body on an early refusal: a stream the handler
+     *  never pulls would otherwise keep the client uploading (PUT). */
+    const discardBody = (c: Context): void => {
+      void c.req.raw.body?.cancel().catch(() => {});
+    };
+    const artifactCap = bodyLimit({
+      maxSize: ARTIFACT_PREPARE_REQUEST_MAX_UTF8_BYTES,
+      onError: (c) => jsonError(c, 413, "request body too large"),
+    });
+
+    app.patch("/api/loops/:id/artifact-dir", cap, async (c) => {
+      const raw = await parseJsonBody(c);
+      if (raw === undefined) return jsonError(c, 400, "invalid request");
+      const parsed = updateArtifactDirRequestSchema.safeParse(raw);
+      if (!parsed.success) {
+        console.warn("[http] update-artifact-dir DTO rejected", parsed.error.issues);
+        return jsonError(c, 400, "invalid request");
+      }
+      const result = await artifacts.updateConfig(c.req.param("id"), parsed.data);
+      if (!result.ok) return artifactError(c, result.failure);
+      const loopSummary = await admin.getLoopSummary(result.loop.id);
+      if (!loopSummary) return jsonError(c, 404, "not found");
+      return c.json({ loop: loopSummary }, 200);
+    });
+
+    app.get("/api/machine/loops/:id/artifacts", async (c) => {
+      const token = credentialOr401(c);
+      if (typeof token !== "string") return token;
+      try {
+        const result = await artifacts.readMachineLoop(token, c.req.param("id"));
+        if (!result.ok) return artifactError(c, result.failure);
+        return c.json(result.response);
+      } catch (err) {
+        if (err instanceof InvalidMachineCredentialError) {
+          console.warn("[http] artifact credential rejected", err.message);
+          return jsonError(c, 401, "invalid machine credential");
+        }
+        throw err;
+      }
+    });
+
+    app.post("/api/machine/sync", artifactCap, async (c) => {
+      const token = credentialOr401(c);
+      if (typeof token !== "string") return token;
+      // The DUAL gate (ADR-010 决策 5): the transport cap above bounds the
+      // body; this re-checks the SAME raw-text ceiling BEFORE JSON.parse —
+      // unknown fields count toward it, and the tolerant strip rescues
+      // nothing. Invalid UTF-8 decodes with replacement chars, so the text
+      // gate is not redundant with the byte gate.
+      const bounded = parseBoundedJsonText(await c.req.text(), ARTIFACT_PREPARE_REQUEST_MAX_UTF8_BYTES);
+      if (!bounded.ok) {
+        if (bounded.failure === "too_large") return jsonError(c, 413, "request body too large");
+        console.warn("[http] sync prepare body rejected");
+        return jsonError(c, 400, "invalid request");
+      }
+      const parsed = prepareArtifactSyncRequestSchema.safeParse(bounded.value);
+      if (!parsed.success) {
+        console.warn("[http] sync prepare DTO rejected", parsed.error.issues);
+        return jsonError(c, 400, "invalid request");
+      }
+      try {
+        const result = await artifacts.prepare(token, parsed.data);
+        if (!result.ok) {
+          // Fixed classification + policy index only — manifest paths and
+          // hashes are user input and never reach the log.
+          if (result.failure === "manifest_invalid") {
+            console.warn("[http] sync prepare policy rejected", result.reason, result.index);
+          }
+          return artifactError(c, result.failure);
+        }
+        return c.json(result.response);
+      } catch (err) {
+        if (err instanceof InvalidMachineCredentialError) {
+          console.warn("[http] sync prepare credential rejected", err.message);
+          return jsonError(c, 401, "invalid machine credential");
+        }
+        throw err;
+      }
+    });
+
+    app.put("/api/machine/blob/:hash", async (c) => {
+      const token = credentialOr401(c);
+      if (typeof token !== "string") {
+        discardBody(c);
+        return token;
+      }
+      const syncId = c.req.header(ARTIFACT_SYNC_ID_HEADER)?.trim();
+      if (!syncId) {
+        discardBody(c);
+        return jsonError(c, 400, "invalid request");
+      }
+      try {
+        // STREAMING (no bodyLimit, no buffering): the raw request body goes
+        // straight to the BlobStore, which counts real bytes and hashes them
+        // against the negotiated entry — declared sizes are never trusted.
+        const result = await artifacts.put(token, {
+          syncId,
+          hash: c.req.param("hash"),
+          bytes: c.req.raw.body ?? (async function* empty() {})(),
+        });
+        if (!result.ok) {
+          discardBody(c);
+          return artifactError(c, result.failure);
+        }
+        return c.json({ ok: true as const, size: result.size, published: result.published });
+      } catch (err) {
+        discardBody(c);
+        if (err instanceof InvalidMachineCredentialError) {
+          console.warn("[http] blob put credential rejected", err.message);
+          return jsonError(c, 401, "invalid machine credential");
+        }
+        throw err;
+      }
+    });
+
+    app.post("/api/machine/sync/:id/commit", async (c) => {
+      const token = credentialOr401(c);
+      if (typeof token !== "string") {
+        discardBody(c);
+        return token;
+      }
+      try {
+        const result = await artifacts.commit(token, { syncId: c.req.param("id") });
+        if (!result.ok) return artifactError(c, result.failure);
+        return c.json(result.receipt);
+      } catch (err) {
+        if (err instanceof InvalidMachineCredentialError) {
+          console.warn("[http] sync commit credential rejected", err.message);
+          return jsonError(c, 401, "invalid machine credential");
+        }
+        throw err;
+      }
+    });
+
+    app.post("/api/machine/loops/:id/artifact-sync-error", cap, async (c) => {
+      const token = credentialOr401(c);
+      if (typeof token !== "string") return token;
+      const raw = await parseJsonBody(c);
+      if (raw === undefined) return jsonError(c, 400, "invalid request");
+      const parsed = artifactSyncErrorReportRequestSchema.safeParse(raw);
+      if (!parsed.success) {
+        console.warn("[http] artifact sync-error DTO rejected", parsed.error.issues);
+        return jsonError(c, 400, "invalid request");
+      }
+      try {
+        const result = await artifacts.reportSyncError(token, c.req.param("id"), parsed.data);
+        if (!result.ok) return artifactError(c, result.failure);
+        return c.json({ ok: true as const, recorded: result.recorded });
+      } catch (err) {
+        if (err instanceof InvalidMachineCredentialError) {
+          console.warn("[http] artifact sync-error credential rejected", err.message);
+          return jsonError(c, 401, "invalid machine credential");
+        }
+        throw err;
+      }
+    });
+  }
 
   // The Dashboard's two HTML routes. Registered last, but their gate is the
   // global middleware above — registering the gate here would leave `/` and
