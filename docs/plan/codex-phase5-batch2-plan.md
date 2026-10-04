@@ -161,10 +161,10 @@ Batch 1 错误映射在 HTTP 接线时补齐：revision 耗尽使用新增 `arti
 | AH1 | PUT 响应 DTO 冻结：`{ok, size, published}` 往返、未知键剥离、半形拒绝、tolerant-reader 登记（CASES 54 → 55） | `protocol/src/artifact.test.ts`、`tolerant-reader.test.ts` |
 | AH2 | PATCH artifact-dir：set/change/clear 代际递增、no-op 零写入、响应携带 `artifactDir`、DTO 400、相对路径无 workdir 400 `artifact_validation_failed`、未知 Loop 404 无码、int32 上界 409 `artifact_revision_exhausted` | `server/src/http/artifact-routes.test.ts` |
 | AH3 | Create 原子持久化：合法 `artifactDir` 与 Loop 同 INSERT 落库（`artifactConfigRevision=1`）、相对无 workdir coded 400 零行、省略 = null+0、显式 null 仍 400 | `server/src/http/app.test.ts`（AD2(a) 重写） |
-| AH4 | 既有 Machine 认证读路径：未注册/哈希不符/形状不符 token 401 且零注册；跨 Machine 的 loop/session 请求失败且六表 item-equal；被拒 PUT 零拉流 | `server/src/http/artifact-routes.test.ts`、`artifact/api.test.ts` |
+| AH4 | 既有 Machine 认证读路径：未注册/哈希不符/形状不符 token 401 且零注册；跨 Machine 的 loop/session 请求失败且六表 item-equal；被拒 PUT 零拉流；已识别可恢复存储故障（SQLSTATE 08/53/57/58）在凭据、归属、Loop 任一路径均归 `storage_error`（HTTP 500 `artifact_storage_error`），未识别异常保持原样抛出 | `server/src/http/artifact-routes.test.ts`、`artifact/api.test.ts` |
 | AH5 | 真实 HTTP E2E（真实监听 + 文件型 PGlite + `<tmp>/blobs`，经生产装配）：prepare → 多块流式 PUT → commit；回执、Loop 指针/代际、manifest 行与落盘字节一致 | `server/src/phase5-batch2-slice2-e2e.test.ts` |
 | AH6 | 幂等恢复：重复 prepare 同 syncId 且 `needHashes:[]`；重复 PUT `published:false`；重复 commit 返回同一固定回执、manifest 行数不变 | 同上、`artifact/api.test.ts` |
-| AH7 | prepare 双闸：运输层 413（content-length 与 chunked 两路径）、原始文本上限 413（含无效 UTF-8 解码膨胀）、边界内通过、畸形 JSON 400、DTO 400 | `server/src/http/artifact-routes.test.ts` |
+| AH7 | prepare 双闸：运输层 413（content-length 与 chunked 两路径）、原始文本上限 413（含无效 UTF-8 解码膨胀）、边界内通过、畸形 JSON 400 无码、DTO 拒绝 400 `artifact_validation_failed`（零领域调用、零状态写入） | `server/src/http/artifact-routes.test.ts` |
 | AH8 | PUT/commit 失败面：缺同步会话头 400、内容不符 400 `artifact_content_mismatch`、已提交 409 `artifact_session_committed`、过期 409、base 漂移 409 `artifact_manifest_conflict`、未协商 hash 409 | 同上 |
 | AH9 | machine 读取：已配置四字段；未配置 409 `artifact_config_conflict`；未知/跨机 404；无凭据 401；wire 无 namespace | 同上 |
 | AH10 | 错误上报：双匹配 `recorded:true`（attemptedAt/error/revision+1，succeededAt 不动）；代际/base 漂移、未配置 Loop、守卫零行均 `recorded:false` 零写；成功后的迟到错误不覆盖；跨机/未知 404 零写；可恢复存储故障 500 `artifact_storage_error` | `server/src/artifact/sync-error.test.ts`、路由套件 |
