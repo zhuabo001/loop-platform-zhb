@@ -27,12 +27,27 @@ import {
 } from "./admin.js";
 import {
   artifactManifestEntrySchema,
+  artifactSyncErrorReportRequestSchema,
+  artifactSyncErrorReportResponseSchema,
   artifactWatchItemSchema,
   commitArtifactSyncResponseSchema,
+  machineLoopArtifactsResponseSchema,
   prepareArtifactSyncRequestSchema,
   prepareArtifactSyncResponseSchema,
 } from "./artifact.js";
 import {
+  artifactDiffEntrySchema,
+  artifactDiffQuerySchema,
+  artifactDiffResponseSchema,
+  artifactDownloadQuerySchema,
+  artifactSnapshotRefSchema,
+  artifactSyncStatusSchema,
+  loopArtifactsResponseSchema,
+  runArtifactsBoundSchema,
+  runArtifactsMissingSchema,
+} from "./artifact-view.js";
+import {
+  deliveryArtifactConfigSchema,
   deliveryLoopSchema,
   deliverySchema,
   pollRequestSchema,
@@ -188,6 +203,68 @@ const CASES: ReadonlyArray<readonly [string, z.ZodTypeAny, Record<string, unknow
   ["commitArtifactSyncResponseSchema", commitArtifactSyncResponseSchema, { artifactSnapshotId: "m", manifestRevision: 1 }],
   ["updateArtifactDirRequestSchema", updateArtifactDirRequestSchema, { artifactDir: null }],
   ["updateArtifactDirResponseSchema", updateArtifactDirResponseSchema, { loop: { ...MINIMAL_LOOP_SUMMARY } }],
+  // Batch 2 slice 1 additions (ADR-010 决策 13/20): machine read, client
+  // failure reporting, delivery artifact config and the read-side views.
+  [
+    "artifactSyncErrorReportRequestSchema",
+    artifactSyncErrorReportRequestSchema,
+    { failure: "timeout", configRevision: 0, baseManifestRevision: 0 },
+  ],
+  ["artifactSyncErrorReportResponseSchema", artifactSyncErrorReportResponseSchema, { ok: true, recorded: true }],
+  [
+    "machineLoopArtifactsResponseSchema",
+    machineLoopArtifactsResponseSchema,
+    { loopId: "l", artifactDir: "d", configRevision: 0, manifestRevision: 0 },
+  ],
+  ["deliveryArtifactConfigSchema", deliveryArtifactConfigSchema, { dir: "d", configRevision: 0 }],
+  ["artifactSyncStatusSchema", artifactSyncStatusSchema, { attemptedAt: null, succeededAt: null, error: null }],
+  [
+    "loopArtifactsResponseSchema",
+    loopArtifactsResponseSchema,
+    {
+      loopId: "l",
+      artifactDir: null,
+      configRevision: 0,
+      manifestRevision: 0,
+      manifestId: null,
+      committedAt: null,
+      stale: false,
+      fileCount: 0,
+      totalBytes: 0,
+      sync: { attemptedAt: null, succeededAt: null, error: null },
+      files: [],
+    },
+  ],
+  [
+    "runArtifactsBoundSchema",
+    runArtifactsBoundSchema,
+    {
+      runId: "r",
+      loopId: "l",
+      state: "bound",
+      snapshotId: "s",
+      manifestRevision: 1,
+      configRevision: 0,
+      committedAt: "t",
+      fileCount: 0,
+      totalBytes: 0,
+      files: [],
+    },
+  ],
+  ["runArtifactsMissingSchema", runArtifactsMissingSchema, { runId: "r", loopId: "l", state: "missing" }],
+  ["artifactDownloadQuerySchema", artifactDownloadQuerySchema, { snapshotId: "s", path: "a/b.txt" }],
+  ["artifactDiffQuerySchema", artifactDiffQuerySchema, { to: "s" }],
+  ["artifactSnapshotRefSchema", artifactSnapshotRefSchema, { snapshotId: "s", manifestRevision: 1 }],
+  [
+    "artifactDiffEntrySchema",
+    artifactDiffEntrySchema,
+    { path: "a", beforeHash: "h1", beforeSize: 1, afterHash: "h2", afterSize: 2 },
+  ],
+  [
+    "artifactDiffResponseSchema",
+    artifactDiffResponseSchema,
+    { loopId: "l", from: null, to: { snapshotId: "s", manifestRevision: 1 }, added: [], modified: [], removed: [] },
+  ],
 ];
 
 describe("tolerant reader: EVERY exported object schema strips unknown keys", () => {
@@ -202,6 +279,6 @@ describe("tolerant reader: EVERY exported object schema strips unknown keys", ()
   it("covers every object schema — adding a new one requires a row here", () => {
     // Guard against a FUTURE schema silently escaping this suite: the case list
     // is reviewed whenever a schema is added (CI review checklist, ADR-002).
-    expect(CASES.length).toBe(41);
+    expect(CASES.length).toBe(54);
   });
 });

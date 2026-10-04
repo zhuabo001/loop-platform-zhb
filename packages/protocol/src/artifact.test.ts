@@ -4,10 +4,15 @@ import {
   ARTIFACT_ERROR_CODES,
   ARTIFACT_ERROR_RETRY_CLASS,
   ARTIFACT_ERROR_RETRY_CLASSES,
+  ARTIFACT_SYNC_FAILURES,
   ARTIFACT_SYNC_ID_HEADER,
+  ARTIFACT_SYNC_STATE_ERRORS,
   artifactManifestEntrySchema,
+  artifactSyncErrorReportRequestSchema,
+  artifactSyncErrorReportResponseSchema,
   artifactWatchItemSchema,
   commitArtifactSyncResponseSchema,
+  machineLoopArtifactsResponseSchema,
   prepareArtifactSyncRequestSchema,
   prepareArtifactSyncResponseSchema,
 } from "./artifact.js";
@@ -180,7 +185,7 @@ describe("admin artifactDir fields (declared, routes mount in Batch 2)", () => {
 });
 
 describe("error taxonomy (ADR-010 决策 13)", () => {
-  it("pins the nine wire codes verbatim and in order", () => {
+  it("pins the eleven wire codes verbatim and in order", () => {
     expect(ARTIFACT_ERROR_CODES).toEqual([
       "artifact_validation_failed",
       "artifact_config_conflict",
@@ -191,11 +196,19 @@ describe("error taxonomy (ADR-010 决策 13)", () => {
       "artifact_blob_missing",
       "artifact_storage_error",
       "artifact_attribution_missing",
+      "artifact_revision_exhausted",
+      "artifact_session_committed",
     ]);
   });
 
   it("pins the retry classes verbatim", () => {
-    expect(ARTIFACT_ERROR_RETRY_CLASSES).toEqual(["idempotent_retry", "resume", "renegotiate", "terminal"]);
+    expect(ARTIFACT_ERROR_RETRY_CLASSES).toEqual([
+      "idempotent_retry",
+      "resume",
+      "renegotiate",
+      "terminal",
+      "recover_receipt",
+    ]);
   });
 
   it("maps EVERY code to a retry class, exhaustively and verbatim", () => {
@@ -209,11 +222,69 @@ describe("error taxonomy (ADR-010 决策 13)", () => {
       artifact_blob_missing: "resume",
       artifact_storage_error: "idempotent_retry",
       artifact_attribution_missing: "terminal",
+      artifact_revision_exhausted: "terminal",
+      artifact_session_committed: "recover_receipt",
     });
     // Exhaustiveness beyond the literal: every declared code has a mapping.
     for (const code of ARTIFACT_ERROR_CODES) {
       expect(ARTIFACT_ERROR_RETRY_CLASSES).toContain(ARTIFACT_ERROR_RETRY_CLASS[code]);
     }
     expect(Object.keys(ARTIFACT_ERROR_RETRY_CLASS)).toHaveLength(ARTIFACT_ERROR_CODES.length);
+  });
+});
+
+describe("client failure taxonomy and sync-error reporting (Batch 2, ADR-010 决策 13)", () => {
+  it("pins the nine client failure classes verbatim and in order", () => {
+    expect(ARTIFACT_SYNC_FAILURES).toEqual([
+      "directory_missing",
+      "unreadable",
+      "outside_jail",
+      "symlink",
+      "special_file",
+      "unstable",
+      "too_large",
+      "watcher_error",
+      "timeout",
+    ]);
+  });
+
+  it("the client taxonomy is DISJOINT from the server wire codes", () => {
+    const wire = new Set<string>(ARTIFACT_ERROR_CODES);
+    for (const failure of ARTIFACT_SYNC_FAILURES) expect(wire.has(failure)).toBe(false);
+  });
+
+  it("ARTIFACT_SYNC_STATE_ERRORS is the ordered deduped union of both sets", () => {
+    expect(ARTIFACT_SYNC_STATE_ERRORS).toEqual([...ARTIFACT_ERROR_CODES, ...ARTIFACT_SYNC_FAILURES]);
+    expect(new Set(ARTIFACT_SYNC_STATE_ERRORS).size).toBe(ARTIFACT_SYNC_STATE_ERRORS.length);
+  });
+
+  it("the sync-error report round-trips failure/revisions and an optional message", () => {
+    const body = { failure: "outside_jail", configRevision: 3, baseManifestRevision: 2 };
+    expect(artifactSyncErrorReportRequestSchema.parse(body)).toEqual(body);
+    const withMessage = { ...body, message: "scan left the jail" };
+    expect(artifactSyncErrorReportRequestSchema.parse(withMessage)).toEqual(withMessage);
+    expect(artifactSyncErrorReportRequestSchema.parse(body)).not.toHaveProperty("message");
+  });
+
+  it("an unknown failure value is rejected at the schema layer (closed taxonomy)", () => {
+    expect(() =>
+      artifactSyncErrorReportRequestSchema.parse({ failure: "kaboom", configRevision: 1, baseManifestRevision: 0 }),
+    ).toThrow();
+  });
+
+  it("the report response carries ok + recorded (false = no state written)", () => {
+    expect(artifactSyncErrorReportResponseSchema.parse({ ok: true, recorded: false })).toEqual({
+      ok: true,
+      recorded: false,
+    });
+  });
+});
+
+describe("machine-scoped artifacts read (Batch 2)", () => {
+  it("round-trips config + current manifest revision; no namespace field", () => {
+    const golden = { loopId: "loop-01", artifactDir: "dist", configRevision: 3, manifestRevision: 5 };
+    const parsed = machineLoopArtifactsResponseSchema.parse(golden);
+    expect(parsed).toEqual(golden);
+    expect(Object.keys(parsed)).not.toContain("namespaceId");
   });
 });

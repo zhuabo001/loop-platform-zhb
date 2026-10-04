@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  deliveryArtifactConfigSchema,
   deliverySchema,
   pollRequestSchema,
   pollResponseSchema,
@@ -151,6 +152,31 @@ describe("deliverySchema", () => {
     expect(() =>
       deliverySchema.parse({ ...GOLDEN_DELIVERY, loop: { ...GOLDEN_DELIVERY.loop, workdir: 3 } }),
     ).toThrow();
+  });
+
+  it("carries the optional artifact config (dir + configRevision); absent for old servers", () => {
+    const artifact = { dir: "dist", configRevision: 3 };
+    expect(deliveryArtifactConfigSchema.parse(artifact)).toEqual(artifact);
+    const withArtifact = {
+      ...GOLDEN_DELIVERY,
+      loop: { ...GOLDEN_DELIVERY.loop, artifact },
+    };
+    expect(deliverySchema.parse(withArtifact).loop.artifact).toEqual(artifact);
+    const absent = deliverySchema.parse(GOLDEN_DELIVERY);
+    expect(absent.loop).not.toHaveProperty("artifact");
+  });
+
+  it("rejects a half-formed artifact config (the two fields are bound)", () => {
+    for (const artifact of [
+      { dir: "dist" },
+      { configRevision: 3 },
+      { dir: "dist", configRevision: 1.5 },
+      { dir: "dist", configRevision: -1 },
+    ]) {
+      expect(() =>
+        deliverySchema.parse({ ...GOLDEN_DELIVERY, loop: { ...GOLDEN_DELIVERY.loop, artifact } }),
+      ).toThrow();
+    }
   });
 });
 
