@@ -23,7 +23,8 @@
  */
 import { and, eq, sql } from "drizzle-orm";
 
-import { normalizeCapabilities } from "@loopzhb/protocol";
+import { isDeviceTokenShape, normalizeCapabilities } from "@loopzhb/protocol";
+import { machineIdFromToken, sha256 } from "@loopzhb/protocol/node";
 
 import { InvalidMachineCredentialError } from "../coordinator/errors.js";
 import type { Db } from "../db/index.js";
@@ -141,6 +142,24 @@ export function machineNameFallback(machineId: string): string {
 
 export async function getMachine(db: Db, id: string): Promise<Machine | undefined> {
   return (await db.select().from(machines).where(eq(machines.id, id)))[0];
+}
+
+/**
+ * Verify an EXISTING machine credential — the artifact routes' auth read path
+ * (Batch 2 slice 2, ADR-010 决策 7/13). Fixed order: shape filter → derived id
+ * → row lookup → FULL tokenHash compare (a 64-bit truncation collision must
+ * not hand one machine's authority to a different token, the reference audit
+ * H-01 rule poll applies too).
+ *
+ * NEVER registers: `undefined` means "no such verified machine" and the
+ * caller maps it to the unified 401. Poll remains the ONLY enrollment
+ * surface; self-registration is untouched by this path.
+ */
+export async function verifyMachineCredential(db: Db, token: string): Promise<Machine | undefined> {
+  if (!isDeviceTokenShape(token)) return undefined;
+  const machine = await getMachine(db, machineIdFromToken(token));
+  if (!machine || machine.tokenHash !== sha256(token)) return undefined;
+  return machine;
 }
 
 /**
