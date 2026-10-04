@@ -528,7 +528,10 @@ export function createServerApp(
       const parsed = prepareArtifactSyncRequestSchema.safeParse(bounded.value);
       if (!parsed.success) {
         console.warn("[http] sync prepare DTO rejected", parsed.error.issues);
-        return jsonError(c, 400, "invalid request");
+        // 决策 13 puts the schema domain on `artifact_validation_failed`
+        // (terminal) with the policy rejections — only MALFORMED JSON keeps
+        // the code-less 400 (#86).
+        return artifactError(c, "manifest_invalid");
       }
       try {
         const result = await artifacts.prepare(token, parsed.data);

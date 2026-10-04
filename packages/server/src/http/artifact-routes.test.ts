@@ -22,10 +22,11 @@ import { sha256 } from "@loopzhb/protocol/node";
 
 import { createLoopAdmin } from "../admin/index.js";
 import { createArtifactApi } from "../artifact/api.js";
+import { createMachineAttributionResolver } from "../artifact/attribution-machine.js";
 import { createMemoryBlobStore } from "../artifact/blob-store-memory.js";
 import { createRunCoordinator } from "../coordinator/index.js";
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
-import { loops } from "../db/schema.js";
+import { artifactSyncSessions, loops } from "../db/schema.js";
 import { createLifecycleAdmin } from "../loop-lifecycle/admin.js";
 import { createOwnerControl } from "../owner/index.js";
 import { createScheduleAdmin } from "../schedule/index.js";
@@ -51,7 +52,29 @@ let machineId: string;
 let syncSeq = 0;
 let manifestSeq = 0;
 
-async function fresh(): Promise<void> {
+/**
+ * Poison the Nth top-level `select()` on a Db (every other query still runs
+ * against the real handle). The machine read flow reads exactly three times —
+ * credential, attribution, loop — so `at` names the failing stage (#85).
+ */
+function faultingSelect(db: Db, at: number, cause: unknown): Db {
+  let n = 0;
+  return new Proxy(db, {
+    get(target, prop, receiver) {
+      if (prop !== "select") {
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+      }
+      return (...args: unknown[]) => {
+        n += 1;
+        if (n === at) throw cause;
+        return (target.select as (...a: unknown[]) => unknown).apply(target, args);
+      };
+    },
+  }) as Db;
+}
+
+async function fresh(options: { artifactFault?: { at: number; cause: unknown } } = {}): Promise<void> {
   const handle = await openMigratedDb();
   handles.push(handle);
   db = handle.db;
@@ -60,6 +83,7 @@ async function fresh(): Promise<void> {
   manifestSeq = 0;
   machineId = await seedMachineForToken(db, TOKEN);
   const otherMachineId = await seedMachineForToken(db, OTHER_TOKEN);
+  const artifactDb = options.artifactFault ? faultingSelect(db, options.artifactFault.at, options.artifactFault.cause) : db;
   app = createServerApp(
     createRunCoordinator(testDeps(db, clock)),
     createLoopAdmin({ db, clock, newLoopId: () => "loop-x" }),
@@ -69,11 +93,15 @@ async function fresh(): Promise<void> {
     undefined,
     undefined,
     createArtifactApi({
-      db,
+      db: artifactDb,
       clock,
       ids: { syncId: () => `sync-${++syncSeq}`, manifestId: () => `amf-${++manifestSeq}` },
       blobStore: createMemoryBlobStore(),
-      attribution: staticAttribution({ [machineId]: "ns-1", [otherMachineId]: "ns-2" }),
+      // Stage-2 fault injection needs a REAL attribution read: the production
+      // resolver queries the machines row, staticAttribution never reads.
+      attribution: options.artifactFault
+        ? createMachineAttributionResolver({ db: artifactDb })
+        : staticAttribution({ [machineId]: "ns-1", [otherMachineId]: "ns-2" }),
     }),
   );
 }
@@ -106,12 +134,12 @@ async function configuredLoop(overrides: Record<string, unknown> = {}): Promise<
 }
 
 /** prepare → the negotiated session id for CONTENT_A. */
-async function negotiate(base = 0, hash = HASH_A, size = CONTENT_A.length): Promise<string> {
+async function negotiate(base = 0, hash = HASH_A, size = CONTENT_A.length, requestId = "req-1"): Promise<string> {
   const res = await machineReq("/api/machine/sync", {
     method: "POST",
     headers: jsonHeaders,
     body: JSON.stringify({
-      requestId: "req-1",
+      requestId,
       loopId: "loop-1",
       configRevision: 1,
       baseManifestRevision: base,
@@ -290,7 +318,7 @@ describe("AH7: POST /api/machine/sync — the dual gate and the wire errors", ()
     await expectJson(res, 413, { error: "request body too large" });
   });
 
-  it("malformed JSON → 400; a bad DTO → 400; a policy rejection → 400 artifact_validation_failed", async () => {
+  it("malformed JSON stays code-less 400; DTO rejections are the coded 400 (#86); a policy rejection shares the code", async () => {
     await fresh();
     await configuredLoop();
     await expectJson(
@@ -298,6 +326,8 @@ describe("AH7: POST /api/machine/sync — the dual gate and the wire errors", ()
       400,
       { error: "invalid request" },
     );
+    // Missing required fields — the schema domain maps through the frozen
+    // `manifest_invalid` → artifact_validation_failed entry (ADR-010 决策 13).
     await expectJson(
       await machineReq("/api/machine/sync", {
         method: "POST",
@@ -305,8 +335,28 @@ describe("AH7: POST /api/machine/sync — the dual gate and the wire errors", ()
         body: JSON.stringify({ requestId: "r", loopId: "loop-1" }),
       }),
       400,
-      { error: "invalid request" },
+      { error: "invalid artifact sync request", code: "artifact_validation_failed" },
     );
+    // A wrong entry field TYPE takes the same coded path.
+    await expectJson(
+      await machineReq("/api/machine/sync", {
+        method: "POST",
+        headers: jsonHeaders,
+        body: JSON.stringify({
+          requestId: "r",
+          loopId: "loop-1",
+          configRevision: 1,
+          baseManifestRevision: 0,
+          entries: [{ path: "a.txt", hash: HASH_A, size: "1" }],
+        }),
+      }),
+      400,
+      { error: "invalid artifact sync request", code: "artifact_validation_failed" },
+    );
+    // Zero domain work and zero state for either rejection: no session row,
+    // no attempt stamp on the loop.
+    expect(await db.select().from(artifactSyncSessions)).toHaveLength(0);
+    expect((await loopRow()).artifactSyncError).toBeNull();
     // A never-sync path is a policy rejection, not a schema issue.
     await expectJson(
       await machineReq("/api/machine/sync", {
@@ -541,3 +591,4 @@ describe("AH10: POST /api/machine/loops/:id/artifact-sync-error", () => {
     );
   });
 });
+
