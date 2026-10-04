@@ -502,17 +502,21 @@ describe("production mint", () => {
   });
 });
 
-describe("AD4 artifact-sync dormancy (Phase 5 Batch 1 slice 3)", () => {
-  it("production bootstrap constructs NO BlobStore and starts NO watcher (ADR-010 决策 16)", async () => {
+describe("AD4 artifact wiring (Batch 2 slice 2 — the dormancy guard, rewritten)", () => {
+  it("bootstrap wires the production ArtifactHome and mounts the routes — still with ZERO fs side effects", async () => {
     const dir = await tmpDataDir();
     const b = await boot(dir);
-    // The whole assembled graph is exactly these five nodes — there is no
-    // blobStore / artifactHome / watcher property to be reached. A future
-    // batch wiring artifact sync into production must update this pin
-    // deliberately.
-    expect(Object.keys(b).sort()).toEqual(["app", "coordinator", "handle", "scheduler", "sweep"]);
-    // And nothing artifact-shaped landed on disk at boot.
+    // Batch 1's pin asserted the graph had NO artifact node. Slice 2 wires it
+    // deliberately: the sixth node is the narrow facade the app consumed.
+    // There is STILL no watcher and no server-side timer.
+    expect(Object.keys(b).sort()).toEqual(["app", "artifacts", "coordinator", "handle", "scheduler", "sweep"]);
+    // Construction stays pure (ADR-010 决策 21): the blob root is created only
+    // by the first verified write, so boot leaves no artifact-shaped entry.
     const entries = await readdir(dir);
     expect(entries.filter((e) => /artifact|blob|watch/i.test(e))).toEqual([]);
+    // The routes are REALLY mounted: a credential-less machine read is a 401,
+    // not the flat 404 an unwired app would return.
+    const res = await b.app.request("/api/machine/loops/loop-1/artifacts");
+    expect(res.status).toBe(401);
   });
 });

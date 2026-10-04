@@ -18,6 +18,8 @@ import { pathToFileURL } from "node:url";
 import { serve, type ServerType } from "@hono/node-server";
 
 import { createLoopAdmin, newUuidLoopId } from "./admin/index.js";
+import { createArtifactApi, type ArtifactApi } from "./artifact/api.js";
+import { createProductionArtifactHome } from "./artifact/production.js";
 import { createRunCoordinator, mintRunCredential, newUuidRunId, type CoordinatorHooks, type RunCoordinator } from "./coordinator/index.js";
 import { isLoopbackHost, loadServerConfig, unauthenticatedExposureWarning, type ServerConfig } from "./config.js";
 import { mintCsrfToken } from "./dashboard/csrf.js";
@@ -42,6 +44,12 @@ export interface BootedServer {
   sweep: InactivitySweep;
   /** Phase 3 Batch 2: Scheduler instance (not yet started). */
   scheduler: Scheduler;
+  /** Phase 5 Batch 2 slice 2: the artifact facade the app consumed — the
+   *  production ArtifactHome (blob root `<dataDir>/blobs`, machine
+   *  attribution, `sync-`/`amf-` id factories) wrapped in its narrow HTTP
+   *  interface. Construction stays side-effect-free: nothing artifact-shaped
+   *  exists on disk until the first verified write. */
+  artifacts: ArtifactApi;
   handle: DbHandle;
 }
 
@@ -130,6 +138,12 @@ export async function bootstrapServer(
         })
       : undefined;
 
+    // Phase 5 Batch 2 slice 2: the production ArtifactHome (ADR-010 决策 21)
+    // mounted through its narrow HTTP facade. Pure construction — the blob
+    // root appears only on the first verified write, and no watcher exists on
+    // the server side at all.
+    const artifacts = createArtifactApi(createProductionArtifactHome({ db: handle.db, dataDir: config.dataDir, clock }));
+
     return {
       app: createServerApp(
         coordinator,
@@ -139,10 +153,12 @@ export async function bootstrapServer(
         ownerControl,
         (loop) => scheduler.reconcile(loop),
         dashboard,
+        artifacts,
       ),
       coordinator,
       sweep,
       scheduler,
+      artifacts,
       handle,
     };
   } catch (err) {
