@@ -31,6 +31,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 
 import {
+  hasArtifactSyncV1,
   hasTerminalJournalV1,
   isDeviceTokenShape,
   TERMINAL_JOURNAL_V1_CAPABILITY,
@@ -41,6 +42,7 @@ import {
 } from "@loopzhb/protocol";
 import { machineIdFromToken, sha256 } from "@loopzhb/protocol/node";
 
+import { planArtifactWatchResponse, readMachineWatchItems } from "../artifact/watch.js";
 import { buildDelivery } from "../gateway/delivery.js";
 import { resolveLiveLease } from "../store/leases.js";
 import {
@@ -221,7 +223,19 @@ export function createRunCoordinator(deps: RunCoordinatorDependencies) {
       if (body.progress !== undefined && body.progress.length > 0) {
         await applyRunProgress(deps, { machineId, entries: body.progress });
       }
-      if (body.availableSlots === 0) return { deliveries: [] }; // busy: skip the claim scan
+
+      // Artifact sync (Batch 2 slice 2, ADR-010 决策 22): the watch
+      // configuration is distributed ONLY to machines that declared
+      // `artifact-sync-v1` — a daemon without it runs no watcher, so the
+      // payload would be dead weight, and every Batch 1 daemon's poll
+      // response stays byte-identical. Assembled BEFORE the busy early-return:
+      // watch is configuration distribution, not run dispatch.
+      const artifactCapable = hasArtifactSyncV1(machine.capabilities);
+      const watchPayload = artifactCapable
+        ? planArtifactWatchResponse(await readMachineWatchItems(deps.db, machine), body.watchDigest)
+        : {};
+
+      if (body.availableSlots === 0) return { deliveries: [], ...watchPayload }; // busy: skip the claim scan
 
       const candidates = await pendingExecRunsForMachine(deps.db, machineId);
 
@@ -229,8 +243,8 @@ export function createRunCoordinator(deps: RunCoordinatorDependencies) {
       // cannot receive new runs. The upgrade hint rides ONLY when claimable
       // work exists — an idle poll stays hint-free.
       if (!hasTerminalJournalV1(machine.capabilities)) {
-        if (candidates.length === 0) return { deliveries: [] };
-        return { deliveries: [], requiredCapabilities: [TERMINAL_JOURNAL_V1_CAPABILITY] };
+        if (candidates.length === 0) return { deliveries: [], ...watchPayload };
+        return { deliveries: [], requiredCapabilities: [TERMINAL_JOURNAL_V1_CAPABILITY], ...watchPayload };
       }
 
       const deliveries: Delivery[] = [];
@@ -240,6 +254,10 @@ export function createRunCoordinator(deps: RunCoordinatorDependencies) {
         const loop = await getLoop(deps.db, candidate.loopId);
         if (!loop) continue; // undeliverable: stays pending, never fails the batch
         if (loop.completedAt !== null) continue; // Completed loops never claim (scan-side hint)
+        // Artifact capability (决策 22, scan-side hint only): a configured loop
+        // needs artifact-sync-v1; the claim re-verifies against the
+        // authoritative row. Skipping one candidate never blocks the others.
+        if (loop.artifactDir !== null && !artifactCapable) continue;
         await deps.hooks?.beforeClaimTx?.(candidate.id);
         let claimed;
         try {
@@ -248,6 +266,7 @@ export function createRunCoordinator(deps: RunCoordinatorDependencies) {
             loopId: loop.id,
             machineId,
             role: candidate.role,
+            artifactCapable,
           });
         } catch (err) {
           // The authoritative loop resolve refused the claim (loop deleted or
@@ -263,7 +282,7 @@ export function createRunCoordinator(deps: RunCoordinatorDependencies) {
         // never end the poll, or a lost race would starve this cycle.
         if (body.availableSlots === 1) break;
       }
-      return { deliveries };
+      return { deliveries, ...watchPayload };
     },
 
     /**

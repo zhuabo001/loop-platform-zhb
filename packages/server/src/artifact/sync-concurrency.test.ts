@@ -426,7 +426,7 @@ describe("slice-5 concurrency acceptance (real PGlite + memory BlobStore)", () =
           // revision bumped WITHOUT touching the artifact columns.
           const claimed = await claimRunWithLeaseTx(
             { db, clock, ...makeTestFactories() },
-            { runId: "run-1", loopId: "loop-1", machineId: "m-1", role: "exec" },
+            { runId: "run-1", loopId: "loop-1", machineId: "m-1", role: "exec", artifactCapable: true },
           );
           if (!claimed) throw new Error("claim fixture must succeed");
           claimLanded = true;
@@ -518,7 +518,7 @@ describe("slice-5 concurrency acceptance (real PGlite + memory BlobStore)", () =
             },
           },
         },
-        { runId: "run-1", loopId: "loop-1", machineId: "m-1", role: "exec" },
+        { runId: "run-1", loopId: "loop-1", machineId: "m-1", role: "exec", artifactCapable: true },
       );
 
       expect(claimed).toBeDefined();

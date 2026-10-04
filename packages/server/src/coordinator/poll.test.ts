@@ -11,12 +11,20 @@
 import { eq, sql } from "drizzle-orm";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { machineIdFromToken, sha256 } from "@loopzhb/protocol/node";
+import { machineIdFromToken, sha256, watchConfigDigest } from "@loopzhb/protocol/node";
 
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
 import { loops, machines, type Machine } from "../db/schema.js";
 import { HEARTBEAT_SKEW_SLACK_MS, applyMachinePollContact } from "../store/machines.js";
-import { FakeClock, seedLoop, seedMachineForToken, seedRun, testDeps } from "../testkit/index.js";
+import {
+  FakeClock,
+  seedLoop,
+  seedMachineForToken,
+  seedRun,
+  snapshotLeases,
+  snapshotRuns,
+  testDeps,
+} from "../testkit/index.js";
 import { createRunCoordinator, type RunCoordinator } from "./index.js";
 
 const TOKEN = "dk_test_machine_alpha";
@@ -302,34 +310,142 @@ describe("poll: heartbeat watermark + identity snapshot (A-13)", () => {
   });
 });
 
-describe("AD2(b): poll never emits watch and never gates on artifact config (ADR-010 决策 16)", () => {
-  it("an idle poll carrying watchDigest resolves to EXACTLY the idle shape", async () => {
+describe("AD2(b): poll distributes watch and gates artifact claims (Batch 2 slice 2, ADR-010 决策 22)", () => {
+  const CAPABLE = ["terminal-journal-v1", "artifact-sync-v1"];
+
+  it("a machine WITHOUT artifact-sync-v1 keeps the Batch 1 idle shape — watchDigest or not", async () => {
     await fresh();
     await seedMachineForToken(db, TOKEN);
-    // The request DTO tolerantly accepts watchDigest (slice 1); the Batch 1
-    // response must carry NEITHER watch nor watchDigest.
+    // The watch configuration is only distributed to machines that declared
+    // the capability: an old daemon's response stays byte-identical.
     await expect(coordinator.poll(TOKEN, { watchDigest: "w-1" })).resolves.toEqual({ deliveries: [] });
+    await expect(coordinator.poll(TOKEN, {})).resolves.toEqual({ deliveries: [] });
   });
 
-  it("a configured loop's artifact columns play no role in the claim; the response carries no watch", async () => {
+  it("a capable machine on drift receives the FULL watch set + digest; a matching digest carries neither key", async () => {
     await fresh();
     const machineId = await seedMachineForToken(db, TOKEN);
-    await seedLoop(db, { id: "loop-1", taskFile: "/home/dev/TASK.md" });
-    // Simulate a loop whose artifact config was set via the internal write
-    // path — the production claim path must not read these columns.
-    await db.update(loops).set({ artifactDir: "/data/out", artifactConfigRevision: 3 }).where(eq(loops.id, "loop-1"));
+    await seedLoop(db, {
+      id: "loop-1",
+      machineId,
+      artifactDir: "/data/out",
+      workdir: "/home/dev/project",
+      artifactConfigRevision: 3,
+    });
+    // The configured loop belongs to THIS machine (unlike the old guard's
+    // fixture) — the watch set is machine-scoped.
+    const item = {
+      loopId: "loop-1",
+      artifactDir: "/data/out",
+      workdir: "/home/dev/project",
+      roots: [] as string[],
+      configRevision: 3,
+    };
+    const digest = watchConfigDigest([item]);
+
+    // No digest = the empty-set digest ⇒ drift ⇒ the complete set.
+    await expect(coordinator.poll(TOKEN, { capabilities: CAPABLE })).resolves.toEqual({
+      deliveries: [],
+      watch: [item],
+      watchDigest: digest,
+    });
+    // Matching digest ⇒ no update (both keys absent).
+    await expect(coordinator.poll(TOKEN, { capabilities: CAPABLE, watchDigest: digest })).resolves.toEqual({
+      deliveries: [],
+    });
+  });
+
+  it("clearing the last configured loop sends watch: [] on drift — the clear-all payload", async () => {
+    await fresh();
+    const machineId = await seedMachineForToken(db, TOKEN);
+    await seedLoop(db, { id: "loop-1", machineId, artifactDir: "/data/out", artifactConfigRevision: 1 });
+    await coordinator.poll(TOKEN, { capabilities: CAPABLE }); // declares the capability
+
+    await db.update(loops).set({ artifactDir: null, artifactConfigRevision: 2 }).where(eq(loops.id, "loop-1"));
+    const result = await coordinator.poll(TOKEN, { capabilities: CAPABLE, watchDigest: "stale-digest" });
+    expect(result).toEqual({ deliveries: [], watch: [], watchDigest: watchConfigDigest([]) });
+  });
+
+  it("busy polls (availableSlots 0) process watchDigest too — watch is not run dispatch", async () => {
+    await fresh();
+    const machineId = await seedMachineForToken(db, TOKEN);
+    await seedLoop(db, { id: "loop-1", machineId, artifactDir: "/data/out", artifactConfigRevision: 1 });
+    const result = await coordinator.poll(TOKEN, { capabilities: CAPABLE, availableSlots: 0 });
+    expect(result.deliveries).toEqual([]);
+    expect(result.watch).toEqual([
+      { loopId: "loop-1", artifactDir: "/data/out", workdir: null, roots: [], configRevision: 1 },
+    ]);
+    expect(result.watchDigest).toBeDefined();
+  });
+
+  it("an UNCONFIGURED loop stays claimable without the capability", async () => {
+    await fresh();
+    const machineId = await seedMachineForToken(db, TOKEN);
+    await seedLoop(db, { id: "loop-1", machineId, taskFile: "/home/dev/TASK.md" });
     await seedRun(db, { id: "run-1", machineId });
 
-    const result = await coordinator.poll(TOKEN, {
-      capabilities: ["terminal-journal-v1"],
-      watchDigest: "w-1",
-    });
-    // The claim succeeds exactly as before (delivery + running run + lease).
+    const result = await coordinator.poll(TOKEN, { capabilities: ["terminal-journal-v1"] });
     expect(result.deliveries).toHaveLength(1);
     expect(result.deliveries[0]!.runId).toBe("run-1");
-    expect(result).not.toHaveProperty("watch");
-    expect(result).not.toHaveProperty("watchDigest");
-    // The delivered loop projection carries no artifact fields either.
-    expect(result.deliveries[0]!).not.toHaveProperty("watch");
+    expect(result.deliveries[0]!.loop).not.toHaveProperty("artifact");
+  });
+
+  it("a configured candidate is skipped without the capability — and never blocks the other candidate", async () => {
+    await fresh();
+    const machineId = await seedMachineForToken(db, TOKEN);
+    await seedLoop(db, { id: "loop-a", machineId, artifactDir: "/data/out", artifactConfigRevision: 3 });
+    await seedLoop(db, { id: "loop-b", machineId, taskFile: "/home/dev/TASK.md" });
+    await seedRun(db, { id: "run-configured", machineId, loopId: "loop-a", ts: "2026-07-01T00:00:00.000Z" });
+    await seedRun(db, { id: "run-plain", machineId, loopId: "loop-b", ts: "2026-07-01T00:00:01.000Z" });
+
+    const result = await coordinator.poll(TOKEN, { capabilities: ["terminal-journal-v1"] });
+    // The configured candidate is skipped; the unconfigured one still delivers.
+    expect(result.deliveries.map((d) => d.runId)).toEqual(["run-plain"]);
+    expect(await snapshotRuns(db)).toMatchObject([
+      { id: "run-configured", phase: "pending" },
+      { id: "run-plain", phase: "running" },
+    ]);
+    expect((await snapshotLeases(db)).map((l) => l.runId)).toEqual(["run-plain"]);
+  });
+
+  it("a capable machine claims the configured loop and the Delivery carries the artifact config", async () => {
+    await fresh();
+    const machineId = await seedMachineForToken(db, TOKEN);
+    await seedLoop(db, { id: "loop-a", machineId, artifactDir: "/data/out", artifactConfigRevision: 5 });
+    await seedRun(db, { id: "run-1", machineId, loopId: "loop-a" });
+
+    const result = await coordinator.poll(TOKEN, { capabilities: CAPABLE });
+    expect(result.deliveries).toHaveLength(1);
+    expect(result.deliveries[0]!.loop.artifact).toEqual({ dir: "/data/out", configRevision: 5 });
+  });
+
+  it("a config write between the scan and the claim is caught by the claim's authoritative re-check", async () => {
+    await fresh();
+    const machineId = await seedMachineForToken(db, TOKEN);
+    await seedLoop(db, { id: "loop-1", machineId, taskFile: "/t/TASK.md" });
+    await seedRun(db, { id: "run-1", machineId });
+    let hooked = false;
+    coordinator = createRunCoordinator(
+      testDeps(db, clock, {
+        hooks: {
+          async beforeClaimTx() {
+            if (hooked) return;
+            hooked = true;
+            // The scan-side hint saw an UNCONFIGURED loop; this write lands
+            // before the claim resolves it authoritatively.
+            await db
+              .update(loops)
+              .set({ artifactDir: "/data/out", artifactConfigRevision: 1 })
+              .where(eq(loops.id, "loop-1"));
+          },
+        },
+      }),
+    );
+
+    const result = await coordinator.poll(TOKEN, { capabilities: ["terminal-journal-v1"] });
+    expect(result.deliveries).toEqual([]);
+    // The claim refused BEFORE opening its transaction: pending, no lease.
+    expect(await snapshotRuns(db)).toMatchObject([{ id: "run-1", phase: "pending" }]);
+    expect(await snapshotLeases(db)).toEqual([]);
   });
 });

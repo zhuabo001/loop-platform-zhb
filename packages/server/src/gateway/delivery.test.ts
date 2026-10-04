@@ -178,4 +178,21 @@ describe("buildDelivery", () => {
       expect(delivery.loop.name).toBe("loop_01");
     }
   });
+
+  it("carries artifact {dir, configRevision} from the authoritative row when configured (AH12)", () => {
+    const delivery = buildDelivery({
+      loop: { ...loopBase, artifactDir: "/home/dev/project/dist", artifactConfigRevision: 5 },
+      run: runBase,
+      roots: [],
+      runToken: "rk_x",
+    });
+    expect(delivery.loop.artifact).toEqual({ dir: "/home/dev/project/dist", configRevision: 5 });
+    expect(deliverySchema.parse(delivery)).toEqual(delivery);
+  });
+
+  it("omits the artifact key entirely for an unconfigured loop (absence is the wire signal)", () => {
+    const delivery = buildDelivery({ loop: loopBase, run: runBase, roots: [], runToken: "rk_x" });
+    expect(delivery.loop).not.toHaveProperty("artifact");
+    expect(Object.keys(delivery.loop)).not.toContain("artifact");
+  });
 });

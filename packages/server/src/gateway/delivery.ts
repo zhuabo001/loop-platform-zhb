@@ -64,6 +64,13 @@ export function buildDelivery(input: { loop: Loop; run: Run; roots: string[]; ru
       allowControl: loop.allowControl,
       agent: loop.agent,
       goal: loop.goal ?? null,
+      // Phase 5 (Batch 2 slice 2, ADR-010 决策 20): the artifact config as
+      // observed on the AUTHORITATIVE claimed row. The key is ABSENT for an
+      // unconfigured loop (not present-with-undefined) — an old reader strips
+      // an unknown field, but the absence is the honest wire signal.
+      ...(loop.artifactDir !== null
+        ? { artifact: { dir: loop.artifactDir, configRevision: loop.artifactConfigRevision } }
+        : {}),
     },
     prevState: loop.state ?? null,
     roots,

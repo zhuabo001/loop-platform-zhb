@@ -73,6 +73,7 @@ describe("R1 — retarget vs claim (SPEC-1/ADV-3): the interleaved claim wins th
             loopId: "loop-1",
             machineId: "m-test",
             role: "exec",
+            artifactCapable: true,
           });
           expect(claimed).toBeDefined();
         },
@@ -110,6 +111,7 @@ describe("R2 — retarget before claim: the delivery carries the NEW path", () =
       loopId: "loop-1",
       machineId: "m-test",
       role: "exec",
+      artifactCapable: true,
     });
     expect(claimed?.loop.taskFile).toBe("/machine/B.md");
     const [loop] = await snapshotLoops(db);
@@ -139,6 +141,7 @@ describe("R2 — retarget before claim: the delivery carries the NEW path", () =
         loopId: "loop-1",
         machineId: "m-test",
         role: "exec",
+        artifactCapable: true,
       },
     );
 
