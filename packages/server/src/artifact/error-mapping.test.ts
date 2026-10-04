@@ -6,7 +6,8 @@
  * two newly frozen wire codes, the full reachability of the 11-code taxonomy,
  * and every operation domain VERBATIM (a removed member changes the pinned
  * array; the 决策 7 rule test covers an operation that lost — or never had —
- * the attribution branch, #83). The table's
+ * the attribution branch, #83). Batch 2 slice 2 adds `machineRead` — the
+ * GET /api/machine/loops/:id/artifacts domain — to the pinned set. The table's
  * `Record<ArtifactInternalFailure, ...>` type is the compile-time
  * exhaustiveness evidence: a literal added to sync.ts/config.ts without a
  * mapping fails `tsc`.
@@ -154,6 +155,7 @@ describe("AT9: artifact failure → HTTP mapping (ADR-010 决策 13)", () => {
         "config_revision_exhausted",
       ],
       syncErrorReport: ["loop_not_found", "attribution_missing", "storage_error"],
+      machineRead: ["attribution_missing", "loop_not_found", "artifact_dir_unconfigured", "storage_error"],
       read: [
         "attribution_missing",
         "loop_not_found",
@@ -171,7 +173,7 @@ describe("AT9: artifact failure → HTTP mapping (ADR-010 决策 13)", () => {
     // ADR-010 决策 7: prepare/PUT/commit/reads/snapshot binding ALL re-resolve
     // attribution per call. A missing or unformable machine row is therefore a
     // first-class result of every one of these operations — reads included.
-    for (const operation of ["prepare", "put", "commit", "syncErrorReport", "read"] as const) {
+    for (const operation of ["prepare", "put", "commit", "syncErrorReport", "machineRead", "read"] as const) {
       expect(ARTIFACT_OPERATION_FAILURES[operation], operation).toContain("attribution_missing");
     }
     expect(mapArtifactFailure("attribution_missing")).toEqual({

@@ -114,6 +114,9 @@ export interface ArtifactOperationFailures {
   commit: readonly CommitArtifactSyncFailure[];
   configUpdate: readonly (ArtifactConfigRejection | "loop_not_found")[];
   syncErrorReport: readonly ("loop_not_found" | "attribution_missing" | "storage_error")[];
+  /** GET /api/machine/loops/:id/artifacts (Batch 2 slice 2): the restart /
+   *  conflict-recovery read. 决策 13 puts reads on the storage-error map too. */
+  machineRead: readonly ("attribution_missing" | "loop_not_found" | "artifact_dir_unconfigured" | "storage_error")[];
   read: readonly ArtifactReadFailure[];
 }
 
@@ -151,6 +154,7 @@ export const ARTIFACT_OPERATION_FAILURES: ArtifactOperationFailures = {
   ],
   configUpdate: ["loop_not_found", "artifact_dir_invalid", "artifact_dir_relative_without_workdir", "config_revision_exhausted"],
   syncErrorReport: ["loop_not_found", "attribution_missing", "storage_error"],
+  machineRead: ["attribution_missing", "loop_not_found", "artifact_dir_unconfigured", "storage_error"],
   read: [
     // 决策 7 first: attribution is resolved before any resource lookup.
     "attribution_missing",
