@@ -95,6 +95,18 @@ export type PrepareArtifactSyncResponse = z.infer<typeof prepareArtifactSyncResp
 /** The header carrying the sync session id on blob PUTs. */
 export const ARTIFACT_SYNC_ID_HEADER = "X-Artifact-Sync-Id";
 
+/** The PUT success body (frozen in Batch 2 slice 2 — the last wire shape
+ *  Batch 2 opens). `size` is the VERIFIED byte count of the uploaded stream,
+ *  never a declared size or Content-Length; `published:false` means the key
+ *  already existed (the dedupe path) — the bytes were verified all the same,
+ *  so a duplicate PUT converges without mutating the stored blob. */
+export const putArtifactBlobResponseSchema = z.object({
+  ok: z.literal(true),
+  size: z.number().int().nonnegative(),
+  published: z.boolean(),
+});
+export type PutArtifactBlobResponse = z.infer<typeof putArtifactBlobResponseSchema>;
+
 // ---- commit (POST /api/machine/sync/:id/commit — the route mounts in Batch 2) ----
 
 export const commitArtifactSyncResponseSchema = z.object({

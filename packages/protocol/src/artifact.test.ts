@@ -15,6 +15,7 @@ import {
   machineLoopArtifactsResponseSchema,
   prepareArtifactSyncRequestSchema,
   prepareArtifactSyncResponseSchema,
+  putArtifactBlobResponseSchema,
 } from "./artifact.js";
 import {
   createLoopRequestSchema,
@@ -86,6 +87,20 @@ describe("artifact sync DTO goldens", () => {
 
   it("pins the sync-id header name (Batch 2's PUT carries the session in it)", () => {
     expect(ARTIFACT_SYNC_ID_HEADER).toBe("X-Artifact-Sync-Id");
+  });
+
+  it("round-trips the PUT response; unknown keys strip and a half-formed body rejects (AH1)", () => {
+    const published = { ok: true, size: 1200, published: true };
+    expect(putArtifactBlobResponseSchema.parse(published)).toEqual(published);
+    // The dedupe shape is legal: published:false still carries the verified size.
+    const deduped = putArtifactBlobResponseSchema.parse({ ...published, size: 0, published: false });
+    expect(deduped).toEqual({ ok: true, size: 0, published: false });
+    // Tolerant reader: an unknown additive field from a newer writer is stripped.
+    expect(putArtifactBlobResponseSchema.parse({ ...published, future: 1 })).toEqual(published);
+    // Half-formed bodies are rejected: a missing published flag or a wrong
+    // literal is not a success shape.
+    expect(putArtifactBlobResponseSchema.safeParse({ ok: true, size: 1 }).success).toBe(false);
+    expect(putArtifactBlobResponseSchema.safeParse({ ok: false, size: 1, published: true }).success).toBe(false);
   });
 });
 

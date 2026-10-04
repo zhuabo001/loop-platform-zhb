@@ -34,6 +34,7 @@ import {
   machineLoopArtifactsResponseSchema,
   prepareArtifactSyncRequestSchema,
   prepareArtifactSyncResponseSchema,
+  putArtifactBlobResponseSchema,
 } from "./artifact.js";
 import {
   artifactDiffEntrySchema,
@@ -201,6 +202,8 @@ const CASES: ReadonlyArray<readonly [string, z.ZodTypeAny, Record<string, unknow
     { syncId: "s", needHashes: [], expiresAt: "t" },
   ],
   ["commitArtifactSyncResponseSchema", commitArtifactSyncResponseSchema, { artifactSnapshotId: "m", manifestRevision: 1 }],
+  // Batch 2 slice 2 (AH1): the PUT success body — the last wire shape opened.
+  ["putArtifactBlobResponseSchema", putArtifactBlobResponseSchema, { ok: true, size: 1, published: true }],
   ["updateArtifactDirRequestSchema", updateArtifactDirRequestSchema, { artifactDir: null }],
   ["updateArtifactDirResponseSchema", updateArtifactDirResponseSchema, { loop: { ...MINIMAL_LOOP_SUMMARY } }],
   // Batch 2 slice 1 additions (ADR-010 决策 13/20): machine read, client
@@ -279,6 +282,6 @@ describe("tolerant reader: EVERY exported object schema strips unknown keys", ()
   it("covers every object schema — adding a new one requires a row here", () => {
     // Guard against a FUTURE schema silently escaping this suite: the case list
     // is reviewed whenever a schema is added (CI review checklist, ADR-002).
-    expect(CASES.length).toBe(54);
+    expect(CASES.length).toBe(55);
   });
 });
