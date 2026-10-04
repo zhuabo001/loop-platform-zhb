@@ -592,3 +592,67 @@ describe("AH10: POST /api/machine/loops/:id/artifact-sync-error", () => {
   });
 });
 
+describe("AH4/AH9: recognized storage faults map to 500 artifact_storage_error (#85)", () => {
+  const recoverable = () => Object.assign(new Error("injected connection failure"), { code: "08006" });
+  const STORAGE_ERROR = { error: "artifact storage error", code: "artifact_storage_error" };
+
+  it("the machine read returns the stable error for a fault at ANY of its three reads", async () => {
+    for (const at of [1, 2, 3]) {
+      await fresh({ artifactFault: { at, cause: recoverable() } });
+      await configuredLoop();
+      await expectJson(await machineReq("/api/machine/loops/loop-1/artifacts"), 500, STORAGE_ERROR);
+    }
+  });
+
+  it("every machine route classifies a fault in the SHARED credential read the same way", async () => {
+    // One boot per request: the poison targets the FIRST read of the request,
+    // so each route needs its own armed app.
+    await fresh({ artifactFault: { at: 1, cause: recoverable() } });
+    await expectJson(await machineReq("/api/machine/loops/loop-1/artifacts"), 500, STORAGE_ERROR);
+    await fresh({ artifactFault: { at: 1, cause: recoverable() } });
+    await expectJson(
+      await machineReq("/api/machine/sync", {
+        method: "POST",
+        headers: jsonHeaders,
+        body: JSON.stringify({
+          requestId: "r",
+          loopId: "loop-1",
+          configRevision: 1,
+          baseManifestRevision: 0,
+          entries: [],
+        }),
+      }),
+      500,
+      STORAGE_ERROR,
+    );
+    await fresh({ artifactFault: { at: 1, cause: recoverable() } });
+    await expectJson(
+      await machineReq(`/api/machine/blob/${HASH_A}`, {
+        method: "PUT",
+        headers: { [ARTIFACT_SYNC_ID_HEADER]: "sync-x" },
+        body: CONTENT_A,
+      }),
+      500,
+      STORAGE_ERROR,
+    );
+    await fresh({ artifactFault: { at: 1, cause: recoverable() } });
+    await expectJson(await machineReq("/api/machine/sync/sync-x/commit", { method: "POST" }), 500, STORAGE_ERROR);
+    await fresh({ artifactFault: { at: 1, cause: recoverable() } });
+    await expectJson(
+      await machineReq("/api/machine/loops/loop-1/artifact-sync-error", {
+        method: "POST",
+        headers: jsonHeaders,
+        body: JSON.stringify({ failure: "timeout", configRevision: 1, baseManifestRevision: 0 }),
+      }),
+      500,
+      STORAGE_ERROR,
+    );
+  });
+
+  it("an UNRECOGNIZED fault keeps the raw boundary: 500 without a code, never misclassified", async () => {
+    await fresh({ artifactFault: { at: 1, cause: new Error("plain driver defect") } });
+    await expectJson(await machineReq("/api/machine/loops/loop-1/artifacts"), 500, { error: "internal server error" });
+    await fresh({ artifactFault: { at: 1, cause: Object.assign(new Error("unique violation"), { code: "23505" }) } });
+    await expectJson(await machineReq("/api/machine/loops/loop-1/artifacts"), 500, { error: "internal server error" });
+  });
+});

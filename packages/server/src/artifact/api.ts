@@ -11,6 +11,14 @@
  * `InvalidMachineCredentialError` — the ONE 401 source the edge already maps
  * for poll. `updateConfig` is the management path: it carries NO credential
  * (loopback/trusted-network boundary, like every other /api/loops route).
+ *
+ * Storage-failure classification is completed HERE, at the operation boundary
+ * (#85): the shared credential read and machineRead's attribution read sit
+ * AROUND the domain call, and the domain keeps its pre-transaction reads on
+ * the raw-throw boundary — yet every one of them is the same storage read
+ * 决策 13 assigns to the stable `storage_error` result. Each machine method
+ * therefore wraps its WHOLE flow, so the failure code and the retry class can
+ * no longer depend on which query failed.
  */
 import { eq } from "drizzle-orm";
 
@@ -29,6 +37,24 @@ import { commitArtifactSync, prepareArtifactSync, putArtifactBlob, type CommitAr
 import { recordArtifactSyncError, type RecordArtifactSyncErrorResult } from "./sync-error.js";
 import { isRecoverableStorageError } from "./storage-error.js";
 import { updateArtifactConfig, type UpdateArtifactConfigResult } from "./config.js";
+
+/**
+ * Run one machine operation; a recognized recoverable storage fault that
+ * ESCAPES it becomes the operation's stable `storage_error` result (决策 13:
+ * `artifact_storage_error` / idempotent_retry), with the original driver
+ * error carried as `cause`. Only the IDENTIFIED SQLSTATE classes
+ * (08/53/57/58) qualify: invalid credentials still raise the unified 401 and
+ * every uncoded/unrecognized defect keeps the raw-throw boundary — an unknown
+ * defect is never laundered into the retryable class.
+ */
+async function withStorageError<T>(run: () => Promise<T>, onStorageError: (cause: unknown) => T): Promise<T> {
+  try {
+    return await run();
+  } catch (err) {
+    if (isRecoverableStorageError(err)) return onStorageError(err);
+    throw err;
+  }
+}
 
 export type MachineLoopArtifactsReadResult =
   | { ok: true; response: MachineLoopArtifactsResponse }
@@ -63,56 +89,69 @@ export function createArtifactApi(home: ArtifactHomeDeps): ArtifactApi {
       return updateArtifactConfig({ db, clock }, loopId, { artifactDir: command.artifactDir });
     },
 
-    async readMachineLoop(token, loopId) {
-      const machine = await authenticate(token);
-      const resolved = await attribution.resolve(machine);
-      if (!resolved.ok) return { ok: false, failure: "attribution_missing" };
-      try {
-        const loop = (
-          await db
-            .select({
-              id: loops.id,
-              machineId: loops.machineId,
-              artifactDir: loops.artifactDir,
-              configRevision: loops.artifactConfigRevision,
-              manifestRevision: loops.artifactManifestRevision,
-            })
-            .from(loops)
-            .where(eq(loops.id, loopId))
-            .limit(1)
-        )[0];
-        // Unknown OR another machine's loop: one leak-free refusal.
-        if (!loop || loop.machineId !== machine.machineId) return { ok: false, failure: "loop_not_found" };
-        if (loop.artifactDir === null) return { ok: false, failure: "artifact_dir_unconfigured" };
-        return {
-          ok: true,
-          response: {
-            loopId: loop.id,
-            artifactDir: loop.artifactDir,
-            configRevision: loop.configRevision,
-            manifestRevision: loop.manifestRevision,
-          },
-        };
-      } catch (err) {
-        if (isRecoverableStorageError(err)) return { ok: false, failure: "storage_error", cause: err };
-        throw err;
-      }
+    readMachineLoop(token, loopId) {
+      return withStorageError(
+        async (): Promise<MachineLoopArtifactsReadResult> => {
+          const machine = await authenticate(token);
+          const resolved = await attribution.resolve(machine);
+          if (!resolved.ok) return { ok: false, failure: "attribution_missing" };
+          const loop = (
+            await db
+              .select({
+                id: loops.id,
+                machineId: loops.machineId,
+                artifactDir: loops.artifactDir,
+                configRevision: loops.artifactConfigRevision,
+                manifestRevision: loops.artifactManifestRevision,
+              })
+              .from(loops)
+              .where(eq(loops.id, loopId))
+              .limit(1)
+          )[0];
+          // Unknown OR another machine's loop: one leak-free refusal.
+          if (!loop || loop.machineId !== machine.machineId) return { ok: false, failure: "loop_not_found" };
+          if (loop.artifactDir === null) return { ok: false, failure: "artifact_dir_unconfigured" };
+          return {
+            ok: true,
+            response: {
+              loopId: loop.id,
+              artifactDir: loop.artifactDir,
+              configRevision: loop.configRevision,
+              manifestRevision: loop.manifestRevision,
+            },
+          };
+        },
+        (cause) => ({ ok: false, failure: "storage_error", cause }),
+      );
     },
 
-    async prepare(token, request) {
-      return prepareArtifactSync(home, await authenticate(token), request);
+    prepare(token, request) {
+      return withStorageError(
+        async (): Promise<PrepareArtifactSyncResult> => prepareArtifactSync(home, await authenticate(token), request),
+        (cause) => ({ ok: false, failure: "storage_error", cause }),
+      );
     },
 
-    async put(token, input) {
-      return putArtifactBlob(home, await authenticate(token), input);
+    put(token, input) {
+      return withStorageError(
+        async (): Promise<PutArtifactBlobResult> => putArtifactBlob(home, await authenticate(token), input),
+        (cause) => ({ ok: false, failure: "storage_error", cause }),
+      );
     },
 
-    async commit(token, input) {
-      return commitArtifactSync(home, await authenticate(token), input);
+    commit(token, input) {
+      return withStorageError(
+        async (): Promise<CommitArtifactSyncResult> => commitArtifactSync(home, await authenticate(token), input),
+        (cause) => ({ ok: false, failure: "storage_error", cause }),
+      );
     },
 
-    async reportSyncError(token, loopId, report) {
-      return recordArtifactSyncError({ db, clock, attribution }, await authenticate(token), loopId, report);
+    reportSyncError(token, loopId, report) {
+      return withStorageError(
+        async (): Promise<RecordArtifactSyncErrorResult> =>
+          recordArtifactSyncError({ db, clock, attribution }, await authenticate(token), loopId, report),
+        (cause) => ({ ok: false, failure: "storage_error", cause }),
+      );
     },
   };
 }
