@@ -217,8 +217,9 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
   - 批次 PR #68（分支 `feat/phase5-batch1-dev`）已于 2026-10-03 转待合入；Batch 3（认证）另行规划。
 - **Batch 2 — Artifact 持续同步、Run 快照与文件视图：进行中**（分支 `feat/phase5-batch2-dev`，8 切片共用 PR [#84](https://github.com/zhuabo001/loop-platform-zhb/pull/84)，权威计划 `docs/plan/codex-phase5-batch2-plan.md`）
   - 片 1（契约、归属与生产边界）已完成：错误码 11 与重试类 5、客户端失败分类法与落库域、Delivery Artifact 配置、10 个端点的 wire 形状（含读取端 DTO）冻结；Machine namespace 归属解析器与生产门面（Blob 根 `<dataDir>/blobs`）实现但不接线；HTTP 失败映射矩阵逐操作域固定。AD1–AD4 休眠守卫零修改全绿。
-  - 片 1 三轨审查唯一须处理项 [#83](https://github.com/zhuabo001/loop-platform-zhb/issues/83)（读取失败域遗漏 `attribution_missing`）已修复（`0a0b5a9`，变异验证），保持 OPEN 待复审核销。
-  - 片 2–8 未开始。
+  - 片 1 三轨审查唯一须处理项 [#83](https://github.com/zhuabo001/loop-platform-zhb/issues/83)（读取失败域遗漏 `attribution_missing`）已修复（`0a0b5a9`，变异验证），并经第二轮独立复审核销关闭（2026-10-04）。
+  - 片 2（Server 配置、同步 HTTP 与 Poll 接线）已完成：生产 ArtifactHome 经 `bootstrapServer` 接线、6 条路由挂载（配置 PATCH、machine 读取、prepare／流式 PUT／commit、同步错误上报；读取端 4 条留片 7）；真实 HTTP prepare → 多块流式 PUT → commit 全通且落盘 `<dataDir>/blobs`，幂等重放返回固定回执；Create 的可选 `artifactDir` 经同一 planner 与创建同语句落库（初始代际 1）；Poll 向声明 `artifact-sync-v1` 的 Machine 下发 watch（缺 digest ≡ 空集合摘要，busy Poll 同样处理），claim 对已配置 Loop 做逐候选 capability 门控并在 Delivery 携带配置代际；AD1／AD2(a)／AD2(b)／AD4 守卫按实际解除范围重写，AD3 与 daemon 零改动。
+  - 片 3–8 未开始。
 
 ### 右移项
 
