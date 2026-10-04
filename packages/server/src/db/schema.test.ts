@@ -2,7 +2,7 @@ import { and, eq } from "drizzle-orm";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
-  ARTIFACT_ERROR_CODES,
+  ARTIFACT_SYNC_STATE_ERRORS,
   CODING_AGENTS,
   LEASE_STATES,
   RUN_OUTCOMES,
@@ -67,8 +67,11 @@ describe("enum pins — the DB can never drift from the protocol single source",
     expect(runLeases.state.enumValues).toEqual([...LEASE_STATES]);
   });
 
-  it("loops.artifactSyncError mirrors ARTIFACT_ERROR_CODES (runs.artifactSyncError stays free-form)", () => {
-    expect(loops.artifactSyncError.enumValues).toEqual([...ARTIFACT_ERROR_CODES]);
+  it("loops.artifactSyncError mirrors ARTIFACT_SYNC_STATE_ERRORS (runs.artifactSyncError stays free-form)", () => {
+    // Batch 2 slice 2 widened the domain to the ordered union of the wire
+    // codes and the client failure classes (ADR-010 决策 13): a commit stamp
+    // writes a wire code, an error report writes a client class.
+    expect(loops.artifactSyncError.enumValues).toEqual([...ARTIFACT_SYNC_STATE_ERRORS]);
     // runs.artifactSyncError deliberately has NO enum: the wire report field
     // is a free-form string whose value set is Batch 2's to define (protocol
     // report.ts) — pinning an enum here would freeze the wrong place. (Drizzle
