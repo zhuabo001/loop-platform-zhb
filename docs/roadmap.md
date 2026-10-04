@@ -214,7 +214,11 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
   - ArtifactHome 状态机：prepare/PUT/commit、Loop CAS、requestId 幂等与固定回执、当前视图与不可变快照读取；并发、交错与故障注入验收（AC4–AC6/AC9、AB5/AB7）。
   - 生产休眠：AD1–AD4 全部在测——Artifact 路由未挂载、Create/Poll 行为不变、Report 忽略新字段、启动不构造 BlobStore、Daemon 不发同步请求。
   - 收口：内部集成链（文件型 PGlite + 本地 BlobStore 的真实磁盘路径）与五道质量门全绿；收口三轨复审零阻断，唯一 P3 证据措辞项经定点复核核销。
-  - 批次 PR #68（分支 `feat/phase5-batch1-dev`）已于 2026-10-03 转待合入；Batch 2（watcher、持续同步、Run 快照与文件视图）与 Batch 3（认证）另行规划。
+  - 批次 PR #68（分支 `feat/phase5-batch1-dev`）已于 2026-10-03 转待合入；Batch 3（认证）另行规划。
+- **Batch 2 — Artifact 持续同步、Run 快照与文件视图：进行中**（分支 `feat/phase5-batch2-dev`，8 切片共用 PR [#84](https://github.com/zhuabo001/loop-platform-zhb/pull/84)，权威计划 `docs/plan/codex-phase5-batch2-plan.md`）
+  - 片 1（契约、归属与生产边界）已完成：错误码 11 与重试类 5、客户端失败分类法与落库域、Delivery Artifact 配置、10 个端点的 wire 形状（含读取端 DTO）冻结；Machine namespace 归属解析器与生产门面（Blob 根 `<dataDir>/blobs`）实现但不接线；HTTP 失败映射矩阵逐操作域固定。AD1–AD4 休眠守卫零修改全绿。
+  - 片 1 三轨审查唯一须处理项 [#83](https://github.com/zhuabo001/loop-platform-zhb/issues/83)（读取失败域遗漏 `attribution_missing`）已修复（`0a0b5a9`，变异验证），保持 OPEN 待复审核销。
+  - 片 2–8 未开始。
 
 ### 右移项
 
