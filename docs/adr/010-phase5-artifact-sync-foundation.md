@@ -3,7 +3,7 @@
 - 状态：Accepted
 - 日期：2026-09-28
 - 关联：ADR-002（协议包纪律）、ADR-009（Phase 4 语义）、`docs/plan/codex-phase5-batch1-plan.md`
-- 实现：Batch 1 片 1（本文档的决策条目先于行为代码写入，作为片 2/3/4 的契约依据；片 6 收口时复核）
+- 实现：Batch 1 片 1（本文档的决策条目先于行为代码写入，作为片 2/3/4 的契约依据；片 6 收口时复核）；Batch 2 片 1 修订契约（2026-10-04）
 
 ## 背景
 
@@ -40,6 +40,8 @@ schema 层只检查 typeof 形状：`path`/`hash` 为 `z.string()`，`size` 使�
 ### 7. namespace 可信归属
 
 存储 namespace 的唯一来源是可信归属解析器：由已认证的可信 Machine 身份产出 `{namespaceId, machineId}`。wire 输入不得指定 namespace；每次 prepare/PUT/commit/读取/快照绑定都重新解析归属。缺少有效归属时拒绝操作（`artifact_attribution_missing` / 403），不提供默认全局命名空间。生产 Team 归属由后续认证批次接入；Batch 1 测试注入归属映射。
+
+Batch 2 的生产解析器使用 **Machine namespace**：`namespaceId` 取已验证 Machine 行的 `machineId`（`m-<sha256(token)[:16]>`，满足 BlobStore 的 `NAMESPACE_ID_RE`）。解析器在每次操作时重新查询 machines 行；行缺失或 id 不满足键规则时返回 `attribution_missing`（403），不抛异常、不写任何状态，也不把非法键交给 BlobStore。凭证校验（tokenHash 比对、不注册）属于 HTTP 认证读路径（Batch 2 片 2）。Batch 3 的 Team 归属替换解析器内部实现，并离线复制 Blob 后切换元数据；wire 与存储键规则不变。
 
 ### 8. 配置代际与过期
 
@@ -109,7 +111,7 @@ Blob 完备性在事务外检查：所有协商 hash 都须有元数据行，已
 
 ### 13. 错误分类、HTTP 映射与重试约定
 
-wire 错误形状复用 `apiErrorSchema` `{error, code?}`；错误文本不是机器契约，code 才是。稳定区分 9 码（内部细粒度 policy 失败字面量映射到这层，双层设计同 RunCapabilityInvalidError 先例）：
+wire 错误形状复用 `apiErrorSchema` `{error, code?}`；错误文本不是机器契约，code 才是。稳定区分 11 码（内部细粒度 policy 失败字面量映射到这层，双层设计同 RunCapabilityInvalidError 先例）：
 
 | code | HTTP | 归属步骤 | 重试类 |
 |---|---|---|---|
@@ -122,10 +124,14 @@ wire 错误形状复用 `apiErrorSchema` `{error, code?}`；错误文本不是�
 | `artifact_blob_missing` | 409 | commit（协商过的 Blob 实际缺失） | resume（重传后原样重试） |
 | `artifact_storage_error` | 500 | prepare/PUT/commit/读取 | idempotent_retry（有界退避） |
 | `artifact_attribution_missing` | 403 | 全部（缺少有效可信归属） | terminal |
+| `artifact_revision_exhausted` | 409 | prepare/PUT/commit/配置更新（config 或 manifest revision 耗尽） | terminal |
+| `artifact_session_committed` | 409 | PUT（会话已提交） | recover_receipt |
 
-从未存在或跨归属的会话/Blob 一律无码平 404——存在性不跨 scope 泄漏（同既有 404 约定）。请求级传输错误沿用既有约定：原始体超限 → 413（bodyLimit）、JSON 畸形 → 400 无码、机器凭证无效 → 401。重试类定义：`idempotent_retry` 可原样有界重试；`resume` 补传缺失 Blob 后原样重试；`renegotiate` 从 prepare 重新协商；`terminal` 同请求必败，须先修复成因。码→重试类映射以 `ARTIFACT_ERROR_RETRY_CLASS` 常量表机器可核对地固定在 protocol。HTTP 映射固定后即为契约（同 ADR-009 修订 2026-09-01 决策 6），Batch 2 以 taxonomy pin 测试钉死。
+从未存在或跨归属的会话/Blob 一律无码平 404——存在性不跨 scope 泄漏（同既有 404 约定）。请求级传输错误沿用既有约定：原始体超限 → 413（bodyLimit）、JSON 畸形 → 400 无码、机器凭证无效 → 401。重试类定义：`idempotent_retry` 可原样有界重试；`resume` 补传缺失 Blob 后原样重试；`renegotiate` 从 prepare 重新协商；`recover_receipt` 对同一 session 重发 commit 取回固定回执（不重传、不重新协商）；`terminal` 同请求必败，须先修复成因。码→重试类映射以 `ARTIFACT_ERROR_RETRY_CLASS` 常量表机器可核对地固定在 protocol。HTTP 映射固定后即为契约（同 ADR-009 修订 2026-09-01 决策 6），Batch 2 以 taxonomy pin 测试钉死。
 
-内部失败字面量细于 wire 码。`config_revision_exhausted`、`manifest_revision_exhausted`、`artifact_dir_unconfigured`、`session_committed` 的 wire 映射留 Batch 2 路由接线时裁决；其中耗尽分类在本批为稳定结果联合、零写入。`loop_not_found`/`session_not_found` 沿用不存在与跨归属统一 404 的规则，避免泄漏存在性。
+内部失败字面量细于 wire 码；Batch 2 片 1 冻结完整映射：`config_revision_exhausted` 与 `manifest_revision_exhausted` → `artifact_revision_exhausted`（409，terminal；稳定结果联合、零写入）；`artifact_dir_unconfigured` → `artifact_config_conflict`（409，renegotiate）；`session_committed` → `artifact_session_committed`（409，recover_receipt）；`artifact_dir_invalid` 与 `artifact_dir_relative_without_workdir` → `artifact_validation_failed`（400，terminal）。`loop_not_found`、`session_not_found`、`run_not_found`、`snapshot_not_found`、`path_not_found` 一律无码 404，沿用不存在与跨归属统一按不存在处理的规则。服务端映射表以 `ARTIFACT_FAILURE_HTTP` 机器可核对地固定在 `packages/server/src/artifact/error-mapping.ts`（Batch 2 片 1 冻结，片 2 接线）。
+
+客户端失败分类法固定为 9 值：`directory_missing`、`unreadable`、`outside_jail`、`symlink`、`special_file`、`unstable`、`too_large`、`watcher_error`、`timeout`。该集合与 wire 错误码不相交，二者的有序并集（`ARTIFACT_SYNC_STATE_ERRORS`）是 Loop 同步尝试状态列的取值域。错误上报 `POST /api/machine/loops/:id/artifact-sync-error` 携带 `failure`、`configRevision` 与 `baseManifestRevision`；仅当二者仍与 Loop 当前值匹配时才更新同步尝试状态（响应 `recorded:false` 表示未写入），迟到的错误不得覆盖较新的成功状态。
 
 ### 14. BlobStore 内部接口契约
 
@@ -151,6 +157,8 @@ fsync 只覆盖 Blob 文件，不做目录 fsync。目录项崩溃丢失由决�
 
 打开后 I/O 失败通过流内终止元素 `{ok:false, failure:"storage_error"}` 返回，迭代器不为 I/O 失败抛异常。正常 EOF、流故障、消费者提前停止均自动关闭句柄；若成功结果未开始迭代，调用方必须显式 `close()`，关闭后不再迭代。内存 adapter 提供同形态的无资源 `close()`。
 
+生产存储根固定为 `<dataDir>/blobs`（`dataDir` 来自 `ServerConfig`，默认 `~/.loopzhb`）。根目录仅由 Server 的可信运行身份独占写入。
+
 ### 15. 可信归属解析器接口契约
 
 服务端内部接口（`packages/server/src/artifact/attribution.ts`），片 1 冻结契约，生产 Team 接线仍留后续认证批次。`resolve(machine: TrustedMachineIdentity): Promise<ArtifactAttribution>`：输入是 store 已从 Bearer 凭证解析出的可信 Machine 身份（永非 wire 输入）；异步（生产 Team 归属需要查库）；缺失归属是预期域结果（联合返回 `{ok:false, failure:"attribution_missing"}`），不抛异常。每次操作重新解析，不从请求缓存。接口的输入/输出、职责与失败语义即决策 7 与本文；TSDoc 与本文不得矛盾，漂移时以本文为准并同步修订。
@@ -159,7 +167,7 @@ fsync 只覆盖 Blob 文件，不做目录 fsync。目录项崩溃丢失由决�
 
 本批不挂载任何 Artifact HTTP 路由、不启动 watcher、Daemon 不声明 `artifact-sync-v1`、Report 不消费 `artifactSnapshotId`/`artifactSyncError`、Run claim 条件不变、旧 Loop 默认未配置 Artifact 目录且不开始上传、生产装配不构造 BlobStore。
 
-Daemon 的 poll 出站体仅包含既有五个静态字段与 `availableSlots`，不发送 `watchDigest`；poll/report 请求仅使用 `/api/machine/poll` 与 `/api/machine/report`。Batch 2 watcher 接线时须显式更新该边界。AD1–AD4 休眠守卫覆盖路由、Create/Poll/Report、出站请求及启动装配，长期验收要求以 Batch 1 计划为准。
+Daemon 的 poll 出站体仅包含既有五个静态字段与 `availableSlots`，不发送 `watchDigest`；poll/report 请求仅使用 `/api/machine/poll` 与 `/api/machine/report`。Batch 2 watcher 接线时须显式更新该边界。AD1–AD4 休眠守卫覆盖路由、Create/Poll/Report、出站请求及启动装配，长期验收要求以 Batch 1 计划为准。Batch 2 按批次计划逐切片解除该边界：片 1 只冻结契约与生产门面（AD1–AD4 仍全绿），片 2 挂路由与生产装配，片 5 声明 capability 并启动 watcher，片 6 消费 Report 字段。
 
 ### 17. 共享 policy 的 ADR-002 窄例外记录
 
@@ -173,13 +181,23 @@ Daemon 的 poll 出站体仅包含既有五个静态字段与 `availableSlots`�
 
 ### 19. Run 快照绑定与配置互斥
 
-绑定仅适用于 `run.phase === "running"`；canceled/superseded 不绑定，reclaimed（terminal-grace 唤醒报告）路径在本层保守排除。Batch 2 将 binding plan 接入 Report 事务的 reconcile 分支时，须显式裁决 reclaimed 是否放行。
+绑定资格以 Report 事务显式确认的 finalize/reconcile 结果为准（Batch 1 的 planner 当前仅接受 `run.phase === "running"`；Batch 2 片 6 落地资格参数，规则见本节末段）。canceled/superseded 不绑定，reclaimed（terminal-grace 唤醒报告）路径在 Batch 1 保守排除，Batch 2 按本节末段裁决。
 
 绑定必须确认已提交 manifest 的 `id === snapshotId`，namespace 匹配可信归属，manifest / Run / Loop / 可信归属四方 machineId 相等，manifest / Run / Loop 的 Loop ID 一致，manifest 配置代际等于当前 Loop 代际。写入已验证的 `manifest.id`。内部拒绝分类为 `snapshot_not_committed` / `cross_namespace` / `cross_machine` / `cross_loop` / `stale_config_generation`；Batch 2 拥有最终接线分类法。
 
 bind 计划携带解析时的 `guardConfigRevision`。落库的 Run UPDATE 守卫 Run `(id, phase)`，并在同一语句的代际子查询中以 `FOR UPDATE` 锁定 Loop 行、复验当前代际。锁持续到该语句或外层 Report 事务提交，与配置 UPDATE 互斥：配置先提交时绑定看到新代际并守卫失败；绑定先取得锁时配置等待绑定提交。普通无锁子查询的语句快照不足以保证此互斥。
 
 守卫零行抛 `ArtifactBindingGuardLostError`，调用方须重解析、重计划；代际前进后转为 `stale_config_generation`。`record_error` 仍守卫 Run `(id, phase)`，但不锁 Loop、不加代际守卫：`cross_*` 与 `snapshot_not_committed` 不受配置代际影响，`stale_config_generation` 在代际单调递增下仍成立。
+
+Batch 2 裁决 reconcile 绑定资格：合法 finalize 与合法 terminal-grace reconcile 都可以绑定 Report 明确携带且通过校验的 snapshot（资格由 Report 事务显式确认，而不是放宽 phase 检查）；取消、superseded 以及没有合法最终 Report 的 reclaimed Run 不绑定。绑定 planner 的资格参数在 Batch 2 片 6 落地。
+
+### 20. Delivery Artifact 配置与最终同步代际
+
+Delivery 的 Loop 投影携带可选 `artifact: {dir, configRevision}`，值来自成功 claim 的权威 Loop 行，不是请求参数。Daemon 的最终同步固定使用该代际；Run 期间新设置的目录不改绑该 Run 的最终同步。配置被清除（`artifactDir=null`）时该字段缺席。
+
+### 21. 生产门面边界
+
+Batch 2 的生产门面是 `packages/server/src/artifact/production.ts` 的 `createProductionArtifactHome({db, dataDir, clock?}) → ArtifactHomeDeps`：构造以 `<dataDir>/blobs` 为根的本地 BlobStore、Machine 归属解析器、生产 ID 工厂（`sync-`/`amf-` 加 UUID）与注入时钟。构造零文件系统副作用、不读环境变量、不依赖启动模块。片 1 只由测试调用该门面；生产装配与路由接线属于片 2。
 
 ## 后果
 
@@ -212,3 +230,10 @@ bind 计划携带解析时的 `guardConfigRevision`。落库的 Run UPDATE 守�
 - 决策 9/11 明确去重与完备性检查使用已验证 size，保证容量统计与实际内容一致。关联：[#81](https://github.com/zhuabo001/loop-platform-zhb/issues/81)。
 - 决策 10 明确元数据登记失败归 `storage_error` 结果联合；决策 11 钉定 commit 回滚矩阵（任一步失败整体回滚、守卫丢失恰一次重跑、持续丢失失败关闭）、真竞态下败方失败打账因陈旧 revision 守卫零行跳过，以及统一 OCC 与 claim/report 真实写方的双向交错收敛。片 5 并发/交错/故障注入验收的 PGlite 证据不替代 #11/#72。
 - 决策 11 修正 commit 回滚矩阵的驱动失败分类：已识别的可恢复存储故障（SQLSTATE 08/53/57/58 类）在事务整体回滚后归稳定 `storage_error` 结果并 best-effort 打账，无码或未识别类错误保留原始抛出边界；同步限定真竞态零行打账的已验证窗口（胜方提交晚于败方观测），并区分 AC9 反向交错的收敛路径——claim 守卫丢失一次后有界重跑，report 写事务快照后至、守卫不丢失直接落地。来源：片 5 Round 1 三轨审查记录（A5-1）。
+
+### 2026-10-04
+
+- 决策 7 确定 Batch 2 生产归属为 Machine namespace：`namespaceId` 取已验证 Machine 行的 `machineId`；行缺失或键不合规统一 `artifact_attribution_missing`（403），wire 与读视图不含 namespace 字段。
+- 决策 13 将 wire 码扩为 11（新增 `artifact_revision_exhausted`、`artifact_session_committed`），冻结完整 HTTP 映射、第 5 个重试类 `recover_receipt`、客户端失败 9 值分类法及错误上报的双匹配写入门槛（迟到错误不覆盖新成功）。
+- 决策 14 固定生产 Blob 根为 `<dataDir>/blobs`；新增决策 20 记录 Delivery Artifact 配置与最终同步代际固定；新增决策 21 记录生产门面边界。
+- 决策 19 裁决 reconcile 绑定资格：合法 finalize 与合法 terminal-grace reconcile 可绑定经校验的 snapshot，取消、superseded 与无合法最终 Report 的 reclaimed 不绑定（代码改动在 Batch 2 片 6）。
