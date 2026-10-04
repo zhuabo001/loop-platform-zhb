@@ -57,9 +57,9 @@ Batch 1 错误映射在 HTTP 接线时补齐：revision 耗尽使用新增 `arti
 ### Slice 1 — 契约、归属与生产边界（0.5–1 天）
 
 - **前置：**Batch 1 已合入。
-- **交付及范围：**Protocol 增量、Machine attribution resolver、ArtifactHome 生产门面契约、ADR-010 修订。
+- **交付及范围：**Protocol 增量（冻结全部 10 个端点的 wire 形状，含读取端视图 DTO）、Machine attribution resolver、ArtifactHome 生产门面实现（真装配工厂 + 测试，不接 `start.ts`／路由）、ADR-010 修订。
 - **步骤：**冻结 API、错误码及重试、Delivery Artifact 配置、客户端错误上报、reconcile 绑定资格；Blob 根目录定为 `<dataDir>/blobs`。
-- **验收：**新增 schema 纳入 tolerant-reader 清单；可信 Machine 映射稳定；缺少归属拒绝；wire 无 namespace 字段；错误映射和重试矩阵均有测试。
+- **验收：**新增 schema 纳入 tolerant-reader 清单；可信 Machine 映射稳定；缺少归属拒绝（prepare／PUT／commit／上报／读取全域，含读取失败域声明）；wire 无 namespace 字段；错误映射和重试矩阵均有测试。
 - **停止边界：**不挂生产路由、不启动 Watcher，不提前创建 Team，不改 Poll 注册行为。
 
 ### Slice 2 — Server 配置、同步 HTTP 与 Poll 接线（1–1.5 天）
@@ -137,6 +137,21 @@ Batch 1 错误映射在 HTTP 接线时补齐：revision 耗尽使用新增 `arti
 | **AR1–AR6** | 最终快照、固定 Report 重试、快照不随后续编辑改变、30 秒期限、同步失败不丢报告、非法 snapshot 引用 |
 | **AR7–AR12** | 取消／supersede、无 Report 的 reclaimed Run、合法迟到 reconcile、配置与绑定竞争、Finish/Report 原子回滚、旧协议兼容 |
 | **AV1–AV8** | 读取接线、跨资源拒绝、HTML/XSS 转义、attachment/响应头、二进制下载、结构 diff、缺失／过期状态、句柄与中断清理 |
+
+片 1 的 AT 编号逐项对应（场景不依赖 handoff 记录）：
+
+| ID | 场景 | 主要证据 |
+|---|---|---|
+| AT1 | 11 码逐字序；5 重试类逐字；码→重试类穷尽映射 | `protocol/src/artifact.test.ts` |
+| AT2 | 客户端失败分类法 9 值；与 wire 码不相交；落库域为有序去重并集 | `protocol/src/artifact.test.ts` |
+| AT3 | 读取端视图形状黄金（loop 视图含 stale／未配置、run bound/missing 判别、download/diff 查询、diff 条目只含前后 hash/size） | `protocol/src/artifact-view.test.ts` |
+| AT4 | Delivery 携带／省略 `artifact`；错误上报 DTO 往返与 unknown failure 拒绝；响应 `ok+recorded` | `protocol/src/artifact.test.ts`、`poll.test.ts` |
+| AT5 | 冻结 Phase 4 reader 剥离 `loop.artifact`；当前 reader 接受旧 delivery 黄金 | `protocol/src/phase5-compat.test.ts` |
+| AT6 | 新增 schema 登记 tolerant-reader（CASES 41 → 54） | `protocol/src/tolerant-reader.test.ts` |
+| AT7 | wire 无 namespace：schema 声明键遍历 + 注入 `namespaceId` 断言被剥离 | `protocol/src/artifact-view.test.ts` |
+| AT8 | 可信 Machine 归属稳定映射；未知／非法键 → `attribution_missing`；resolve 零写入 | `server/src/artifact/attribution-machine.test.ts` |
+| AT9 | 20 字面量 HTTP 映射矩阵；逐操作失败域逐字固定（含读取域的 403 归属拒绝）；taxonomy 可达性 | `server/src/artifact/error-mapping.test.ts` |
+| AT10 | 生产门面：构造零 fs 副作用、真实落盘 `<dataDir>/blobs/<machineId>/<hash>`、ID 工厂、已配置 Loop 跑通 prepare | `server/src/artifact/production.test.ts` |
 
 额外覆盖配置 no-op、Create 原子性、busy Poll 的 watch 更新、capability 与 claim 交错、错误 taxonomy、8 MiB 请求边界和迟到错误不得覆盖新状态。
 
