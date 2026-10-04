@@ -41,7 +41,7 @@ schema 层只检查 typeof 形状：`path`/`hash` 为 `z.string()`，`size` 使�
 
 存储 namespace 的唯一来源是可信归属解析器：由已认证的可信 Machine 身份产出 `{namespaceId, machineId}`。wire 输入不得指定 namespace；每次 prepare/PUT/commit/读取/快照绑定都重新解析归属。缺少有效归属时拒绝操作（`artifact_attribution_missing` / 403），不提供默认全局命名空间。生产 Team 归属由后续认证批次接入；Batch 1 测试注入归属映射。
 
-Batch 2 的生产解析器使用 **Machine namespace**：`namespaceId` 取已验证 Machine 行的 `machineId`（`m-<sha256(token)[:16]>`，满足 BlobStore 的 `NAMESPACE_ID_RE`）。解析器在每次操作时重新查询 machines 行；行缺失或 id 不满足键规则时返回 `attribution_missing`（403），不抛异常、不写任何状态，也不把非法键交给 BlobStore。凭证校验（tokenHash 比对、不注册）属于 HTTP 认证读路径（Batch 2 片 2）。Batch 3 的 Team 归属替换解析器内部实现，并离线复制 Blob 后切换元数据；wire 与存储键规则不变。
+Batch 2 的生产解析器使用 **Machine namespace**：`namespaceId` 取已验证 Machine 行的 `machineId`（`m-<sha256(token)[:16]>`，满足 BlobStore 的 `NAMESPACE_ID_RE`）。解析器在每次操作时重新查询 machines 行；行缺失或 id 不满足键规则时返回 `attribution_missing`（403），不抛异常、不写任何状态，也不把非法键交给 BlobStore。凭证校验属于 HTTP 认证读路径（Batch 2 片 2 落地为 `verifyMachineCredential`：形状检查 → 派生 id → 行查找 → 全量 tokenHash 比对，**永不注册**——注册只属 poll），解析器在其后运行并信任 store 解析出的身份。Batch 3 的 Team 归属替换解析器内部实现，并离线复制 Blob 后切换元数据；wire 与存储键规则不变。
 
 ### 8. 配置代际与过期
 
@@ -50,6 +50,8 @@ Batch 2 的生产解析器使用 **Machine namespace**：`namespaceId` 取已验
 `artifactDir` 的 workdir-相对/绝对路径规则是 Server 单侧 policy：相对路径基于显式 workdir 解析，无 workdir 时必须是绝对路径。该规则不进入共享 policy，Server 不解析机器上的文件系统路径。配置更新允许用于 completed Loop，沿用 `updateTaskFile` 的运维重定向语义。
 
 配置 planner 的求值序固定为 validate → noop → exhaustion。等值合法命令在 int32 上界仍为 noop；非法值即使与存储值相等也拒绝。有效变更遇上界返回 `config_revision_exhausted`，零写入。
+
+Loop 创建时携带的可选 `artifactDir` 经**同一** planner 求值（快照为 `{artifactDir: null, artifactConfigRevision: 0, workdir}`）并与 Loop 创建在**同一 INSERT** 落库：合法值即初始代际为 **1**（代际 0 专表「从未配置」），非法值以与 PATCH 相同的 coded 400（`artifact_validation_failed`）拒绝整个创建（零行写入）。创建不是一次「变更事件」，但「已配置 ⇒ 代际 ≥ 1」由该裁决统一成立。
 
 ### 9. prepare 幂等与 requestId
 
@@ -133,6 +135,10 @@ wire 错误形状复用 `apiErrorSchema` `{error, code?}`；错误文本不是�
 
 客户端失败分类法固定为 9 值：`directory_missing`、`unreadable`、`outside_jail`、`symlink`、`special_file`、`unstable`、`too_large`、`watcher_error`、`timeout`。该集合与 wire 错误码不相交，二者的有序并集（`ARTIFACT_SYNC_STATE_ERRORS`）是 Loop 同步尝试状态列的取值域。错误上报 `POST /api/machine/loops/:id/artifact-sync-error` 携带 `failure`、`configRevision` 与 `baseManifestRevision`；仅当二者仍与 Loop 当前值匹配时才更新同步尝试状态（响应 `recorded:false` 表示未写入），迟到的错误不得覆盖较新的成功状态。
 
+片 2 冻结两处补充：PUT 的成功响应为 `{ok, size, published}`（`size` = 已验证字节数，绝不信声明 size/Content-Length；`published:false` = 同 key 已存在的去重命中，字节同样经过完整校验）；服务端映射表新增 `machineRead` 失败域（归属缺失、Loop 缺失/跨 Machine、目录未配置、存储故障），读取路径的存储故障同样归 `artifact_storage_error`。
+
+错误上报的写入裁决（`recordArtifactSyncError`）：求值序为可信归属 → Loop 作用域（非上报 Machine 的 Loop 按不存在处理）→ **未配置门槛**（`artifactDir` 为空 ⇒ `recorded:false` 零写入，防 0/0 假匹配污染从未配置的 Loop）→ 双匹配门槛。仅在门槛全过后执行守卫 UPDATE（`attemptedAt=now`、`error=失败类`、统一 revision +1，**`succeededAt` 不动**），守卫为 `id + revision + 观测 artifactConfigRevision + 观测 artifactManifestRevision`；任一门槛不符或守卫零行都返回 `recorded:false`、零写入、**不重试**（记账从不重跑，同 `stampCommitFailure` 先例）。`message` 只做接受：无列可存，不落库也不记日志。
+
 ### 14. BlobStore 内部接口契约
 
 服务端内部接口位于 `packages/server/src/artifact/blob-store.ts`，由片 1 冻结、片 3 实现。方法为 `writeVerified`、`has`、`read`；无删除、无历史 GC。预期失败使用结果联合：`invalid_key`/`content_mismatch`/`blob_missing`/`not_regular_file`/`storage_error`。内存与本地 adapter 遵守同一契约。
@@ -167,7 +173,7 @@ fsync 只覆盖 Blob 文件，不做目录 fsync。目录项崩溃丢失由决�
 
 本批不挂载任何 Artifact HTTP 路由、不启动 watcher、Daemon 不声明 `artifact-sync-v1`、Report 不消费 `artifactSnapshotId`/`artifactSyncError`、Run claim 条件不变、旧 Loop 默认未配置 Artifact 目录且不开始上传、生产装配不构造 BlobStore。
 
-Daemon 的 poll 出站体仅包含既有五个静态字段与 `availableSlots`，不发送 `watchDigest`；poll/report 请求仅使用 `/api/machine/poll` 与 `/api/machine/report`。Batch 2 watcher 接线时须显式更新该边界。AD1–AD4 休眠守卫覆盖路由、Create/Poll/Report、出站请求及启动装配，长期验收要求以 Batch 1 计划为准。Batch 2 按批次计划逐切片解除该边界：片 1 只冻结契约与生产门面（AD1–AD4 仍全绿），片 2 挂路由与生产装配，片 5 声明 capability 并启动 watcher，片 6 消费 Report 字段。
+Daemon 的 poll 出站体仅包含既有五个静态字段与 `availableSlots`，不发送 `watchDigest`；poll/report 请求仅使用 `/api/machine/poll` 与 `/api/machine/report`。Batch 2 watcher 接线时须显式更新该边界。AD1–AD4 休眠守卫覆盖路由、Create/Poll/Report、出站请求及启动装配，长期验收要求以 Batch 1 计划为准。Batch 2 按批次计划逐切片解除该边界：片 1 只冻结契约与生产门面（AD1–AD4 仍全绿），片 2 挂 6 条路由与生产装配并解除 Create/Poll/claim/Delivery 的相关休眠，片 5 声明 capability 并启动 watcher，片 6 消费 Report 字段。片 2 之后休眠仍覆盖：Report Artifact 字段（片 6）、Daemon watcher 与 `artifact-sync-v1` 声明（片 5）、读路由与 Dashboard（片 7）；对应守卫按各片的实际解除范围重写（AD1 拆为已挂/未挂两半、AD2(a)/(b) 反转为启用语义、AD4 保留「启动零 fs 副作用、无 watcher」并新增装配断言）。
 
 ### 17. 共享 policy 的 ADR-002 窄例外记录
 
@@ -193,11 +199,17 @@ Batch 2 裁决 reconcile 绑定资格：合法 finalize 与合法 terminal-grace
 
 ### 20. Delivery Artifact 配置与最终同步代际
 
-Delivery 的 Loop 投影携带可选 `artifact: {dir, configRevision}`，值来自成功 claim 的权威 Loop 行，不是请求参数。Daemon 的最终同步固定使用该代际；Run 期间新设置的目录不改绑该 Run 的最终同步。配置被清除（`artifactDir=null`）时该字段缺席。
+Delivery 的 Loop 投影携带可选 `artifact: {dir, configRevision}`，值来自成功 claim 的权威 Loop 行，不是请求参数。Daemon 的最终同步固定使用该代际；Run 期间新设置的目录不改绑该 Run 的最终同步。配置被清除（`artifactDir=null`）时该字段缺席。片 2 接线：值取自 claim 事务 CAS 返回的权威行（`buildDelivery` 在 `artifactDir` 非空时才带该键）。
 
 ### 21. 生产门面边界
 
-Batch 2 的生产门面是 `packages/server/src/artifact/production.ts` 的 `createProductionArtifactHome({db, dataDir, clock?}) → ArtifactHomeDeps`：构造以 `<dataDir>/blobs` 为根的本地 BlobStore、Machine 归属解析器、生产 ID 工厂（`sync-`/`amf-` 加 UUID）与注入时钟。构造零文件系统副作用、不读环境变量、不依赖启动模块。片 1 只由测试调用该门面；生产装配与路由接线属于片 2。
+Batch 2 的生产门面是 `packages/server/src/artifact/production.ts` 的 `createProductionArtifactHome({db, dataDir, clock?}) → ArtifactHomeDeps`：构造以 `<dataDir>/blobs` 为根的本地 BlobStore、Machine 归属解析器、生产 ID 工厂（`sync-`/`amf-` 加 UUID）与注入时钟。构造零文件系统副作用、不读环境变量、不依赖启动模块。片 1 只由测试调用该门面；片 2 由 `bootstrapServer` 装配为 `BootedServer.artifacts = createArtifactApi(home)`，HTTP 适配器只经该窄接口消费——构造仍零副作用（`<dataDir>/blobs` 首次写入才出现）。
+
+### 22. Poll watch 下发与 claim capability 门控
+
+Poll 的 watch 集合是该 Machine 名下**全部已配置 Loop**（`artifactDir` 非空，含 Paused 与 Completed，不按 enabled/completedAt 过滤）；每项为 `{loopId, artifactDir, workdir: loop.workdir ?? null, roots: machine.roots ?? [], configRevision}`。**服务端只在 Machine 已声明 `artifact-sync-v1` 时下发 watch**——未声明的 daemon 不运行 watcher，配置是死重；未声明者（含全部 Batch 1 daemon）的 poll 响应因此与 Batch 1 逐字一致。判定规则：请求缺 `watchDigest` **等价于空集合的摘要**（无 watch 状态的 daemon 与空集合语义等价，旧 daemon 因此不产生噪声）；有效摘要 ≠ 计算摘要才返回 `{watch, watchDigest}`，相等则两者都缺席；`watch: []` 表示清空全部 watch。busy Poll（`availableSlots: 0`）同样处理 watchDigest——watch 是配置分发，不依赖 run 领取。
+
+claim 的 capability 门控是**逐候选**的，不是整轮 Poll 门控：已配置 Loop 要求 Machine 声明 `artifact-sync-v1`，缺 capability 的候选被跳过、不阻塞同 Machine 的其他候选（未配置 Loop 的领取条件不变）。判定发生在 claim 的权威 Loop 解析处（与 Completed 检查同点），其快照由事务内 `id + revision` CAS 证明——扫描与 claim 之间落地的配置写入使 CAS 丢失、有界重跑以新状态重裁。服务端不下发 artifact 的 `requiredCapabilities` 提示（该提示保持 terminal-journal 语义；daemon 在片 5 才声明该 capability）。
 
 ## 后果
 
@@ -237,3 +249,11 @@ Batch 2 的生产门面是 `packages/server/src/artifact/production.ts` 的 `cre
 - 决策 13 将 wire 码扩为 11（新增 `artifact_revision_exhausted`、`artifact_session_committed`），冻结完整 HTTP 映射、第 5 个重试类 `recover_receipt`、客户端失败 9 值分类法及错误上报的双匹配写入门槛（迟到错误不覆盖新成功）。
 - 决策 14 固定生产 Blob 根为 `<dataDir>/blobs`；新增决策 20 记录 Delivery Artifact 配置与最终同步代际固定；新增决策 21 记录生产门面边界。
 - 决策 19 裁决 reconcile 绑定资格：合法 finalize 与合法 terminal-grace reconcile 可绑定经校验的 snapshot，取消、superseded 与无合法最终 Report 的 reclaimed 不绑定（代码改动在 Batch 2 片 6）。
+
+### 2026-10-05
+
+- 决策 13 冻结 PUT 成功响应 `{ok, size, published}`（`size` = 已验证字节数、`published:false` = 去重命中）与 `machineRead` 失败域（归属、Loop、未配置、存储故障）；记录错误上报的写入裁决：未配置门槛、双匹配门槛、守卫 UPDATE 形状，门槛不符或守卫零行均 `recorded:false`、零写入、不重试。
+- 决策 8 裁决 Create 携带的 `artifactDir` 经同一 planner 求值、与创建同 INSERT 落库、初始代际为 1（代际 0 专表从未配置）；非法值与 PATCH 同码（400 `artifact_validation_failed`）且整个创建零写入。
+- 决策 7 记录凭证校验落地为 `verifyMachineCredential`（形状检查 → 派生 id → 行查找 → 全量 tokenHash 比对，永不注册）。
+- 新增决策 22：Poll watch 集合与下发门控（仅 Machine 声明 `artifact-sync-v1` 才下发；缺 `watchDigest` 等价于空集合摘要；busy Poll 同样处理）与 claim 的逐候选 capability 门控（权威解析 + 事务内 CAS 证明，非阻塞跳过，`requiredCapabilities` 保持 terminal-journal 语义）。
+- 决策 16 更新：片 2 挂 6 条路由与生产装配，明确片 2 后仍休眠的范围（Report 字段、Daemon watcher、读路由）与各守卫的重写方式。

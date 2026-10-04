@@ -128,6 +128,7 @@ Batch 1 错误映射在 HTTP 接线时补齐：revision 耗尽使用新增 `arti
 | 编组 | 验收场景 |
 |---|---|
 | **AT1–AT10** | 契约与归属（片 1）：协议增量与 tolerant-reader 登记、11 码与 5 重试类矩阵、客户端失败分类法、Delivery Artifact 配置、wire 无 namespace、可信 Machine 归属映射、错误映射矩阵、生产门面 |
+| **AH1–AH12** | 配置与同步接线（片 2）：PUT 响应冻结、配置 API、Create 原子持久化、既有 Machine 认证读路径、真实 HTTP prepare→PUT→commit 与幂等恢复、8 MiB 双闸、失败面、machine 读取、错误上报、watch 下发与 claim capability 门控、taxonomy |
 | **AW1–AW7** | 文件创建、修改、删除、文件重命名、目录重命名、idle 编辑、同大小快速改写 |
 | **AW8–AW14** | 原子替换、分块写入、事件合并、遗漏事件补偿、订阅与初扫交错、缓存失效、Paused/Completed 持续同步 |
 | **AJ1–AJ5** | workdir 相对路径、无 workdir 的绝对路径、roots 交集及越界、目录 symlink、文件 symlink |
@@ -152,6 +153,23 @@ Batch 1 错误映射在 HTTP 接线时补齐：revision 耗尽使用新增 `arti
 | AT8 | 可信 Machine 归属稳定映射；未知／非法键 → `attribution_missing`；resolve 零写入 | `server/src/artifact/attribution-machine.test.ts` |
 | AT9 | 20 字面量 HTTP 映射矩阵；逐操作失败域逐字固定（含读取域的 403 归属拒绝）；taxonomy 可达性 | `server/src/artifact/error-mapping.test.ts` |
 | AT10 | 生产门面：构造零 fs 副作用、真实落盘 `<dataDir>/blobs/<machineId>/<hash>`、ID 工厂、已配置 Loop 跑通 prepare | `server/src/artifact/production.test.ts` |
+
+片 2 的 AH 编号逐项对应（场景不依赖 handoff 记录）：
+
+| ID | 场景 | 主要证据 |
+|---|---|---|
+| AH1 | PUT 响应 DTO 冻结：`{ok, size, published}` 往返、未知键剥离、半形拒绝、tolerant-reader 登记（CASES 54 → 55） | `protocol/src/artifact.test.ts`、`tolerant-reader.test.ts` |
+| AH2 | PATCH artifact-dir：set/change/clear 代际递增、no-op 零写入、响应携带 `artifactDir`、DTO 400、相对路径无 workdir 400 `artifact_validation_failed`、未知 Loop 404 无码、int32 上界 409 `artifact_revision_exhausted` | `server/src/http/artifact-routes.test.ts` |
+| AH3 | Create 原子持久化：合法 `artifactDir` 与 Loop 同 INSERT 落库（`artifactConfigRevision=1`）、相对无 workdir coded 400 零行、省略 = null+0、显式 null 仍 400 | `server/src/http/app.test.ts`（AD2(a) 重写） |
+| AH4 | 既有 Machine 认证读路径：未注册/哈希不符/形状不符 token 401 且零注册；跨 Machine 的 loop/session 请求失败且六表 item-equal；被拒 PUT 零拉流 | `server/src/http/artifact-routes.test.ts`、`artifact/api.test.ts` |
+| AH5 | 真实 HTTP E2E（真实监听 + 文件型 PGlite + `<tmp>/blobs`，经生产装配）：prepare → 多块流式 PUT → commit；回执、Loop 指针/代际、manifest 行与落盘字节一致 | `server/src/phase5-batch2-slice2-e2e.test.ts` |
+| AH6 | 幂等恢复：重复 prepare 同 syncId 且 `needHashes:[]`；重复 PUT `published:false`；重复 commit 返回同一固定回执、manifest 行数不变 | 同上、`artifact/api.test.ts` |
+| AH7 | prepare 双闸：运输层 413（content-length 与 chunked 两路径）、原始文本上限 413（含无效 UTF-8 解码膨胀）、边界内通过、畸形 JSON 400、DTO 400 | `server/src/http/artifact-routes.test.ts` |
+| AH8 | PUT/commit 失败面：缺同步会话头 400、内容不符 400 `artifact_content_mismatch`、已提交 409 `artifact_session_committed`、过期 409、base 漂移 409 `artifact_manifest_conflict`、未协商 hash 409 | 同上 |
+| AH9 | machine 读取：已配置四字段；未配置 409 `artifact_config_conflict`；未知/跨机 404；无凭据 401；wire 无 namespace | 同上 |
+| AH10 | 错误上报：双匹配 `recorded:true`（attemptedAt/error/revision+1，succeededAt 不动）；代际/base 漂移、未配置 Loop、守卫零行均 `recorded:false` 零写；成功后的迟到错误不覆盖；跨机/未知 404 零写；可恢复存储故障 500 `artifact_storage_error` | `server/src/artifact/sync-error.test.ts`、路由套件 |
+| AH11 | watch：capable 且无 digest ⇒ 全集 + digest；digest 一致 ⇒ 两键缺席；新增/变更/清空配置 ⇒ 全量；清空 ⇒ `watch:[]`；busy Poll 同样携带；Paused/Completed 在集合内；非 capable 完全不发且不查询 | `server/src/artifact/watch.test.ts`、`coordinator/poll.test.ts`（AD2(b) 重写） |
+| AH12 | claim 门控与 Delivery：已配置 + 非 capable ⇒ 候选跳过（无 lease、run 仍 pending、零写）且不阻塞其他候选；未配置 Loop 照常领取；capable ⇒ 领取且 Delivery 携带 `{dir, configRevision}`；扫描后配置竞态在 claim 侧被拒 | `coordinator/poll.test.ts`、`coordinator/claim.test.ts`、`gateway/delivery.test.ts` |
 
 额外覆盖配置 no-op、Create 原子性、busy Poll 的 watch 更新、capability 与 claim 交错、错误 taxonomy、8 MiB 请求边界和迟到错误不得覆盖新状态。
 
