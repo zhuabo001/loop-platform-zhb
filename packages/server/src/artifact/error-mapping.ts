@@ -22,9 +22,13 @@ import type { ArtifactConfigRejection } from "./config.js";
 import type { CommitArtifactSyncFailure, PrepareArtifactSyncFailure, PutArtifactBlobFailure } from "./sync.js";
 
 /** Read-side failures, pre-frozen for Batch 2 slice 7 (the read facade and
- *  the download/diff routes consume them; a new literal extends this union
- *  AND the table below in the same change). */
+ *  the download/diff routes consume them; a new literal extends this union,
+ *  the table and `ARTIFACT_OPERATION_FAILURES.read` in the same change).
+ *  决策 7 spans reads too: the facade re-resolves attribution per call, so a
+ *  vanished machine row or an unformable namespace key is a first-class read
+ *  result (403), not an excluded branch (#83). */
 export type ArtifactReadFailure =
+  | "attribution_missing"
   | "loop_not_found"
   | "run_not_found"
   | "snapshot_not_found"
@@ -148,6 +152,8 @@ export const ARTIFACT_OPERATION_FAILURES: ArtifactOperationFailures = {
   configUpdate: ["loop_not_found", "artifact_dir_invalid", "artifact_dir_relative_without_workdir", "config_revision_exhausted"],
   syncErrorReport: ["loop_not_found", "attribution_missing", "storage_error"],
   read: [
+    // 决策 7 first: attribution is resolved before any resource lookup.
+    "attribution_missing",
     "loop_not_found",
     "run_not_found",
     "snapshot_not_found",
