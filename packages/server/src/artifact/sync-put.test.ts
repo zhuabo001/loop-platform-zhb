@@ -39,8 +39,7 @@ import { ARTIFACT_SYNC_SESSION_TTL_MILLIS, type PrepareArtifactSyncRequest } fro
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
 import { artifactBlobs, artifactSyncSessions, loops, type ArtifactBlobRow } from "../db/schema.js";
 import { eq } from "drizzle-orm";
-import { FakeClock, seedLoop, seedMachine, snapshotLoops } from "../testkit/index.js";
-import type { ArtifactAttributionResolver } from "./attribution.js";
+import { FakeClock, seedLoop, seedMachine, snapshotLoops, staticAttribution } from "../testkit/index.js";
 import { createMemoryBlobStore, type MemoryBlobStoreFaults } from "./blob-store-memory.js";
 import type { BlobStore } from "./blob-store.js";
 import { updateArtifactConfig } from "./config.js";
@@ -68,19 +67,6 @@ function makeRequest(overrides: Partial<PrepareArtifactSyncRequest> = {}): Prepa
     baseManifestRevision: 0,
     entries: [{ path: "a.txt", hash: HASH_A, size: 3 }],
     ...overrides,
-  };
-}
-
-function staticAttribution(map: Record<string, string>): ArtifactAttributionResolver {
-  return {
-    resolve: (machine) => {
-      const namespaceId = map[machine.machineId];
-      return Promise.resolve(
-        namespaceId
-          ? { ok: true as const, namespaceId, machineId: machine.machineId }
-          : { ok: false as const, failure: "attribution_missing" as const },
-      );
-    },
   };
 }
 

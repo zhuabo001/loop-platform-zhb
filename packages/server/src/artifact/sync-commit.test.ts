@@ -61,8 +61,7 @@ import {
   type Loop,
 } from "../db/schema.js";
 import { REVISION_INT32_MAX } from "../schedule/transition.js";
-import { FakeClock, seedLoop, seedMachine, seedRun, snapshotLoops } from "../testkit/index.js";
-import type { ArtifactAttributionResolver } from "./attribution.js";
+import { FakeClock, seedLoop, seedMachine, seedRun, snapshotLoops, staticAttribution } from "../testkit/index.js";
 import { applyArtifactBindingPlan, planArtifactSnapshotBinding } from "./binding-plan.js";
 import { createMemoryBlobStore, type MemoryBlobStoreFaults } from "./blob-store-memory.js";
 import type { BlobStore } from "./blob-store.js";
@@ -103,19 +102,6 @@ function makeRequest(overrides: Partial<PrepareArtifactSyncRequest> = {}): Prepa
       { path: "b.txt", hash: HASH_B, size: 3 },
     ],
     ...overrides,
-  };
-}
-
-function staticAttribution(map: Record<string, string>): ArtifactAttributionResolver {
-  return {
-    resolve: (machine) => {
-      const namespaceId = map[machine.machineId];
-      return Promise.resolve(
-        namespaceId
-          ? { ok: true as const, namespaceId, machineId: machine.machineId }
-          : { ok: false as const, failure: "attribution_missing" as const },
-      );
-    },
   };
 }
 

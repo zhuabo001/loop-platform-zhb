@@ -54,8 +54,7 @@ import {
 import { createRunCoordinator } from "../coordinator/index.js";
 import { executeReportTx } from "../store/report.js";
 import { claimRunWithLeaseTx } from "../store/runs.js";
-import { FakeClock, makeTestFactories, seedLease, seedLoop, seedMachine, seedRun, testDeps } from "../testkit/index.js";
-import type { ArtifactAttributionResolver } from "./attribution.js";
+import { FakeClock, makeTestFactories, seedLease, seedLoop, seedMachine, seedRun, testDeps, staticAttribution } from "../testkit/index.js";
 import { createMemoryBlobStore } from "./blob-store-memory.js";
 import type { BlobStore } from "./blob-store.js";
 import { updateArtifactConfig } from "./config.js";
@@ -84,19 +83,6 @@ function makeRequest(overrides: Partial<PrepareArtifactSyncRequest> = {}): Prepa
     baseManifestRevision: 0,
     entries: [{ path: "a.txt", hash: HASH_A, size: 3 }],
     ...overrides,
-  };
-}
-
-function staticAttribution(map: Record<string, string>): ArtifactAttributionResolver {
-  return {
-    resolve: (machine) => {
-      const namespaceId = map[machine.machineId];
-      return Promise.resolve(
-        namespaceId
-          ? { ok: true as const, namespaceId, machineId: machine.machineId }
-          : { ok: false as const, failure: "attribution_missing" as const },
-      );
-    },
   };
 }
 

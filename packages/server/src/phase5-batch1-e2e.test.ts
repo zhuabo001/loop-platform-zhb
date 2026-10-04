@@ -53,8 +53,7 @@ import type { PrepareArtifactSyncRequest } from "@loopzhb/protocol";
 
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "./db/index.js";
 import { artifactManifests, artifactSyncSessions, loops, runs, type Loop, type Run } from "./db/schema.js";
-import { FakeClock, seedLoop, seedMachine, seedRun, snapshotLoops } from "./testkit/index.js";
-import type { ArtifactAttributionResolver } from "./artifact/attribution.js";
+import { FakeClock, seedLoop, seedMachine, seedRun, snapshotLoops, staticAttribution } from "./testkit/index.js";
 import { applyArtifactBindingPlan, planArtifactSnapshotBinding } from "./artifact/binding-plan.js";
 import { createLocalBlobStore } from "./artifact/blob-store-local.js";
 import type { BlobKey, BlobStore } from "./artifact/blob-store.js";
@@ -88,19 +87,6 @@ function patternBytes(size: number): Uint8Array {
 /** Multi-chunk source stream — the PUT path must stream, not single-shot. */
 async function* chunks(bytes: Uint8Array, chunkSize: number): AsyncIterable<Uint8Array> {
   for (let off = 0; off < bytes.byteLength; off += chunkSize) yield bytes.subarray(off, off + chunkSize);
-}
-
-function staticAttribution(map: Record<string, string>): ArtifactAttributionResolver {
-  return {
-    resolve: (machine) => {
-      const namespaceId = map[machine.machineId];
-      return Promise.resolve(
-        namespaceId
-          ? { ok: true as const, namespaceId, machineId: machine.machineId }
-          : { ok: false as const, failure: "attribution_missing" as const },
-      );
-    },
-  };
 }
 
 /** Consume a blob read to completion with per-element ok assertions (the
