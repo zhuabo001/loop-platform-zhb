@@ -14,6 +14,7 @@ import {
   canonicalPreparePayloadString,
   canonicalWatchConfigString,
   hasArtifactSyncV1,
+  isNeverSyncDirectoryPath,
   isNeverSyncPath,
   normalizeManifestEntries,
   parseBoundedJsonText,
@@ -338,6 +339,42 @@ describe("AP10: never-sync control-directory and credential rules", () => {
       "myid_rsa", // the rule is a PREFIX
     ]) {
       expect(isNeverSyncPath(path), path).toBe(false);
+    }
+  });
+});
+
+describe("A5 (slice-5): the root/ancestor never-sync DIRECTORY predicate", () => {
+  it("matches a directory rule on the root itself or ANY ancestor, for absolute and relative paths", () => {
+    for (const path of [
+      ".git",
+      ".ssh",
+      "/home/u/.ssh",
+      "/home/u/.ssh/keys",
+      "/home/u/project/.config/gcloud",
+      "/srv/x/node_modules/pkg",
+      "/tmp/loopzhb-runs-1/state",
+      "/home/u/.cache/proj",
+      "a/.git/b",
+      ".config/gcloud/x",
+    ]) {
+      expect(isNeverSyncDirectoryPath(path), path).toBe(true);
+    }
+  });
+
+  it("matches ASCII-case-insensitively and does not over-match lookalikes", () => {
+    for (const path of ["/HOME/U/.SSH/x", "/home/u/Node_Modules/y"]) {
+      expect(isNeverSyncDirectoryPath(path), path).toBe(true);
+    }
+    for (const path of ["/home/u/my.gitignore", "/home/u/node_modulesx", "/home/u/venv2", "/home/u/.envrc"]) {
+      expect(isNeverSyncDirectoryPath(path), path).toBe(false);
+    }
+  });
+
+  it("does NOT apply FILE rules to a directory: basenames like `credentials` or `.env` stay legal", () => {
+    // The slice-3 scanner stays the single policy for relative manifest paths
+    // (isNeverSyncPath); this predicate guards the ROOT, which is a directory.
+    for (const path of ["/home/u/credentials", "/home/u/project/.env", "/home/u/keep.pem", "credentials"]) {
+      expect(isNeverSyncDirectoryPath(path), path).toBe(false);
     }
   });
 });
