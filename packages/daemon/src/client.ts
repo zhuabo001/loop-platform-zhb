@@ -71,8 +71,11 @@ export interface MachineClientDeps {
 }
 
 /** Statuses the NEXT attempt can fix: the server asked us to slow down or is
- *  itself transiently broken. */
-function isTransientStatus(status: number): boolean {
+ *  itself transiently broken. Exported for the artifact sync client
+ *  (artifact-sync.ts): the artifact transport's `refused` outcome carries the
+ *  raw status, and a refusal with no known artifact code falls back to this
+ *  same retryability test. */
+export function isTransientStatus(status: number): boolean {
   return status === 408 || status === 429 || status >= 500;
 }
 
