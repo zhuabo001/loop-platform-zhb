@@ -219,6 +219,7 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
   - 片 1（契约、归属与生产边界）已完成：错误码 11 与重试类 5、客户端失败分类法与落库域、Delivery Artifact 配置、10 个端点的 wire 形状（含读取端 DTO）冻结；Machine namespace 归属解析器与生产门面（Blob 根 `<dataDir>/blobs`）实现但不接线；HTTP 失败映射矩阵逐操作域固定。AD1–AD4 休眠守卫零修改全绿。
   - 片 1 三轨审查唯一须处理项 [#83](https://github.com/zhuabo001/loop-platform-zhb/issues/83)（读取失败域遗漏 `attribution_missing`）已修复（`0a0b5a9`，变异验证），并经第二轮独立复审核销关闭（2026-10-04）。
   - 片 2（Server 配置、同步 HTTP 与 Poll 接线）已完成：生产 ArtifactHome 经 `bootstrapServer` 接线、6 条路由挂载（配置 PATCH、machine 读取、prepare／流式 PUT／commit、同步错误上报；读取端 4 条留片 7）；真实 HTTP prepare → 多块流式 PUT → commit 全通且落盘 `<dataDir>/blobs`，幂等重放返回固定回执；Create 的可选 `artifactDir` 经同一 planner 与创建同语句落库（初始代际 1）；Poll 向声明 `artifact-sync-v1` 的 Machine 下发 watch（缺 digest ≡ 空集合摘要，busy Poll 同样处理），claim 对已配置 Loop 做逐候选 capability 门控并在 Delivery 携带配置代际；AD1／AD2(a)／AD2(b)／AD4 守卫按实际解除范围重写，AD3 与 daemon 零改动。
+  - 片 2 三轨审查两项 P2：[#85](https://github.com/zhuabo001/loop-platform-zhb/issues/85)（认证与读取归属的可恢复 SQLSTATE 漏稳定错误码）已修复（`c139168`，操作级 `withStorageError` + facade／路由双份故障注入回归）、[#86](https://github.com/zhuabo001/loop-platform-zhb/issues/86)（prepare schema 拒绝无码 400）已修复（`6b81de8`，coded 400 `artifact_validation_failed`），AH8 路由级 base 漂移证据已补（`85fbf5a`）；三项均经变异验证并经第二轮独立复审核销关闭（2026-10-05）。
   - 片 3–8 未开始。
 
 ### 右移项
