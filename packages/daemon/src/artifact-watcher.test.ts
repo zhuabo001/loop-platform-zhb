@@ -138,7 +138,7 @@ describe("artifact-watcher (real chokidar)", () => {
   });
 
   it(
-    "catches a root that does not exist yet (the directory_missing recovery path)",
+    "catches a root that appears after the subscription started (adapter capability)",
     async () => {
       const missing = path.join(base, "later");
       const recorder = await subscribe(missing);
