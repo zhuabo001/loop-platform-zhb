@@ -91,7 +91,10 @@ function makeClient(
  *  upload group while its siblings keep going. The scanner writes the cache
  *  too, so the test arms it after the scan (at prepare time) — the fault then
  *  lands in the pre-upload verification. */
-function faultingCacheOn(suffix: string): { cache: ArtifactHashCache; arm: () => void } {
+function faultingCacheOn(
+  suffix: string,
+  error: unknown = new Error("injected cache fault"),
+): { cache: ArtifactHashCache; arm: () => void } {
   const real = createArtifactHashCache();
   let armed = false;
   return {
@@ -101,7 +104,7 @@ function faultingCacheOn(suffix: string): { cache: ArtifactHashCache; arm: () =>
     cache: {
       get: (absolutePath) => real.get(absolutePath),
       set: (absolutePath, entry) => {
-        if (armed && absolutePath.endsWith(suffix)) throw new Error("injected cache fault");
+        if (armed && absolutePath.endsWith(suffix)) throw error;
         real.set(absolutePath, entry);
       },
       delete: (absolutePath) => real.delete(absolutePath),
@@ -476,6 +479,65 @@ describe("AS11 — backoff, budgets and the upload gate", () => {
     expect(server.maxConcurrentPuts).toBe(4);
   });
 
+  it("cancels gate waiters while another loop holds all permits, then admits successors", async () => {
+    const loopIds = ["holder", "cancel-1", "cancel-2", "successor"];
+    for (let index = 0; index < 4; index += 1) write(`holder/${index}.txt`, `held ${index}`);
+    for (const loopId of loopIds.slice(1)) write(`${loopId}/file.txt`, loopId);
+    server = createFakeArtifactServer({
+      machineCredential: CREDENTIAL,
+      loops: loopIds.map((loopId) => ({ loopId, artifactDir: path.join(base, loopId) })),
+    });
+    client = makeClient();
+    const run = (loopId: string, signal?: AbortSignal) => client.syncLoop({
+      target: target({ loopId, artifactDir: path.join(base, loopId) }),
+      daemonRoots: [base],
+      signal,
+    });
+    const release = server.holdPuts();
+    const holder = run("holder");
+    const rounds: Promise<ArtifactSyncOutcome>[] = [holder];
+    try {
+      await until(() => server.stepCalls("put").length === 4);
+      const controllers = [new AbortController(), new AbortController()];
+      let cancelled = 0;
+      const waiters = controllers.map((controller, index) => {
+        const round = run(`cancel-${index + 1}`, controller.signal).then((outcome) => {
+          cancelled += 1;
+          return outcome;
+        });
+        rounds.push(round);
+        return round;
+      });
+      await until(() => server.stepCalls("prepare").length === 3);
+      // Let both prepared rounds reach the full gate before aborting them.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      for (const controller of controllers) controller.abort();
+      await until(() => cancelled === 2, 200);
+      expect(await Promise.all(waiters)).toEqual([{ kind: "cancelled" }, { kind: "cancelled" }]);
+      expect(server.stepCalls("put")).toHaveLength(4);
+      expect(server.stepCalls("commit")).toHaveLength(0);
+      let drained = false;
+      const drain = client.settled().then(() => { drained = true; });
+      const successor = run("successor");
+      rounds.push(successor);
+      await until(() => server.stepCalls("prepare").length === 4);
+      expect(drained).toBe(false);
+      expect(server.stepCalls("put")).toHaveLength(4);
+      release();
+      expect((await holder).kind).toBe("synced");
+      expect((await successor).kind).toBe("synced");
+      await drain;
+      expect(drained).toBe(true);
+      expect(server.stepCalls("put")).toHaveLength(5);
+      expect(server.maxConcurrentPuts).toBe(4);
+      // Reusing a previously cancelled loop also proves no permit was lost.
+      expect((await run("cancel-1")).kind).toBe("synced");
+    } finally {
+      release();
+      await Promise.allSettled(rounds);
+    }
+  });
+
   it("serializes two calls for the same loop and lets the second see the first's result", async () => {
     write("a.txt", "alpha");
     start();
@@ -771,6 +833,25 @@ describe("numbered-outside evidence", () => {
     expect(loop().manifestRevision).toBe(1);
   });
 
+  it("terminates with the original content mismatch after two rescans, without committing or continuing", async () => {
+    const file = write("a.txt", "alpha");
+    start();
+    // The fourth refusal must never be requested: initial PUT + two rescans.
+    for (let index = 0; index < 4; index += 1) {
+      server.failNextPut(file.hash, { kind: "status", status: 400, code: "artifact_content_mismatch" });
+    }
+
+    expect(await sync()).toMatchObject({ kind: "terminal", code: "artifact_content_mismatch" });
+    await client.settled();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(server.stepCalls("prepare")).toHaveLength(3);
+    expect(server.stepCalls("put")).toHaveLength(3);
+    expect(server.stepCalls("commit")).toHaveLength(0);
+    expect(server.stepCalls("report")).toHaveLength(0);
+    expect(loop().manifestRevision).toBe(0);
+    expect(new Set(server.stepCalls("prepare").map((call) => call.requestId)).size).toBe(1);
+  });
+
   it("cancels during the backoff without a further request or a report", async () => {
     write("a.txt", "alpha");
     start();
@@ -890,6 +971,57 @@ describe("numbered-outside evidence", () => {
     // surfaces to the caller instead of being swallowed as an outcome.
     expect(server.stepCalls("put")[0]!.published).toBe(true);
     expect(await inflight).toBe("rejected");
+  });
+
+  it.each([
+    { status: 401, code: undefined },
+    { status: 403, code: "artifact_attribution_missing" as const },
+    { status: 400, code: undefined },
+  ].flatMap((refusal) => [
+    { ...refusal, error: new Error("original upload exception"), errorKind: "Error" },
+    { ...refusal, error: new TypeError("original upload exception"), errorKind: "TypeError" },
+    { ...refusal, error: { unknown: "original upload exception" }, errorKind: "unknown" },
+  ]))("preserves the original $errorKind alongside HTTP $status and drains its sibling", async ({ status, code, error }) => {
+    write("a.txt", "alpha");
+    const beta = write("b.txt", "beta");
+    write("c.txt", "charlie");
+    const fault = faultingCacheOn("a.txt", error);
+    start({ cache: fault.cache });
+    const release = server.holdPuts();
+    server.beforePrepare = () => fault.arm();
+    server.failNextPut(beta.hash, { kind: "status", status, code });
+    let roundDone = false;
+    const inflight = sync().then(
+      (value) => {
+        roundDone = true;
+        return { kind: "resolved" as const, value };
+      },
+      (reason: unknown) => {
+        roundDone = true;
+        return { kind: "rejected" as const, reason };
+      },
+    );
+    let settled = false;
+    const drain = client.settled().then(() => { settled = true; });
+    try {
+      await until(() => server.stepCalls("put").length === 2);
+      expect(roundDone).toBe(false);
+      expect(settled).toBe(false);
+      release();
+      const result = await inflight;
+      expect(result).toEqual({ kind: "rejected", reason: error });
+      if (result.kind === "rejected") expect(result.reason).toBe(error);
+      await drain;
+      if (status === 401 || status === 403) {
+        const before = server.calls.length;
+        expect(await sync()).toMatchObject({ kind: "stopped", scope: "machine", status });
+        expect(await sync({ target: target({ loopId: "another-loop" }) })).toMatchObject({ kind: "stopped", scope: "machine", status });
+        expect(server.calls.length).toBe(before);
+      }
+    } finally {
+      release();
+      await Promise.allSettled([inflight, drain]);
+    }
   });
 
   it("freshSession mints a new session even when nothing changed", async () => {

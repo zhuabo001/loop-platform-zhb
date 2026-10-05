@@ -210,6 +210,12 @@ Batch 1 错误映射在 HTTP 接线时补齐：revision 耗尽使用新增 `arti
 
 片 4 以编号外证据覆盖：只传 `needHashes`、无变化抑制及其失效规则、requestId 指纹复用规则、已验证字节即上传字节、上报三态、`config_conflict ⇒ config_changed`、取消、`settled()` 语义、会话纪元（不提交被取代的 syncId）、`freshSession`、11 码到动作的表驱动覆盖与传输层分类（`daemon/src/artifact-client.test.ts`）。
 
+片 4 的长期契约验收还包括（规则见 ADR-010 决策 24，证据均在 `daemon/src/artifact-sync.test.ts`）：
+
+- **内容拒绝的动作例外**：wire 侧 `artifact_content_mismatch` 仍属 `terminal`；客户端仅对此码消费重扫预算。一次拒绝后重扫可恢复成功；持续拒绝最多执行初始 PUT 加 2 次重扫（共 3 次 PUT），随后返回保留原码的 `terminal`，零 commit、零本地失败上报，排空后不再发起 prepare/PUT/commit。验收锚点：`terminates with the original content mismatch after two rescans, without committing or continuing`。本地校验的 `changed`/`missing` 仍走重扫恢复，不改为 terminal。
+- **混合上传结果**：Error、TypeError 与其他未知异常分别和 401、403、普通 HTTP 拒绝并存时，先等待全部上传组，再记录所有停止，最后按原身份抛出未知异常；停机后的各 Loop 零请求。验收锚点：`preserves the original $errorKind alongside HTTP $status and drains its sibling`。
+- **上传许可等待取消**：其他 Loop 占满上传许可时，多个已 prepare 的等待调用可以取消并结束，零 PUT/commit；持有者继续受 `settled()` 排空约束，后继调用和已取消 Loop 的新调用仍可取得许可，在途 PUT 始终不超过 4。验收锚点：`cancels gate waiters while another loop holds all permits, then admits successors`。
+
 额外覆盖配置 no-op、Create 原子性、busy Poll 的 watch 更新、capability 与 claim 交错、错误 taxonomy、8 MiB 请求边界和迟到错误不得覆盖新状态。
 
 质量门：

@@ -226,7 +226,8 @@ function refusalAction(code: ArtifactErrorCode | undefined): RefusalAction {
 
 /** Exported (with `createGate`) for the concurrency-invariant test. */
 export interface Gate {
-  run<T>(task: () => Promise<T>): Promise<T>;
+  /** `undefined` means the caller was cancelled before its task started. */
+  run<T>(task: () => Promise<T>, signal?: AbortSignal): Promise<T | undefined>;
 }
 
 /** The instance-level upload gate (决策 24). A released permit is HANDED to the
@@ -237,10 +238,29 @@ export function createGate(limit: number): Gate {
   let held = 0;
   const waiting: Array<() => void> = [];
   return {
-    async run<T>(task: () => Promise<T>): Promise<T> {
-      if (held >= limit) await new Promise<void>((resolve) => waiting.push(resolve));
-      else held += 1;
+    async run<T>(task: () => Promise<T>, signal?: AbortSignal): Promise<T | undefined> {
+      if (isAborted(signal)) return undefined;
+      if (held >= limit) {
+        const acquired = await new Promise<boolean>((resolve) => {
+          const handoff = () => {
+            signal?.removeEventListener("abort", cancel);
+            resolve(true);
+          };
+          const cancel = () => {
+            const index = waiting.indexOf(handoff);
+            if (index < 0) return;
+            waiting.splice(index, 1);
+            signal?.removeEventListener("abort", cancel);
+            resolve(false);
+          };
+          waiting.push(handoff);
+          signal?.addEventListener("abort", cancel, { once: true });
+        });
+        if (!acquired) return undefined;
+      } else held += 1;
       try {
+        // Cancellation after handoff still owns the permit and releases it.
+        if (isAborted(signal)) return undefined;
         return await task();
       } finally {
         const next = waiting.shift();
@@ -457,7 +477,7 @@ export function createArtifactSyncClient(deps: ArtifactSyncClientDeps): Artifact
   ): Promise<UploadGroupResult> {
     enterWork();
     try {
-      return await gate.run(async () => {
+      const uploaded = await gate.run<UploadGroupResult>(async () => {
         if (isAborted(signal)) return { kind: "aborted" };
         let bytes: Buffer | null = null;
         for (const entry of group) {
@@ -476,7 +496,8 @@ export function createArtifactSyncClient(deps: ArtifactSyncClientDeps): Artifact
           signal,
         );
         return { kind: "put", put };
-      });
+      }, signal);
+      return uploaded ?? { kind: "aborted" };
     } finally {
       leaveWork();
     }
@@ -526,14 +547,14 @@ export function createArtifactSyncClient(deps: ArtifactSyncClientDeps): Artifact
       firstRefusal ??= uploaded.put.value;
       if (recordStop(loopId, uploaded.put.value) !== null) firstStoppable ??= uploaded.put.value;
     }
-    const refusal = firstStoppable ?? firstRefusal;
-    if (refusal !== null) return { kind: "refused", refusal };
-
     // An internal exception is a bug, not a protocol outcome: it surfaces to
     // the caller — but only once every sibling has settled, so nothing is left
     // running behind the caller's back.
     const rejected = settledGroups.find((result): result is PromiseRejectedResult => result.status === "rejected");
     if (rejected !== undefined) throw rejected.reason;
+
+    const refusal = firstStoppable ?? firstRefusal;
+    if (refusal !== null) return { kind: "refused", refusal };
 
     for (const result of settledGroups) {
       if (result.status !== "fulfilled") continue;
