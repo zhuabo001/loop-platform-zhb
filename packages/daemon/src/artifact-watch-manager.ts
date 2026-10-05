@@ -5,20 +5,31 @@
  * subscription per configured loop, and drives the slice-4 sync client:
  *
  *  - SUBSCRIBE BEFORE THE FIRST SCAN: the watcher is opened and awaited
- *    `ready` before the initial full scan, and events arriving during that
- *    scan merely mark the loop dirty — nothing is lost (AW12);
+ *    `ready` before the initial full scan. Nothing scans before `ready`: an
+ *    event seen during admission is only recorded, and the full scan that
+ *    follows `ready` — plus the follow-up round it queues — covers it (AW12);
  *  - events coalesce in a FIXED 250 ms window measured from the first event
  *    (never a reset debounce: a chunked write whose chunks are closer than
- *    the window apart would starve it, AW9), and a round that ends still
- *    dirty opens a fresh window;
+ *    the window apart would starve it, AW9);
+ *  - every round is driven to completion: work that arrives while a round is
+ *    in flight (an event whose window expired mid-round, or a reconcile
+ *    request) is recorded as PENDING and the round's own driver starts the
+ *    follow-up the moment it ends, so a slow scan can never lose a window or
+ *    degrade a reconcile request into the cached-hash event path;
  *  - a material watch-set change (any of the five item fields) performs the
  *    fixed generation swap — abort the old round, CLOSE THE OLD WATCHER, then
  *    subscribe the new root and full-scan (AS7); a removal cancels, closes and
- *    drops the state without any forced commit (AS8);
+ *    drops the state without any forced commit (AS8). The whole set is
+ *    reconciled SYNCHRONOUSLY inside `apply` (no I/O, no await), so a suspended
+ *    older set can never overwrite a newer one, and a successor never
+ *    subscribes before its predecessor's watcher is closed — even across
+ *    LoopWatch objects (removal → re-add);
  *  - one instance-wide 60 s tick re-runs a FULL-rehash scan for every watching
  *    loop (the missed-event compensation, AW11) and locally re-verifies the
- *    ones whose watcher was refused or closed (jail/root failures) so a
- *    recovered root is re-admitted without a network round;
+ *    ones whose watcher was refused or closed (jail/root failures, including
+ *    `directory_missing`: a vanished root closes its subscription and is
+ *    re-admitted only after the local re-check succeeds) so a recovered root
+ *    is re-admitted without a network round;
  *  - `drain` stops new events and timers, aborts every round, closes every
  *    watcher and joins the sync client's own settled() under a deadline —
  *    it NEVER issues a final commit and keeps no persistent outbox (AS12).
@@ -82,7 +93,13 @@ export interface ArtifactWatchManagerDeps {
   log?: (line: string) => void;
 }
 
-type LoopStatus = "watching" | "refused" | "config_changed" | "parked";
+type LoopStatus = "admitting" | "watching" | "refused" | "config_changed" | "parked";
+
+/** Why a round is due. The event path may reuse cached hashes; startup, the
+ *  60 s reconcile and the (slice-6) final sync rehash everything (决策 23/25).
+ *  A pending request keeps the STRONGER of the two modes, so a reconcile
+ *  request recorded during a round is never downgraded to the cached path. */
+type SyncMode = "event" | "full";
 
 interface LoopWatch {
   item: ArtifactWatchItem;
@@ -96,13 +113,20 @@ interface LoopWatch {
   /** True once this generation's admission refusal has been reported (one
    *  report per generation, never one per tick). */
   reportedRefusal: boolean;
-  dirty: boolean;
+  /** Work that no in-flight round covers: events seen before `ready`, and
+   *  events or reconcile requests that arrived while a round was running. The
+   *  running round's driver consumes it the moment that round ends. */
+  pending: SyncMode | null;
   windowCtl: AbortController | null;
   errorWindowCtl: AbortController | null;
   inFlight: Promise<void> | null;
 }
 
-const ROOT_FAILURES: ReadonlySet<ArtifactSyncFailure> = new Set(["outside_jail"]);
+/** Root-shaped failures: the subscription is closed and the loop falls back to
+ *  the tick's LOCAL re-verification (zero network) until its root is usable
+ *  again. `directory_missing` belongs here too — a vanished root must neither
+ *  keep a watcher alive nor keep round-tripping to the server. */
+const ROOT_FAILURES: ReadonlySet<ArtifactSyncFailure> = new Set(["outside_jail", "directory_missing"]);
 
 const defaultWatchSleep: ArtifactSyncSleepFn = (ms, signal) =>
   new Promise<void>((resolve) => {
@@ -152,6 +176,10 @@ export function createArtifactWatchManager(deps: ArtifactWatchManagerDeps): Arti
   const log = deps.log ?? ((): void => {});
 
   const states = new Map<string, LoopWatch>();
+  /** Per loop, the newest watcher close. A successor NEVER subscribes before
+   *  its predecessor is closed — across LoopWatch objects too (removal →
+   *  re-add), so AS7's close-then-subscribe order holds for every generation. */
+  const closes = new Map<string, Promise<void>>();
   let appliedItems: readonly ArtifactWatchItem[] = [];
   let appliedDigest: string | undefined;
   let machineStopped = false;
@@ -194,10 +222,36 @@ export function createArtifactWatchManager(deps: ArtifactWatchManagerDeps): Arti
     return new Promise<void>((resolve) => settleWaiters.add(resolve));
   }
 
-  async function closeWatcher(state: LoopWatch): Promise<void> {
+  /** True while this LoopWatch is still the map's entry for its loop. A new
+   *  generation REPLACES the object, so a late admission, round or window of
+   *  the predecessor must check this before writing anything. */
+  function isCurrent(state: LoopWatch): boolean {
+    return states.get(state.item.loopId) === state;
+  }
+
+  function canRun(state: LoopWatch): boolean {
+    return (
+      !draining &&
+      !machineStopped &&
+      !state.ctl.signal.aborted &&
+      state.status === "watching" &&
+      isCurrent(state)
+    );
+  }
+
+  /** Close this generation's watcher and KEEP the close: the next generation
+   *  of the same loop awaits it before subscribing, so the AS7 order survives
+   *  a hanging close (and a removal → re-add never runs two watchers at once). */
+  function closeWatcher(state: LoopWatch): Promise<void> {
     const watcher = state.watcher;
     state.watcher = null;
-    if (watcher !== null) await watcher.close();
+    const previous = closes.get(state.item.loopId);
+    const close = (async (): Promise<void> => {
+      if (previous !== undefined) await previous;
+      if (watcher !== null) await watcher.close();
+    })();
+    closes.set(state.item.loopId, close);
+    return close;
   }
 
   /** Local admission (zero network): the root must resolve inside the jail
@@ -248,38 +302,56 @@ export function createArtifactWatchManager(deps: ArtifactWatchManagerDeps): Arti
     }
   }
 
-  async function runSync(state: LoopWatch, mode: "event" | "full"): Promise<void> {
-    if (state.inFlight !== null) {
-      // A round is already running for this loop: the event merge collapses
-      // into it and the fresh-window rule picks the change up afterwards.
-      state.dirty = true;
-      return;
+  /** Keep the stronger mode: a reconcile request must never degrade into the
+   *  cached-hash event path just because an event is pending as well. */
+  function notePending(state: LoopWatch, mode: SyncMode): void {
+    state.pending = state.pending === "full" || mode === "full" ? "full" : "event";
+  }
+
+  /** One round per mode, then every round that was requested while it ran. The
+   *  chain holds `inFlight` for its whole length, so a loop still runs ONE
+   *  round at a time; a request that arrives mid-chain only extends it. */
+  async function driveRounds(state: LoopWatch, first: SyncMode): Promise<void> {
+    let mode = first;
+    for (;;) {
+      if (!canRun(state)) return;
+      const generation = state.generation;
+      const target = state.item;
+      const outcome = await deps.sync.syncLoop({
+        target,
+        daemonRoots: deps.daemonRoots,
+        signal: state.ctl.signal,
+        // The EVENT path is the only one allowed to reuse cached hashes
+        // (决策 23/25); startup, this 60 s tick and slice 6 keep rehashing.
+        reuseCachedHashes: mode === "event",
+      });
+      // A round that belongs to a REPLACED generation is void: its abort
+      // raced its completion, and acting on it could close the successor's
+      // watcher or park a healthy loop.
+      if (state.generation !== generation || !isCurrent(state)) return;
+      await handleOutcome(state, outcome);
+      const followUp = state.pending;
+      if (followUp === null) return;
+      state.pending = null;
+      mode = followUp;
     }
-    if (state.ctl.signal.aborted || draining || machineStopped) return;
-    const generation = state.generation;
-    const target = state.item;
-    let run!: Promise<void>;
-    run = (async () => {
-      try {
-        const outcome = await deps.sync.syncLoop({
-          target,
-          daemonRoots: deps.daemonRoots,
-          signal: state.ctl.signal,
-          // The EVENT path is the only one allowed to reuse cached hashes
-          // (决策 23/25); startup, this 60 s tick and slice 6 keep rehashing.
-          reuseCachedHashes: mode === "event",
-        });
-        // A round that belongs to a REPLACED generation is void: its abort
-        // raced its completion, and acting on it could close the successor's
-        // watcher or park a healthy loop.
-        if (state.generation !== generation) return;
-        await handleOutcome(state, outcome);
-      } finally {
-        if (state.inFlight === run) state.inFlight = null;
-      }
-    })();
+  }
+
+  function runSync(state: LoopWatch, mode: SyncMode): Promise<void> {
+    if (state.inFlight !== null) {
+      // A round is already running for this loop: this work is RECORDED and
+      // the running round's driver starts the follow-up the moment it ends,
+      // so a window that expires mid-round is never lost (决策 25).
+      notePending(state, mode);
+      return Promise.resolve();
+    }
+    if (!canRun(state)) return Promise.resolve();
+    let run: Promise<void> | null = null;
+    run = driveRounds(state, mode).finally(() => {
+      if (state.inFlight === run) state.inFlight = null;
+    });
     state.inFlight = run;
-    await run;
+    return run;
   }
 
   function openWindow(state: LoopWatch): void {
@@ -291,12 +363,13 @@ export function createArtifactWatchManager(deps: ArtifactWatchManagerDeps): Arti
         await sleep(ARTIFACT_WATCH_EVENT_MERGE_MS, ctl.signal);
         if (ctl.signal.aborted || draining || state.generation !== generation) return;
         state.windowCtl = null;
-        if (!state.dirty) return;
-        state.dirty = false;
+        const mode = state.pending;
+        if (mode === null) return;
+        state.pending = null;
         // Events that arrive DURING this round re-arm through markDirty: the
         // window controller is already null here, so the next event opens a
         // FRESH window instead of being folded into the finished one (AW12).
-        await runSync(state, "event");
+        await runSync(state, mode);
       } finally {
         if (state.windowCtl === ctl) state.windowCtl = null;
       }
@@ -304,28 +377,41 @@ export function createArtifactWatchManager(deps: ArtifactWatchManagerDeps): Arti
   }
 
   function markDirty(state: LoopWatch): void {
-    if (draining || state.status !== "watching") return;
-    state.dirty = true;
+    if (draining) return;
+    if (state.status === "admitting") {
+      // Nothing scans before `ready` (决策 25): the event is only recorded —
+      // the admission's own FULL scan (which starts after `ready`) and the
+      // follow-up round it queues cover it, with no pre-subscription scan.
+      notePending(state, "event");
+      return;
+    }
+    if (state.status !== "watching") return;
+    notePending(state, "event");
     if (state.windowCtl !== null) return; // a fixed window is already running
     openWindow(state);
   }
 
   function onWatcherError(state: LoopWatch, error: unknown): void {
-    if (draining || state.status !== "watching") return;
+    if (draining) return;
+    if (state.status !== "watching" && state.status !== "admitting") return;
     const detail = error instanceof Error ? error.message : String(error);
     if (state.errorWindowCtl !== null) return; // coalesce: one report per window
+    const generation = state.generation;
     const ctl = new AbortController();
     state.errorWindowCtl = ctl;
     void runWork(async () => {
       try {
         await sleep(ARTIFACT_WATCH_EVENT_MERGE_MS, ctl.signal);
-        if (ctl.signal.aborted || draining) return;
+        if (ctl.signal.aborted || draining || state.generation !== generation || !isCurrent(state)) {
+          return;
+        }
         const outcome = await deps.sync.reportLocalFailure({
           target: state.item,
           failure: "watcher_error",
           detail,
           signal: state.ctl.signal,
         });
+        if (state.generation !== generation || !isCurrent(state)) return;
         await handleOutcome(state, outcome);
       } finally {
         if (state.errorWindowCtl === ctl) state.errorWindowCtl = null;
@@ -333,11 +419,20 @@ export function createArtifactWatchManager(deps: ArtifactWatchManagerDeps): Arti
     });
   }
 
-  /** The generation start: subscribe (and await ready) BEFORE the full scan. */
+  /** The generation start: subscribe (and await ready) BEFORE the full scan,
+   *  and never before the PREVIOUS generation's watcher is closed. */
   async function admitAndScan(state: LoopWatch): Promise<void> {
-    if (draining || state.ctl.signal.aborted || machineStopped) return;
+    const generation = state.generation;
+    const abandoned = (): boolean =>
+      draining ||
+      machineStopped ||
+      state.ctl.signal.aborted ||
+      state.generation !== generation ||
+      state.status !== "admitting" ||
+      !isCurrent(state);
+    if (abandoned()) return;
     const admission = await admit(state.item);
-    if (draining || state.ctl.signal.aborted) return;
+    if (abandoned()) return;
     if (admission.kind === "refused") {
       state.status = "refused";
       if (state.reportedRefusal) return;
@@ -351,15 +446,19 @@ export function createArtifactWatchManager(deps: ArtifactWatchManagerDeps): Arti
         detail: admission.detail,
         signal: state.ctl.signal,
       });
+      if (draining || state.generation !== generation || !isCurrent(state)) return;
       await handleOutcome(state, outcome);
       return;
     }
+    const predecessor = closes.get(state.item.loopId);
+    if (predecessor !== undefined) await predecessor;
+    if (abandoned()) return;
     const watcher = deps.createWatcher(admission.root);
     state.watcher = watcher;
     watcher.onEvent(() => markDirty(state));
     watcher.onError((error) => onWatcherError(state, error));
     await watcher.ready();
-    if (draining || state.ctl.signal.aborted) {
+    if (abandoned()) {
       await closeWatcher(state);
       return;
     }
@@ -371,11 +470,11 @@ export function createArtifactWatchManager(deps: ArtifactWatchManagerDeps): Arti
     return {
       item,
       generation,
-      status: "watching", // until admission decides otherwise
+      status: "admitting", // until the subscription is ready and the scan ran
       ctl: new AbortController(),
       watcher: null,
       reportedRefusal: false,
-      dirty: false,
+      pending: null,
       windowCtl: null,
       errorWindowCtl: null,
       inFlight: null,
@@ -389,7 +488,7 @@ export function createArtifactWatchManager(deps: ArtifactWatchManagerDeps): Arti
    *  here would let one slow round stall the swap indefinitely. */
   async function stopLoop(state: LoopWatch): Promise<void> {
     state.generation += 1;
-    state.dirty = false;
+    state.pending = null;
     state.ctl.abort();
     state.windowCtl?.abort();
     state.errorWindowCtl?.abort();
@@ -406,45 +505,58 @@ export function createArtifactWatchManager(deps: ArtifactWatchManagerDeps): Arti
   }
 
   function launchAdmission(state: LoopWatch): void {
+    state.status = "admitting";
     void runWork(() => admitAndScan(state));
   }
 
-  function reconcileSet(items: readonly ArtifactWatchItem[]): Promise<void> {
-    return runWork(async () => {
-      const wanted = new Map(items.map((item) => [item.loopId, item]));
-      for (const [loopId, state] of [...states]) {
-        if (wanted.has(loopId)) continue;
-        // Drop it from the watch set FIRST: the loop is no longer watched the
-        // moment the set says so, even while its resources wind down.
-        states.delete(loopId);
-        await stopLoop(state);
+  /** Reconcile the materialized watch set with the newly applied one.
+   *
+   *  Everything here is SYNCHRONOUS — no I/O, no `await` — so the whole set is
+   *  reconciled inside `apply` before any other task can run. That removes the
+   *  stale-pass defect class outright: there is no suspension point at which a
+   *  newer set could arrive and be overwritten, so a slow close or a slow
+   *  admission can never resurrect a removed loop or substitute an outdated
+   *  one. All fallible work (root resolution, the never-sync guard, the
+   *  subscription and the scan) lives in the admission task this launches, and
+   *  a successor awaits the loop's retained close before it subscribes.
+   *
+   *  A loop that left the set stops being watched the moment the set says so
+   *  (AS8): the state is dropped and its close is started here, in the
+   *  background. */
+  function reconcileSet(): void {
+    const wanted = new Set(appliedItems.map((item) => item.loopId));
+    for (const [loopId, state] of [...states]) {
+      if (wanted.has(loopId)) continue;
+      states.delete(loopId);
+      void runWork(() => stopLoop(state));
+    }
+    for (const item of appliedItems) {
+      const state = states.get(item.loopId);
+      if (state === undefined) {
+        const created = newState(item, 1);
+        states.set(item.loopId, created);
+        launchAdmission(created);
+        continue;
       }
-      for (const item of items) {
-        const state = states.get(item.loopId);
-        if (state === undefined) {
-          const created = newState(item, 1);
-          states.set(item.loopId, created);
-          launchAdmission(created);
-          continue;
-        }
-        if (!sameItem(state.item, item)) {
-          await stopLoop(state);
-          const replaced = newState(item, state.generation + 1);
-          states.set(item.loopId, replaced);
-          launchAdmission(replaced);
-          continue;
-        }
-        if (state.status === "parked") {
-          // The set changed materially, which clears the stops — a parked loop
-          // gets a fresh generation (and a fresh controller: the parked one
-          // was aborted).
-          state.generation += 1;
-          state.ctl = new AbortController();
-          state.status = "watching";
-          launchAdmission(state);
-        }
+      if (!sameItem(state.item, item)) {
+        // stopLoop's synchronous prefix (generation bump, abort) and the close
+        // it retains both happen here; the successor below waits for that
+        // close before it subscribes.
+        void runWork(() => stopLoop(state));
+        const replaced = newState(item, state.generation + 1);
+        states.set(item.loopId, replaced);
+        launchAdmission(replaced);
+        continue;
       }
-    });
+      if (state.status === "parked") {
+        // The set changed materially, which clears the stops — a parked loop
+        // gets a fresh generation (and a fresh controller: the parked one
+        // was aborted).
+        state.generation += 1;
+        state.ctl = new AbortController();
+        launchAdmission(state);
+      }
+    }
   }
 
   function apply(items: readonly ArtifactWatchItem[], digest?: string): void {
@@ -456,7 +568,7 @@ export function createArtifactWatchManager(deps: ArtifactWatchManagerDeps): Arti
     // (决策 24/25: config generation swap / credential rotation).
     deps.sync.clearStops();
     machineStopped = false;
-    void reconcileSet(appliedItems);
+    reconcileSet();
   }
 
   /** The 60 s compensation pass: a full-rehash round for every watching loop,
@@ -464,13 +576,22 @@ export function createArtifactWatchManager(deps: ArtifactWatchManagerDeps): Arti
   async function reconcileTick(): Promise<void> {
     for (const state of [...states.values()]) {
       if (draining) return;
+      const generation = state.generation;
       if (state.status === "watching") {
         await runSync(state, "full");
         continue;
       }
       if (state.status !== "refused" || machineStopped) continue;
       const admission = await admit(state.item);
-      if (admission.kind === "refused" || draining || state.ctl.signal.aborted) continue;
+      if (
+        admission.kind === "refused" ||
+        draining ||
+        state.ctl.signal.aborted ||
+        state.generation !== generation ||
+        !isCurrent(state)
+      ) {
+        continue;
+      }
       state.reportedRefusal = false;
       state.generation += 1;
       state.ctl = new AbortController();
@@ -495,17 +616,17 @@ export function createArtifactWatchManager(deps: ArtifactWatchManagerDeps): Arti
   async function drain(deadlineMs: number): Promise<{ settled: boolean }> {
     draining = true;
     reconcileCtl?.abort();
-    const closes: Array<Promise<void>> = [];
+    const closesInFlight: Array<Promise<void>> = [];
     for (const state of states.values()) {
       state.generation += 1;
-      state.dirty = false;
+      state.pending = null;
       state.ctl.abort();
       state.windowCtl?.abort();
       state.errorWindowCtl?.abort();
-      closes.push(closeWatcher(state));
+      closesInFlight.push(closeWatcher(state));
     }
     const join = (async (): Promise<void> => {
-      await Promise.allSettled(closes);
+      await Promise.allSettled(closesInFlight);
       for (const state of states.values()) {
         if (state.inFlight !== null) await state.inFlight.catch(() => {});
       }

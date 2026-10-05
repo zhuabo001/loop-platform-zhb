@@ -195,6 +195,30 @@ describe("artifact watch end-to-end (real watcher, real dirs, fake server)", () 
     expect(tracked[1]!.root).toBe(realpathSync(next));
   });
 
+  it("closes the watcher when the root disappears and re-subscribes when it returns (P2)", async () => {
+    writeFileSync(path.join(base, "a.txt"), "a");
+    start(base);
+    manager!.apply([target()]);
+    await until(() => loop().manifestRevision >= 1, "the startup scan to commit");
+    expect(tracked).toHaveLength(1);
+
+    rmSync(base, { recursive: true, force: true });
+    // Mutation: only `outside_jail` counts as root-shaped ⇒ the subscription
+    // stays open over a directory that no longer exists.
+    await until(() => tracked[0]!.closed, "the vanished root's close");
+
+    // While the root is gone the tick re-verifies LOCALLY: zero requests.
+    const callsWhileGone = server.calls.length;
+    await sleep(1_500);
+    expect(server.calls).toHaveLength(callsWhileGone);
+    expect(tracked).toHaveLength(1);
+
+    mkdirSync(base, { recursive: true });
+    writeFileSync(path.join(base, "back.txt"), "back");
+    await until(() => tracked.length === 2, "the recovered subscription");
+    await until(() => manifestPaths().includes("back.txt"), "the re-admission scan");
+  });
+
   it("drains within the deadline and stops intake (AS12)", async () => {
     writeFileSync(path.join(base, "a.txt"), "a");
     start(base);

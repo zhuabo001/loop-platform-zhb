@@ -50,10 +50,22 @@ async function waitUntil(predicate: () => boolean, label: string, timeoutMs = 2_
   }
 }
 
+/** Give the manager a bounded window to (mis)behave before asserting on the
+ *  absence of an effect whose admission needs real fs I/O to reach. */
+async function settleFor(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 interface FakeWatcherHandle {
   root: string;
   watcher: ArtifactWatcher;
+  /** The close was called and has not completed yet. */
+  closing: boolean;
+  /** The close COMPLETED (chokidar's close is async: this is the only honest
+   *  "the old subscription is gone" signal). */
   closed: boolean;
+  holdClose: () => void;
+  releaseClose: () => void;
   emit: () => void;
   emitError: (error: unknown) => void;
   releaseReady: () => void;
@@ -62,12 +74,16 @@ interface FakeWatcherHandle {
 interface WatcherHarness {
   factory: ArtifactWatcherFactory;
   handles: FakeWatcherHandle[];
+  /** For each created watcher, how many watchers were still OPEN at creation:
+       the successor of a swap must never see a live predecessor. */
+  openAtCreate: number[];
   log: string[];
   autoReady: { value: boolean };
 }
 
 function createWatcherHarness(): WatcherHarness {
   const handles: FakeWatcherHandle[] = [];
+  const openAtCreate: number[] = [];
   const log: string[] = [];
   const autoReady = { value: true };
   const factory: ArtifactWatcherFactory = (root) => {
@@ -75,9 +91,21 @@ function createWatcherHarness(): WatcherHarness {
     const errorListeners: Array<(error: unknown) => void> = [];
     let releaseReady: (() => void) | null = null;
     let released = false;
+    let holdClose = false;
+    let releaseCloseLatch: (() => void) | null = null;
+    let closePromise: Promise<void> | null = null;
     const handle: FakeWatcherHandle = {
       root,
+      closing: false,
       closed: false,
+      holdClose: () => {
+        holdClose = true;
+      },
+      releaseClose: () => {
+        const release = releaseCloseLatch;
+        releaseCloseLatch = null;
+        release?.();
+      },
       emit: () => {
         if (!handle.closed) for (const listener of eventListeners) listener();
       },
@@ -101,20 +129,31 @@ function createWatcherHarness(): WatcherHarness {
         onError: (listener) => {
           errorListeners.push(listener);
         },
+        // Idempotent like the chokidar adapter: a second caller joins the
+        // close already in flight instead of starting a second one.
         close: () => {
-          handle.closed = true;
+          if (closePromise !== null) return closePromise;
+          handle.closing = true;
           log.push(`close:${root}`);
-          releaseReady?.();
+          releaseReady?.(); // a caller parked on ready() must not hang
           releaseReady = null;
-          return Promise.resolve();
+          closePromise = (async (): Promise<void> => {
+            if (holdClose) await new Promise<void>((resolve) => {
+              releaseCloseLatch = resolve;
+            });
+            handle.closing = false;
+            handle.closed = true;
+          })();
+          return closePromise;
         },
       },
     };
     log.push(`create:${root}`);
+    openAtCreate.push(handles.filter((entry) => !entry.closed).length);
     handles.push(handle);
     return handle.watcher;
   };
-  return { factory, handles, log, autoReady };
+  return { factory, handles, openAtCreate, log, autoReady };
 }
 
 interface ManualSleep {
@@ -455,9 +494,11 @@ describe("artifact-watch-manager", () => {
     await tick();
     expect(harness.sync.reports).toHaveLength(1);
 
-    // A new generation with a legal dir is admitted normally.
-    harness.manager.apply([item({ artifactDir: path.join(base, "legal"), configRevision: 2 })]);
+    // A new generation with a legal dir is admitted normally. The directory
+    // exists BEFORE the apply: admission resolves the root as soon as it is
+    // launched, so a later mkdir would race the realpath (threadpool op).
     mkdirSync(path.join(base, "legal"));
+    harness.manager.apply([item({ artifactDir: path.join(base, "legal"), configRevision: 2 })]);
     await waitUntil(() => harness.watchers.handles.length === 1, "the legal root's watcher");
   });
 
@@ -544,5 +585,221 @@ describe("artifact-watch-manager", () => {
     harness.manager.apply([item(), item({ loopId: "loop-2", artifactDir: path.join(base, "two") })]);
     await waitUntil(() => harness.watchers.handles.length === 2, "loop-2's watcher without waiting for loop-1");
     releaseHold();
+  });
+
+  // ---- round-2 review fixes: the concurrently-updated watch set (P1) ----
+
+  it("discards a superseded reconcile pass: the newest set wins, one watcher per loop (P1)", async () => {
+    const harness = createHarness();
+    harness.manager.apply([item()], "d1");
+    await waitForFirstScan(harness);
+
+    // The swap to rev 2 stalls INSIDE the old watcher's close.
+    harness.watchers.handles[0]!.holdClose();
+    harness.manager.apply([item({ configRevision: 2 })], "d2");
+    await waitUntil(() => harness.watchers.handles[0]!.closing, "the held close");
+
+    // A third set arrives while that pass is still winding down.
+    harness.manager.apply([item({ configRevision: 3 })], "d3");
+    await tick();
+    // Mutation: run passes concurrently ⇒ the stalled rev-2 pass would already
+    // have subscribed a successor before the old watcher was closed.
+    expect(harness.watchers.handles).toHaveLength(1);
+    expect(harness.sync.calls).toHaveLength(1);
+
+    harness.watchers.handles[0]!.releaseClose();
+    await waitUntil(() => harness.sync.calls.length === 2, "the newest generation's scan");
+    await harness.manager.settled();
+
+    // rev 2 was never scanned and never substituted: the LATEST set is what
+    // materialized (mutation: no epoch check ⇒ [1, 3, 2] and two live roots).
+    expect(harness.sync.calls.map((call) => call.target.configRevision)).toEqual([1, 3]);
+    expect(harness.manager.currentDigest()).toBe("d3");
+    expect(harness.watchers.handles).toHaveLength(2);
+    expect(harness.watchers.handles.filter((handle) => !handle.closed)).toHaveLength(1);
+    // The successor subscribed only AFTER the predecessor was closed.
+    expect(harness.watchers.openAtCreate).toEqual([0, 0]);
+    expect(harness.sync.calls[1]!.reuseCachedHashes).toBe(false);
+  });
+
+  it("keeps the newest (empty) set: a stalled swap is discarded, never revived (P1/AS8)", async () => {
+    const harness = createHarness();
+    harness.manager.apply([item()], "d1");
+    await waitForFirstScan(harness);
+
+    harness.watchers.handles[0]!.holdClose();
+    harness.manager.apply([item({ configRevision: 2 })], "d2");
+    await waitUntil(() => harness.watchers.handles[0]!.closing, "the held close");
+
+    harness.manager.apply([], "empty");
+    // AS8 is synchronous: the loop is out of the set the moment it says so,
+    // even though the close (and the stalled pass) are still winding down.
+    expect(harness.manager.watchedLoopIds()).toEqual([]);
+
+    harness.watchers.handles[0]!.releaseClose();
+    await harness.manager.settled();
+    await tick();
+
+    expect(harness.manager.watchedLoopIds()).toEqual([]);
+    expect(harness.manager.currentDigest()).toBe("empty");
+    // Mutation: let the stalled pass continue ⇒ rev 2 is subscribed and scanned.
+    expect(harness.sync.calls.map((call) => call.target.configRevision)).toEqual([1]);
+    expect(harness.watchers.handles).toHaveLength(1);
+    expect(harness.watchers.handles[0]!.closed).toBe(true);
+  });
+
+  it("re-adds a loop only after its predecessor's watcher is closed (P1/AS8)", async () => {
+    const harness = createHarness();
+    harness.manager.apply([item()]);
+    await waitForFirstScan(harness);
+
+    harness.watchers.handles[0]!.holdClose();
+    harness.manager.apply([]);
+    await waitUntil(() => harness.watchers.handles[0]!.closing, "the held close");
+    await tick();
+    expect(harness.manager.watchedLoopIds()).toEqual([]);
+
+    harness.manager.apply([item({ configRevision: 2 })]);
+    expect(harness.manager.watchedLoopIds()).toEqual(["loop-1"]);
+    // Give the admission every chance to subscribe early (the admission's own
+    // root resolution is real fs I/O): with the retained close still in
+    // flight, nothing may subscribe for this loop yet.
+    // Mutation: subscribe without awaiting the retained close ⇒ a second live
+    // watcher for the same loop before the first one is gone.
+    await settleFor(150);
+    expect(harness.watchers.handles).toHaveLength(1);
+
+    harness.watchers.handles[0]!.releaseClose();
+    await waitUntil(() => harness.watchers.handles.length === 2, "the re-added watcher");
+    await waitUntil(() => harness.sync.calls.length === 2, "the re-added loop's full scan");
+    expect(harness.watchers.openAtCreate).toEqual([0, 0]);
+    expect(harness.sync.calls[1]!.reuseCachedHashes).toBe(false);
+  });
+
+  it("drains a stalled swap and leaves no live watcher behind (P1/AS12)", async () => {
+    const harness = createHarness();
+    harness.manager.apply([item()], "d1");
+    await waitForFirstScan(harness);
+
+    harness.watchers.handles[0]!.holdClose();
+    harness.manager.apply([item({ configRevision: 2 })], "d2");
+    await waitUntil(() => harness.watchers.handles[0]!.closing, "the held close");
+
+    const draining = harness.manager.drain(1_000);
+    await tick();
+    expect(harness.time.fire(1_000)).toBe(1); // the deadline fires: the close is still held
+    expect(await draining).toEqual({ settled: false });
+    expect(harness.logs.some((line) => line.includes("drain exceeded"))).toBe(true);
+
+    harness.watchers.handles[0]!.releaseClose(); // the OS finally answers
+    await harness.manager.settled();
+    await tick();
+
+    expect(harness.watchers.handles.filter((handle) => !handle.closed)).toHaveLength(0);
+    expect(harness.watchers.handles).toHaveLength(1); // no successor was ever subscribed
+    expect(harness.sync.calls.map((call) => call.target.configRevision)).toEqual([1]);
+  });
+
+  // ---- round-2 review fixes: the round/scan interleavings (P2) ----
+
+  it("queues a follow-up round when the window expires while a round is in flight (P2)", async () => {
+    const harness = createHarness();
+    harness.manager.apply([item()]);
+    await waitForFirstScan(harness);
+
+    const releaseHold = harness.sync.hold();
+    harness.watchers.handles[0]!.emit();
+    await fireWindow(harness); // round 2 is held
+    expect(harness.sync.calls).toHaveLength(2);
+
+    harness.watchers.handles[0]!.emit(); // the event that lands mid-round
+    await fireWindow(harness); // its window expires BEFORE that round ends
+    expect(harness.sync.calls).toHaveLength(2);
+    expect(harness.time.pendingMs().filter((ms) => ms === ARTIFACT_WATCH_EVENT_MERGE_MS)).toHaveLength(0);
+
+    // No new event, no new tick: the round that ends starts the catch-up.
+    // Mutation: keep only a dirty flag and never re-check it ⇒ stays at 2.
+    releaseHold();
+    await waitUntil(() => harness.sync.calls.length === 3, "the catch-up round");
+    await harness.manager.settled();
+    expect(harness.sync.calls[2]!.reuseCachedHashes).toBe(true);
+  });
+
+  it("keeps a reconcile request at FULL rehash when it lands during a round (P2/AW11)", async () => {
+    const harness = createHarness();
+    harness.manager.start();
+    harness.manager.apply([item()]);
+    await waitForFirstScan(harness);
+
+    const releaseHold = harness.sync.hold();
+    harness.watchers.handles[0]!.emit();
+    await fireWindow(harness); // an event round is held
+    expect(harness.sync.calls).toHaveLength(2);
+
+    await waitUntil(() => harness.time.pendingMs().includes(ARTIFACT_WATCH_RECONCILE_MS), "the tick");
+    harness.time.fire(ARTIFACT_WATCH_RECONCILE_MS); // the tick lands mid-round
+    await tick();
+    releaseHold();
+    await waitUntil(() => harness.sync.calls.length === 3, "the tick's follow-up round");
+    // Mutation: a plain boolean dirty flag ⇒ the follow-up would reuse the cache.
+    expect(harness.sync.calls[2]!.reuseCachedHashes).toBe(false);
+  });
+
+  it("never scans before `ready`: a pre-ready event is only recorded (P2/AW12)", async () => {
+    const harness = createHarness();
+    harness.watchers.autoReady.value = false;
+    harness.manager.apply([item()]);
+    await waitUntil(() => harness.watchers.handles.length === 1, "the watcher");
+
+    harness.watchers.handles[0]!.emit();
+    await tick();
+    // Mutation: default the state to "watching" ⇒ a window opens and a scan
+    // starts against a subscription that is not established yet.
+    expect(harness.time.pendingMs().filter((ms) => ms === ARTIFACT_WATCH_EVENT_MERGE_MS)).toHaveLength(0);
+    expect(harness.sync.calls).toHaveLength(0);
+
+    harness.watchers.handles[0]!.releaseReady();
+    await waitForFirstScan(harness);
+    expect(harness.sync.calls[0]!.reuseCachedHashes).toBe(false); // the first scan rehashes
+    await waitUntil(() => harness.sync.calls.length === 2, "the follow-up round for the pre-ready event");
+    expect(harness.sync.calls[1]!.reuseCachedHashes).toBe(true);
+  });
+
+  it("closes the watcher when the root disappears and re-verifies locally (P2)", async () => {
+    const harness = createHarness();
+    harness.manager.start();
+    harness.manager.apply([item()]);
+    await waitForFirstScan(harness);
+
+    harness.sync.setOutcome({
+      kind: "failed",
+      failure: "directory_missing",
+      detail: "root vanished",
+      reported: "recorded",
+    });
+    harness.watchers.handles[0]!.emit();
+    await fireWindow(harness);
+    // Mutation: only `outside_jail` counts as root-shaped ⇒ the watcher stays
+    // open over a directory that is not there any more.
+    await waitUntil(() => harness.watchers.handles[0]!.closed, "the vanished root's close");
+    const callsAfterFailure = harness.sync.calls.length;
+
+    // The tick re-verifies LOCALLY: with the root still gone it adds no request.
+    rmSync(base, { recursive: true, force: true });
+    await waitUntil(() => harness.time.pendingMs().includes(ARTIFACT_WATCH_RECONCILE_MS), "the tick");
+    harness.time.fire(ARTIFACT_WATCH_RECONCILE_MS);
+    await tick();
+    await tick();
+    expect(harness.sync.calls).toHaveLength(callsAfterFailure);
+    expect(harness.watchers.handles).toHaveLength(1);
+
+    // Recovery: the root comes back ⇒ re-subscribe and FULL rehash.
+    mkdirSync(base, { recursive: true });
+    harness.sync.setOutcome({ kind: "unchanged" });
+    await waitUntil(() => harness.time.pendingMs().includes(ARTIFACT_WATCH_RECONCILE_MS), "the re-armed tick");
+    harness.time.fire(ARTIFACT_WATCH_RECONCILE_MS);
+    await waitUntil(() => harness.watchers.handles.length === 2, "the recovered subscription");
+    await waitUntil(() => harness.sync.calls.length === callsAfterFailure + 1, "the re-admission scan");
+    expect(harness.sync.calls.at(-1)!.reuseCachedHashes).toBe(false);
   });
 });
