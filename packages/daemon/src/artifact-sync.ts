@@ -43,6 +43,7 @@ import {
   ARTIFACT_PREPARE_REQUEST_MAX_UTF8_BYTES,
   type ArtifactErrorCode,
   type ArtifactSyncErrorReportRequest,
+  type ArtifactSyncFailure,
   type ArtifactWatchItem,
   type NormalizedManifestEntry,
   type PrepareArtifactSyncRequest,
@@ -107,7 +108,7 @@ export type ArtifactReportState = "recorded" | "stale" | "unreported";
 export type ArtifactSyncOutcome =
   | { kind: "unchanged" }
   | { kind: "synced"; manifestRevision: number; artifactSnapshotId: string; uploaded: number }
-  | { kind: "failed"; failure: ArtifactScanFailure; detail: string; reported: ArtifactReportState }
+  | { kind: "failed"; failure: ArtifactSyncFailure; detail: string; reported: ArtifactReportState }
   | { kind: "config_changed"; detail: string }
   | { kind: "stopped"; scope: ArtifactStopScope; status: number; detail: string }
   | { kind: "terminal"; code?: ArtifactErrorCode; detail: string }
@@ -132,6 +133,22 @@ export interface ArtifactSyncInput {
   /** Slice 6: every Run-final sync uses a NEW session even when the content is
    *  unchanged (决策 11), so it bypasses suppression and mints a requestId. */
   freshSession?: boolean;
+  /** Slice 5's EVENT path only (决策 23/25): reuse a cached hash on an exact
+   *  five-field identity match. Default FALSE — startup, the 60 s reconcile
+   *  and slice 6's final sync always rehash every file. */
+  reuseCachedHashes?: boolean;
+}
+
+/** A local failure observed WITHOUT a sync attempt (slice 5: the watcher's own
+ *  errors and the WatchManager's admission refusals). */
+export interface ArtifactLocalFailureInput {
+  target: ArtifactWatchItem;
+  /** The FULL nine-value client taxonomy: this path exists precisely to
+   *  report the two classes a scan can never invent (`watcher_error`, and
+   *  slice 6's `timeout`). */
+  failure: ArtifactSyncFailure;
+  detail: string;
+  signal?: AbortSignal;
 }
 
 export interface ArtifactSyncClientDeps {
@@ -152,6 +169,13 @@ export interface ArtifactSyncClientDeps {
 export interface ArtifactSyncClient {
   syncLoop(input: ArtifactSyncInput): Promise<ArtifactSyncOutcome>;
   readBaseline(loopId: string, signal?: AbortSignal): Promise<ArtifactBaselineOutcome>;
+  /** Report a LOCAL failure that never reached a sync attempt (slice 5: the
+   *  watcher's own errors). Same rules as an attempt's local failure: the
+   *  baseline read precedes the report (so it carries the server's REAL
+   *  revisions, #95); a target/server mismatch is `config_changed` with NO
+   *  report; the report itself is one-shot with the tri-state result and
+   *  sticky-stop recording; the loop record is invalidated either way. */
+  reportLocalFailure(input: ArtifactLocalFailureInput): Promise<ArtifactSyncOutcome>;
   /** Clear the sticky 401/403 stops (config generation swap, credential
    *  rotation, or an operator decision to try again). */
   clearStops(): void;
@@ -411,7 +435,7 @@ export function createArtifactSyncClient(deps: ArtifactSyncClientDeps): Artifact
   async function reportFailure(
     target: ArtifactWatchItem,
     state: LoopState,
-    failure: ArtifactScanFailure,
+    failure: ArtifactSyncFailure,
     detail: string,
     signal: AbortSignal | undefined,
   ): Promise<ArtifactSyncOutcome> {
@@ -631,10 +655,15 @@ export function createArtifactSyncClient(deps: ArtifactSyncClientDeps): Artifact
       if (guard.kind === "refused") return reportFailure(target, state, "outside_jail", guard.detail, signal);
       const scan = await scanArtifactRoot(resolved, {
         cache: deps.cache,
-        reuseCachedHashes: false,
+        // The EVENT path may reuse a cached hash (five-field identity match);
+        // every other caller — startup, the 60 s reconcile, slice 6's final
+        // sync — keeps the default full rehash (决策 23/25).
+        reuseCachedHashes: input.reuseCachedHashes === true,
         limits: deps.limits,
         io: deps.io,
+        signal,
       });
+      if (scan.kind === "cancelled") return { kind: "cancelled" };
       if (scan.kind === "failed") return reportFailure(target, state, scan.failure, scan.detail, signal);
       const entries = scan.entries;
 
@@ -829,18 +858,18 @@ export function createArtifactSyncClient(deps: ArtifactSyncClientDeps): Artifact
     }
   }
 
-  async function syncLoop(input: ArtifactSyncInput): Promise<ArtifactSyncOutcome> {
-    const { loopId } = input.target;
-    const stop = stopFor(loopId);
-    if (stop !== null) return stoppedOutcome(stop);
-    if (isAborted(input.signal)) return { kind: "cancelled" };
-
+  /** This call's place in the per-loop chain: SAME-LOOP work never interleaves
+   *  (rounds AND slice-5's reporting-only calls share the chain). The slot is
+   *  held for as long as the call is queued OR running, and released even when
+   *  the call is cancelled before it starts — a successor must still queue
+   *  behind the round that is actually on the wire. Cancellation races the
+   *  QUEUE wait only, never the task itself ([#93]). */
+  async function runSerialized<T>(
+    loopId: string,
+    signal: AbortSignal | undefined,
+    task: () => Promise<T>,
+  ): Promise<T | { kind: "cancelled" }> {
     const previous = tails.get(loopId) ?? Promise.resolve();
-
-    // This call's place in the per-loop chain. The slot is held for as long as
-    // the call is queued OR running, and released even when the call is
-    // cancelled before it starts — a successor must still queue behind the
-    // round that is actually on the wire.
     let releaseSlot!: () => void;
     const slot = new Promise<void>((resolve) => {
       releaseSlot = resolve;
@@ -856,17 +885,58 @@ export function createArtifactSyncClient(deps: ArtifactSyncClientDeps): Artifact
 
     enterWork();
     try {
-      if (!(await waitInQueue(previous, input.signal))) return { kind: "cancelled" };
-      return await runRound(input);
+      if (!(await waitInQueue(previous, signal))) return { kind: "cancelled" };
+      return await task();
     } finally {
       releaseSlot();
       leaveWork();
     }
   }
 
+  async function syncLoop(input: ArtifactSyncInput): Promise<ArtifactSyncOutcome> {
+    const { loopId } = input.target;
+    const stop = stopFor(loopId);
+    if (stop !== null) return stoppedOutcome(stop);
+    if (isAborted(input.signal)) return { kind: "cancelled" };
+    return runSerialized(loopId, input.signal, () => runRound(input));
+  }
+
+  /** Slice-5 reporting-only path (watcher errors, admission refusals): the
+   *  baseline read keeps the report's revisions REAL (#95), a target/server
+   *  mismatch is `config_changed` with no report, and the report is the same
+   *  one-shot tri-state call an attempt would make. The record is invalidated
+   *  afterwards (决策 24: only unchanged/synced may keep it). */
+  async function reportLocalFailure(input: ArtifactLocalFailureInput): Promise<ArtifactSyncOutcome> {
+    const { loopId } = input.target;
+    const stop = stopFor(loopId);
+    if (stop !== null) return stoppedOutcome(stop);
+    if (isAborted(input.signal)) return { kind: "cancelled" };
+    const result = await runSerialized(loopId, input.signal, async (): Promise<ArtifactSyncOutcome> => {
+      const state = loopState(loopId);
+      try {
+        const read = await readBaselineOnce(loopId, input.signal);
+        if (read.kind !== "ok") return read;
+        if (read.configRevision !== input.target.configRevision || read.artifactDir !== input.target.artifactDir) {
+          state.baseline = undefined;
+          state.pending = undefined;
+          return {
+            kind: "config_changed",
+            detail: `server config (revision ${read.configRevision}, dir ${read.artifactDir}) no longer matches the sync target`,
+          };
+        }
+        state.baseline = { configRevision: read.configRevision, manifestRevision: read.manifestRevision, entries: null };
+        return await reportFailure(input.target, state, input.failure, input.detail, input.signal);
+      } finally {
+        invalidate(state);
+      }
+    });
+    return result;
+  }
+
   return {
     syncLoop,
     readBaseline,
+    reportLocalFailure,
     clearStops() {
       machineStop = null;
       loopStops.clear();

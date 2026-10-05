@@ -92,6 +92,10 @@ export const ARTIFACT_SCAN_MAX_ATTEMPTS = 3;
 
 export type ArtifactScanResult =
   | { kind: "ok"; root: string; entries: NormalizedManifestEntry[] }
+  /** The caller's signal aborted the scan (slice-5 drain, slice-6 deadline):
+   *  a structural NON-result — never a partial manifest, never a failure class
+   *  to report. */
+  | { kind: "cancelled" }
   | { kind: "failed"; failure: ArtifactScanFailure; detail: string };
 
 export interface ArtifactScanOptions {
@@ -102,6 +106,11 @@ export interface ArtifactScanOptions {
   reuseCachedHashes?: boolean;
   limits?: Partial<ArtifactScanLimits>;
   io?: ArtifactScanIo;
+  /** Cooperative cancellation (ADR-010 决策 25): checked at the rescan-loop,
+   *  per traversal frame and per entry. Aborting returns `{kind:"cancelled"}`
+   *  — the scan owns no partial state, so there is structurally no truncated
+   *  manifest. `undefined` (the default) is byte-identical to slice 3. */
+  signal?: AbortSignal;
 }
 
 /** Raised when the shared policy rejects an entry the scanner itself built:
@@ -208,7 +217,9 @@ export async function scanArtifactRoot(
   const limits: ArtifactScanLimits = { ...ARTIFACT_SCAN_DEFAULT_LIMITS, ...options.limits };
   const reuseCachedHashes = options.reuseCachedHashes ?? false;
   for (let attempt = 1; attempt <= ARTIFACT_SCAN_MAX_ATTEMPTS; attempt++) {
-    const outcome = await walkAttempt(resolved, limits, reuseCachedHashes, options.cache, options.io);
+    if (options.signal?.aborted) return { kind: "cancelled" };
+    const outcome = await walkAttempt(resolved, limits, reuseCachedHashes, options.cache, options.io, options.signal);
+    if (outcome.kind === "aborted") return { kind: "cancelled" };
     if (outcome.kind === "failed") return outcome;
     if (!outcome.dirty) return closeOut(resolved, outcome.entries);
   }
@@ -231,6 +242,9 @@ type Frame =
 
 type WalkOutcome =
   | { kind: "failed"; failure: ArtifactScanFailure; detail: string }
+  /** Cooperative cancellation (决策 25): like a failure, it structurally
+   *  carries NO partial manifest. */
+  | { kind: "aborted" }
   | { kind: "ok"; entries: NormalizedManifestEntry[]; dirty: boolean };
 
 const dirIdentity = (stat: FileStat): DirIdentity => ({
@@ -362,6 +376,7 @@ async function walkAttempt(
   reuseCachedHashes: boolean,
   cache: ArtifactHashCache,
   io: ArtifactScanIo | undefined,
+  signal: AbortSignal | undefined,
 ): Promise<WalkOutcome> {
   const lstat = io?.lstat ?? fs.lstat;
   const listNames = io?.listNames ?? listDirectoryNames;
@@ -391,6 +406,7 @@ async function walkAttempt(
     { kind: "dir", absDir: resolved.root, relPrefix: "", identity: dirIdentity(rootStat) },
   ];
   while (stack.length > 0) {
+    if (signal?.aborted) return { kind: "aborted" };
     const frame = stack.pop()!;
     if (frame.kind === "check") {
       let after: FileStat;
@@ -441,6 +457,7 @@ async function walkAttempt(
     const childDirs: Frame[] = [];
 
     for (const name of names) {
+      if (signal?.aborted) return { kind: "aborted" };
       const relPath = frame.relPrefix === "" ? name : `${frame.relPrefix}/${name}`;
       // Prune BEFORE any I/O: no lstat, no open, no descent.
       if (isNeverSyncPath(relPath)) continue;

@@ -4,7 +4,7 @@
  * the mutation that would make it red in its name or its assertion comment.
  */
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { promises as fs, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -14,6 +14,7 @@ import type { ArtifactErrorCode, ArtifactWatchItem } from "@loopzhb/protocol";
 
 import { createArtifactTransport } from "./artifact-client.js";
 import { createArtifactHashCache, type ArtifactHashCache } from "./artifact-hash-cache.js";
+import type { ArtifactScanIo } from "./artifact-scan.js";
 import {
   createArtifactSyncClient,
   createGate,
@@ -51,7 +52,13 @@ function write(relativePath: string, content: string): { hash: string; bytes: Bu
 }
 
 function start(
-  options: { artifactDir?: string | null; uploadConcurrency?: number; maxAttempts?: number; cache?: ArtifactHashCache } = {},
+  options: {
+    artifactDir?: string | null;
+    uploadConcurrency?: number;
+    maxAttempts?: number;
+    cache?: ArtifactHashCache;
+    io?: ArtifactScanIo;
+  } = {},
 ): void {
   server = createFakeArtifactServer({
     machineCredential: CREDENTIAL,
@@ -68,13 +75,19 @@ function start(
 /** A client over the CURRENT fake server — a second call models a restarted
  *  daemon process (no in-process baseline). */
 function makeClient(
-  options: { uploadConcurrency?: number; maxAttempts?: number; cache?: ArtifactHashCache } = {},
+  options: {
+    uploadConcurrency?: number;
+    maxAttempts?: number;
+    cache?: ArtifactHashCache;
+    io?: ArtifactScanIo;
+    fetchImpl?: typeof fetch;
+  } = {},
 ): ArtifactSyncClient {
   return createArtifactSyncClient({
     transport: createArtifactTransport({
       baseUrl: "http://fake.invalid",
       machineCredential: CREDENTIAL,
-      fetchImpl: server.fetchImpl,
+      fetchImpl: options.fetchImpl ?? server.fetchImpl,
     }),
     cache: options.cache ?? createArtifactHashCache(),
     // Time is injected, never faked: the delay sequence IS the evidence.
@@ -83,6 +96,7 @@ function makeClient(
     },
     uploadConcurrency: options.uploadConcurrency,
     maxAttempts: options.maxAttempts,
+    io: options.io,
   });
 }
 
@@ -421,6 +435,206 @@ describe("#91 (片 5) — the never-sync root guard", () => {
     const outcome = await sync({ target: target({ artifactDir: root }) });
 
     expect(outcome).toMatchObject({ kind: "synced", uploaded: 1 });
+  });
+});
+
+describe("片 5 — the slice-5 sync seams (决策 25)", () => {
+  /** Counts every byte-carrying open (scans AND pre-upload verification). */
+  function countingOpen(): { io: ArtifactScanIo; count: () => number } {
+    let count = 0;
+    return {
+      io: {
+        open: async (target, flags, mode) => {
+          count += 1;
+          return fs.open(target, flags as never, mode as never);
+        },
+      },
+      count: () => count,
+    };
+  }
+
+  it("reuses cached hashes ONLY when the caller opts in (the event path)", async () => {
+    write("a.txt", "alpha");
+    const counting = countingOpen();
+    start({ io: counting.io });
+
+    expect(await sync()).toMatchObject({ kind: "synced", uploaded: 1 });
+    const afterFirst = counting.count();
+    expect(afterFirst).toBeGreaterThan(0);
+
+    // Default (startup / 60 s reconcile / run-final): full rehash, even though
+    // the cache holds a five-field-identical entry.
+    expect(await sync()).toEqual({ kind: "unchanged" });
+    const afterDefault = counting.count();
+    expect(afterDefault).toBeGreaterThan(afterFirst);
+
+    // Event path: the cache hit means ZERO re-reads.
+    expect(await sync({ reuseCachedHashes: true })).toEqual({ kind: "unchanged" });
+    expect(counting.count()).toBe(afterDefault);
+  });
+
+  it("returns cancelled on an aborted signal — zero requests, zero reports, no partial manifest", async () => {
+    write("a.txt", "alpha");
+    start();
+    const ctl = new AbortController();
+    const aborting: ArtifactScanIo = {
+      lstat: async (target) => {
+        ctl.abort();
+        return fs.lstat(target);
+      },
+    };
+    client = makeClient({ io: aborting });
+
+    const outcome = await sync({ signal: ctl.signal });
+
+    expect(outcome).toEqual({ kind: "cancelled" });
+    expect(server.stepCalls("prepare")).toHaveLength(0);
+    expect(server.stepCalls("put")).toHaveLength(0);
+    expect(server.stepCalls("commit")).toHaveLength(0);
+    // A cancellation is NOT a local failure: nothing may be reported.
+    expect(server.stepCalls("report")).toHaveLength(0);
+    expect(loop().manifestRevision).toBe(0);
+  });
+
+  it("reports a local failure once with the server's real revisions, then invalidates the record", async () => {
+    write("a.txt", "alpha");
+    start();
+    expect(await sync()).toMatchObject({ kind: "synced" });
+
+    const outcome = await client.reportLocalFailure({
+      target: target(),
+      failure: "watcher_error",
+      detail: "chokidar exploded",
+    });
+
+    expect(outcome).toEqual({
+      kind: "failed",
+      failure: "watcher_error",
+      detail: "chokidar exploded",
+      reported: "recorded",
+    });
+    expect(server.stepCalls("report")).toHaveLength(1);
+    // The report carried the manifest revision the baseline read returned.
+    expect(loop().syncError).toEqual({ failure: "watcher_error", configRevision: 1, baseManifestRevision: 1 });
+    // Decision 24: only unchanged/synced may keep the record — the report did
+    // NOT, so the next call re-reads the baseline and re-commits instead of
+    // suppressing (the accepted equivalent-content residual, ADR-010 决策 24).
+    const reads = server.stepCalls("read").length;
+    expect(await sync()).toMatchObject({ kind: "synced", manifestRevision: 2 });
+    expect(server.stepCalls("read").length).toBeGreaterThan(reads);
+  });
+
+  it("returns `stale` when the pointer moved before the report landed", async () => {
+    start();
+    server.beforeReport = () => {
+      loop().manifestRevision += 1;
+    };
+
+    const outcome = await client.reportLocalFailure({
+      target: target(),
+      failure: "watcher_error",
+      detail: "late",
+    });
+
+    expect(outcome).toMatchObject({ kind: "failed", reported: "stale" });
+  });
+
+  it("returns `unreported` when the report's own transport fails — the failure stays the outcome", async () => {
+    start();
+    // Only the REPORT fails: the baseline read that precedes it still lands.
+    server.failNext("report", { kind: "network_error" });
+
+    const outcome = await client.reportLocalFailure({
+      target: target(),
+      failure: "timeout",
+      detail: "deadline",
+    });
+
+    expect(outcome).toMatchObject({ kind: "failed", failure: "timeout", reported: "unreported" });
+    // One-shot: the failed report is NEVER retried.
+    expect(server.stepCalls("report")).toHaveLength(1);
+  });
+
+  it("a 401 on the report records the machine stop and keeps the failure as the outcome", async () => {
+    start();
+    server.failNext("report", { kind: "status", status: 401 });
+
+    const outcome = await client.reportLocalFailure({
+      target: target(),
+      failure: "watcher_error",
+      detail: "unauthorized",
+    });
+
+    expect(outcome).toMatchObject({ kind: "failed", reported: "unreported" });
+    const calls = server.calls.length;
+    expect(await sync()).toMatchObject({ kind: "stopped", scope: "machine" });
+    expect(server.calls.length).toBe(calls); // sticky: zero further requests
+  });
+
+  it("says config_changed (no report) when the target disagrees with the server's dir", async () => {
+    start();
+
+    const outcome = await client.reportLocalFailure({
+      target: target({ artifactDir: path.join(base, "gone") }),
+      failure: "watcher_error",
+      detail: "stale target",
+    });
+
+    expect(outcome).toMatchObject({ kind: "config_changed" });
+    expect(server.stepCalls("report")).toHaveLength(0);
+  });
+
+  it("serializes behind an in-flight round for the same loop", async () => {
+    write("a.txt", "alpha");
+    start();
+    const release = server.holdPuts();
+    const round = sync();
+    await until(() => server.stepCalls("put").length === 1);
+
+    const reporting = client.reportLocalFailure({
+      target: target(),
+      failure: "watcher_error",
+      detail: "during the round",
+    });
+    await Promise.resolve();
+    expect(server.stepCalls("report")).toHaveLength(0); // queued, not interleaved
+
+    release();
+    expect(await round).toMatchObject({ kind: "synced" });
+    expect(await reporting).toMatchObject({ kind: "failed", failure: "watcher_error" });
+    expect(server.stepCalls("report")).toHaveLength(1);
+  });
+
+  it("counts a pending report in settled() so a drain cannot miss it", async () => {
+    start();
+    let releaseReport!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseReport = resolve;
+    });
+    let reportStarted = 0;
+    client = makeClient({
+      fetchImpl: async (input, init) => {
+        if (String(input).endsWith("/artifact-sync-error")) {
+          reportStarted += 1;
+          await gate;
+        }
+        return server.fetchImpl(input, init);
+      },
+    });
+
+    const pending = client.reportLocalFailure({ target: target(), failure: "watcher_error", detail: "held" });
+    await until(() => reportStarted === 1);
+    let settled = false;
+    void client.settled().then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    releaseReport();
+    expect(await pending).toMatchObject({ kind: "failed", reported: "recorded" });
+    await client.settled();
+    expect(settled).toBe(true);
   });
 });
 

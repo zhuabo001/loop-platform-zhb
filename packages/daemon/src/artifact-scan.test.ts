@@ -74,7 +74,7 @@ async function expectFailure(
   failure: ArtifactScanFailure,
 ): Promise<ArtifactScanResult & { kind: "failed" }> {
   const result = await resultPromise;
-  if (result.kind !== "failed") throw new Error(`expected a failure, got ok with ${result.entries.length} entries`);
+  if (result.kind !== "failed") throw new Error(`expected a failure, got ${result.kind}`);
   expect(result.failure).toBe(failure);
   // A failed scan is structurally incapable of carrying a partial manifest.
   expect("entries" in result).toBe(false);
@@ -247,11 +247,11 @@ describe("AJ7 — a missing directory is never an empty manifest", () => {
 describe("AJ8 — a legal empty directory is an empty manifest, sorted on output", () => {
   it("an empty tree and a tree of empty directories are both ok with []", async () => {
     const empty = await scanTree();
-    if (empty.kind !== "ok") throw new Error(`expected ok, got ${empty.failure}`);
+    if (empty.kind !== "ok") throw new Error(`expected ok, got ${empty.kind}`);
     expect(empty.entries).toEqual([]);
     mkdirSync(p("a", "b", "c"), { recursive: true });
     const nested = await scanTree();
-    if (nested.kind !== "ok") throw new Error(`expected ok, got ${nested.failure}`);
+    if (nested.kind !== "ok") throw new Error(`expected ok, got ${nested.kind}`);
     expect(nested.entries).toEqual([]);
   });
 
@@ -261,7 +261,7 @@ describe("AJ8 — a legal empty directory is an empty manifest, sorted on output
     writeFileSync(p("a", "b"), "world");
     writeFileSync(p("a.txt"), "!");
     const result = await scanTree();
-    if (result.kind !== "ok") throw new Error(`expected ok, got ${result.failure}`);
+    if (result.kind !== "ok") throw new Error(`expected ok, got ${result.kind}`);
     expect(result.entries.map((entry) => entry.path)).toEqual(["a.txt", "a/b", "zz.txt"]);
     expect(result.entries.map((entry) => entry.hash)).toEqual([
       "bb7208bc9b5d7c04f1236a82a0093a5e33f40423d5ba8d4266f7092c3ba43b62", // "!"
@@ -368,7 +368,7 @@ describe("AJ9 — read failures and instability discard the whole attempt", () =
       },
     };
     const result = await scanTree(base, { io });
-    if (result.kind !== "ok") throw new Error(`expected ok, got ${result.failure}: ${result.detail}`);
+    if (result.kind !== "ok") throw new Error(`expected ok, got ${result.kind}`);
     expect(opens).toBe(2); // attempt 1 was discarded, attempt 2 read the file
     expect(result.entries.map((entry) => entry.path)).toEqual(["a.txt"]);
   });
@@ -384,7 +384,7 @@ describe("AJ9 — read failures and instability discard the whole attempt", () =
       },
     };
     const result = await scanTree(base, { io });
-    if (result.kind !== "ok") throw new Error(`expected ok, got ${result.failure}: ${result.detail}`);
+    if (result.kind !== "ok") throw new Error(`expected ok, got ${result.kind}`);
     expect(opens).toBe(2); // attempt 1 was discarded, attempt 2 read the file
     expect(result.entries).toHaveLength(1);
     expect(result.entries[0]!.size).toBe(8); // the settled content
@@ -416,7 +416,7 @@ describe("AJ9 — read failures and instability discard the whole attempt", () =
       },
     };
     const result = await scanTree(base, { io });
-    if (result.kind !== "ok") throw new Error(`expected ok, got ${result.failure}: ${result.detail}`);
+    if (result.kind !== "ok") throw new Error(`expected ok, got ${result.kind}`);
     expect(listings).toBe(2); // attempt 1 was discarded
     expect(result.entries.map((entry) => entry.path)).toEqual(["early.txt", "late.txt"]);
   });
@@ -436,7 +436,7 @@ describe("AJ10 — never-sync pruning happens before any I/O", () => {
     const { io, listed } = recordingListNames();
     const { io: openIo, count } = countingOpen();
     const result = await scanTree(base, { io: { ...io, ...openIo } });
-    if (result.kind !== "ok") throw new Error(`expected ok, got ${result.failure}: ${result.detail}`);
+    if (result.kind !== "ok") throw new Error(`expected ok, got ${result.kind}`);
     expect(result.entries.map((entry) => entry.path)).toEqual(["visible.txt"]);
     expect(count()).toBe(1); // exactly the visible file was opened
     // `.config` alone is NOT a directory rule — only the two-segment
@@ -452,7 +452,7 @@ describe("AJ10 — never-sync pruning happens before any I/O", () => {
     writeFileSync(p(".env"), "secret");
     const { io, count } = countingOpen();
     const result = await scanTree(base, { io });
-    if (result.kind !== "ok") throw new Error(`expected ok, got ${result.failure}: ${result.detail}`);
+    if (result.kind !== "ok") throw new Error(`expected ok, got ${result.kind}`);
     expect(result.entries).toEqual([]);
     expect(count()).toBe(0);
   });
@@ -472,7 +472,7 @@ describe("AJ10 — capacity ceilings stop the scan before it reads", () => {
     writeFileSync(exact, "");
     truncateSync(exact, ARTIFACT_FILE_MAX_BYTES);
     const ok = await scanTree();
-    if (ok.kind !== "ok") throw new Error(`expected ok, got ${ok.failure}: ${ok.detail}`);
+    if (ok.kind !== "ok") throw new Error(`expected ok, got ${ok.kind}`);
     expect(ok.entries).toHaveLength(1);
     expect(ok.entries[0]!.size).toBe(ARTIFACT_FILE_MAX_BYTES);
     truncateSync(exact, ARTIFACT_FILE_MAX_BYTES + 1);
@@ -553,11 +553,11 @@ describe("hash cache integration", () => {
       return cache;
     };
     const fresh = await scanTree(base, { cache: seeded() });
-    if (fresh.kind !== "ok") throw new Error(`expected ok, got ${fresh.failure}`);
+    if (fresh.kind !== "ok") throw new Error(`expected ok, got ${fresh.kind}`);
     expect(fresh.entries[0]!.hash).toBe("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
 
     const reused = await scanTree(base, { cache: seeded(), reuseCachedHashes: true });
-    if (reused.kind !== "ok") throw new Error(`expected ok, got ${reused.failure}`);
+    if (reused.kind !== "ok") throw new Error(`expected ok, got ${reused.kind}`);
     expect(reused.entries[0]!.hash).toBe("f".repeat(64)); // the cached value, untouched
   });
 
@@ -574,7 +574,7 @@ describe("hash cache integration", () => {
       hash: "f".repeat(64),
     });
     const result = await scanTree(base, { cache, reuseCachedHashes: true });
-    if (result.kind !== "ok") throw new Error(`expected ok, got ${result.failure}`);
+    if (result.kind !== "ok") throw new Error(`expected ok, got ${result.kind}`);
     expect(result.entries[0]!.hash).toBe("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
   });
 
@@ -582,7 +582,7 @@ describe("hash cache integration", () => {
     writeFileSync(p("a.txt"), "hello");
     const cache = createArtifactHashCache();
     const result = await scanTree(base, { cache });
-    if (result.kind !== "ok") throw new Error(`expected ok, got ${result.failure}`);
+    if (result.kind !== "ok") throw new Error(`expected ok, got ${result.kind}`);
     const cached = cache.get(p("a.txt"));
     expect(cached?.hash).toBe(result.entries[0]!.hash);
     const stat = await fs.lstat(p("a.txt"));
@@ -666,5 +666,41 @@ describe("readArtifactFileWithBytes — the bytes that were hashed come back (U3
     writeFileSync(p("moved.txt"), "abc"); // a fresh fixture for the byte-less form
     const plain = await readArtifactFile(p("moved.txt"), { maxBytes: ARTIFACT_FILE_MAX_BYTES, io: midReadRewrite() });
     expect(plain.kind).toBe("changed");
+  });
+});
+
+describe("A5 (slice-5): cooperative cancellation (决策 25)", () => {
+  it("returns cancelled — never a partial manifest, never a failure class — when the signal aborts mid-scan", async () => {
+    writeFileSync(p("a.txt"), "alpha");
+    mkdirSync(p("sub"));
+    writeFileSync(p("sub", "b.txt"), "beta");
+
+    const ctl = new AbortController();
+    const abortOnFirstStat: ArtifactScanIo = {
+      lstat: async (target) => {
+        ctl.abort();
+        return fs.lstat(target);
+      },
+    };
+    const result = await scanTree(base, { io: abortOnFirstStat, signal: ctl.signal });
+
+    expect(result).toEqual({ kind: "cancelled" });
+    // Structurally like a failure: no entries to submit.
+    expect("entries" in result).toBe(false);
+  });
+
+  it("an already-aborted signal never touches the tree", async () => {
+    writeFileSync(p("a.txt"), "alpha");
+    const ctl = new AbortController();
+    ctl.abort();
+    let stats = 0;
+    const counting: ArtifactScanIo = {
+      lstat: async (target) => {
+        stats += 1;
+        return fs.lstat(target);
+      },
+    };
+    expect(await scanTree(base, { io: counting, signal: ctl.signal })).toEqual({ kind: "cancelled" });
+    expect(stats).toBe(0);
   });
 });
