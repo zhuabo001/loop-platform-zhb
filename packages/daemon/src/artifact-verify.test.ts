@@ -18,7 +18,13 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createArtifactHashCache, type ArtifactHashCache } from "./artifact-hash-cache.js";
 import type { ResolvedArtifactRoot } from "./artifact-jail.js";
 import type { ArtifactScanIo } from "./artifact-scan.js";
-import { verifyArtifactEntry, type ArtifactVerifyFailure, type ArtifactVerifyResult } from "./artifact-verify.js";
+import {
+  readVerifiedArtifactEntry,
+  verifyArtifactEntry,
+  type ArtifactVerifiedRead,
+  type ArtifactVerifyFailure,
+  type ArtifactVerifyResult,
+} from "./artifact-verify.js";
 
 let base: string;
 
@@ -65,6 +71,17 @@ const expectedFor = (relPath: string, text: string): { path: string; hash: strin
   hash: sha256(text),
   size: Buffer.byteLength(text),
 });
+
+async function expectReadFailure(
+  resultPromise: Promise<ArtifactVerifiedRead>,
+  failure: ArtifactVerifyFailure,
+  label = "readVerifiedArtifactEntry",
+): Promise<void> {
+  const result = await resultPromise;
+  if (result.kind !== "failed") throw new Error(`${label}: expected a failure, got ok for ${result.entry.path}`);
+  expect(result.failure, label).toBe(failure);
+  expect("bytes" in result, label).toBe(false); // a failed read never hands back bytes
+}
 
 describe("containment guard — nothing outside the root is ever read", () => {
   it("a `..` chain that escapes the root is `changed` with zero opens", async () => {
@@ -291,5 +308,132 @@ describe("the cache is write-only here (U3)", () => {
     const cache = createArtifactHashCache();
     await expectFailure(verifyArtifactEntry(root(), expectedFor("a.txt", "hello"), { cache }), "changed");
     expect(cache.size).toBe(0);
+  });
+});
+
+describe("readVerifiedArtifactEntry — the verified bytes ARE the upload bytes (U3)", () => {
+  it("returns the entry plus exactly the bytes that hash to the declared sha256", async () => {
+    const content = Buffer.from([0x00, 0x68, 0x69, 0xff, 0x0a, 0x00]); // binary, NUL-delimited
+    writeFileSync(p("a.bin"), content);
+    const declared = { path: "a.bin", hash: createHash("sha256").update(content).digest("hex"), size: content.length };
+    const cache = createArtifactHashCache();
+    const result = await readVerifiedArtifactEntry(root(), declared, { cache });
+    if (result.kind !== "ok") throw new Error(`expected ok, got ${result.failure}: ${result.detail}`);
+    expect(result.bytes.equals(content)).toBe(true);
+    expect(createHash("sha256").update(result.bytes).digest("hex")).toBe(declared.hash);
+    expect(result.entry).toEqual(declared);
+    // The cache key stays the ABSOLUTE path — the resolved read path, not the
+    // manifest-relative one.
+    expect(cache.get(p("a.bin"))?.hash).toBe(declared.hash);
+  });
+
+  it("hands back the verified bytes even after the path is rewritten (no re-read)", async () => {
+    writeFileSync(p("a.txt"), "hello");
+    const result = await readVerifiedArtifactEntry(root(), expectedFor("a.txt", "hello"), { cache: createArtifactHashCache() });
+    if (result.kind !== "ok") throw new Error(`expected ok, got ${result.failure}: ${result.detail}`);
+    writeFileSync(p("a.txt"), "world"); // drift between verification and upload
+    expect(result.bytes.toString()).toBe("hello");
+    expect(createHash("sha256").update(result.bytes).digest("hex")).toBe(sha256("hello"));
+  });
+
+  it("classifies every failure arm exactly as verifyArtifactEntry does", async () => {
+    writeFileSync(p("plain.txt"), "hello");
+    mkdirSync(p("a-dir"));
+    symlinkSync(p("plain.txt"), p("a-link"));
+    writeFileSync(p("denied.txt"), "hello");
+    writeFileSync(p("big.bin"), "");
+    truncateSync(p("big.bin"), ARTIFACT_FILE_MAX_BYTES + 1);
+    const denied: ArtifactScanIo = {
+      lstat: async (target) => {
+        if (target === p("denied.txt")) throw Object.assign(new Error("denied"), { code: "EACCES" });
+        return fs.lstat(target);
+      },
+    };
+    const arms: Array<{ name: string; path: string; hash: string; size: number; failure: ArtifactVerifyFailure; io?: ArtifactScanIo }> = [
+      { name: "missing", path: "gone.txt", hash: sha256("x"), size: 1, failure: "missing" },
+      { name: "symlink", path: "a-link", hash: sha256("hello"), size: 5, failure: "symlink" },
+      { name: "special_file", path: "a-dir", hash: sha256("x"), size: 1, failure: "special_file" },
+      { name: "unreadable", path: "denied.txt", hash: sha256("hello"), size: 5, failure: "unreadable", io: denied },
+      { name: "too_large", path: "big.bin", hash: sha256("x"), size: 1, failure: "too_large" },
+      { name: "changed", path: "plain.txt", hash: sha256("world"), size: 5, failure: "changed" },
+    ];
+    for (const arm of arms) {
+      const expected = { path: arm.path, hash: arm.hash, size: arm.size };
+      const plain = await verifyArtifactEntry(root(), expected, { cache: createArtifactHashCache(), io: arm.io });
+      const read = await readVerifiedArtifactEntry(root(), expected, { cache: createArtifactHashCache(), io: arm.io });
+      expect(plain.kind, arm.name).toBe("failed");
+      expect(read.kind, arm.name).toBe("failed");
+      if (plain.kind !== "failed" || read.kind !== "failed") throw new Error(arm.name);
+      expect(plain.failure, arm.name).toBe(arm.failure);
+      expect(read.failure, arm.name).toBe(arm.failure);
+      expect("bytes" in read, arm.name).toBe(false);
+    }
+  });
+
+  it("still refuses an escaping path FIRST — zero opens, zero bytes, zero cache writes", async () => {
+    writeFileSync(p("outside.txt"), "OUTSIDE");
+    mkdirSync(p("tree"));
+    let opens = 0;
+    const io: ArtifactScanIo = {
+      open: async (target, flags, mode) => {
+        opens++;
+        return fs.open(target, flags as never, mode as never);
+      },
+    };
+    const resolved = { root: p("tree"), effectiveRoots: [p("tree")] };
+    const cache = createArtifactHashCache();
+    await expectReadFailure(
+      readVerifiedArtifactEntry(resolved, expectedFor("../outside.txt", "OUTSIDE"), { cache, io }),
+      "changed",
+      "the `..` chain",
+    );
+    await expectReadFailure(
+      readVerifiedArtifactEntry(resolved, { path: p("outside.txt"), hash: sha256("OUTSIDE"), size: 7 }, { cache, io }),
+      "changed",
+      "the absolute path",
+    );
+    expect(opens).toBe(0);
+    expect(cache.size).toBe(0);
+  });
+
+  it("writes the cache only on success — never for a failure", async () => {
+    writeFileSync(p("a.txt"), "hello");
+    const ok = createArtifactHashCache();
+    const result = await readVerifiedArtifactEntry(root(), expectedFor("a.txt", "hello"), { cache: ok });
+    if (result.kind !== "ok") throw new Error(`expected ok, got ${result.failure}: ${result.detail}`);
+    expect(ok.get(p("a.txt"))?.hash).toBe(sha256("hello"));
+
+    const mismatch = createArtifactHashCache();
+    await expectReadFailure(
+      readVerifiedArtifactEntry(root(), expectedFor("a.txt", "world"), { cache: mismatch }),
+      "changed",
+      "the content mismatch",
+    );
+    expect(mismatch.size).toBe(0);
+
+    writeFileSync(p("big.bin"), "");
+    truncateSync(p("big.bin"), ARTIFACT_FILE_MAX_BYTES + 1);
+    const over = createArtifactHashCache();
+    await expectReadFailure(
+      readVerifiedArtifactEntry(root(), { path: "big.bin", hash: sha256("x"), size: 1 }, { cache: over }),
+      "too_large",
+      "the over-ceiling file",
+    );
+    expect(over.size).toBe(0);
+  });
+
+  it("a file rewritten mid-read is `changed`, with no bytes", async () => {
+    writeFileSync(p("a.txt"), "abc");
+    let opens = 0;
+    const io: ArtifactScanIo = {
+      open: async (target, flags, mode) => {
+        if (++opens === 1) await fs.appendFile(target as string, "EXTRA");
+        return fs.open(target, flags as never, mode as never);
+      },
+    };
+    await expectReadFailure(
+      readVerifiedArtifactEntry(root(), expectedFor("a.txt", "abc"), { cache: createArtifactHashCache(), io }),
+      "changed",
+    );
   });
 });

@@ -8,7 +8,7 @@
  *
  * Two rules that are easy to get wrong:
  *
- *  - the cache is NEVER a fast path here (U3). Verification always re-reads
+ *  - the cache is NEVER a fast path here (ADR-010 决策 24). Verification always re-reads
  *    and recomputes; a cached hash may only be WRITTEN back afterwards, so
  *    the slice-5 event path can reuse it.
  *  - the containment guard runs FIRST and refuses without touching the disk:
@@ -22,7 +22,7 @@ import { ARTIFACT_FILE_MAX_BYTES, type NormalizedManifestEntry } from "@loopzhb/
 import type { ArtifactHashCache } from "./artifact-hash-cache.js";
 import type { ResolvedArtifactRoot } from "./artifact-jail.js";
 import { isWithinOrEqual } from "./jail.js";
-import { readArtifactFile, type ArtifactScanIo } from "./artifact-scan.js";
+import { readArtifactFileWithBytes, type ArtifactScanIo } from "./artifact-scan.js";
 
 /** Deliberately FINER than the wire taxonomy: the caller (slice 4) maps
  *  `changed`/`missing` onto the `unstable` re-scan-and-report path and passes
@@ -34,13 +34,20 @@ export type ArtifactVerifyResult =
   | { kind: "ok"; entry: NormalizedManifestEntry }
   | { kind: "failed"; failure: ArtifactVerifyFailure; detail: string };
 
-export async function verifyArtifactEntry(
+/** `ArtifactVerifyResult` plus the verified BYTES (ADR-010 决策 24). The uploader sends
+ *  these bytes — the ones just hashed — so no verify→upload window exists to
+ *  race; `verifyArtifactEntry` is this with the bytes dropped. */
+export type ArtifactVerifiedRead =
+  | { kind: "ok"; entry: NormalizedManifestEntry; bytes: Buffer }
+  | { kind: "failed"; failure: ArtifactVerifyFailure; detail: string };
+
+export async function readVerifiedArtifactEntry(
   resolved: ResolvedArtifactRoot,
   /** A path/hash/size triple that already passed the shared policy — normally
    *  an entry of the scan's own output. */
   expected: { path: string; hash: string; size: number },
   options: { cache: ArtifactHashCache; io?: ArtifactScanIo },
-): Promise<ArtifactVerifyResult> {
+): Promise<ArtifactVerifiedRead> {
   // Containment before any I/O: resolve() collapses `..` and lets an absolute
   // path win outright, and the lexical containment test then refuses both.
   const absolutePath = path.resolve(resolved.root, expected.path);
@@ -51,7 +58,7 @@ export async function verifyArtifactEntry(
       detail: `entry escapes the artifact root: ${JSON.stringify(expected.path)}`,
     };
   }
-  const read = await readArtifactFile(absolutePath, { maxBytes: ARTIFACT_FILE_MAX_BYTES, io: options.io });
+  const read = await readArtifactFileWithBytes(absolutePath, { maxBytes: ARTIFACT_FILE_MAX_BYTES, io: options.io });
   if (read.kind !== "ok") {
     if (read.kind === "changed") {
       return { kind: "failed", failure: "changed", detail: `entry changed while being verified: ${JSON.stringify(expected.path)}` };
@@ -67,5 +74,17 @@ export async function verifyArtifactEntry(
   }
   // Only a fully verified read is cached — and only AFTER the comparison.
   options.cache.set(absolutePath, read.identity);
-  return { kind: "ok", entry: { path: expected.path, hash: read.hash, size: read.size } };
+  return { kind: "ok", entry: { path: expected.path, hash: read.hash, size: read.size }, bytes: read.bytes };
+}
+
+/** The same verification with the bytes dropped — the caller that only needs
+ *  the proof (a scan-driven check) never holds file contents. */
+export async function verifyArtifactEntry(
+  resolved: ResolvedArtifactRoot,
+  expected: { path: string; hash: string; size: number },
+  options: { cache: ArtifactHashCache; io?: ArtifactScanIo },
+): Promise<ArtifactVerifyResult> {
+  const read = await readVerifiedArtifactEntry(resolved, expected, options);
+  if (read.kind !== "ok") return read;
+  return { kind: "ok", entry: read.entry };
 }

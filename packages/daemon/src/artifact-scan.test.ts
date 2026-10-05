@@ -5,6 +5,7 @@
  * special file, an EACCES) — never fake timers, never a blocking FIFO read.
  */
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { promises as fs } from "node:fs";
 import type { Stats } from "node:fs";
@@ -24,7 +25,10 @@ import type { ArtifactScanFailure } from "./artifact-jail.js";
 import {
   ARTIFACT_SCAN_DEFAULT_LIMITS,
   listDirectoryNames,
+  readArtifactFile,
+  readArtifactFileWithBytes,
   scanArtifactRoot,
+  type ArtifactFileRead,
   type ArtifactScanIo,
   type ArtifactScanOptions,
   type ArtifactScanResult,
@@ -587,5 +591,80 @@ describe("hash cache integration", () => {
       ino: stat.ino,
       size: stat.size,
     });
+  });
+});
+
+describe("readArtifactFileWithBytes — the bytes that were hashed come back (U3)", () => {
+  it("returns exactly the file's bytes, hashed to the declared sha256", async () => {
+    const content = Buffer.from([0x00, 0x68, 0x69, 0xff, 0x0a, 0x00]); // binary, NUL-delimited
+    writeFileSync(p("blob.bin"), content);
+    const result = await readArtifactFileWithBytes(p("blob.bin"), { maxBytes: ARTIFACT_FILE_MAX_BYTES });
+    if (result.kind !== "ok") throw new Error(`expected ok, got ${result.kind}`);
+    expect(result.bytes.equals(content)).toBe(true);
+    expect(result.size).toBe(content.length);
+    expect(result.hash).toBe(createHash("sha256").update(content).digest("hex"));
+    expect(result.identity.hash).toBe(result.hash); // the cache entry describes those bytes
+    expect(result.identity.size).toBe(content.length);
+  });
+
+  it("readArtifactFile drops the bytes — the identical identity, the identical shape", async () => {
+    writeFileSync(p("plain.txt"), "hello");
+    const result = await readArtifactFile(p("plain.txt"), { maxBytes: ARTIFACT_FILE_MAX_BYTES });
+    if (result.kind !== "ok") throw new Error(`expected ok, got ${result.kind}`);
+    expect("bytes" in result).toBe(false);
+    expect(Object.keys(result).sort()).toEqual(["hash", "identity", "kind", "size"]);
+    expect(result.hash).toBe(createHash("sha256").update("hello").digest("hex"));
+    expect(result.size).toBe(5);
+  });
+
+  it("classifies every arm exactly as readArtifactFile does", async () => {
+    writeFileSync(p("plain.txt"), "hello");
+    mkdirSync(p("a-dir"));
+    symlinkSync(p("plain.txt"), p("a-link"));
+    writeFileSync(p("over.bin"), "");
+    truncateSync(p("over.bin"), ARTIFACT_FILE_MAX_BYTES + 1);
+    writeFileSync(p("denied.txt"), "hello");
+    const denied: ArtifactScanIo = {
+      lstat: async (target) => {
+        if (target === p("denied.txt")) throw Object.assign(new Error("denied"), { code: "EACCES" });
+        return fs.lstat(target);
+      },
+    };
+    const arms: Array<{ name: string; path: string; kind: ArtifactFileRead["kind"]; io?: ArtifactScanIo }> = [
+      { name: "ok", path: "plain.txt", kind: "ok" },
+      { name: "missing", path: "gone.txt", kind: "missing" },
+      { name: "symlink", path: "a-link", kind: "symlink" },
+      { name: "special_file", path: "a-dir", kind: "special_file" },
+      { name: "unreadable", path: "denied.txt", kind: "unreadable", io: denied },
+      { name: "too_large", path: "over.bin", kind: "too_large" },
+    ];
+    for (const arm of arms) {
+      const options = { maxBytes: ARTIFACT_FILE_MAX_BYTES, io: arm.io };
+      const plain = await readArtifactFile(p(arm.path), options);
+      const bytes = await readArtifactFileWithBytes(p(arm.path), options);
+      expect(plain.kind, arm.name).toBe(arm.kind);
+      expect(bytes.kind, arm.name).toBe(arm.kind);
+    }
+  });
+
+  it("a file rewritten mid-read is still `changed`, and carries no bytes", async () => {
+    // A fresh counter per call: the append happens exactly once per fixture.
+    const midReadRewrite = (): ArtifactScanIo => {
+      let opens = 0;
+      return {
+        open: async (target, flags, mode) => {
+          if (++opens === 1) await fs.appendFile(target as string, "EXTRA");
+          return fs.open(target, flags as never, mode as never);
+        },
+      };
+    };
+    writeFileSync(p("moved.txt"), "abc");
+    const bytes = await readArtifactFileWithBytes(p("moved.txt"), { maxBytes: ARTIFACT_FILE_MAX_BYTES, io: midReadRewrite() });
+    expect(bytes.kind).toBe("changed");
+    expect("bytes" in bytes).toBe(false);
+
+    writeFileSync(p("moved.txt"), "abc"); // a fresh fixture for the byte-less form
+    const plain = await readArtifactFile(p("moved.txt"), { maxBytes: ARTIFACT_FILE_MAX_BYTES, io: midReadRewrite() });
+    expect(plain.kind).toBe("changed");
   });
 });

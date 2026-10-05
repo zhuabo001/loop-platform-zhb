@@ -125,14 +125,27 @@ export type ArtifactFileRead =
   | { kind: "unreadable" }
   | { kind: "too_large" };
 
+/** `ArtifactFileRead` plus the BYTES that were hashed, so an uploader can send
+ *  exactly what it verified (ADR-010 决策 24): a second read of the path would reopen the
+ *  verify→upload window this closes. Same failure arms, same classification. */
+export type ArtifactFileBytesRead =
+  | { kind: "ok"; hash: string; size: number; identity: ArtifactHashCacheEntry; bytes: Buffer }
+  | { kind: "missing" }
+  | { kind: "changed" }
+  | { kind: "symlink" }
+  | { kind: "special_file" }
+  | { kind: "unreadable" }
+  | { kind: "too_large" };
+
 /** One bounded, no-follow, identity-verified read of a regular file — the
- *  scan's and the pre-upload verifier's single read path. `preStat` is the
- *  caller's own lstat when it already has one; the post-read lstat runs here
- *  regardless (it is the check that makes the hash trustworthy). */
-export async function readArtifactFile(
+ *  scan's and the pre-upload verifier's single read path, kept in ONE place so
+ *  the byte-returning and byte-less forms can never drift apart. `preStat` is
+ *  the caller's own lstat when it already has one; the post-read lstat runs
+ *  here regardless (it is the check that makes the hash trustworthy). */
+export async function readArtifactFileWithBytes(
   absolutePath: string,
   options: { maxBytes: number; preStat?: FileStat; io?: ArtifactScanIo },
-): Promise<ArtifactFileRead> {
+): Promise<ArtifactFileBytesRead> {
   const lstat = options.io?.lstat ?? fs.lstat;
   let before: FileStat;
   if (options.preStat !== undefined) {
@@ -172,7 +185,20 @@ export async function readArtifactFile(
     hash,
     size: after.size,
     identity: { dev: after.dev, ino: after.ino, size: after.size, mtimeMs: after.mtimeMs, ctimeMs: after.ctimeMs, hash },
+    bytes: read.bytes,
   };
+}
+
+/** The same pipeline with the bytes dropped: the scan wants only the identity,
+ *  and not retaining the buffer lets each file's contents go as soon as its
+ *  hash is taken. Failure arms pass through unchanged. */
+export async function readArtifactFile(
+  absolutePath: string,
+  options: { maxBytes: number; preStat?: FileStat; io?: ArtifactScanIo },
+): Promise<ArtifactFileRead> {
+  const read = await readArtifactFileWithBytes(absolutePath, options);
+  if (read.kind !== "ok") return read;
+  return { kind: "ok", hash: read.hash, size: read.size, identity: read.identity };
 }
 
 export async function scanArtifactRoot(
