@@ -477,8 +477,10 @@ describe("片 5 — the slice-5 sync seams (决策 25)", () => {
     write("a.txt", "alpha");
     start();
     const ctl = new AbortController();
+    let stats = 0;
     const aborting: ArtifactScanIo = {
       lstat: async (target) => {
+        stats += 1;
         ctl.abort();
         return fs.lstat(target);
       },
@@ -488,6 +490,9 @@ describe("片 5 — the slice-5 sync seams (决策 25)", () => {
     const outcome = await sync({ signal: ctl.signal });
 
     expect(outcome).toEqual({ kind: "cancelled" });
+    // The scan STOPPED at its next boundary: only the root lstat ran (mutation:
+    // drop the signal from the scan options ⇒ the walk keeps statting entries).
+    expect(stats).toBe(1);
     expect(server.stepCalls("prepare")).toHaveLength(0);
     expect(server.stepCalls("put")).toHaveLength(0);
     expect(server.stepCalls("commit")).toHaveLength(0);

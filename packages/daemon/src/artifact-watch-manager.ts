@@ -293,9 +293,10 @@ export function createArtifactWatchManager(deps: ArtifactWatchManagerDeps): Arti
         state.windowCtl = null;
         if (!state.dirty) return;
         state.dirty = false;
+        // Events that arrive DURING this round re-arm through markDirty: the
+        // window controller is already null here, so the next event opens a
+        // FRESH window instead of being folded into the finished one (AW12).
         await runSync(state, "event");
-        // Events that arrived DURING the round need a fresh window (AW12).
-        if (state.dirty && state.generation === generation && !draining) openWindow(state);
       } finally {
         if (state.windowCtl === ctl) state.windowCtl = null;
       }
