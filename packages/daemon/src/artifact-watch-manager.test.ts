@@ -765,6 +765,88 @@ describe("artifact-watch-manager", () => {
     expect(harness.sync.calls[1]!.reuseCachedHashes).toBe(true);
   });
 
+  it("catches up when a window expires while the FIRST scan is in flight (P2)", async () => {
+    const harness = createHarness();
+    const releaseHold = harness.sync.hold();
+    harness.manager.apply([item()]);
+    await waitUntil(() => harness.sync.calls.length === 1, "the held first scan");
+
+    harness.watchers.handles[0]!.emit();
+    await fireWindow(harness); // the event's window expires mid-first-scan
+    expect(harness.sync.calls).toHaveLength(1);
+
+    releaseHold();
+    await waitUntil(() => harness.sync.calls.length === 2, "the catch-up round");
+    await harness.manager.settled();
+    expect(harness.sync.calls[1]!.reuseCachedHashes).toBe(true);
+  });
+
+  it("does not scan on a reconcile tick that lands during admission (P2)", async () => {
+    const harness = createHarness();
+    harness.watchers.autoReady.value = false;
+    harness.manager.start();
+    harness.manager.apply([item()]);
+    await waitUntil(() => harness.watchers.handles.length === 1, "the watcher");
+
+    await waitUntil(() => harness.time.pendingMs().includes(ARTIFACT_WATCH_RECONCILE_MS), "the tick");
+    harness.time.fire(ARTIFACT_WATCH_RECONCILE_MS);
+    await tick();
+    await tick();
+    // The tick must ignore a loop that is still admitting. The structural
+    // guard is `canRun` (a scan requires status `watching`), so no single-line
+    // un-fix flips this; the interleaving is pinned because the review asked
+    // for it explicitly.
+    expect(harness.sync.calls).toHaveLength(0);
+    expect(harness.watchers.handles).toHaveLength(1);
+
+    harness.watchers.handles[0]!.releaseReady();
+    await waitForFirstScan(harness);
+    await tick();
+    expect(harness.sync.calls).toHaveLength(1); // exactly the one full scan
+    expect(harness.sync.calls[0]!.reuseCachedHashes).toBe(false);
+  });
+
+  it("never scans a generation that left the set while it was admitting (P2/AS8)", async () => {
+    const harness = createHarness();
+    harness.watchers.autoReady.value = false;
+    harness.manager.apply([item()]);
+    await waitUntil(() => harness.watchers.handles.length === 1, "the watcher");
+
+    harness.manager.apply([]); // removed before `ready`
+    expect(harness.manager.watchedLoopIds()).toEqual([]);
+
+    harness.watchers.handles[0]!.releaseReady();
+    await harness.manager.settled();
+    await tick();
+    // Requested interleaving (removal BEFORE `ready`). Structural guards: the
+    // abort in `stopLoop` plus `canRun`, so no single-line un-fix flips it —
+    // the assertions pin the behaviour, not one mutation.
+    expect(harness.sync.calls).toHaveLength(0);
+    expect(harness.watchers.handles[0]!.closed).toBe(true);
+  });
+
+  it("replaces a generation that was still admitting without scanning the old one (P2/AS7)", async () => {
+    const harness = createHarness();
+    harness.watchers.autoReady.value = false;
+    harness.manager.apply([item()]);
+    await waitUntil(() => harness.watchers.handles.length === 1, "the first watcher");
+
+    harness.manager.apply([item({ configRevision: 2 })]);
+    harness.watchers.handles[0]!.releaseReady(); // the superseded generation's `ready`
+    await tick();
+    // Same requested interleaving as the removal case, for a SWAP (AS7): the
+    // superseded generation must not scan once its `ready` arrives late.
+    expect(harness.sync.calls).toHaveLength(0); // the old generation never scanned
+
+    harness.watchers.autoReady.value = true;
+    harness.watchers.handles[1]?.releaseReady();
+    await waitForFirstScan(harness);
+    await harness.manager.settled();
+    expect(harness.sync.calls).toHaveLength(1);
+    expect(harness.sync.calls[0]!.target.configRevision).toBe(2);
+    expect(harness.watchers.handles[0]!.closed).toBe(true);
+  });
+
   it("closes the watcher when the root disappears and re-verifies locally (P2)", async () => {
     const harness = createHarness();
     harness.manager.start();
