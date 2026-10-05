@@ -104,6 +104,16 @@ export interface FakeArtifactServer {
   seedBlob: (hash: string, bytes: Buffer) => void;
   /** Hold every subsequent PUT until the returned release runs. */
   holdPuts: () => () => void;
+  /** Run once at the START of the next PUT, after its session lookup and
+   *  before the committed/TTL checks — the seam for "a competing commit landed
+   *  while our PUT was in flight". */
+  beforePut?: (session: FakeSessionState) => void;
+  /** Run once at the START of the next prepare — the seam for "the tree moved
+   *  between the scan and the upload", which is what pre-upload verification
+   *  exists to catch. */
+  beforePrepare?: () => void;
+  /** Commit a session out-of-band, exactly like a successful client commit. */
+  commitSession: (syncId: string) => void;
   putCount: (hash: string) => number;
   stepCalls: (step: FakeStep) => FakeCall[];
 }
@@ -203,6 +213,11 @@ export function createFakeArtifactServer(options: FakeArtifactServerOptions): Fa
         release();
       };
     },
+    commitSession(syncId) {
+      const session = sessions.get(syncId);
+      if (session === undefined) throw new Error(`no such session: ${syncId}`);
+      commitSession(session);
+    },
     putCount(hash) {
       return calls.filter((call) => call.step === "put" && call.hash === hash).length;
     },
@@ -292,6 +307,18 @@ export function createFakeArtifactServer(options: FakeArtifactServerOptions): Fa
     return json(200, { syncId: session.syncId, needHashes: session.needHashes, expiresAt: EXPIRES_AT });
   }
 
+  /** The commit core (one receipt per session, pointer +1, immutable manifest). */
+  function commitSession(session: FakeSessionState): { artifactSnapshotId: string; manifestRevision: number } {
+    const loop = loops.get(session.loopId);
+    if (loop === undefined) throw new Error(`no loop for session ${session.syncId}`);
+    const receipt = { artifactSnapshotId: nextId("snap"), manifestRevision: loop.manifestRevision + 1 };
+    session.receipt = receipt;
+    loop.manifest = [...session.entries];
+    loop.manifestRevision = receipt.manifestRevision;
+    loop.syncError = null;
+    return receipt;
+  }
+
   async function handlePut(call: FakeCall, hash: string, init: RequestInit): Promise<Response> {
     const syncId = headerValue(init, ARTIFACT_SYNC_ID_HEADER);
     if (syncId === undefined || syncId.trim() === "") return refuse(400, "missing sync session header");
@@ -299,6 +326,11 @@ export function createFakeArtifactServer(options: FakeArtifactServerOptions): Fa
     if (!session) return refuse(404, "not found");
     const loop = loops.get(session.loopId);
     if (!loop) return refuse(404, "not found");
+    if (server.beforePut !== undefined) {
+      const hook = server.beforePut;
+      server.beforePut = undefined;
+      hook(session);
+    }
     if (session.receipt !== null) return refuse(409, "session committed", "artifact_session_committed");
     if (session.expired) return refuse(409, "session expired", "artifact_session_expired");
     if (session.configRevision !== loop.configRevision) return refuse(409, "config conflict", "artifact_config_conflict");
@@ -339,15 +371,7 @@ export function createFakeArtifactServer(options: FakeArtifactServerOptions): Fa
       return refuse(409, "revision exhausted", "artifact_revision_exhausted");
     }
     if (!completeManifest(session.entries)) return refuse(409, "blob missing", "artifact_blob_missing");
-    const receipt = {
-      artifactSnapshotId: nextId("snap"),
-      manifestRevision: loop.manifestRevision + 1,
-    };
-    session.receipt = receipt;
-    loop.manifest = [...session.entries];
-    loop.manifestRevision = receipt.manifestRevision;
-    loop.syncError = null;
-    return json(200, receipt);
+    return json(200, commitSession(session));
   }
 
   function handleRead(loopId: string): Response {
@@ -432,6 +456,11 @@ export function createFakeArtifactServer(options: FakeArtifactServerOptions): Fa
 
     let response: Response;
     if (step === "prepare") {
+      if (server.beforePrepare !== undefined) {
+        const hook = server.beforePrepare;
+        server.beforePrepare = undefined;
+        hook();
+      }
       response = await handlePrepare(init);
     } else if (step === "put") {
       response = await handlePut(call, call.hash!, init);

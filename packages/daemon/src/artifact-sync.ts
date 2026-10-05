@@ -531,7 +531,10 @@ export function createArtifactSyncClient(deps: ArtifactSyncClientDeps): Artifact
         }
         return { kind: "terminal", code: refusal.code, detail: refusal.reason };
       }
-      if (state.pending !== pending) continue; // superseded (slice 5's cancel path)
+      // The epoch guard: a response for a session that has since been replaced
+      // must never be acted on (slice 5's config-swap cancellation is the
+      // expected trigger). Per-loop serialization makes it unreachable today.
+      if (state.pending?.epoch !== pending.epoch) continue;
       pending.syncId = prepared.value.value.syncId;
       needHashes = prepared.value.value.needHashes;
       const syncId = pending.syncId;
@@ -622,7 +625,11 @@ export function createArtifactSyncClient(deps: ArtifactSyncClientDeps): Artifact
         state.pending = undefined;
         return { kind: "config_changed", detail: refusal.reason };
       }
-      if (refusal.status === 404) return null;
+      // `resume` (blob_missing) and `renegotiate` (expired/conflict) both mean
+      // "run the round again": the loop re-reads the baseline, and an unchanged
+      // payload reuses the requestId while a moved base mints a new one.
+      const action = refusalAction(refusal.code);
+      if (refusal.status === 404 || action === "reprepare" || action === "rescan") return null;
       return { kind: "terminal", code: refusal.code, detail: refusal.reason };
     }
     const receipt = committed.value.value;
@@ -650,7 +657,16 @@ export function createArtifactSyncClient(deps: ArtifactSyncClientDeps): Artifact
     if (isAborted(input.signal)) return { kind: "cancelled" };
     active += 1;
     const previous = tails.get(loopId) ?? Promise.resolve();
-    const run = previous.then(() => runSync(input));
+    const run = previous.then(async () => {
+      const outcome = await runSync(input);
+      // The record survives ONLY an unchanged/synced round (ADR-010 决策 24):
+      // a commit whose response was lost may have landed, and a later content
+      // revert would otherwise suppress forever against a stale record.
+      if (outcome.kind !== "unchanged" && outcome.kind !== "synced") {
+        invalidate(loopState(loopId));
+      }
+      return outcome;
+    });
     const tail = run.then(
       () => undefined,
       () => undefined,
