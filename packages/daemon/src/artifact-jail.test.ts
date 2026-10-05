@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { ARTIFACT_SYNC_FAILURES } from "@loopzhb/protocol";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { resolveArtifactRoot, type ArtifactScanFailure } from "./artifact-jail.js";
 
@@ -191,7 +191,7 @@ describe("AJ3 — the daemon ∩ server roots intersection", () => {
     // canonicalizer must convert the expected filesystem fault into ITS
     // contract (JailError), so the resolver keeps returning a result instead
     // of throwing — the failure domain stays closed for slice 4/5 callers.
-    for (const code of ["ENOENT", "EACCES", "EPERM"]) {
+    for (const code of ["ENOENT", "ENOTDIR", "EACCES", "EPERM", "EIO", "ELOOP", "EMFILE", "ENFILE"]) {
       const result = await resolveArtifactRoot({
         artifactDir: p("work"),
         workdir: null,
@@ -206,6 +206,42 @@ describe("AJ3 — the daemon ∩ server roots intersection", () => {
       });
       if (result.kind !== "failed") throw new Error(`expected a failure for ${code}, got ok with ${result.resolved.root}`);
       expect(result.failure, code).toBe("outside_jail");
+    }
+  });
+
+  it("preserves unknown and programming stat errors instead of reporting outside_jail (#89)", async () => {
+    const errors: unknown[] = [
+      new TypeError("program defect"),
+      new Error("unknown failure"),
+      Object.assign(new TypeError("invalid argument"), { code: "ERR_INVALID_ARG_TYPE" }),
+      Object.assign(new Error("unknown code"), { code: "EUNKNOWN" }),
+      null,
+      "not an errno error",
+    ];
+    for (const error of errors) {
+      await expect(
+        resolveArtifactRoot({
+          artifactDir: p("work"),
+          workdir: null,
+          serverRoots: [base],
+          daemonRoots: [base],
+          io: {
+            stat: async () => { throw error; },
+          },
+        }),
+      ).rejects.toBe(error);
+    }
+  });
+
+  it("also preserves programming errors from server-root realpath (#89)", async () => {
+    const error = Object.assign(new TypeError("invalid realpath argument"), { code: "ERR_INVALID_ARG_TYPE" });
+    const realpath = vi.spyOn(fs, "realpath").mockRejectedValue(error);
+    try {
+      await expect(
+        resolveArtifactRoot({ artifactDir: p("work"), workdir: null, serverRoots: [base], daemonRoots: [base] }),
+      ).rejects.toBe(error);
+    } finally {
+      realpath.mockRestore();
     }
   });
 

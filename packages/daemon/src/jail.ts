@@ -18,6 +18,7 @@
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import type { Stats } from "node:fs";
+import { constants as osConstants } from "node:os";
 import path from "node:path";
 
 export class JailError extends Error {
@@ -70,14 +71,23 @@ export interface CanonicalizeRootsIo {
   stat?: (absolutePath: string) => Promise<Stats>;
 }
 
+/** Only OS errno codes describe an unusable filesystem root. Node's
+ *  ERR_* argument errors and unknown exceptions remain programming failures
+ *  and must retain their original identity for the caller (#89). */
+function isFilesystemError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const code = (error as NodeJS.ErrnoException).code;
+  return typeof code === "string" && Object.hasOwn(osConstants.errno, code);
+}
+
 /** Canonicalize a root set: every root must be an absolute, `..`-free path to
  *  an existing directory; realpath collapses symlink aliases, exact
  *  duplicates drop out (first-seen order). Used for the daemon roots ONCE at
  *  construction (fail-fast startup) AND for server roots on EVERY resolve —
- *  the server is never trusted to have normalized. EVERY rejection — a bad
- *  shape, a failed realpath, or a filesystem fault on the post-realpath stat
- *  — is a JailError (fail-closed): a raw errno escaping this helper would
- *  give the same unusable root two different control flows depending on
+ *  the server is never trusted to have normalized. A rejected shape or a
+ *  recognized filesystem fault in realpath/stat is a JailError (fail-closed);
+ *  unknown and programming exceptions propagate unchanged. A recognized errno
+ *  escaping this helper would give the same unusable root two control flows depending on
  *  which syscall noticed it (review #89). Exported for the slice-3 artifact
  *  root resolver, which applies the same discipline to the server roots on
  *  every scan. */
@@ -91,13 +101,15 @@ export async function canonicalizeRoots(roots: string[], label: string, io?: Can
     let real: string;
     try {
       real = await fs.realpath(root);
-    } catch {
+    } catch (error) {
+      if (!isFilesystemError(error)) throw error;
       throw new JailError(`${label} does not exist: ${JSON.stringify(root)}`);
     }
     let observation: Stats;
     try {
       observation = await stat(real);
-    } catch {
+    } catch (error) {
+      if (!isFilesystemError(error)) throw error;
       // The root vanished, or its permissions changed, between the realpath
       // and the stat — the same unusable root as a failed realpath.
       throw new JailError(`${label} could not be inspected: ${JSON.stringify(root)}`);

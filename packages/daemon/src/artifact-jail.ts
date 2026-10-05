@@ -81,9 +81,9 @@ export async function resolveArtifactRoot(input: ResolveArtifactRootInput): Prom
   if (narrowed) {
     let serverRoots: string[];
     try {
-      // Every rejection is a JailError, including a filesystem fault on the
-      // post-realpath stat (review #89) — the failure domain stays closed and
-      // no raw errno escapes to callers that only handle the result union.
+      // Recognized filesystem faults become JailError (review #89), keeping
+      // unusable roots in the result domain. Unknown/programming exceptions
+      // retain their original identity and are deliberately not classified.
       serverRoots = await canonicalizeRoots([...input.serverRoots], "server root", input.io);
     } catch (error) {
       if (!(error instanceof JailError)) throw error;

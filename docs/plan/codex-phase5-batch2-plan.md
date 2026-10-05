@@ -190,9 +190,9 @@ Batch 1 错误映射在 HTTP 接线时补齐：revision 耗尽使用新增 `arti
 
 片 3 首轮三轨审查修复后的回归（编号外；裁决见 ADR-010 决策 23 的 2026-10-05 修订）：
 
-- [#87](https://github.com/zhuabo001/loop-platform-zhb/issues/87)：真实 FIFO 在 `lstat` 与 `open` 之间替换 ⇒ 共享有界读取、扫描与上传前验证都必须**及时**返回（带截止期断言，卡住即失败）`special_file`，且被拒绝的句柄已关闭（`daemon/src/bounded-read.test.ts`、`artifact-scan.test.ts`、`artifact-verify.test.ts`）。
+- [#87](https://github.com/zhuabo001/loop-platform-zhb/issues/87)：真实 FIFO 在 `lstat` 与 `open` 之间替换 ⇒ 共享有界读取必须**及时**返回 `not_regular`，扫描与上传前验证映射为 `special_file`（带截止期断言，卡住即失败），且被拒绝的句柄已关闭（`daemon/src/bounded-read.test.ts`、`artifact-scan.test.ts`、`artifact-verify.test.ts`）。
 - [#88](https://github.com/zhuabo001/loop-platform-zhb/issues/88)：读后 `lstat` 与目录终检的 `EACCES`/`EPERM` ⇒ 确定性 `unreadable`（单次尝试、单次打开；上传前验证同为 `unreadable`），不再三次重扫后报 `unstable`；`ENOENT` 与身份变化仍走有界重扫（`daemon/src/artifact-scan.test.ts`）。
-- [#89](https://github.com/zhuabo001/loop-platform-zhb/issues/89)：server root 在 realpath 成功后 stat 失败（`ENOENT`/`EACCES`/`EPERM`）与非目录 ⇒ 根解析返回封闭结果 `outside_jail`，不抛原异常（`daemon/src/artifact-jail.test.ts`）。
+- [#89](https://github.com/zhuabo001/loop-platform-zhb/issues/89)：server root 在 realpath/stat 遇已识别 OS errno（含 `ENOENT`/`ENOTDIR`/`EACCES`/`EPERM`/`EIO`/`ELOOP`/`EMFILE`/`ENFILE`）与非目录 ⇒ 根解析返回 `outside_jail`；无码异常、未知码、`ERR_*` 程序异常原样抛出并保留身份，不伪装成配置失败（`daemon/src/artifact-jail.test.ts`）。
 
 额外覆盖配置 no-op、Create 原子性、busy Poll 的 watch 更新、capability 与 claim 交错、错误 taxonomy、8 MiB 请求边界和迟到错误不得覆盖新状态。
 
