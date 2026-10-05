@@ -13,9 +13,10 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { ArtifactErrorCode, ArtifactWatchItem } from "@loopzhb/protocol";
 
 import { createArtifactTransport } from "./artifact-client.js";
-import { createArtifactHashCache } from "./artifact-hash-cache.js";
+import { createArtifactHashCache, type ArtifactHashCache } from "./artifact-hash-cache.js";
 import {
   createArtifactSyncClient,
+  createGate,
   type ArtifactSyncClient,
   type ArtifactSyncInput,
   type ArtifactSyncOutcome,
@@ -49,7 +50,9 @@ function write(relativePath: string, content: string): { hash: string; bytes: Bu
   return { hash: createHash("sha256").update(bytes).digest("hex"), bytes };
 }
 
-function start(options: { artifactDir?: string | null; uploadConcurrency?: number; maxAttempts?: number } = {}): void {
+function start(
+  options: { artifactDir?: string | null; uploadConcurrency?: number; maxAttempts?: number; cache?: ArtifactHashCache } = {},
+): void {
   server = createFakeArtifactServer({
     machineCredential: CREDENTIAL,
     loops: [
@@ -64,14 +67,16 @@ function start(options: { artifactDir?: string | null; uploadConcurrency?: numbe
 
 /** A client over the CURRENT fake server — a second call models a restarted
  *  daemon process (no in-process baseline). */
-function makeClient(options: { uploadConcurrency?: number; maxAttempts?: number } = {}): ArtifactSyncClient {
+function makeClient(
+  options: { uploadConcurrency?: number; maxAttempts?: number; cache?: ArtifactHashCache } = {},
+): ArtifactSyncClient {
   return createArtifactSyncClient({
     transport: createArtifactTransport({
       baseUrl: "http://fake.invalid",
       machineCredential: CREDENTIAL,
       fetchImpl: server.fetchImpl,
     }),
-    cache: createArtifactHashCache(),
+    cache: options.cache ?? createArtifactHashCache(),
     // Time is injected, never faked: the delay sequence IS the evidence.
     sleep: async (ms) => {
       delays.push(ms);
@@ -79,6 +84,33 @@ function makeClient(options: { uploadConcurrency?: number; maxAttempts?: number 
     uploadConcurrency: options.uploadConcurrency,
     maxAttempts: options.maxAttempts,
   });
+}
+
+/** A cache whose write-back throws for one path ONCE ARMED: an ALLOWED
+ *  interface fault (no monkey-patching), i.e. an internal exception inside one
+ *  upload group while its siblings keep going. The scanner writes the cache
+ *  too, so the test arms it after the scan (at prepare time) — the fault then
+ *  lands in the pre-upload verification. */
+function faultingCacheOn(suffix: string): { cache: ArtifactHashCache; arm: () => void } {
+  const real = createArtifactHashCache();
+  let armed = false;
+  return {
+    arm: () => {
+      armed = true;
+    },
+    cache: {
+      get: (absolutePath) => real.get(absolutePath),
+      set: (absolutePath, entry) => {
+        if (armed && absolutePath.endsWith(suffix)) throw new Error("injected cache fault");
+        real.set(absolutePath, entry);
+      },
+      delete: (absolutePath) => real.delete(absolutePath),
+      clear: () => real.clear(),
+      get size() {
+        return real.size;
+      },
+    },
+  };
 }
 
 /** A client whose backoff hangs until the signal aborts — for cancellation
@@ -274,8 +306,11 @@ describe("AS6 — a restarted daemon", () => {
 
 describe("AS9 — roots and jail changes", () => {
   it("fails a vanished directory closed, with a report and zero sync requests", async () => {
-    start();
-    const outcome = await sync({ target: target({ artifactDir: path.join(base, "gone") }) });
+    const gone = path.join(base, "gone");
+    // The server's config points at the same path, so this is a LOCAL failure
+    // (the directory vanished), not a config generation change.
+    start({ artifactDir: gone });
+    const outcome = await sync({ target: target({ artifactDir: gone }) });
 
     expect(outcome).toEqual({
       kind: "failed",
@@ -287,6 +322,18 @@ describe("AS9 — roots and jail changes", () => {
     expect(server.stepCalls("put")).toHaveLength(0);
     expect(server.stepCalls("commit")).toHaveLength(0);
     expect(loop().syncError).toEqual({ failure: "directory_missing", configRevision: 1, baseManifestRevision: 0 });
+  });
+
+  it("surfaces a watch target that disagrees with the server's dir as config_changed", async () => {
+    write("a.txt", "alpha");
+    start();
+    // The baseline read is what proves the target is stale, and it happens
+    // BEFORE any local work — so no failure is reported for a target that is
+    // simply out of date.
+    const outcome = await sync({ target: target({ artifactDir: path.join(base, "gone") }) });
+
+    expect(outcome).toMatchObject({ kind: "config_changed" });
+    expect(server.stepCalls("report")).toHaveLength(0);
   });
 
   it("fails a roots narrowing that no longer intersects the daemon roots", async () => {
@@ -346,6 +393,28 @@ describe("AS10 — 401/403 stops", () => {
 
     expect(outcome).toMatchObject({ kind: "stopped", scope: "machine", status: 403 });
     expect(server.stepCalls("report")).toHaveLength(0);
+  });
+
+  it("stops the machine when the REPORT itself is refused, and keeps making zero requests", async () => {
+    const gone = path.join(base, "gone");
+    start({ artifactDir: gone });
+    server.failNext("report", { kind: "status", status: 403, code: "artifact_attribution_missing" });
+
+    const outcome = await sync({ target: target({ artifactDir: gone }) });
+
+    // Reporting is best-effort, so the outcome is still the local failure...
+    expect(outcome).toMatchObject({ kind: "failed", failure: "directory_missing", reported: "unreported" });
+    // ...but the machine must not keep negotiating with a credential the
+    // server refuses: no loop, and no second report ([#94]).
+    const before = server.calls.length;
+    expect(await sync({ target: target({ artifactDir: gone }) })).toMatchObject({
+      kind: "stopped",
+      scope: "machine",
+      status: 403,
+    });
+    const other = await client.syncLoop({ target: target({ loopId: "loop-2" }), daemonRoots: [base] });
+    expect(other).toMatchObject({ kind: "stopped", scope: "machine", status: 403 });
+    expect(server.calls.length).toBe(before);
   });
 });
 
@@ -422,6 +491,38 @@ describe("AS11 — backoff, budgets and the upload gate", () => {
     expect((await first).kind).toBe("synced");
     expect(await second).toEqual({ kind: "unchanged" });
     expect(server.stepCalls("prepare")).toHaveLength(1);
+  });
+
+  it("hands a released permit to the waiter instead of racing a newcomer", async () => {
+    // The gate's own invariant, pinned at the microtask level: after a release
+    // the permit is TRANSFERRED, so a newcomer that lands in the release→wake
+    // window must queue behind the woken waiter, never run beside it ([#99]).
+    const gate = createGate(1);
+    let inFlight = 0;
+    let peak = 0;
+    let open!: () => void;
+    const latch = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    const task = async (): Promise<void> => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await latch;
+      inFlight -= 1;
+    };
+
+    const first = gate.run(task);
+    const queued = gate.run(task);
+    await Promise.resolve();
+    open();
+    // Two nested microtasks place the newcomer exactly between the release
+    // (which decrements) and the woken waiter's resumption: the buggy
+    // decrement-then-wake gate observes TWO uploads in flight here.
+    queueMicrotask(() => queueMicrotask(() => void gate.run(task)));
+
+    await Promise.all([first, queued]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(peak).toBe(1);
   });
 });
 
@@ -529,28 +630,57 @@ describe("numbered-outside evidence", () => {
     expect(prepares.at(-1)!.requestId).not.toBe(prepares[1]!.requestId);
   });
 
-  it("a stale report is `stale`, sent exactly once", async () => {
-    write("a.txt", "alpha");
-    start();
-    // The loop's base moved on: the report's generation/base no longer match.
-    loop().manifestRevision = 5;
+  it("a report whose base moved on before it landed is `stale`, sent exactly once", async () => {
+    const gone = path.join(base, "gone");
+    start({ artifactDir: gone });
+    // The loop's pointer moves between the client's baseline read and the
+    // report: the double-match gate must refuse it, and it is never retried.
+    server.beforeReport = () => {
+      loop().manifestRevision = 5;
+    };
 
-    const outcome = await sync({ target: target({ artifactDir: path.join(base, "gone") }) });
+    const outcome = await sync({ target: target({ artifactDir: gone }) });
 
     expect(outcome).toMatchObject({ kind: "failed", failure: "directory_missing", reported: "stale" });
     expect(server.stepCalls("report")).toHaveLength(1);
   });
 
   it("an unreachable report is `unreported`, and is never retried", async () => {
-    write("a.txt", "alpha");
-    start();
+    const gone = path.join(base, "gone");
+    start({ artifactDir: gone });
     server.failNext("report", { kind: "network_error" });
 
-    const outcome = await sync({ target: target({ artifactDir: path.join(base, "gone") }) });
+    const outcome = await sync({ target: target({ artifactDir: gone }) });
 
     expect(outcome).toMatchObject({ kind: "failed", failure: "directory_missing", reported: "unreported" });
     expect(server.stepCalls("report")).toHaveLength(1);
     expect(delays).toEqual([]);
+  });
+
+  it("reads the server baseline BEFORE a local failure, so the report is not stale forever", async () => {
+    const art = path.join(base, "art");
+    mkdirSync(art);
+    write("art/a.txt", "alpha");
+    start({ artifactDir: art });
+    expect((await sync({ target: target({ artifactDir: art }) })).kind).toBe("synced");
+    expect(loop().manifestRevision).toBe(1);
+    rmSync(art, { recursive: true, force: true });
+
+    // A restarted daemon (no in-process record) whose directory is gone: the
+    // base must come from the server. A guessed 0 would be refused by the
+    // double-match gate for good, leaving the loop's error state unwritten.
+    const restarted = makeClient();
+
+    const outcome = await restarted.syncLoop({ target: target({ artifactDir: art }), daemonRoots: [base] });
+
+    expect(outcome).toEqual({
+      kind: "failed",
+      failure: "directory_missing",
+      detail: expect.any(String),
+      reported: "recorded",
+    });
+    expect(loop().syncError).toEqual({ failure: "directory_missing", configRevision: 1, baseManifestRevision: 1 });
+    expect(server.calls.slice(-2).map((call) => call.step)).toEqual(["read", "report"]);
   });
 
   it("surfaces a config generation mismatch as config_changed, without negotiating", async () => {
@@ -674,6 +804,33 @@ describe("numbered-outside evidence", () => {
     expect(server.stepCalls("prepare")).toHaveLength(1);
   });
 
+  it("ends a queued call as soon as it is aborted, without waiting for the running PUT", async () => {
+    write("a.txt", "alpha");
+    start();
+    const release = server.holdPuts();
+    const first = sync();
+    await until(() => server.stepCalls("put").length === 1);
+
+    const controller = new AbortController();
+    const queued = sync({ signal: controller.signal });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    controller.abort();
+    let outcome: ArtifactSyncOutcome | null = null;
+    void queued.then((value) => {
+      outcome = value;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    // The predecessor's PUT is STILL held: the abort must end the queued call
+    // now, not once the running round finally finishes ([#93]).
+    expect(outcome).toEqual({ kind: "cancelled" });
+
+    release();
+    expect((await first).kind).toBe("synced");
+    expect(await queued).toEqual({ kind: "cancelled" });
+    expect(server.stepCalls("prepare")).toHaveLength(1);
+  });
+
   it("settled() waits for queued work and resolves only once the queue drains", async () => {
     write("a.txt", "alpha");
     start();
@@ -695,6 +852,46 @@ describe("numbered-outside evidence", () => {
     expect(settled).toBe(true);
   });
 
+  it("keeps the drain pending while a sibling upload is in flight after an internal fault", async () => {
+    write("a.txt", "alpha");
+    write("b.txt", "beta");
+    const fault = faultingCacheOn("a.txt");
+    start({ cache: fault.cache });
+    const release = server.holdPuts();
+    server.beforePrepare = () => fault.arm();
+    let roundDone = false;
+    const inflight = sync().then(
+      () => {
+        roundDone = true;
+        return "resolved";
+      },
+      () => {
+        roundDone = true;
+        return "rejected";
+      },
+    );
+    await until(() => server.stepCalls("put").length === 1);
+
+    // One group faulted; the other is still uploading. The round must not have
+    // reported yet (its sibling was detached), and the drain must not report a
+    // settled client while those bytes are on the wire ([#92]).
+    let settled = false;
+    const waiter = client.settled().then(() => {
+      settled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(roundDone).toBe(false);
+    expect(settled).toBe(false);
+
+    release();
+    await waiter;
+
+    // The sibling ran to completion (its blob landed), and the fault still
+    // surfaces to the caller instead of being swallowed as an outcome.
+    expect(server.stepCalls("put")[0]!.published).toBe(true);
+    expect(await inflight).toBe("rejected");
+  });
+
   it("freshSession mints a new session even when nothing changed", async () => {
     write("a.txt", "alpha");
     start();
@@ -708,5 +905,48 @@ describe("numbered-outside evidence", () => {
     expect(prepares).toHaveLength(preparesBefore + 1);
     expect(prepares.at(-1)!.requestId).not.toBe(prepares.at(-2)!.requestId);
     expect(server.stepCalls("commit")).toHaveLength(2);
+  });
+
+  it("keeps ONE identity when a freshSession round has to renew an expired session", async () => {
+    write("a.txt", "alpha");
+    start();
+    await sync();
+    // A real upload, so the session is exercised — freshSession skips
+    // suppression, not the server's needHashes.
+    write("b.txt", "beta");
+    // The fresh call's session expires under it: the recovery must renew in
+    // place under the SAME requestId, not mint a second session ([#97]).
+    server.failNext("put", { kind: "status", status: 409, code: "artifact_session_expired" });
+
+    const outcome = await sync({ freshSession: true });
+
+    expect(outcome).toMatchObject({ kind: "synced", manifestRevision: 2 });
+    const prepares = server.stepCalls("prepare");
+    expect(prepares).toHaveLength(3);
+    // The first call minted one identity; the fresh call minted one and reused
+    // it across the renewal.
+    expect(prepares.at(-1)!.requestId).toBe(prepares.at(-2)!.requestId);
+    expect(prepares.at(-2)!.requestId).not.toBe(prepares.at(-3)!.requestId);
+    expect(new Set(server.stepCalls("put").slice(-2).map((call) => call.syncId)).size).toBe(1);
+    // One session per call: the renewal did not create a third.
+    expect(server.sessions.size).toBe(2);
+  });
+
+  it("records a sticky stop even when another group's transient budget masks it", async () => {
+    const alpha = write("a.txt", "alpha");
+    const beta = write("b.txt", "beta");
+    start({ maxAttempts: 2 });
+    // The FIRST group exhausts its transient budget while the second is
+    // refused with a machine-wide 401: the stop must not be masked.
+    server.failNextPut(alpha.hash, { kind: "status", status: 500 });
+    server.failNextPut(alpha.hash, { kind: "status", status: 500 });
+    server.failNextPut(beta.hash, { kind: "status", status: 401 });
+
+    const outcome = await sync();
+
+    expect(outcome).toMatchObject({ kind: "stopped", scope: "machine", status: 401 });
+    const before = server.calls.length;
+    expect(await sync()).toMatchObject({ kind: "stopped", scope: "machine", status: 401 });
+    expect(server.calls.length).toBe(before);
   });
 });

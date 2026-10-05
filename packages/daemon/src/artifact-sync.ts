@@ -23,7 +23,15 @@
  *  - 401 stops the whole machine; the only 403 the server emits
  *    (`artifact_attribution_missing`) is machine-attribution-wide, so it stops
  *    the machine too. Stops are sticky: later calls make ZERO requests and
- *    return `stopped` until `clearStops()`.
+ *    return `stopped` until `clearStops()`. A refusal observed ANYWHERE — on a
+ *    report, or on one upload group while another group's budget exhausts —
+ *    is recorded before the round reports.
+ *  - the base revision is read BEFORE any local step that can fail: a local
+ *    failure is reported against (configRevision, baseManifestRevision), so a
+ *    restarted client that guessed 0 would be refused as stale forever.
+ *  - the drain is honest. `settled()` waits for queued calls, direct baseline
+ *    reads AND every outstanding upload task (running or parked at the gate),
+ *    and a fault in one upload group never detaches its siblings.
  *
  * No production wiring here: slice 5 owns the watcher and the 60 s reconcile,
  * slice 6 owns the Run-final deadline (which composes as a caller `signal`).
@@ -38,6 +46,7 @@ import {
   type ArtifactWatchItem,
   type NormalizedManifestEntry,
   type PrepareArtifactSyncRequest,
+  type PutArtifactBlobResponse,
 } from "@loopzhb/protocol";
 import { preparePayloadFingerprint } from "@loopzhb/protocol/node";
 
@@ -145,7 +154,8 @@ export interface ArtifactSyncClient {
   /** Clear the sticky 401/403 stops (config generation swap, credential
    *  rotation, or an operator decision to try again). */
   clearStops(): void;
-  /** Resolves when no queued or in-flight sync work remains. */
+  /** Resolves when no queued or in-flight sync work remains — calls, direct
+   *  baseline reads and upload tasks (including ones parked at the gate). */
   settled(): Promise<void>;
 }
 
@@ -177,14 +187,16 @@ interface Stop {
   detail: string;
 }
 
-interface Gate {
-  run<T>(task: () => Promise<T>): Promise<T>;
-}
-
 type SendResult<T> =
   | { kind: "value"; value: ArtifactHttpOutcome<T> }
   | { kind: "exhausted"; detail: string }
   | { kind: "aborted" };
+
+/** One hash group's verified upload attempt. */
+type UploadGroupResult =
+  | { kind: "aborted" }
+  | { kind: "verify_failed"; failure: ArtifactVerifyFailure; detail: string }
+  | { kind: "put"; put: SendResult<PutArtifactBlobResponse> };
 
 /** The refused arm of any transport outcome (code absent when the server sent
  *  none the client recognizes). */
@@ -212,18 +224,30 @@ function refusalAction(code: ArtifactErrorCode | undefined): RefusalAction {
   }
 }
 
-function createGate(limit: number): Gate {
-  let active = 0;
+/** Exported (with `createGate`) for the concurrency-invariant test. */
+export interface Gate {
+  run<T>(task: () => Promise<T>): Promise<T>;
+}
+
+/** The instance-level upload gate (决策 24). A released permit is HANDED to the
+ *  next waiter, never released and then re-taken: decrementing first leaves a
+ *  window in which a newcomer passes the `held < limit` check while the woken
+ *  waiter has yet to resume, putting limit+1 uploads in flight ([#99]). */
+export function createGate(limit: number): Gate {
+  let held = 0;
   const waiting: Array<() => void> = [];
   return {
     async run<T>(task: () => Promise<T>): Promise<T> {
-      if (active >= limit) await new Promise<void>((resolve) => waiting.push(resolve));
-      active += 1;
+      if (held >= limit) await new Promise<void>((resolve) => waiting.push(resolve));
+      else held += 1;
       try {
         return await task();
       } finally {
-        active -= 1;
-        waiting.shift()?.();
+        const next = waiting.shift();
+        // The permit transfers with the wakeup, so `held` stays put; only a
+        // release with nobody waiting actually frees it.
+        if (next === undefined) held -= 1;
+        else next();
       }
     },
   };
@@ -233,6 +257,33 @@ function createGate(limit: number): Gate {
  *  flow analysis from narrowing a later check away. */
 function isAborted(signal: AbortSignal | undefined): boolean {
   return signal?.aborted === true;
+}
+
+/** Wait for this call's turn in the per-loop chain, or for the caller to abort
+ *  — whichever comes first. Racing the WAIT (never the round) is what ends a
+ *  queued call as soon as it is cancelled instead of after the predecessor's
+ *  PUT finishes ([#93]), while keeping the round's own promise honest: it never
+ *  resolves while this call still has bytes in flight. */
+function waitInQueue(previous: Promise<void>, signal: AbortSignal | undefined): Promise<boolean> {
+  if (signal === undefined) {
+    return previous.then(
+      () => true,
+      () => true,
+    );
+  }
+  if (signal.aborted) return Promise.resolve(false);
+  return new Promise<boolean>((resolve) => {
+    const onAbort = (): void => finish(false);
+    const finish = (ready: boolean): void => {
+      signal.removeEventListener("abort", onAbort);
+      resolve(ready);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    void previous.then(
+      () => finish(true),
+      () => finish(true),
+    );
+  });
 }
 
 function sameEntries(a: readonly NormalizedManifestEntry[], b: readonly NormalizedManifestEntry[]): boolean {
@@ -253,12 +304,28 @@ export function createArtifactSyncClient(deps: ArtifactSyncClientDeps): Artifact
   const gate = createGate(deps.uploadConcurrency ?? ARTIFACT_UPLOAD_CONCURRENCY);
 
   const states = new Map<string, LoopState>();
-  const tails = new Map<string, Promise<unknown>>();
+  const tails = new Map<string, Promise<void>>();
   const loopStops = new Map<string, Stop>();
   let machineStop: Stop | null = null;
-  let active = 0;
+  /** Everything a drain must wait for: queued/running calls, direct baseline
+   *  reads, and every outstanding upload task — running OR parked at the gate.
+   *  Counting only the calls would let `settled()` resolve while a sibling
+   *  upload is still on the wire ([#92]). */
+  let outstanding = 0;
   const settleWaiters = new Set<() => void>();
   const never = new AbortController().signal;
+
+  function enterWork(): void {
+    outstanding += 1;
+  }
+
+  function leaveWork(): void {
+    outstanding -= 1;
+    if (outstanding !== 0) return;
+    const waiters = [...settleWaiters];
+    settleWaiters.clear();
+    for (const waiter of waiters) waiter();
+  }
 
   function loopState(loopId: string): LoopState {
     const existing = states.get(loopId);
@@ -334,15 +401,26 @@ export function createArtifactSyncClient(deps: ArtifactSyncClientDeps): Artifact
       message: detail,
     };
     const sent = await deps.transport.reportSyncError(target.loopId, report, signal);
-    if (sent.kind === "refused" && sent.status === 401) {
-      machineStop = { scope: "machine", status: 401, detail: sent.reason };
-    }
+    // A refusal on the REPORT is adjudicated like any other: an unauthenticated
+    // (401) or unattributable (403) report must stop the machine, or the next
+    // loop would keep negotiating against the same broken credential ([#94]).
+    // The outcome still belongs to the local failure — reporting is best-effort.
+    if (sent.kind === "refused") recordStop(target.loopId, sent);
     const reported: ArtifactReportState =
       sent.kind === "ok" ? (sent.value.recorded ? "recorded" : "stale") : "unreported";
     return { kind: "failed", failure, detail, reported };
   }
 
   async function readBaseline(loopId: string, signal?: AbortSignal): Promise<ArtifactBaselineOutcome> {
+    enterWork();
+    try {
+      return await readBaselineOnce(loopId, signal);
+    } finally {
+      leaveWork();
+    }
+  }
+
+  async function readBaselineOnce(loopId: string, signal?: AbortSignal): Promise<ArtifactBaselineOutcome> {
     const stop = stopFor(loopId);
     if (stop !== null) return { kind: "stopped", scope: stop.scope, status: stop.status, detail: stop.detail };
     if (isAborted(signal)) return { kind: "cancelled" };
@@ -368,9 +446,46 @@ export function createArtifactSyncClient(deps: ArtifactSyncClientDeps): Artifact
     };
   }
 
+  /** Verify every path of ONE hash group and PUT the verified bytes through
+   *  the gate. The work slot is taken synchronously — before the gate parks it
+   *  — so a parked upload still counts as outstanding work ([#92]). */
+  async function uploadGroup(
+    resolved: ResolvedArtifactRoot,
+    group: readonly NormalizedManifestEntry[],
+    syncId: string,
+    signal: AbortSignal | undefined,
+  ): Promise<UploadGroupResult> {
+    enterWork();
+    try {
+      return await gate.run(async () => {
+        if (isAborted(signal)) return { kind: "aborted" };
+        let bytes: Buffer | null = null;
+        for (const entry of group) {
+          const verified = await readVerifiedArtifactEntry(
+            resolved,
+            { path: entry.path, hash: entry.hash, size: entry.size },
+            { cache: deps.cache, io: deps.io },
+          );
+          if (verified.kind === "failed") {
+            return { kind: "verify_failed", failure: verified.failure, detail: verified.detail };
+          }
+          bytes ??= verified.bytes;
+        }
+        const put = await send(
+          (inner) => deps.transport.putBlob(group[0]!.hash, syncId, bytes!, inner),
+          signal,
+        );
+        return { kind: "put", put };
+      });
+    } finally {
+      leaveWork();
+    }
+  }
+
   /** Verify every path behind the negotiated hashes and upload each hash once,
    *  with the verified bytes, through the daemon-global gate. */
   async function uploadNeeded(
+    loopId: string,
     resolved: ResolvedArtifactRoot,
     entries: readonly NormalizedManifestEntry[],
     needHashes: readonly string[],
@@ -391,40 +506,47 @@ export function createArtifactSyncClient(deps: ArtifactSyncClientDeps): Artifact
       if (group === undefined) groups.set(entry.hash, [entry]);
       else group.push(entry);
     }
-    const results = await Promise.all(
-      [...groups.values()].map((group) =>
-        gate.run(async () => {
-          if (isAborted(signal)) return { kind: "aborted" as const };
-          let bytes: Buffer | null = null;
-          for (const entry of group) {
-            const verified = await readVerifiedArtifactEntry(
-              resolved,
-              { path: entry.path, hash: entry.hash, size: entry.size },
-              { cache: deps.cache, io: deps.io },
-            );
-            if (verified.kind === "failed") {
-              return { kind: "verify_failed" as const, failure: verified.failure, detail: verified.detail };
-            }
-            bytes ??= verified.bytes;
-          }
-          const put = await send(
-            (inner) => deps.transport.putBlob(group[0]!.hash, syncId, bytes!, inner),
-            signal,
-          );
-          return { kind: "put" as const, put };
-        }),
-      ),
+    // `allSettled`, never `all`: an exception in one group must not reject the
+    // round while its siblings are still uploading — the drain would then
+    // report a settled client with bytes still on the wire ([#92]).
+    const settledGroups = await Promise.allSettled(
+      [...groups.values()].map((group) => uploadGroup(resolved, group, syncId, signal)),
     );
-    for (const result of results) {
-      if (result.kind === "aborted") return { kind: "aborted" };
-      if (result.kind === "verify_failed") {
-        return { kind: "verify_failed", failure: result.failure, detail: result.detail };
+
+    // A refusal on ANY group is adjudicated for stops BEFORE the round reports,
+    // and a stop-worthy one takes precedence: a sticky 401/403 must not be
+    // masked by another group's transient exhaustion, or the next call would
+    // keep negotiating with a broken credential ([#98]).
+    let firstRefusal: ArtifactRefusal | null = null;
+    let firstStoppable: ArtifactRefusal | null = null;
+    for (const result of settledGroups) {
+      if (result.status !== "fulfilled") continue;
+      const uploaded = result.value;
+      if (uploaded.kind !== "put" || uploaded.put.kind !== "value" || uploaded.put.value.kind !== "refused") continue;
+      firstRefusal ??= uploaded.put.value;
+      if (recordStop(loopId, uploaded.put.value) !== null) firstStoppable ??= uploaded.put.value;
+    }
+    const refusal = firstStoppable ?? firstRefusal;
+    if (refusal !== null) return { kind: "refused", refusal };
+
+    // An internal exception is a bug, not a protocol outcome: it surfaces to
+    // the caller — but only once every sibling has settled, so nothing is left
+    // running behind the caller's back.
+    const rejected = settledGroups.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (rejected !== undefined) throw rejected.reason;
+
+    for (const result of settledGroups) {
+      if (result.status !== "fulfilled") continue;
+      const uploaded = result.value;
+      if (uploaded.kind === "aborted") return { kind: "aborted" };
+      if (uploaded.kind === "verify_failed") {
+        return { kind: "verify_failed", failure: uploaded.failure, detail: uploaded.detail };
       }
-      const put = result.put;
+      const put = uploaded.put;
       if (put.kind === "aborted") return { kind: "aborted" };
       if (put.kind === "exhausted") return { kind: "unavailable", detail: put.detail };
       if (put.value.kind === "unreachable") return { kind: "unavailable", detail: put.value.reason };
-      if (put.value.kind === "refused") return { kind: "refused", refusal: put.value };
+      // The `refused` arm returned above.
     }
     return { kind: "ok", uploaded: groups.size };
   }
@@ -435,42 +557,22 @@ export function createArtifactSyncClient(deps: ArtifactSyncClientDeps): Artifact
     const state = loopState(loopId);
     let rescans = 0;
     let renegotiations = 0;
+    /** `freshSession` mints a new identity for this call's FIRST proposal only:
+     *  a recovery round inside the same call is a renewal, not a new session. */
+    let freshPending = freshSession === true;
 
     for (;;) {
       if (isAborted(signal)) return { kind: "cancelled" };
 
-      // (1) Root resolution and the full scan run EVERY round: a roots change
-      // takes effect on the next call, never from a cached root.
-      const resolution = await resolveArtifactRoot({ artifactDir, workdir, serverRoots: roots, daemonRoots });
-      if (resolution.kind === "failed") {
-        return reportFailure(target, state, resolution.failure, resolution.detail, signal);
-      }
-      const resolved = resolution.resolved;
-      const scan = await scanArtifactRoot(resolved, {
-        cache: deps.cache,
-        reuseCachedHashes: false,
-        limits: deps.limits,
-        io: deps.io,
-      });
-      if (scan.kind === "failed") return reportFailure(target, state, scan.failure, scan.detail, signal);
-      const entries = scan.entries;
-
-      // (2) Suppression: our own last committed manifest, same generation,
-      // unchanged content ⇒ nothing to say to the server at all.
-      const current = state.baseline;
-      if (
-        freshSession !== true &&
-        current !== undefined &&
-        current.entries !== null &&
-        current.configRevision === configRevision &&
-        sameEntries(current.entries, entries)
-      ) {
-        return { kind: "unchanged" };
-      }
-
-      // (3) The negotiation base must be a revision the SERVER told us about.
-      let base = current;
-      if (base === undefined || base.entries === null) {
+      // (1) The negotiation base must be a revision the SERVER told us about,
+      // and it is needed BEFORE any local step that can fail: a local-failure
+      // report's double-match gate takes (configRevision, baseManifestRevision),
+      // so a restarted client reporting against a guessed 0 would be refused as
+      // stale forever ([#95]). A record from the CURRENT generation whose
+      // entries are known still skips the read — the suppressed path must keep
+      // costing zero requests.
+      let base = state.baseline;
+      if (base === undefined || base.entries === null || base.configRevision !== configRevision) {
         const read = await readBaseline(loopId, signal);
         if (read.kind === "cancelled") return { kind: "cancelled" };
         if (read.kind === "stopped" || read.kind === "unavailable" || read.kind === "terminal") return read;
@@ -491,6 +593,35 @@ export function createArtifactSyncClient(deps: ArtifactSyncClientDeps): Artifact
         state.baseline = base;
       }
 
+      // (2) Root resolution and the full scan run EVERY round: a roots change
+      // takes effect on the next call, never from a cached root.
+      const resolution = await resolveArtifactRoot({ artifactDir, workdir, serverRoots: roots, daemonRoots });
+      if (resolution.kind === "failed") {
+        return reportFailure(target, state, resolution.failure, resolution.detail, signal);
+      }
+      const resolved = resolution.resolved;
+      const scan = await scanArtifactRoot(resolved, {
+        cache: deps.cache,
+        reuseCachedHashes: false,
+        limits: deps.limits,
+        io: deps.io,
+      });
+      if (scan.kind === "failed") return reportFailure(target, state, scan.failure, scan.detail, signal);
+      const entries = scan.entries;
+
+      // (3) Suppression: our own last committed manifest, same generation,
+      // unchanged content ⇒ nothing to say to the server at all.
+      const recorded = state.baseline;
+      if (
+        freshSession !== true &&
+        recorded !== undefined &&
+        recorded.entries !== null &&
+        recorded.configRevision === configRevision &&
+        sameEntries(recorded.entries, entries)
+      ) {
+        return { kind: "unchanged" };
+      }
+
       // (4) Negotiate. The requestId belongs to the PAYLOAD (决策 6/9).
       const payload = {
         loopId,
@@ -500,7 +631,8 @@ export function createArtifactSyncClient(deps: ArtifactSyncClientDeps): Artifact
       };
       const fingerprint = preparePayloadFingerprint(payload);
       let pending = state.pending;
-      if (freshSession === true || pending === undefined || pending.fingerprint !== fingerprint) {
+      if (freshPending || pending === undefined || pending.fingerprint !== fingerprint) {
+        freshPending = false;
         pending = { epoch: (state.epoch += 1), requestId: randomBytes(12).toString("hex"), fingerprint, syncId: null };
         state.pending = pending;
       }
@@ -540,7 +672,7 @@ export function createArtifactSyncClient(deps: ArtifactSyncClientDeps): Artifact
       const syncId = pending.syncId;
 
       // (5) Upload exactly the negotiated hashes, and ONLY those.
-      const uploaded = await uploadNeeded(resolved, entries, needHashes, syncId, signal);
+      const uploaded = await uploadNeeded(loopId, resolved, entries, needHashes, syncId, signal);
       if (uploaded.kind === "aborted") return { kind: "cancelled" };
       if (uploaded.kind === "unavailable") return { kind: "unavailable", detail: uploaded.detail };
       if (uploaded.kind === "verify_failed") {
@@ -650,40 +782,56 @@ export function createArtifactSyncClient(deps: ArtifactSyncClientDeps): Artifact
     };
   }
 
+  /** One call's round, with the invalidation rule applied to its result: the
+   *  record survives ONLY an unchanged/synced round (ADR-010 决策 24), because
+   *  a commit whose response was lost may have landed and a later content
+   *  revert would otherwise suppress forever. An internal exception leaves the
+   *  state just as unknown, so it invalidates too. */
+  async function runRound(input: ArtifactSyncInput): Promise<ArtifactSyncOutcome> {
+    const { loopId } = input.target;
+    let outcome: ArtifactSyncOutcome | null = null;
+    try {
+      outcome = await runSync(input);
+      return outcome;
+    } finally {
+      if (outcome === null || (outcome.kind !== "unchanged" && outcome.kind !== "synced")) {
+        invalidate(loopState(loopId));
+      }
+    }
+  }
+
   async function syncLoop(input: ArtifactSyncInput): Promise<ArtifactSyncOutcome> {
     const { loopId } = input.target;
     const stop = stopFor(loopId);
     if (stop !== null) return stoppedOutcome(stop);
     if (isAborted(input.signal)) return { kind: "cancelled" };
-    active += 1;
+
     const previous = tails.get(loopId) ?? Promise.resolve();
-    const run = previous.then(async () => {
-      const outcome = await runSync(input);
-      // The record survives ONLY an unchanged/synced round (ADR-010 决策 24):
-      // a commit whose response was lost may have landed, and a later content
-      // revert would otherwise suppress forever against a stale record.
-      if (outcome.kind !== "unchanged" && outcome.kind !== "synced") {
-        invalidate(loopState(loopId));
-      }
-      return outcome;
+
+    // This call's place in the per-loop chain. The slot is held for as long as
+    // the call is queued OR running, and released even when the call is
+    // cancelled before it starts — a successor must still queue behind the
+    // round that is actually on the wire.
+    let releaseSlot!: () => void;
+    const slot = new Promise<void>((resolve) => {
+      releaseSlot = resolve;
     });
-    const tail = run.then(
-      () => undefined,
-      () => undefined,
+    const tail = previous.then(
+      () => slot,
+      () => slot,
     );
     tails.set(loopId, tail);
     void tail.then(() => {
       if (tails.get(loopId) === tail) tails.delete(loopId);
     });
+
+    enterWork();
     try {
-      return await run;
+      if (!(await waitInQueue(previous, input.signal))) return { kind: "cancelled" };
+      return await runRound(input);
     } finally {
-      active -= 1;
-      if (active === 0) {
-        const waiters = [...settleWaiters];
-        settleWaiters.clear();
-        for (const waiter of waiters) waiter();
-      }
+      releaseSlot();
+      leaveWork();
     }
   }
 
@@ -695,7 +843,7 @@ export function createArtifactSyncClient(deps: ArtifactSyncClientDeps): Artifact
       loopStops.clear();
     },
     settled() {
-      if (active === 0) return Promise.resolve();
+      if (outstanding === 0) return Promise.resolve();
       return new Promise<void>((resolve) => settleWaiters.add(resolve));
     },
   };

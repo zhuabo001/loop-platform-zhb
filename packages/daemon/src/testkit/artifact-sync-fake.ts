@@ -97,6 +97,10 @@ export interface FakeArtifactServer {
   offline: boolean;
   /** Queue a one-shot failure for the NEXT request of that step. */
   failNext: (step: FakeStep, mode: FakeFailMode) => void;
+  /** Queue a one-shot failure for the next PUT of THIS hash — the group-scoped
+   *  seam, so a test never depends on which concurrent group reaches the
+   *  server first. */
+  failNextPut: (hash: string, mode: FakeFailMode) => void;
   expireSession: (syncId: string) => void;
   /** Server restart that loses every pending session (durable loop state stays). */
   dropSessions: () => void;
@@ -112,6 +116,9 @@ export interface FakeArtifactServer {
    *  between the scan and the upload", which is what pre-upload verification
    *  exists to catch. */
   beforePrepare?: () => void;
+  /** Run once at the START of the next report — the seam for "the loop's
+   *  pointer moved between the client's baseline read and its report". */
+  beforeReport?: () => void;
   /** Commit a session out-of-band, exactly like a successful client commit. */
   commitSession: (syncId: string) => void;
   putCount: (hash: string) => number;
@@ -174,6 +181,7 @@ export function createFakeArtifactServer(options: FakeArtifactServerOptions): Fa
   const sessions = new Map<string, FakeSessionState>();
   const calls: FakeCall[] = [];
   const failures = new Map<FakeStep, FakeFailMode[]>();
+  const putFailures = new Map<string, FakeFailMode[]>();
   let idSeq = 0;
   const nextId = (prefix: string): string => `${prefix}-${++idSeq}`;
   let hold: { promise: Promise<void>; release: () => void } | null = null;
@@ -191,6 +199,11 @@ export function createFakeArtifactServer(options: FakeArtifactServerOptions): Fa
       const queue = failures.get(step) ?? [];
       queue.push(mode);
       failures.set(step, queue);
+    },
+    failNextPut(hash, mode) {
+      const queue = putFailures.get(hash) ?? [];
+      queue.push(mode);
+      putFailures.set(hash, queue);
     },
     expireSession(syncId) {
       const session = sessions.get(syncId);
@@ -356,6 +369,18 @@ export function createFakeArtifactServer(options: FakeArtifactServerOptions): Fa
     return json(200, { ok: true, size: bytes.length, published: !existed });
   }
 
+  /** The per-hash PUT wrapper: the group-scoped failure is injected the same
+   *  way the step-level one is — before the handler, or after it applied. */
+  async function handlePutWithFailure(call: FakeCall, hash: string, init: RequestInit): Promise<Response> {
+    const injected = (putFailures.get(hash) ?? []).shift();
+    if (injected?.kind === "network_error") throw new TypeError("fetch failed");
+    if (injected?.kind === "status") return refuse(injected.status, "injected", injected.code);
+    const response = await handlePut(call, hash, init);
+    if (injected?.kind === "throw_after_apply") throw new TypeError("fetch failed");
+    if (injected?.kind === "malformed_2xx") return new Response("{not json", { status: 200 });
+    return response;
+  }
+
   async function handleCommit(syncId: string): Promise<Response> {
     const session = sessions.get(syncId);
     if (!session) return refuse(404, "not found");
@@ -463,10 +488,15 @@ export function createFakeArtifactServer(options: FakeArtifactServerOptions): Fa
       }
       response = await handlePrepare(init);
     } else if (step === "put") {
-      response = await handlePut(call, call.hash!, init);
+      response = await handlePutWithFailure(call, call.hash!, init);
     } else if (step === "commit") {
       response = await handleCommit(path.slice("/api/machine/sync/".length, -"/commit".length));
     } else if (step === "report") {
+      if (server.beforeReport !== undefined) {
+        const hook = server.beforeReport;
+        server.beforeReport = undefined;
+        hook();
+      }
       response = await handleReport(path.split("/")[4]!, init);
     } else {
       response = handleRead(path.split("/")[4]!);
