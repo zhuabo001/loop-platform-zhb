@@ -53,6 +53,7 @@ import { preparePayloadFingerprint } from "@loopzhb/protocol/node";
 import type { ArtifactHttpOutcome, ArtifactTransport } from "./artifact-client.js";
 import type { ArtifactHashCache } from "./artifact-hash-cache.js";
 import { resolveArtifactRoot, type ArtifactScanFailure, type ResolvedArtifactRoot } from "./artifact-jail.js";
+import { guardArtifactRoot } from "./artifact-root-guard.js";
 import { scanArtifactRoot, type ArtifactScanIo, type ArtifactScanLimits } from "./artifact-scan.js";
 import { readVerifiedArtifactEntry, type ArtifactVerifyFailure } from "./artifact-verify.js";
 import { isTransientStatus } from "./client.js";
@@ -621,6 +622,13 @@ export function createArtifactSyncClient(deps: ArtifactSyncClientDeps): Artifact
         return reportFailure(target, state, resolution.failure, resolution.detail, signal);
       }
       const resolved = resolution.resolved;
+      // (2b) The never-sync root guard (#91, 决策 25): the root itself, its
+      // ancestors and a root symlink's landing point must not live in a
+      // never-sync region. Refused ⇒ the ordinary local-failure path (the
+      // baseline above already carries the server's REAL revisions), with ZERO
+      // scan and zero upload — every caller is guarded structurally.
+      const guard = await guardArtifactRoot(resolved.root);
+      if (guard.kind === "refused") return reportFailure(target, state, "outside_jail", guard.detail, signal);
       const scan = await scanArtifactRoot(resolved, {
         cache: deps.cache,
         reuseCachedHashes: false,

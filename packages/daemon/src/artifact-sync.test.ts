@@ -365,6 +365,65 @@ describe("AS9 — roots and jail changes", () => {
   });
 });
 
+describe("#91 (片 5) — the never-sync root guard", () => {
+  it("refuses a root inside a never-sync region with zero scan, upload or commit", async () => {
+    const keys = path.join(base, "real", ".ssh", "keys");
+    mkdirSync(keys, { recursive: true });
+    // An innocuous entry name: it is the ROOT that makes this a refusal, not
+    // the relative-entry policy (which never sees the root, #91).
+    writeFileSync(path.join(keys, "notes.txt"), "ordinary-looking");
+    start({ artifactDir: keys });
+
+    const outcome = await sync({ target: target({ artifactDir: keys }) });
+
+    expect(outcome).toMatchObject({ kind: "failed", failure: "outside_jail", reported: "recorded" });
+    expect(server.stepCalls("prepare")).toHaveLength(0);
+    expect(server.stepCalls("put")).toHaveLength(0);
+    expect(server.stepCalls("commit")).toHaveLength(0);
+    expect(server.stepCalls("report")).toHaveLength(1);
+    // The report carried the REAL base revisions (the baseline read precedes
+    // every fallible local step, #95) and the loop's pointer never moved.
+    expect(loop().syncError).toEqual({ failure: "outside_jail", configRevision: 1, baseManifestRevision: 0 });
+    expect(loop().manifestRevision).toBe(0);
+    expect(server.blobs.size).toBe(0);
+  });
+
+  it("refuses a root whose ancestor symlink lands in a never-sync region", async () => {
+    mkdirSync(path.join(base, "real", ".ssh", "proj"), { recursive: true });
+    mkdirSync(path.join(base, "work"));
+    symlinkSync(path.join(base, "real", ".ssh"), path.join(base, "work", "link"));
+    const root = path.join(base, "work", "link", "proj");
+    start({ artifactDir: root });
+
+    const outcome = await sync({ target: target({ artifactDir: root }) });
+
+    expect(outcome).toMatchObject({ kind: "failed", failure: "outside_jail", reported: "recorded" });
+    expect(server.stepCalls("prepare")).toHaveLength(0);
+  });
+
+  it("refuses a root SYMLINK whose landing point is a never-sync region", async () => {
+    mkdirSync(path.join(base, "real", ".config", "gcloud"), { recursive: true });
+    symlinkSync(path.join(base, "real", ".config", "gcloud"), path.join(base, "gcloud-link"));
+    const root = path.join(base, "gcloud-link");
+    start({ artifactDir: root });
+
+    const outcome = await sync({ target: target({ artifactDir: root }) });
+
+    expect(outcome).toMatchObject({ kind: "failed", failure: "outside_jail", reported: "recorded" });
+    expect(server.stepCalls("prepare")).toHaveLength(0);
+  });
+
+  it("still syncs a DIRECTORY merely named like a credential file (file rules do not apply)", async () => {
+    write("credentials/notes.txt", "ordinary content");
+    const root = path.join(base, "credentials");
+    start({ artifactDir: root });
+
+    const outcome = await sync({ target: target({ artifactDir: root }) });
+
+    expect(outcome).toMatchObject({ kind: "synced", uploaded: 1 });
+  });
+});
+
 describe("AS10 — 401/403 stops", () => {
   it("a 401 stops the whole machine and keeps making zero requests until cleared", async () => {
     write("a.txt", "alpha");
