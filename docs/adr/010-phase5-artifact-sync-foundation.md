@@ -229,6 +229,26 @@ claim 的 capability 门控是**逐候选**的，不是整轮 Poll 门控：已�
 
 **残余边界与 follow-up。** 扫描的 TOCTOU 口径与 `bounded-read.ts` 逐字一致：O_NOFOLLOW 只护终端组件，不宣称同 UID 进程替换**中间目录**时的原子性；扫描一致性截止到读取时刻，读取后至上传间的漂移由上传前验证兜底（片 4 消费）。`artifactDir` 根**自身**落在 never-sync 区域（如 `~/.ssh`）不做检查：共享 policy 只约束 manifest 相对路径（决策 4/17），服务端同样只按条目判断，单侧拒绝会造成两侧口径不一——记为配置面 follow-up，片 3 不拓宽冻结的失败域。
 
+### 24. 同步客户端与恢复状态机（Daemon 本地库模块）
+
+片 4 交付 Daemon 的 artifact 同步客户端（`artifact-client.ts` 传输 + `artifact-sync.ts` 状态机），只提供**可手动驱动**的同步能力：不监听目录、不声明 `artifact-sync-v1`、不接 Run 最终 Report、不接线 `runtime.ts`/`cli.ts`/`index.ts`（片 5/6 各自接线）。一次调用给定 watch 目标（`ArtifactWatchItem`：`loopId`/`artifactDir`/`workdir`/`roots`/`configRevision`）与 `daemonRoots`，返回一个封闭结果：`unchanged｜synced｜failed（本地 7 类）｜config_changed｜stopped｜terminal｜unavailable｜cancelled`。
+
+**幂等身份由 payload 决定。** requestId 是幂等键、不是 payload（决策 6）：客户端用共享的 `preparePayloadFingerprint` 判定——待发 payload 的指纹与 pending 会话相同时复用 requestId（服务端据此复用同一会话），不同时新铸。绝不在 payload 变化时复用 requestId（服务端会判 409 `artifact_manifest_conflict`，决策 9）。prepare 的序列化体在首次发送时冻结，重试逐字节相同（镜像 `SerializedReportRequest`）。
+
+**重试类 → 客户端动作。** 逐字消费决策 13 的 `ARTIFACT_ERROR_RETRY_CLASS`：`idempotent_retry` ⇒ 同请求同身份退避重试；`resume`（commit 409 `artifact_blob_missing`）⇒ **同一 payload 重新 prepare**（服务端对 pending 会话重算 `needHashes`）→ 传缺失项 → 重试同一 commit；客户端因此不需要知道缺哪个 blob，也绝不重传全部协商 hash。`renegotiate` ⇒ 重读服务端基线后按新 payload 重新 prepare；`artifact_session_expired` 与 404 `session_not_found` 走**同一 payload** 路径——服务端对未提交的过期 pending 会话原地续期，**syncId 不变**。`recover_receipt` ⇒ 对同一 syncId 直接 commit 取固定回执（零 PUT）。`terminal` ⇒ 终止结果。畸形 2xx 视为**响应丢失**（可重试），与 poll 的 fatal 判定相反：artifact 的三个操作在冻结身份下全部幂等。无码状态按步判定：PUT/commit 404 ⇒ renegotiate；prepare 404（Loop 不存在或跨机）⇒ terminal；prepare 请求体超 8 MiB（`ARTIFACT_PREPARE_REQUEST_MAX_UTF8_BYTES`）⇒ 本地预检按 `too_large` 上报且不发请求。
+
+**上传的字节就是校验过的字节。** 决策 23 的「上传前一律重读重算」由 `verifyArtifactEntry` 执行；片 4 在 `artifact-scan.ts`/`artifact-verify.ts` 增加**加法导出**（`readArtifactFileWithBytes`/`readVerifiedArtifactEntry`，现有函数行为逐字不变），使 PUT 的请求体正是刚通过校验的那批内存字节——单次读、单次哈希，**结构上不存在 verify→upload 窗口**；服务端的字节级校验退化为纵深防御。需要上传的 entry 逐条校验（**按 entry 而非按 hash**）：同一 hash 出现在多个路径时逐路径校验、同一 hash 只上传一次（用首个通过校验的字节），任何一条漂移都整轮重扫，不提交过期清单。
+
+**无变化抑制与其失效规则。** 服务端不比较内容等价（决策 11：每次成功提交都新建快照），因此「无变化的后台核对应不新建 manifest」是客户端职责：进程内保留上次成功提交的 `(configRevision, manifestRevision, entries)`，当新扫描逐条相等且代际相同时直接返回 `unchanged`，**零请求**。失效规则：只有 `unchanged`/`synced` 保留并刷新基线；其余任何结果（含瞬态预算耗尽的 `unavailable`、取消、服务端拒绝、回放旧回执）都置 entries 未知并在下次调用前重读 revision——否则「提交已落地但响应丢失，随后内容回退到旧值」会永久抑制出一处真实分歧。**重启残余**：进程重启后没有进程内基线，只能读回 `(configRevision, manifestRevision)` 作为协商基点，因此首轮可能为等价内容新建一次 revision；Daemon 不引入本地持久化状态。
+
+**停止按作用域，且是粘性的。** 401 ⇒ 机器级停止（该客户端全部 Loop）；403 按 code 取作用域——服务端唯一的 403 是 `artifact_attribution_missing`（机器归属级），故为机器级停止，结果联合保留 `"loop"` 选项以备将来。停止后后续调用零请求直接返回 `stopped`；`clearStops()` 供配置换代或凭据轮换后恢复。
+
+**并发、退避与预算。** 每 Loop 串行（同 Loop 排队、不同 Loop 并发）；Blob 上传经实例级闸，全局在途 ≤ 4（一个客户端实例对应一个 daemon，片 5 只构造一个）；瞬态失败退避 1、2、4、8……封顶 60 秒；预算 `ARTIFACT_SYNC_MAX_ATTEMPTS = 6`、重扫 `ARTIFACT_SYNC_MAX_RESCANS = 2`；PUT 单独 60 秒超时（≤10 MiB 的有界窗口），其余请求 10 秒。每次调用接受 `AbortSignal`：fetch、退避与排队等待都可中止；片 3 的扫描/校验不接 signal，取消在文件边界生效。
+
+**本地失败上报是一次性的。** 只有本地扫描/校验失败（决策 23 的 7 值，含重扫预算耗尽时的 `unstable`）走上报端点；网络、超时与服务端拒绝绝不走（否则等于给断网加一次注定失败的请求）。上报携带**本次尝试实际使用的** `configRevision`/`baseManifestRevision`（否则服务端双匹配门槛会记 `recorded:false`），单次发送不重试，三态结果 `recorded` / `stale`（`recorded:false`，服务端状态已前进）/ `unreported`（传输失败）。
+
+**freshSession。** `syncLoop(target, {freshSession: true})` 跳过抑制并强制新铸 requestId ⇒ 每次都是新会话（决策 11 的「每次最终同步使用新会话，即使内容相同」），供片 6 使用；本片只交付机制。
+
 ## 后果
 
 - 片 2/3 可以并行：表结构与 BlobStore adapter 都只对本文档与已编译接口负责。
@@ -281,3 +301,5 @@ claim 的 capability 门控是**逐候选**的，不是整轮 Poll 门控：已�
 - 决策 23 记录：`artifactDir` 根自身命 never-sync 的配置面防护由 [#91](https://github.com/zhuabo001/loop-platform-zhb/issues/91) 跟踪（roadmap 加指针，启用生产持续同步前明确责任与规则）；Batch 2 计划与上位 Phase 5 计划已同步根 symlink 例外、树内拒绝、事件 hash 缓存复用条件与全量/上传前必重读边界（[#90](https://github.com/zhuabo001/loop-platform-zhb/issues/90)）。
 
 - 决策 23 修订（片 3 二轮审查 #89 补修）：roots canonicalize 仅将当前平台 `node:os.constants.errno` 登记的文件系统错误转换为 `JailError`；realpath 与 stat 的无码、未知码及 `ERR_*` 程序异常保留原异常身份，不误报 `outside_jail`。既有首轮修复记录保留为历史，当前异常边界以此修订为准。含 NUL 的 root 是非法配置形状，在 realpath 前以 `JailError` 拒绝，保持 Artifact resolver 的 `outside_jail` 与 workdir jail 的既有错误契约；不将真实非法配置误当程序异常。
+- 新增决策 24（片 4）：Daemon 同步客户端的幂等身份规则（payload 决定 requestId、prepare 序列化体冻结）、重试类到客户端动作的映射（`resume` 经同 payload 重新 prepare 重算 `needHashes`；`artifact_session_expired` 与 404 会话丢失原地续期、syncId 不变；`recover_receipt` 零 PUT；畸形 2xx 视为响应丢失可重试）、**已验证字节上传**（片 3 模块加法导出 `readArtifactFileWithBytes`/`readVerifiedArtifactEntry`，PUT 的请求体即刚校验通过的内存字节，结构上消除 verify→upload 窗口）、无变化抑制与失效规则（只有 `unchanged`/`synced` 保留基线；重启只读服务端、首轮可能为等价内容新建一次 revision 的残余）、按 code 取作用域的粘性停止与 `clearStops()`、每 Loop 串行与实例级上传闸 ≤4、退避/预算/超时常数、本地失败上报一次性且三态（`recorded`/`stale`/`unreported`）、`freshSession` 机制。
+- 决策 16 更新：片 4 只新增 Daemon 本地同步库模块（可手动驱动、零接线、零依赖、wire 面零变更），休眠边界与片 3 之后逐字相同（AD4 daemon 半 `identity.test.ts` 零修改全绿为证）。

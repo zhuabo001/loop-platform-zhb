@@ -194,6 +194,22 @@ Batch 1 错误映射在 HTTP 接线时补齐：revision 耗尽使用新增 `arti
 - [#88](https://github.com/zhuabo001/loop-platform-zhb/issues/88)：读后 `lstat` 与目录终检的 `EACCES`/`EPERM` ⇒ 确定性 `unreadable`（单次尝试、单次打开；上传前验证同为 `unreadable`），不再三次重扫后报 `unstable`；`ENOENT` 与身份变化仍走有界重扫（`daemon/src/artifact-scan.test.ts`）。
 - [#89](https://github.com/zhuabo001/loop-platform-zhb/issues/89)：server root 在 realpath/stat 遇已识别 OS errno（含 `ENOENT`/`ENOTDIR`/`EACCES`/`EPERM`/`EIO`/`ELOOP`/`EMFILE`/`ENFILE`）与非目录 ⇒ 根解析返回 `outside_jail`；含 NUL 的 root 在 I/O 前按非法配置拒绝，workdir jail 保持 `JailError`；有效输入下的无码异常、未知码、`ERR_*` 程序异常原样抛出并保留身份，不伪装成配置失败（`daemon/src/artifact-jail.test.ts`）。
 
+片 4 的 AS 编号逐项对应（场景不依赖 handoff 记录；AS7/AS8/AS12 归片 5）：
+
+| ID | 场景 | 主要证据 |
+|---|---|---|
+| AS1 | 断网：退避 1、2、4、8……封顶 60 秒、尝试预算 6；结果 `unavailable`，本地失败上报 0 次 | `daemon/src/artifact-sync.test.ts` |
+| AS2 | prepare 响应丢失（服务端已建会话）：同 requestId、同字节重试，只建一个会话 | 同上 |
+| AS3 | PUT 响应丢失（blob 已落盘）：同 syncId 重发得 `published:false`；每个 needHash 恰一次 PUT，已在服务端的 hash 零上传 | 同上 |
+| AS4 | commit 响应丢失（已提交）：同 syncId 重试取回同一固定回执，只产生一个 revision | 同上 |
+| AS5 | 服务端重启／会话丢失：404 `session_not_found` 与 409 `artifact_session_expired` 均以同 payload 重新 prepare 收敛（续期时 syncId 不变） | 同上 |
+| AS6 | Daemon 重启：先读服务端 revision 作协商基点；等价内容可能新建一次 revision（残余），随后同实例无变化 ⇒ 零请求 | 同上 |
+| AS9 | roots/jail 变化：每次调用重新解析根，越界或缺失 ⇒ 封闭失败 + 携带本次尝试代际的上报，零同步请求 | 同上 |
+| AS10 | 401/403：按作用域粘性停止（401 与 `artifact_attribution_missing` 均为机器级），后续调用零请求，`clearStops()` 恢复 | 同上 |
+| AS11 | 退避与并发：延迟序列与 60 秒封顶；同 Loop 串行、不同 Loop 并发、全局在途 PUT ≤ 4 | 同上 |
+
+片 4 以编号外证据覆盖：只传 `needHashes`、无变化抑制及其失效规则、requestId 指纹复用规则、已验证字节即上传字节、上报三态、`config_conflict ⇒ config_changed`、取消、`settled()` 语义、会话纪元（不提交被取代的 syncId）、`freshSession`、11 码到动作的表驱动覆盖与传输层分类（`daemon/src/artifact-client.test.ts`）。
+
 额外覆盖配置 no-op、Create 原子性、busy Poll 的 watch 更新、capability 与 claim 交错、错误 taxonomy、8 MiB 请求边界和迟到错误不得覆盖新状态。
 
 质量门：
