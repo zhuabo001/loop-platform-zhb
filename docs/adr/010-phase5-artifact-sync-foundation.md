@@ -173,7 +173,7 @@ fsync 只覆盖 Blob 文件，不做目录 fsync。目录项崩溃丢失由决�
 
 本批不挂载任何 Artifact HTTP 路由、不启动 watcher、Daemon 不声明 `artifact-sync-v1`、Report 不消费 `artifactSnapshotId`/`artifactSyncError`、Run claim 条件不变、旧 Loop 默认未配置 Artifact 目录且不开始上传、生产装配不构造 BlobStore。
 
-Daemon 的 poll 出站体仅包含既有五个静态字段与 `availableSlots`，不发送 `watchDigest`；poll/report 请求仅使用 `/api/machine/poll` 与 `/api/machine/report`。Batch 2 watcher 接线时须显式更新该边界。AD1–AD4 休眠守卫覆盖路由、Create/Poll/Report、出站请求及启动装配，长期验收要求以 Batch 1 计划为准。Batch 2 按批次计划逐切片解除该边界：片 1 只冻结契约与生产门面（AD1–AD4 仍全绿），片 2 挂 6 条路由与生产装配并解除 Create/Poll/claim/Delivery 的相关休眠，片 5 声明 capability 并启动 watcher，片 6 消费 Report 字段。片 2 之后休眠仍覆盖：Report Artifact 字段（片 6）、Daemon watcher 与 `artifact-sync-v1` 声明（片 5）、读路由与 Dashboard（片 7）；对应守卫按各片的实际解除范围重写（AD1 拆为已挂/未挂两半、AD2(a)/(b) 反转为启用语义、AD4 保留「启动零 fs 副作用、无 watcher」并新增装配断言）。
+Daemon 的 poll 出站体仅包含既有五个静态字段与 `availableSlots`，不发送 `watchDigest`；poll/report 请求仅使用 `/api/machine/poll` 与 `/api/machine/report`。Batch 2 watcher 接线时须显式更新该边界。AD1–AD4 休眠守卫覆盖路由、Create/Poll/Report、出站请求及启动装配，长期验收要求以 Batch 1 计划为准。Batch 2 按批次计划逐切片解除该边界：片 1 只冻结契约与生产门面（AD1–AD4 仍全绿），片 2 挂 6 条路由与生产装配并解除 Create/Poll/claim/Delivery 的相关休眠，片 5 声明 capability 并启动 watcher，片 6 消费 Report 字段。片 2 之后休眠仍覆盖：Report Artifact 字段（片 6）、Daemon watcher 与 `artifact-sync-v1` 声明（片 5）、读路由与 Dashboard（片 7）；对应守卫按各片的实际解除范围重写（AD1 拆为已挂/未挂两半、AD2(a)/(b) 反转为启用语义、AD4 保留「启动零 fs 副作用、无 watcher」并新增装配断言）。片 3 只新增 Daemon 本地库模块（决策 23），不改任何装配与 wire 面：休眠边界与片 2 之后逐字相同，AD4 的 daemon 半（`identity.test.ts`）零修改全绿即其可执行证据。
 
 ### 17. 共享 policy 的 ADR-002 窄例外记录
 
@@ -210,6 +210,24 @@ Batch 2 的生产门面是 `packages/server/src/artifact/production.ts` 的 `cre
 Poll 的 watch 集合是该 Machine 名下**全部已配置 Loop**（`artifactDir` 非空，含 Paused 与 Completed，不按 enabled/completedAt 过滤）；每项为 `{loopId, artifactDir, workdir: loop.workdir ?? null, roots: machine.roots ?? [], configRevision}`。**服务端只在 Machine 已声明 `artifact-sync-v1` 时下发 watch**——未声明的 daemon 不运行 watcher，配置是死重；未声明者（含全部 Batch 1 daemon）的 poll 响应因此与 Batch 1 逐字一致。判定规则：请求缺 `watchDigest` **等价于空集合的摘要**（无 watch 状态的 daemon 与空集合语义等价，旧 daemon 因此不产生噪声）；有效摘要 ≠ 计算摘要才返回 `{watch, watchDigest}`，相等则两者都缺席；`watch: []` 表示清空全部 watch。busy Poll（`availableSlots: 0`）同样处理 watchDigest——watch 是配置分发，不依赖 run 领取。
 
 claim 的 capability 门控是**逐候选**的，不是整轮 Poll 门控：已配置 Loop 要求 Machine 声明 `artifact-sync-v1`，缺 capability 的候选被跳过、不阻塞同 Machine 的其他候选（未配置 Loop 的领取条件不变）。判定发生在 claim 的权威 Loop 解析处（与 Completed 检查同点），其快照由事务内 `id + revision` CAS 证明——扫描与 claim 之间落地的配置写入使 CAS 丢失、有界重跑以新状态重裁。服务端不下发 artifact 的 `requiredCapabilities` 提示（该提示保持 terminal-journal 语义；daemon 在片 5 才声明该 capability）。
+
+### 23. Artifact 扫描器（Daemon 本地库模块）
+
+片 3 只交付 Daemon 本地的库模块（`artifact-jail.ts` / `artifact-scan.ts` / `artifact-hash-cache.ts` / `artifact-verify.ts`，既有 `jail.ts` 仅新增两处 `export`），不接线 `runtime.ts`/`cli.ts`/`index.ts`、不声明 `artifact-sync-v1`、不启动 watcher、不访问网络。给定 `{artifactDir, workdir, serverRoots}` 时，它要么产出**完整可提交**的 manifest（经共享 policy 收口与排序），要么返回一个封闭分类的失败——**结构上不存在部分清单**（决策 1 的本地执行体）。
+
+**根解析复用 workdir jail 的 roots 纪律，但不复用 Task File 的 symlink 跟随。** `daemonRoots` 为空、或 `artifactDir` 为相对路径而无显式 `workdir`（`path.resolve(workdir, dir)` 解析失败）⇒ `outside_jail`；server roots 每次重新 canonicalize（非信任输入，`..`/不存在/非目录一律拒绝）后求交集，空交集 ⇒ `outside_jail`。解析序为 `realpath` **先于**容器检查，因此**根自身是 symlink 时被跟随**，落点在有效 roots 内即通过、越界 ⇒ `outside_jail`（与 `jail.ts` 的 workdir 解析同规）；**树内**任何 symlink（指向内/外/悬空）一律使整次扫描失败，绝不读取目标。`ENOENT`/`ENOTDIR` 或 realpath 后非目录 ⇒ `directory_missing`；`ELOOP` ⇒ `symlink`；`EACCES`/`EPERM` ⇒ `unreadable`。解析零 scratch：不 import `mkdtemp`、不触碰 `createWorkdirJail`。
+
+**遍历前剪枝先于一切 I/O。** never-sync 规则（决策 4）在 `lstat` 之前判定：命中的目录不下降（不枚举其子项）、命中的文件不 `lstat` 不 `open`——秘密文件连「被打开过」都不发生。合法空目录产出空 manifest；目录缺失绝不降级为空 manifest。
+
+**失败分类映射（wire 9 值的子集）。** 扫描器类型层只产出 `Exclude<ArtifactSyncFailure, "watcher_error" | "timeout">` 七个值（后两者是片 5/片 4–6 的职责）。wire 不可表示的路径拒绝细分映射：`path_too_long ⇒ too_large`（决策 3 把路径上限归入容量组）；`path_backslash`/`path_drive_letter` 及其余防御性路径拒绝 ⇒ `unreadable`（detail 写明原因）。绝不跳过、绝不截断。
+
+**读纪律与不稳定重扫。** 每个文件 `lstat`（分类 + 尺寸早检）→ `readRegularFileNoFollow`（决策：O_NOFOLLOW 单次打开、fstat 证明常规文件、分配前尺寸闸、有界读取）→ 读后 `lstat` 复验 `dev/ino/size/mtimeMs/ctimeMs` 五元组全等且字节长度等于 size。每访问过的目录在子树处理完后复检一次（覆盖「列完 A 后 A 被增删」）。**确定性失败**（symlink/special/unreadable/too_large/路径拒绝）立即返回；仅当标脏且无确定性失败时整轮丢弃重扫，最多 3 次，仍脏 ⇒ `unstable`。收口由 `normalizeManifestEntries` 完成，它是唯一校验/排序源；`path_never_sync`/`duplicate_path`/`file_dir_conflict`/`hash_size_mismatch`/`hash_malformed`/`size_invalid` 在本地不可达，出现即抛不变量错误（说明扫描器自身不变量被破坏），不伪装成可提交失败。
+
+**容量与 DoS 上界。** 单文件超 10 MiB 在 `lstat` 早检拒绝（不 open）；条目数与聚合字节（按路径累加）早停 ⇒ `too_large`；Daemon 另设 `maxVisitedDirents = 4 × ARTIFACT_MANIFEST_MAX_ENTRIES` 的已访问目录项上限——这是**本地防 DoS 上限，不是 wire 策略上限**，服务端不执行、不感知。
+
+**hash 缓存与复用边界。** 缓存键为绝对路径，条目为文件身份五元组 + hash；`sameArtifactFileIdentity` 要求五元组**全等**才允许复用（绝不 size-only），Map 插入序 FIFO 驱逐，上界 `4 × ARTIFACT_MANIFEST_MAX_ENTRIES`，由调用方持有、无单例。默认（启动/每 60 秒/Run 最终同步）**全量重哈希**；只有片 5 的事件路径增量扫描显式选择复用缓存（本片只交付机制与测试，不预设调用方）。**上传前验证一律重新读取并重算 hash**（对应决策 13「上传前重新读取并验证 hash/size」），验证结果写回缓存；上传前验证先做包含守卫，越界 ⇒ `changed` 且不读取。
+
+**残余边界与 follow-up。** 扫描的 TOCTOU 口径与 `bounded-read.ts` 逐字一致：O_NOFOLLOW 只护终端组件，不宣称同 UID 进程替换**中间目录**时的原子性；扫描一致性截止到读取时刻，读取后至上传间的漂移由上传前验证兜底（片 4 消费）。`artifactDir` 根**自身**落在 never-sync 区域（如 `~/.ssh`）不做检查：共享 policy 只约束 manifest 相对路径（决策 4/17），服务端同样只按条目判断，单侧拒绝会造成两侧口径不一——记为配置面 follow-up，片 3 不拓宽冻结的失败域。
 
 ## 后果
 
@@ -257,3 +275,5 @@ claim 的 capability 门控是**逐候选**的，不是整轮 Poll 门控：已�
 - 决策 7 记录凭证校验落地为 `verifyMachineCredential`（形状检查 → 派生 id → 行查找 → 全量 tokenHash 比对，永不注册）。
 - 新增决策 22：Poll watch 集合与下发门控（仅 Machine 声明 `artifact-sync-v1` 才下发；缺 `watchDigest` 等价于空集合摘要；busy Poll 同样处理）与 claim 的逐候选 capability 门控（权威解析 + 事务内 CAS 证明，非阻塞跳过，`requiredCapabilities` 保持 terminal-journal 语义）。
 - 决策 16 更新：片 2 挂 6 条路由与生产装配，明确片 2 后仍休眠的范围（Report 字段、Daemon watcher、读路由）与各守卫的重写方式。
+- 新增决策 23（片 3）：Daemon 本地扫描器的根解析（复用 roots 交集、根 symlink 跟随并做容器检查、树内 symlink 整扫失败）、失败映射（`path_too_long ⇒ too_large`；其余防御性路径拒绝 ⇒ `unreadable`）、never-sync 剪枝先于一切 I/O、读纪律（无跟随打开 + 读后身份五元组复验）、目录终检与有界丢弃重扫（3 次 ⇒ `unstable`）、容量与本地 dirent 防 DoS 上界、hash 缓存的五元组复用边界（默认全量重哈希、仅事件路径增量、上传前验证一律重读重算）、与 `bounded-read.ts` 同口径的残余 TOCTOU 声明，以及「`artifactDir` 根自身命 never-sync 不检查」的配置面 follow-up。
+- 决策 16 更新：片 3 只新增 Daemon 本地库模块（零接线、零依赖、零 wire 面），休眠边界与片 2 之后逐字相同；AD4 daemon 半（`identity.test.ts`）零修改全绿为证。

@@ -171,6 +171,23 @@ Batch 1 错误映射在 HTTP 接线时补齐：revision 耗尽使用新增 `arti
 | AH11 | watch：capable 且无 digest ⇒ 全集 + digest；digest 一致 ⇒ 两键缺席；新增/变更/清空配置 ⇒ 全量；清空 ⇒ `watch:[]`；busy Poll 同样携带；Paused/Completed 在集合内；非 capable 完全不发且不查询 | `server/src/artifact/watch.test.ts`、`coordinator/poll.test.ts`（AD2(b) 重写） |
 | AH12 | claim 门控与 Delivery：已配置 + 非 capable ⇒ 候选跳过（无 lease、run 仍 pending、零写）且不阻塞其他候选；未配置 Loop 照常领取；capable ⇒ 领取且 Delivery 携带 `{dir, configRevision}`；扫描后配置竞态在 claim 侧被拒 | `coordinator/poll.test.ts`、`coordinator/claim.test.ts`、`gateway/delivery.test.ts` |
 
+片 3 的 AJ 编号逐项对应（场景不依赖 handoff 记录）：
+
+| ID | 场景 | 主要证据 |
+|---|---|---|
+| AJ1 | workdir 相对路径：显式 workdir 下 `resolve`；`..` 逃出交集、越界 ⇒ `outside_jail`；不存在 ⇒ `directory_missing`；**不**落到 `process.cwd()` | `daemon/src/artifact-jail.test.ts` |
+| AJ2 | 无 workdir：绝对路径通过；相对路径 ⇒ `outside_jail`（不隐性取进程 cwd）；绝对越界 ⇒ `outside_jail` | 同上 |
+| AJ3 | roots 交集：窄者存活、被父覆盖的子根丢弃、`effectiveRoots` 可观察；`serverRoots=[]` ≡ 全部 daemon roots；不相交或非法 server root ⇒ `outside_jail`；`/foo` vs `/foobar` 非包含 | 同上 |
+| AJ4 | 目录 symlink：树内（指向内/外/悬空）⇒ `symlink`，目标内容永不进 entries 且不对其枚举；根自身是 symlink ⇒ 落点在内 `ok`（root = realpath）、越界 `outside_jail` | `daemon/src/artifact-scan.test.ts` |
+| AJ5 | 文件 symlink：指向内/外/悬空 ⇒ `symlink`；`open` 计数为 0（不读目标） | 同上 |
+| AJ6 | 特殊文件：FIFO／socket 等非普通文件 ⇒ `special_file`、`open` 计数 0（绝不阻塞在 `O_RDONLY`） | 同上 |
+| AJ7 | 目录缺失：不存在、指向普通文件、resolve 后扫描前被删 ⇒ `directory_missing`，绝不当空 manifest | 同上 |
+| AJ8 | 合法空目录：纯空树／嵌套空目录 ⇒ `ok` + `entries=[]`；输出排序为 UTF-16 code unit 序（钉 `a.txt < a/b`） | 同上 |
+| AJ9 | 读取失败／不稳定：`EACCES` ⇒ `unreadable`；首轮脏次轮净 ⇒ `ok`（attempt=2）；持续脏 ⇒ `unstable`（attempt≤3）；读后身份/尺寸漂移与目录终检捕获增删；失败结果**结构上无 entries 字段** | 同上 |
+| AJ10 | never-sync 与容量：`.git`/`node_modules`/`.config/gcloud` 不下降、`.env`/`id_rsa*`/`*.pem` 及大小写变体不读（枚举/`open` 日志为证），纯 never-sync 树 ⇒ `ok []`；单文件超 10 MiB 由 `lstat` 早检拒绝；条目数／聚合字节／已访问 dirent 超限 ⇒ `too_large` 且早停；>1024 UTF-8 字节路径 ⇒ `too_large`；反斜杠与盘符路径 ⇒ `unreadable` | 同上 |
+
+编号外证据：hash 缓存的五元组逐字段失效、FIFO 驱逐与 `clear()`（`daemon/src/artifact-hash-cache.test.ts`）；上传前验证的包含守卫、失败分类、一律重读重算与成功写回缓存（`daemon/src/artifact-verify.test.ts`）。
+
 额外覆盖配置 no-op、Create 原子性、busy Poll 的 watch 更新、capability 与 claim 交错、错误 taxonomy、8 MiB 请求边界和迟到错误不得覆盖新状态。
 
 质量门：
