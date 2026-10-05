@@ -4,6 +4,7 @@
  * io seam for what cannot be raced deterministically (a mid-scan rewrite, a
  * special file, an EACCES) — never fake timers, never a blocking FIFO read.
  */
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { promises as fs } from "node:fs";
 import type { Stats } from "node:fs";
@@ -32,6 +33,22 @@ import {
 let base: string;
 
 const p = (...parts: string[]): string => path.join(base, ...parts);
+
+/** A blocking open() never settles, so a regression must FAIL on a deadline
+ *  instead of wedging the suite (review #87). */
+async function withDeadline<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} did not settle within ${ms} ms`)), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 beforeEach(() => {
   base = mkdtempSync(path.join(realpathSync(tmpdir()), "loopzhb-artifact-scan-test-"));
@@ -166,6 +183,32 @@ describe("AJ6 — special files are refused without opening them", () => {
     expect(existsSync(target)).toBe(true); // the real file was never read
   });
 
+  it("a FIFO swapped in between lstat and open fails promptly as `special_file` (#87)", async () => {
+    // lstat sees a regular file; the injected open replaces it with a REAL
+    // FIFO before delegating. A blocking O_RDONLY open would wait for a writer
+    // forever, so the deadline turns that regression into a failure. The
+    // refused handle must still be closed.
+    writeFileSync(p("a.txt"), "hello");
+    const target = p("a.txt");
+    const handles: Awaited<ReturnType<typeof fs.open>>[] = [];
+    const io: ArtifactScanIo = {
+      open: async (file, flags, mode) => {
+        if (file === target) {
+          rmSync(target);
+          execFileSync("mkfifo", [target]);
+        }
+        const handle = await fs.open(file, flags as never, mode as never);
+        handles.push(handle);
+        return handle;
+      },
+    };
+    const result = await withDeadline(scanTree(base, { io }), 5000, "the FIFO-swapped scan");
+    if (result.kind !== "failed") throw new Error("expected a failure, got ok");
+    expect(result.failure).toBe("special_file");
+    expect(handles).toHaveLength(1);
+    expect(handles[0]!.fd).toBe(-1); // closed, not leaked
+  });
+
   it("a real unix socket is `special_file` (no seam)", async () => {
     const sock = p("service.sock");
     const server = createServer();
@@ -237,6 +280,93 @@ describe("AJ9 — read failures and instability discard the whole attempt", () =
       },
     };
     await expectFailure(scanTree(base, { io }), "unreadable");
+  });
+
+  it("a post-read EACCES/EPERM is `unreadable` at once, never `unstable` (#88)", async () => {
+    for (const code of ["EACCES", "EPERM"]) {
+      writeFileSync(p("a.txt"), "abc");
+      const target = p("a.txt");
+      let looks = 0;
+      let opens = 0;
+      const io: ArtifactScanIo = {
+        lstat: async (absolutePath) => {
+          if (absolutePath === target) {
+            looks++;
+            // Every POST-read look (the even-numbered one) refuses, so the
+            // pre-fix behaviour is the review's exact evidence: three reads,
+            // then `unstable` — instead of one read and `unreadable`.
+            if (looks % 2 === 0) throw Object.assign(new Error(`injected ${code}`), { code });
+          }
+          return fs.lstat(absolutePath);
+        },
+        open: async (file, flags, mode) => {
+          opens++;
+          return fs.open(file, flags as never, mode as never);
+        },
+      };
+      // A permission fault is deterministic: one attempt, the right class —
+      // not three retries ending in `unstable` (and the pre-upload verifier
+      // routes through the same read, so it reports `unreadable` too).
+      await expectFailure(scanTree(base, { io }), "unreadable");
+      expect(opens, code).toBe(1);
+      expect(looks, code).toBe(2);
+      rmSync(target);
+    }
+  });
+
+  it("a post-subtree EACCES/EPERM on the directory re-check is `unreadable` at once (#88)", async () => {
+    for (const code of ["EACCES", "EPERM"]) {
+      writeFileSync(p("a.txt"), "abc");
+      let rootLooks = 0;
+      let listings = 0;
+      const io: ArtifactScanIo = {
+        lstat: async (absolutePath) => {
+          if (absolutePath === base) {
+            rootLooks++;
+            // Every directory RE-check (the even-numbered look) refuses, so
+            // the pre-fix behaviour is the review's exact evidence: three
+            // attempts, then `unstable`.
+            if (rootLooks % 2 === 0) throw Object.assign(new Error(`injected ${code}`), { code });
+          }
+          return fs.lstat(absolutePath);
+        },
+        listNames: async (dir, max) => {
+          listings++;
+          return listDirectoryNames(dir, max);
+        },
+      };
+      await expectFailure(scanTree(base, { io }), "unreadable");
+      expect(listings, code).toBe(1); // one attempt — no dirty-retry loop
+      expect(rootLooks, code).toBe(2); // one inspection + one re-check
+      rmSync(p("a.txt"));
+    }
+  });
+
+  it("a file that vanishes after its read still takes the bounded rescan (ENOENT ⇒ moved)", async () => {
+    writeFileSync(p("a.txt"), "abc");
+    const target = p("a.txt");
+    let rootLooks = 0;
+    let opens = 0;
+    const io: ArtifactScanIo = {
+      lstat: async (absolutePath) => {
+        if (absolutePath === base) {
+          rootLooks++;
+          // The attempt-1 directory re-check: the vanished file comes back
+          // BEFORE attempt 2 starts, so the rescan meets a settled tree.
+          if (rootLooks === 2) writeFileSync(target, "abc");
+        }
+        return fs.lstat(absolutePath);
+      },
+      open: async (file, flags, mode) => {
+        const handle = await fs.open(file, flags as never, mode as never);
+        if (++opens === 1) rmSync(target); // gone right after attempt 1's read
+        return handle;
+      },
+    };
+    const result = await scanTree(base, { io });
+    if (result.kind !== "ok") throw new Error(`expected ok, got ${result.failure}: ${result.detail}`);
+    expect(opens).toBe(2); // attempt 1 was discarded, attempt 2 read the file
+    expect(result.entries.map((entry) => entry.path)).toEqual(["a.txt"]);
   });
 
   it("a mid-read rewrite marks the attempt dirty and the rescan succeeds", async () => {

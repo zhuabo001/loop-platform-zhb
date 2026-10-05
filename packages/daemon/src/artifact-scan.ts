@@ -26,6 +26,9 @@
  *    added, removed or renamed while it was being enumerated also marks the
  *    attempt dirty. A dirty attempt is DISCARDED whole and rescanned, up to
  *    ARTIFACT_SCAN_MAX_ATTEMPTS; a tree that never settles is `unstable`.
+ *  - a re-check the kernel REFUSES (EACCES/EPERM, …) is not a change: it is
+ *    the deterministic `unreadable` failure and is reported at once, never
+ *    retried three times and mislabelled `unstable` (review #88).
  *
  * Residual (same wording as bounded-read.ts): O_NOFOLLOW guards only the
  * terminal path component, and a swapped INTERMEDIATE directory between the
@@ -153,8 +156,10 @@ export async function readArtifactFile(
   let after: FileStat;
   try {
     after = await lstat(absolutePath);
-  } catch {
-    return { kind: "changed" };
+  } catch (error) {
+    // A path that MOVED is a transient observation (dirty, rescan); a kernel
+    // refusal is deterministic and must be reported as `unreadable` at once.
+    return classifyRecheckError(error) === "moved" ? { kind: "changed" } : { kind: "unreadable" };
   }
   if (after.isSymbolicLink() || !after.isFile()) return { kind: "changed" };
   // The same file, before and after — and the same file the fd was opened on.
@@ -216,6 +221,18 @@ function classifyStatError(error: unknown): "missing" | "symlink" | "unreadable"
   const code = (error as NodeJS.ErrnoException).code;
   if (code === "ENOENT" || code === "ENOTDIR") return "missing";
   if (code === "ELOOP") return "symlink";
+  return "unreadable";
+}
+
+/** The post-read and post-subtree RE-checks answer a different question from
+ *  the first inspection: did the path MOVE (a transient observation — the
+ *  attempt is dirty and gets rescanned) or did the kernel REFUSE to look at
+ *  it (a deterministic failure that must surface at once, review #88)? A
+ *  terminal symlink is caught by a SUCCESSFUL lstat, so ELOOP here means an
+ *  INTERMEDIATE component changed. */
+function classifyRecheckError(error: unknown): "moved" | "unreadable" {
+  const code = (error as NodeJS.ErrnoException).code;
+  if (code === "ENOENT" || code === "ENOTDIR" || code === "ELOOP") return "moved";
   return "unreadable";
 }
 
@@ -353,9 +370,18 @@ async function walkAttempt(
       let after: FileStat;
       try {
         after = await lstat(frame.absDir);
-      } catch {
-        dirty = true;
-        continue;
+      } catch (error) {
+        if (classifyRecheckError(error) === "moved") {
+          dirty = true;
+          continue;
+        }
+        // A refused re-check is deterministic — never a third retry of a
+        // permission fault (review #88).
+        return {
+          kind: "failed",
+          failure: "unreadable",
+          detail: `directory could not be re-checked: ${JSON.stringify(frame.absDir)}`,
+        };
       }
       if (after.isSymbolicLink() || !after.isDirectory() || !sameDirIdentity(frame.identity, dirIdentity(after))) {
         dirty = true;

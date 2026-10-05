@@ -4,6 +4,7 @@
  * and verification ALWAYS re-reads and recomputes — the cache is written
  * back, never consulted.
  */
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { promises as fs } from "node:fs";
@@ -25,6 +26,22 @@ const p = (...parts: string[]): string => path.join(base, ...parts);
 const sha256 = (text: string): string => createHash("sha256").update(text).digest("hex");
 
 const root: () => ResolvedArtifactRoot = () => ({ root: base, effectiveRoots: [base] });
+
+/** A blocking open() never settles, so a regression must FAIL on a deadline
+ *  instead of wedging the suite (review #87). */
+async function withDeadline<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} did not settle within ${ms} ms`)), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 beforeEach(() => {
   base = mkdtempSync(path.join(realpathSync(tmpdir()), "loopzhb-artifact-verify-test-"));
@@ -149,6 +166,58 @@ describe("classification", () => {
       verifyArtifactEntry(root(), expectedFor("fifo", ""), { cache: createArtifactHashCache(), io: specialIo }),
       "special_file",
     );
+  });
+
+  it("a FIFO swapped in between lstat and open is `special_file`, promptly (#87)", async () => {
+    // The same check/use window as the scanner's: a blocking open would wait
+    // for a writer forever, so the verifier would hang instead of reporting.
+    writeFileSync(p("a.txt"), "hello");
+    const target = p("a.txt");
+    const handles: Awaited<ReturnType<typeof fs.open>>[] = [];
+    const io: ArtifactScanIo = {
+      open: async (file, flags, mode) => {
+        if (file === target) {
+          rmSync(target);
+          execFileSync("mkfifo", [target]);
+        }
+        const handle = await fs.open(file, flags as never, mode as never);
+        handles.push(handle);
+        return handle;
+      },
+    };
+    await expectFailure(
+      withDeadline(
+        verifyArtifactEntry(root(), expectedFor("a.txt", "hello"), { cache: createArtifactHashCache(), io }),
+        5000,
+        "the FIFO-swapped verification",
+      ),
+      "special_file",
+    );
+    expect(handles).toHaveLength(1);
+    expect(handles[0]!.fd).toBe(-1); // closed, not leaked
+  });
+
+  it("a post-read EACCES/EPERM is `unreadable`, not `changed` (#88)", async () => {
+    for (const code of ["EACCES", "EPERM"]) {
+      writeFileSync(p("a.txt"), "hello");
+      const target = p("a.txt");
+      let looks = 0;
+      const io: ArtifactScanIo = {
+        lstat: async (absolutePath) => {
+          if (absolutePath === target) {
+            looks++;
+            // 1st look = the read's own inspection, 2nd = the post-read one.
+            if (looks === 2) throw Object.assign(new Error(`injected ${code}`), { code });
+          }
+          return fs.lstat(absolutePath);
+        },
+      };
+      await expectFailure(
+        verifyArtifactEntry(root(), expectedFor("a.txt", "hello"), { cache: createArtifactHashCache(), io }),
+        "unreadable",
+      );
+      rmSync(target);
+    }
   });
 
   it("an EACCES lstat is `unreadable`; an over-ceiling file is `too_large`", async () => {

@@ -4,8 +4,12 @@
  * that consumes an agent-influenceable file — the journal record, the task
  * file, the wrapper's *-file arguments.
  *
- *  - the file is opened ONCE with O_NOFOLLOW (a terminal-component symlink
- *    swap between check and use gets ELOOP, never the swapped target);
+ *  - the file is opened ONCE with O_NOFOLLOW and O_NONBLOCK: a terminal
+ *    symlink swap between check and use gets ELOOP, never the swapped target,
+ *    and a terminal swap to a FIFO cannot PARK the open — with no writer a
+ *    blocking O_RDONLY open waits forever, so the same-fd fstat that refuses
+ *    the FIFO could never run (review #87). O_NONBLOCK has no effect on
+ *    regular-file reads, which is the only kind this function accepts;
  *  - fstat on THAT handle proves a regular file and enforces the byte
  *    ceiling BEFORE any allocation sized by the attacker;
  *  - the read itself is bounded: a fixed maxBytes+1 buffer, never a
@@ -36,7 +40,7 @@ export async function readRegularFileNoFollow(
   maxBytes: number,
   openImpl: typeof fs.open = fs.open, // TEST-ONLY seam (spawnImpl precedent)
 ): Promise<BoundedRead> {
-  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0);
   let handle: fs.FileHandle;
   try {
     handle = await openImpl(filePath, flags);

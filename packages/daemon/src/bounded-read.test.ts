@@ -3,6 +3,7 @@
  * fstat-guarded regular-file + size ceiling, bounded allocation, and the
  * TEST-ONLY open seam that deterministically replays a check/use swap.
  */
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, truncateSync, writeFileSync, promises as fs } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -11,6 +12,22 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { readRegularFileNoFollow } from "./bounded-read.js";
 
 let base: string;
+
+/** A blocking open() never settles, so a regression must FAIL on a deadline
+ *  instead of wedging the suite (review #87). */
+async function withDeadline<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} did not settle within ${ms} ms`)), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 beforeEach(() => {
   base = mkdtempSync(path.join(tmpdir(), "loopzhb-bounded-read-test-"));
@@ -84,6 +101,26 @@ describe("readRegularFileNoFollow", () => {
       return fs.open(p, flags as never, mode as never);
     });
     expect(result.kind).toBe("symlink");
+  });
+
+  it("a FIFO swapped in between the caller's lstat and the open cannot park the open (#87)", async () => {
+    // The real check/use window: the caller lstat'ed `file` as a regular file,
+    // and the FIFO appears before the open. Without O_NONBLOCK this open waits
+    // for a writer FOREVER (the review's real probe was still pending at
+    // 1500 ms), so the fstat that refuses the FIFO never runs. The read must
+    // return promptly with the same-fd verdict, never read the FIFO.
+    const file = path.join(base, "swap-target");
+    writeFileSync(file, "regular");
+    const result = await withDeadline(
+      readRegularFileNoFollow(file, 64, async (target, flags, mode) => {
+        rmSync(String(target));
+        execFileSync("mkfifo", [String(target)]);
+        return fs.open(target, flags as never, mode as never);
+      }),
+      5000,
+      "the FIFO-swapped read",
+    );
+    expect(result.kind).toBe("not_regular");
   });
 
   it("a directory is not_regular; missing is not_found; other errors unreadable", async () => {
