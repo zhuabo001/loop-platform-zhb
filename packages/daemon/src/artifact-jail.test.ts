@@ -178,12 +178,13 @@ describe("AJ3 — the daemon ∩ server roots intersection", () => {
     );
   });
 
-  it("an illegal server root (missing, relative, non-directory, `..`) is outside_jail", async () => {
+  it("an illegal server root (missing, relative, non-directory, `..`, NUL) is outside_jail", async () => {
     const shared = { artifactDir: p("work"), workdir: null, daemonRoots: [base] } as const;
     await expectFailure({ ...shared, serverRoots: [p("missing")] }, "outside_jail");
     await expectFailure({ ...shared, serverRoots: ["relative/root"] }, "outside_jail");
     await expectFailure({ ...shared, serverRoots: [p("a-file")] }, "outside_jail");
     await expectFailure({ ...shared, serverRoots: [`..${path.sep}${path.basename(base)}`] }, "outside_jail");
+    await expectFailure({ ...shared, serverRoots: [p("nul\0root")] }, "outside_jail");
   });
 
   it("a post-realpath stat failure is outside_jail — no raw errno escapes (#89)", async () => {

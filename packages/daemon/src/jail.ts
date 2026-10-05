@@ -80,7 +80,7 @@ function isFilesystemError(error: unknown): boolean {
   return typeof code === "string" && Object.hasOwn(osConstants.errno, code);
 }
 
-/** Canonicalize a root set: every root must be an absolute, `..`-free path to
+/** Canonicalize a root set: every root must be an absolute, NUL/`..`-free path to
  *  an existing directory; realpath collapses symlink aliases, exact
  *  duplicates drop out (first-seen order). Used for the daemon roots ONCE at
  *  construction (fail-fast startup) AND for server roots on EVERY resolve —
@@ -95,6 +95,11 @@ export async function canonicalizeRoots(roots: string[], label: string, io?: Can
   const stat = io?.stat ?? fs.stat;
   const canonical: string[] = [];
   for (const root of roots) {
+    // NUL is a rejected configuration shape, not an injected program error:
+    // Node reports it as ERR_INVALID_ARG_VALUE, so reject before realpath.
+    if (root.includes("\0")) {
+      throw new JailError(`${label} contains a NUL byte: ${JSON.stringify(root)}`);
+    }
     if (!path.isAbsolute(root) || root.split(path.sep).includes("..")) {
       throw new JailError(`${label} must be an absolute path without .. segments: ${JSON.stringify(root)}`);
     }

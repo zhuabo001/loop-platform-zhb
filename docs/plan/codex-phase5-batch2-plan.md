@@ -177,7 +177,7 @@ Batch 1 错误映射在 HTTP 接线时补齐：revision 耗尽使用新增 `arti
 |---|---|---|
 | AJ1 | workdir 相对路径：显式 workdir 下 `resolve`；`..` 逃出交集、越界 ⇒ `outside_jail`；不存在 ⇒ `directory_missing`；**不**落到 `process.cwd()` | `daemon/src/artifact-jail.test.ts` |
 | AJ2 | 无 workdir：绝对路径通过；相对路径 ⇒ `outside_jail`（不隐性取进程 cwd）；绝对越界 ⇒ `outside_jail` | 同上 |
-| AJ3 | roots 交集：窄者存活、被父覆盖的子根丢弃、`effectiveRoots` 可观察；`serverRoots=[]` ≡ 全部 daemon roots；不相交或非法 server root ⇒ `outside_jail`；`/foo` vs `/foobar` 非包含 | 同上 |
+| AJ3 | roots 交集：窄者存活、被父覆盖的子根丢弃、`effectiveRoots` 可观察；`serverRoots=[]` ≡ 全部 daemon roots；不相交或非法 server root（含 NUL）⇒ `outside_jail`；`/foo` vs `/foobar` 非包含 | 同上 |
 | AJ4 | 目录 symlink：树内（指向内/外/悬空）⇒ `symlink`，目标内容永不进 entries 且不对其枚举；根自身是 symlink ⇒ 落点在内 `ok`（root = realpath）、越界 `outside_jail`；resolve 后被换成 symlink 的根 ⇒ `symlink` | `daemon/src/artifact-jail.test.ts`（根解析半）、`daemon/src/artifact-scan.test.ts`（树内半） |
 | AJ5 | 文件 symlink：指向内/外/悬空 ⇒ `symlink`；`open` 计数为 0（不读目标） | 同上 |
 | AJ6 | 特殊文件：FIFO／socket 等非普通文件 ⇒ `special_file`、`open` 计数 0（绝不阻塞在 `O_RDONLY`） | 同上 |
@@ -192,7 +192,7 @@ Batch 1 错误映射在 HTTP 接线时补齐：revision 耗尽使用新增 `arti
 
 - [#87](https://github.com/zhuabo001/loop-platform-zhb/issues/87)：真实 FIFO 在 `lstat` 与 `open` 之间替换 ⇒ 共享有界读取必须**及时**返回 `not_regular`，扫描与上传前验证映射为 `special_file`（带截止期断言，卡住即失败），且被拒绝的句柄已关闭（`daemon/src/bounded-read.test.ts`、`artifact-scan.test.ts`、`artifact-verify.test.ts`）。
 - [#88](https://github.com/zhuabo001/loop-platform-zhb/issues/88)：读后 `lstat` 与目录终检的 `EACCES`/`EPERM` ⇒ 确定性 `unreadable`（单次尝试、单次打开；上传前验证同为 `unreadable`），不再三次重扫后报 `unstable`；`ENOENT` 与身份变化仍走有界重扫（`daemon/src/artifact-scan.test.ts`）。
-- [#89](https://github.com/zhuabo001/loop-platform-zhb/issues/89)：server root 在 realpath/stat 遇已识别 OS errno（含 `ENOENT`/`ENOTDIR`/`EACCES`/`EPERM`/`EIO`/`ELOOP`/`EMFILE`/`ENFILE`）与非目录 ⇒ 根解析返回 `outside_jail`；无码异常、未知码、`ERR_*` 程序异常原样抛出并保留身份，不伪装成配置失败（`daemon/src/artifact-jail.test.ts`）。
+- [#89](https://github.com/zhuabo001/loop-platform-zhb/issues/89)：server root 在 realpath/stat 遇已识别 OS errno（含 `ENOENT`/`ENOTDIR`/`EACCES`/`EPERM`/`EIO`/`ELOOP`/`EMFILE`/`ENFILE`）与非目录 ⇒ 根解析返回 `outside_jail`；含 NUL 的 root 在 I/O 前按非法配置拒绝，workdir jail 保持 `JailError`；有效输入下的无码异常、未知码、`ERR_*` 程序异常原样抛出并保留身份，不伪装成配置失败（`daemon/src/artifact-jail.test.ts`）。
 
 额外覆盖配置 no-op、Create 原子性、busy Poll 的 watch 更新、capability 与 claim 交错、错误 taxonomy、8 MiB 请求边界和迟到错误不得覆盖新状态。
 
