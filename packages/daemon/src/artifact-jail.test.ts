@@ -4,7 +4,7 @@
  * macOS tmpdir() is itself behind a symlink (/var → /private/var) and this
  * resolver speaks only canonical paths.
  */
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync, promises as fs } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -184,6 +184,36 @@ describe("AJ3 — the daemon ∩ server roots intersection", () => {
     await expectFailure({ ...shared, serverRoots: ["relative/root"] }, "outside_jail");
     await expectFailure({ ...shared, serverRoots: [p("a-file")] }, "outside_jail");
     await expectFailure({ ...shared, serverRoots: [`..${path.sep}${path.basename(base)}`] }, "outside_jail");
+  });
+
+  it("a post-realpath stat failure is outside_jail — no raw errno escapes (#89)", async () => {
+    // The root exists for the realpath and then the stat fails: the shared
+    // canonicalizer must convert the expected filesystem fault into ITS
+    // contract (JailError), so the resolver keeps returning a result instead
+    // of throwing — the failure domain stays closed for slice 4/5 callers.
+    for (const code of ["ENOENT", "EACCES", "EPERM"]) {
+      const result = await resolveArtifactRoot({
+        artifactDir: p("work"),
+        workdir: null,
+        serverRoots: [base],
+        daemonRoots: [base],
+        io: {
+          stat: async (target) => {
+            if (target === base) throw Object.assign(new Error(`injected ${code}`), { code });
+            return fs.stat(target);
+          },
+        },
+      });
+      if (result.kind !== "failed") throw new Error(`expected a failure for ${code}, got ok with ${result.resolved.root}`);
+      expect(result.failure, code).toBe("outside_jail");
+    }
+  });
+
+  it("a non-directory server root is outside_jail (real filesystem, same domain)", async () => {
+    await expectFailure(
+      { artifactDir: p("work"), workdir: null, serverRoots: [p("a-file")], daemonRoots: [base] },
+      "outside_jail",
+    );
   });
 
   it("no daemon root at all is outside_jail, checked before anything else", async () => {

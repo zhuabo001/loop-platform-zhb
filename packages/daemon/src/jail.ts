@@ -17,6 +17,7 @@
  */
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
+import type { Stats } from "node:fs";
 import path from "node:path";
 
 export class JailError extends Error {
@@ -63,14 +64,25 @@ export interface WorkdirJail {
   dispose(): Promise<void>;
 }
 
+/** TEST-ONLY seam (the bounded-read `openImpl` precedent): lets a test make
+ *  the post-realpath stat fail without racing the real filesystem. */
+export interface CanonicalizeRootsIo {
+  stat?: (absolutePath: string) => Promise<Stats>;
+}
+
 /** Canonicalize a root set: every root must be an absolute, `..`-free path to
  *  an existing directory; realpath collapses symlink aliases, exact
  *  duplicates drop out (first-seen order). Used for the daemon roots ONCE at
  *  construction (fail-fast startup) AND for server roots on EVERY resolve —
- *  the server is never trusted to have normalized. Any rejection is a
- *  JailError (fail-closed). Exported for the slice-3 artifact root resolver,
- *  which applies the same discipline to the server roots on every scan. */
-export async function canonicalizeRoots(roots: string[], label: string): Promise<string[]> {
+ *  the server is never trusted to have normalized. EVERY rejection — a bad
+ *  shape, a failed realpath, or a filesystem fault on the post-realpath stat
+ *  — is a JailError (fail-closed): a raw errno escaping this helper would
+ *  give the same unusable root two different control flows depending on
+ *  which syscall noticed it (review #89). Exported for the slice-3 artifact
+ *  root resolver, which applies the same discipline to the server roots on
+ *  every scan. */
+export async function canonicalizeRoots(roots: string[], label: string, io?: CanonicalizeRootsIo): Promise<string[]> {
+  const stat = io?.stat ?? fs.stat;
   const canonical: string[] = [];
   for (const root of roots) {
     if (!path.isAbsolute(root) || root.split(path.sep).includes("..")) {
@@ -82,7 +94,15 @@ export async function canonicalizeRoots(roots: string[], label: string): Promise
     } catch {
       throw new JailError(`${label} does not exist: ${JSON.stringify(root)}`);
     }
-    if (!(await fs.stat(real)).isDirectory()) {
+    let observation: Stats;
+    try {
+      observation = await stat(real);
+    } catch {
+      // The root vanished, or its permissions changed, between the realpath
+      // and the stat — the same unusable root as a failed realpath.
+      throw new JailError(`${label} could not be inspected: ${JSON.stringify(root)}`);
+    }
+    if (!observation.isDirectory()) {
       throw new JailError(`${label} is not a directory: ${JSON.stringify(root)}`);
     }
     if (!canonical.includes(real)) canonical.push(real);

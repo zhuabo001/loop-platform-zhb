@@ -25,7 +25,7 @@ import path from "node:path";
 
 import type { ArtifactSyncFailure } from "@loopzhb/protocol";
 
-import { JailError, canonicalizeRoots, intersectRoots, isWithinOrEqual } from "./jail.js";
+import { JailError, canonicalizeRoots, intersectRoots, isWithinOrEqual, type CanonicalizeRootsIo } from "./jail.js";
 
 /** The failure classes a LOCAL scan can produce: the shared nine-value client
  *  taxonomy minus the two the scanner must never invent — `watcher_error` is
@@ -44,6 +44,8 @@ export interface ResolveArtifactRootInput {
    *  PRECONDITION: already canonical; a raw config value may fail containment
    *  closed rather than resolving the tree the operator meant. */
   daemonRoots: readonly string[];
+  /** TEST-ONLY seam forwarded to the shared canonicalizer (#89). */
+  io?: CanonicalizeRootsIo;
 }
 
 export interface ResolvedArtifactRoot {
@@ -79,7 +81,10 @@ export async function resolveArtifactRoot(input: ResolveArtifactRootInput): Prom
   if (narrowed) {
     let serverRoots: string[];
     try {
-      serverRoots = await canonicalizeRoots([...input.serverRoots], "server root");
+      // Every rejection is a JailError, including a filesystem fault on the
+      // post-realpath stat (review #89) — the failure domain stays closed and
+      // no raw errno escapes to callers that only handle the result union.
+      serverRoots = await canonicalizeRoots([...input.serverRoots], "server root", input.io);
     } catch (error) {
       if (!(error instanceof JailError)) throw error;
       return failed("outside_jail", error.message);
