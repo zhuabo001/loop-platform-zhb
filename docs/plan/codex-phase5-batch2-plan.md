@@ -178,7 +178,7 @@ Batch 1 错误映射在 HTTP 接线时补齐：revision 耗尽使用新增 `arti
 | AJ1 | workdir 相对路径：显式 workdir 下 `resolve`；`..` 逃出交集、越界 ⇒ `outside_jail`；不存在 ⇒ `directory_missing`；**不**落到 `process.cwd()` | `daemon/src/artifact-jail.test.ts` |
 | AJ2 | 无 workdir：绝对路径通过；相对路径 ⇒ `outside_jail`（不隐性取进程 cwd）；绝对越界 ⇒ `outside_jail` | 同上 |
 | AJ3 | roots 交集：窄者存活、被父覆盖的子根丢弃、`effectiveRoots` 可观察；`serverRoots=[]` ≡ 全部 daemon roots；不相交或非法 server root ⇒ `outside_jail`；`/foo` vs `/foobar` 非包含 | 同上 |
-| AJ4 | 目录 symlink：树内（指向内/外/悬空）⇒ `symlink`，目标内容永不进 entries 且不对其枚举；根自身是 symlink ⇒ 落点在内 `ok`（root = realpath）、越界 `outside_jail` | `daemon/src/artifact-scan.test.ts` |
+| AJ4 | 目录 symlink：树内（指向内/外/悬空）⇒ `symlink`，目标内容永不进 entries 且不对其枚举；根自身是 symlink ⇒ 落点在内 `ok`（root = realpath）、越界 `outside_jail`；resolve 后被换成 symlink 的根 ⇒ `symlink` | `daemon/src/artifact-jail.test.ts`（根解析半）、`daemon/src/artifact-scan.test.ts`（树内半） |
 | AJ5 | 文件 symlink：指向内/外/悬空 ⇒ `symlink`；`open` 计数为 0（不读目标） | 同上 |
 | AJ6 | 特殊文件：FIFO／socket 等非普通文件 ⇒ `special_file`、`open` 计数 0（绝不阻塞在 `O_RDONLY`） | 同上 |
 | AJ7 | 目录缺失：不存在、指向普通文件、resolve 后扫描前被删 ⇒ `directory_missing`，绝不当空 manifest | 同上 |
