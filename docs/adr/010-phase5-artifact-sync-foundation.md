@@ -251,6 +251,26 @@ claim 的 capability 门控是**逐候选**的，不是整轮 Poll 门控：已�
 
 **freshSession。** `syncLoop(target, {freshSession: true})` 跳过抑制并强制新铸 requestId ⇒ 每次都是新会话（决策 11 的「每次最终同步使用新会话，即使内容相同」），供片 6 使用；本片只交付机制。**新铸只作用于该次调用的首次提议**：同一调用内的恢复轮（过期/丢会话重新 prepare）沿用同一身份，否则 pending 会话会被孤儿化、服务端无法原地续期（[#97](https://github.com/zhuabo001/loop-platform-zhb/issues/97)）。
 
+**生产启用与 capability（片 5）。** 片 5 起 Daemon 在生产声明 `artifact-sync-v1`（`machineIdentity()` = `terminal-journal-v1` + `artifact-sync-v1`），并按 Poll 下发的 watch 集合为每个已配置 Loop 启动 watcher；`prepareDaemon` 构造**恰好一个** artifact transport、hash 缓存、同步客户端与 WatchManager（单实例 ⇒ 实例级上传闸即 daemon 全局闸）。休眠边界按实际解除范围重写（决策 16）：AD4 daemon 半的 capability pin 与 poll body pin 故意更新，保留「构造零 fs 副作用」「收到 watch 前不开 watcher」「runtime→wire 只走 poll/report」三条断言。
+
+**watcher adapter 与冻结选项。** 锁定 chokidar **4.0.3**（engines ≥14.16；不用要求 Node ≥22.22 的 v6），选项 `{ignoreInitial:true, followSymlinks:false, ignorePermissionErrors:false, persistent:true}`；**不设 `awaitWriteFinish`**——文件稳定性由扫描器判定（决策 23）。chokidar 只出现在 `artifact-watcher.ts`、CLI 装配及其测试，不进入 wrapper bundle 图与 `index.ts` 导出面。
+
+**事件合并与订阅顺序。** **先订阅再全扫描**：打开 watcher → `ready` → 全量扫描；`ready` 前与扫描期间的事件一律置脏，事件不丢。事件按 **250 ms 固定窗口**（自首个事件起算，不做 debounce 重置——重置在分块写入下会饥饿）合并；一轮扫描结束时仍脏则开新窗口立即重扫。`ignoreInitial:true` 使订阅不产生首轮事件洪峰，初扫由管理器自己执行。
+
+**两条扫描路径的分工（消费决策 23）。** 启动首扫、每 60 秒完整核对与片 6 的 Run 最终同步一律全量重哈希（`reuseCachedHashes:false`）；**只有事件路径**显式 `reuseCachedHashes:true`（片 4 客户端新增加法输入，默认 false）。60 秒核对由 WatchManager 的单实例计时器驱动（与 Poll 心跳互不阻塞）；在途扫描时核对只置脏。
+
+**配置换代、移除与摘要。** 五字段（`loopId`/`artifactDir`/`workdir`/`roots`/`configRevision`）任一变化 ⇒ **先中止旧代任务、`await` 关闭旧 watcher，再解析新根、订阅并全扫**（顺序即 AS7 证据；旧代响应因中止与代际不可能写新代状态）；集合移除（含 `watch: []`）⇒ 中止 + 关闭 + 丢弃状态，不强制提交。摘要保留：`watch` 缺席 ⇒ 集合与摘要都不动；收到集合即存摘要（**在 apply 时存**，不等 watcher 起好），否则服务端每轮重发全集。
+
+**粘性停止与恢复。** 观察到 `stopped{machine}` ⇒ 中止并关闭全部 watcher（parked）；`stopped{loop}` ⇒ 仅该 Loop（服务端当前不可达，保留作用域）；**watch 集合实质变化 ⇒ `clearStops()` 并重新准入**（呼应决策 24 的「配置换代后恢复」）。无配置变化时机器级停止保持到进程重启——片 5 无凭据轮换流程（残余）。
+
+**drain（关闭排空）。** 标记 draining（不再接受新事件/新工作）→ 清合并与核对计时器 → 中止全部 Loop 任务并 `await` 关闭全部 watcher → 以 **10 秒**为界竞速等待在途工作与 `settled()`；超时返回未排空并记日志。**从不发起最终提交、无持久 outbox**；中止的轮次在每次操作后复查 signal，结构上不会提交部分清单。
+
+**根 never-sync 防护（[#91](https://github.com/zhuabo001/loop-platform-zhb/issues/91)）。** 判定 = 解析后的根（`resolveArtifactRoot` 已 realpath 化，覆盖根自身、祖先与根 symlink 落点）命中 `NEVER_SYNC_DIRECTORY_RULES` 的**任一连续段窗口**（ASCII 大小写不敏感）——**只用目录规则**；文件规则不适用于目录根（名为 `credentials` 的目录仍允许）。规则以 protocol 的加法导出 `isNeverSyncDirectoryPath` 为单一来源（无 schema 变更 ⇒ tolerant-reader 与 server 不变）。执行两处：① 片 4 状态机在解析根之后、扫描之前拒绝，走既有本地失败路径 ⇒ `failed{outside_jail, reported}`，零扫描零上传（**结构性保护全部调用方**，含片 6 最终同步）；② WatchManager 准入：拒绝则不开 watcher、不枚举，每 60 秒本地重验（零网络），恢复后订阅 + 全扫；每个代际的首次拒绝复用一次同步尝试完成上报，之后不再重复上报。失败码复用 `outside_jail`（taxonomy 冻结，不新增第 10 值）。
+
+**watcher 错误与扫描级取消。** chokidar error 事件按同一 250 ms 窗口合并后经片 4 客户端新增的加法方法 `reportLocalFailure(target, failure, detail)` 上报（复用基线读取、一次性三态与粘性停止；计入 `settled()`/drain 覆盖）。`ArtifactScanOptions.signal?: AbortSignal`（默认 `undefined`，既有行为逐字不变）在重扫循环与目录/条目边界检查，`syncLoop` 透传调用方 signal：中止 ⇒ `cancelled`，结构上无部分清单、无提交——片 5 的 10 秒 drain 与片 6 的 30 秒期限由此可真正取消长扫描。上传前校验的单文件读（≤10 MiB 有界）不加 signal，取消在文件边界生效（残余）。
+
+**片 5 残余。** chokidar 自身遍历无 depth 上限（扫描器的容量上限只管自己的遍历）；roots 重叠的多个 Loop 各自订阅（不共享 watcher，事件冗余）；`directory_missing` 期间不常开 watcher（按 60 秒 tick 重验恢复，最长 60 秒延迟）。
+
 ## 后果
 
 - 片 2/3 可以并行：表结构与 BlobStore adapter 都只对本文档与已编译接口负责。
@@ -308,3 +328,7 @@ claim 的 capability 门控是**逐候选**的，不是整轮 Poll 门控：已�
 - 决策 24 修订（片 4 首轮三轨审查修复）：**上传许可在释放时直接移交下一个等待者**，消除「减计数—异步唤醒」之间新到者与等待者竞争的窗口（真实 dist 探针曾观测 5 个在途 PUT，上限 4）（[#99](https://github.com/zhuabo001/loop-platform-zhb/issues/99)）；一轮上传改用 `Promise.allSettled` 并让 `settled()` 计入全部在途上传任务（含停在闸前的），某组的内部异常不再脱挂兄弟组、drain 不再在字节仍上网时报完成（[#92](https://github.com/zhuabo001/loop-platform-zhb/issues/92)）；排队中被取消的调用立即结束而不等待前序 PUT（[#93](https://github.com/zhuabo001/loop-platform-zhb/issues/93)）；拒绝的裁决覆盖任意位置——上传各组的拒绝在整轮分类前全部裁决且可停止者优先，错误上报自身被 401/403 拒绝时同样记录停止（[#94](https://github.com/zhuabo001/loop-platform-zhb/issues/94)、[#98](https://github.com/zhuabo001/loop-platform-zhb/issues/98)）；基线读取前移到任何可能失败的本地步骤之前，重启后的本地失败上报不再因猜测的 0 被永久记为 `recorded:false`（[#95](https://github.com/zhuabo001/loop-platform-zhb/issues/95)）；`freshSession` 的新铸只作用于该次调用的首次提议，恢复轮沿用同一身份以支持服务端原地续期（[#97](https://github.com/zhuabo001/loop-platform-zhb/issues/97)）；`artifact_content_mismatch` 的客户端动作例外（计入重扫预算后整轮重扫、预算耗尽才终止）在决策 24 正文写明，消除与决策 13 表的表面矛盾（实现与测试未变，wire 侧重试类仍为 terminal）（[#96](https://github.com/zhuabo001/loop-platform-zhb/issues/96)）。
 
 - 决策 24 补充：跨 Loop 的上传许可等待可取消；取消只移除未取得许可的等待者，移交后的许可仍须释放，已开始的任务须落定。混合上传结果先排空、再记录停止、最后保留原身份传播未知异常，不以 HTTP 拒绝覆盖程序异常。内容拒绝的既有重扫例外、默认 2 次重扫上限和 wire terminal 分类不变；持续拒绝的长期验收锚点补入 Batch 2 计划。
+- 新增决策 25（片 5）：Daemon 生产声明 `artifact-sync-v1` 并启动 watcher（单实例装配）；chokidar 4.0.3 与冻结选项（`ignoreInitial`/`followSymlinks:false`/`ignorePermissionErrors:false`/`persistent`，不设 `awaitWriteFinish`）；先订阅再全扫描、250 ms 固定窗口合并、drain 期间忽略新事件；启动/60 秒核对/最终同步全量重哈希与**仅事件路径** `reuseCachedHashes:true` 的分工；五字段换代顺序（中止旧代 → 关旧 watcher → 订阅新根 → 全扫）与移除清理；摘要 apply 时保留（缺席不动、`[]` 清空）；粘性停止的 watcher 处置与「watch 集合实质变化 ⇒ `clearStops()`」；10 秒 drain（不强制提交、无持久 outbox）；根 never-sync 防护（只用目录规则、protocol 加法导出 `isNeverSyncDirectoryPath`、`syncLoop` 内结构性拒绝并映射 `outside_jail`、watcher 准入与 60 秒本地重验）；`reportLocalFailure` 加法上报与扫描级可选 `signal`（默认行为不变）。
+- 决策 16 更新：片 5 声明 capability 并启动 watcher；AD4 daemon 半按实际解除范围重写（capability pin 与 poll body pin 故意更新），保留「构造零 fs 副作用」「收到 watch 前不开 watcher」「runtime→wire 只走 poll/report」。
+- 决策 23 补充：事件路径的缓存复用与全量重哈希分工在片 5 落地（`ArtifactSyncInput.reuseCachedHashes?`，默认 false）；扫描新增可选 `signal`（默认 `undefined`，既有行为逐字不变），供 drain 与片 6 的最终同步期限协作取消。
+- 决策 23 的配置面 follow-up（`artifactDir` 根自身命 never-sync）在片 5 按决策 25 实施（`outside_jail` 映射、watcher 准入与真实临时目录回归）；[#91](https://github.com/zhuabo001/loop-platform-zhb/issues/91) 保持 OPEN，由独立复审按关闭条件核销。

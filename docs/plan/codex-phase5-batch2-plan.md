@@ -216,6 +216,30 @@ Batch 1 错误映射在 HTTP 接线时补齐：revision 耗尽使用新增 `arti
 - **混合上传结果**：Error、TypeError 与其他未知异常分别和 401、403、普通 HTTP 拒绝并存时，先等待全部上传组，再记录所有停止，最后按原身份抛出未知异常；停机后的各 Loop 零请求。验收锚点：`preserves the original $errorKind alongside HTTP $status and drains its sibling`。
 - **上传许可等待取消**：其他 Loop 占满上传许可时，多个已 prepare 的等待调用可以取消并结束，零 PUT/commit；持有者继续受 `settled()` 排空约束，后继调用和已取消 Loop 的新调用仍可取得许可，在途 PUT 始终不超过 4。验收锚点：`cancels gate waiters while another loop holds all permits, then admits successors`。
 
+片 5 的 AW/AS 编号逐项对应（规则见 ADR-010 决策 25）：
+
+| ID | 场景 | 主要证据 |
+|---|---|---|
+| AW1 | 创建：新文件 ⇒ 事件 ⇒ 下一次提交含该路径 | `daemon/src/artifact-watcher.test.ts`、`artifact-watch-integration.test.ts` |
+| AW2 | 修改：追写 ⇒ `change` ⇒ 新 hash 到达服务端 | 同上 |
+| AW3 | 删除：unlink ⇒ 下一提交不含该路径 | 同上 |
+| AW4 | 文件重命名：a→b ⇒ 事件覆盖 b，manifest 有 b 无 a | 同上 |
+| AW5 | 目录重命名：目录改名 ⇒ 事件 ⇒ manifest 重定根 | 同上 |
+| AW6 | idle 编辑：零 Run/Delivery 下编辑仍同步；扫描在途时 poll 心跳不受阻 | `artifact-watch-integration.test.ts`、`daemon/src/runtime.test.ts` |
+| AW7 | 同大小快速改写：同字节长度改写 ⇒ 服务端得新 hash | 同上 |
+| AW8 | 原子替换：临时文件 + rename 覆盖 ⇒ ≥1 事件、最终内容收敛 | `daemon/src/artifact-watcher.test.ts` |
+| AW9 | 分块写入：块间隔短于合并窗口 ⇒ 事件不丢、最终收敛（固定窗口不重置） | 同上、`artifact-watch-manager.test.ts` |
+| AW10 | 事件合并：一个窗口内多事件 ⇒ 恰一次同步，窗口延迟 = 250 ms | `artifact-watch-manager.test.ts` |
+| AW11 | 遗漏事件补偿：无事件、60 秒核对 ⇒ 全量扫描捕获（`reuseCachedHashes:false`） | 同上 |
+| AW12 | 订阅与初扫交错：ready 前不扫；首扫在途的事件 ⇒ 放行后再扫 | 同上 |
+| AW13 | 缓存失效：事件路径复用五元组缓存、启动/核对一律重哈希 | 同上、`artifact-sync.test.ts` |
+| AW14 | Paused/Completed Loop 持续同步（不依赖 Run 状态） | `artifact-watch-integration.test.ts` |
+| AS7 | 配置换代：中止旧代 → 关旧 watcher → 订阅新根 → 全扫；旧代迟到结果不写新代 | `artifact-watch-manager.test.ts`、`artifact-watch-integration.test.ts` |
+| AS8 | 配置移除（含 `watch:[]`）：中止 + 关闭 + 丢弃状态，零后续扫描，不强制提交 | 同上 |
+| AS12 | 关闭 drain：停新事件/计时器、取消在途、10 秒内返回、零最终提交、无持久 outbox | 同上 |
+
+片 5 以编号外证据覆盖：根 never-sync 防护（协议加法导出 `isNeverSyncDirectoryPath`、`syncLoop` 内 `outside_jail` 拒绝与真实临时目录回归、watcher 准入与 60 秒本地重验）、`reportLocalFailure` 三态与停止记录、扫描级 `signal` 中止无部分清单、粘性停止的作用域处置与 `clearStops()` 恢复、poll 摘要通道（apply 时保留、缺席保持、`[]` 清空）、AD4 daemon 半重写（capability pin、构造零 fs 副作用、收到 watch 前不开 watcher、无直接 outbound）。
+
 额外覆盖配置 no-op、Create 原子性、busy Poll 的 watch 更新、capability 与 claim 交错、错误 taxonomy、8 MiB 请求边界和迟到错误不得覆盖新状态。
 
 质量门：
