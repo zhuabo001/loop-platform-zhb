@@ -227,8 +227,8 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
   - 片 4（同步客户端与恢复状态机）已完成：daemon 新增 `artifact-client`（5 条 machine 路由的纯分类传输：畸形 2xx 即「响应丢失」可重试——与 poll 的 fatal 判定相反、凭据不入失败原因、PUT 单列 60 秒窗口）与 `artifact-sync`（状态机：**payload 决定 requestId** 的幂等身份；重试类到动作的映射——`resume` 经同 payload 重新 prepare 重算 `needHashes`、`recover_receipt` 零 PUT 取回执、`artifact_session_expired`／404 走同 payload 路径（原地续期或重建）；**PUT 的字节就是刚校验通过的那批**（`readVerifiedArtifactEntry` 加法导出，按 entry 逐条校验、同 hash 只传一次，结构上消除 verify→upload 窗口）；无变化抑制与失效规则——只有 `unchanged`/`synced` 保留基线，重启只从服务端读回基点；按作用域粘性停止 + `clearStops()`；每 Loop 串行、实例级上传闸 ≤4、1/2/4/8……封顶 60 秒退避；本地失败上报三态 `recorded`/`stale`/`unreported`）；`artifact-scan`/`artifact-verify` 只加两个加法导出，既有函数行为逐字不变、既有测试零修改全绿。
   - 片 4 验收：AS1–AS6、AS9–AS11 全覆盖（daemon 新增 63 项 = 状态机 35 + 传输 18 + 两个加法导出 10），配套 test-only 假服务端 `src/testkit/artifact-sync-fake.ts`（真实 protocol schema + 真实 policy 与指纹函数，经 `tsconfig.build.json` 排除出 dist）；七项变异全部被对应用例抓住（删无变化抑制 ⇒ 3 项红、删失效规则 1、上传闸改无界 1、去 requestId 复用 4、跳过上传前校验 1、退避封顶改 30 秒 1、停止改为不粘 1），失效规则用例还在开发中抓出一处真实缺口；dist 探针 10 项断言全过（真实 dist 导入、完整同步、无变化零请求、只传变更文件、401 粘性停止、jail 越界失败）。全量五门 exit=0（tip `fc4dc15`）：protocol **285** / daemon **675 + 7 skipped** / server **894 + 3 skipped** / `pnpm typecheck` / `pnpm build` / `db:check` 无 drift（零 migration）/ `git diff --check` 干净。
   - 片 4 休眠边界不变：不接线 `runtime.ts`/`cli.ts`/`index.ts`、不声明 `artifact-sync-v1`、不启动 watcher、不接 Run 最终 Report、零新依赖、server/protocol 零改动；AD4 daemon 半（`identity.test.ts`）零修改全绿。
-  - 片 4 修复待第三轮独立三轨复核；同步与恢复规则见 ADR-010 决策 24，剩余项由 [#92](https://github.com/zhuabo001/loop-platform-zhb/issues/92)、[#96](https://github.com/zhuabo001/loop-platform-zhb/issues/96)、[#100](https://github.com/zhuabo001/loop-platform-zhb/issues/100)、[#101](https://github.com/zhuabo001/loop-platform-zhb/issues/101) 跟踪。
-  - 片 4 待第三轮独立复审核销；[#91](https://github.com/zhuabo001/loop-platform-zhb/issues/91) 仍须在片 5 启用生产持续同步前处理。
+  - 片 4 第三轮独立三轨复核通过（2026-10-05），已收口；同步与恢复规则见 ADR-010 决策 24。
+  - [#91](https://github.com/zhuabo001/loop-platform-zhb/issues/91) 仍须在片 5 启用生产持续同步前处理。
   - 片 5–8 未开始。
 
 ### 右移项
