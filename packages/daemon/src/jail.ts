@@ -68,8 +68,9 @@ export interface WorkdirJail {
  *  duplicates drop out (first-seen order). Used for the daemon roots ONCE at
  *  construction (fail-fast startup) AND for server roots on EVERY resolve —
  *  the server is never trusted to have normalized. Any rejection is a
- *  JailError (fail-closed). */
-async function canonicalizeRoots(roots: string[], label: string): Promise<string[]> {
+ *  JailError (fail-closed). Exported for the slice-3 artifact root resolver,
+ *  which applies the same discipline to the server roots on every scan. */
+export async function canonicalizeRoots(roots: string[], label: string): Promise<string[]> {
   const canonical: string[] = [];
   for (const root of roots) {
     if (!path.isAbsolute(root) || root.split(path.sep).includes("..")) {
@@ -103,8 +104,11 @@ export function isWithinOrEqual(parent: string, child: string): boolean {
  *  the NARROWER one survives. Exact duplicates and children already covered
  *  by a parent in the result set are dropped. Empty ⇒ the caller rejects —
  *  the server may only ever NARROW the daemon's roots, and a disjoint
- *  delivery gets no workdir at all. */
-function intersectRoots(daemonRoots: readonly string[], serverRoots: string[]): string[] {
+ *  delivery gets no workdir at all. Exported for the slice-3 artifact root
+ *  resolver: an artifact tree obeys the SAME intersection (it is not a
+ *  scratch-minting workdir resolution). PRECONDITION (both callers): every
+ *  input root is already canonical — the containment test is lexical. */
+export function intersectRoots(daemonRoots: readonly string[], serverRoots: string[]): string[] {
   const pairs: string[] = [];
   for (const d of daemonRoots) {
     for (const s of serverRoots) {
