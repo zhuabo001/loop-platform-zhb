@@ -229,10 +229,8 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
   - 片 4 休眠边界不变：不接线 `runtime.ts`/`cli.ts`/`index.ts`、不声明 `artifact-sync-v1`、不启动 watcher、不接 Run 最终 Report、零新依赖、server/protocol 零改动；AD4 daemon 半（`identity.test.ts`）零修改全绿。
   - 片 4 第三轮独立三轨复核通过（2026-10-05），已收口；同步与恢复规则见 ADR-010 决策 24。
   - [#91](https://github.com/zhuabo001/loop-platform-zhb/issues/91) 仍须在片 5 启用生产持续同步前处理。
-  - 片 5（WatchManager 与 Daemon 生命周期）已交付：`artifact-watcher`（chokidar **4.0.3** 精确锁版，唯一 import chokidar 的模块；`ignoreInitial`/`followSymlinks:false`/`ignorePermissionErrors:false`/`persistent`，不设 `awaitWriteFinish`——稳定性归扫描器）与 `artifact-watch-manager`（先订阅 `ready` 再全扫；**250 ms 固定窗口**合并事件（非重置 debounce，分块写入不饥饿）；扫描期间事件置脏并开新窗口；启动、每 60 秒完整核对与片 6 最终同步**全量重哈希**、仅事件路径 `reuseCachedHashes:true`；五字段换代 ⇒ 先中止旧代、关旧 watcher，再订阅新根全扫（迟到结果因代际守卫作废）；移除即中止+关闭+丢弃，不强制提交；机器级停止 park 全部 watcher、watch 集合实质变化走 `clearStops()` 重新准入；drain 停新事件/计时器、中止在途、关闭 watcher、10 秒内加入 `settled()`，零最终提交、无持久 outbox；`apply()` 同步无 I/O ⇒ Poll 心跳不被扫描/上传阻塞）。
-  - 片 5 落实 [#91](https://github.com/zhuabo001/loop-platform-zhb/issues/91) 的根 never-sync 防护：protocol 加法导出 `isNeverSyncDirectoryPath`（目录规则的连续段窗口、单一来源、无 schema 变更），`syncLoop` 在解析根之后、扫描之前拒绝（**结构性保护全部调用方**，含片 6 最终同步）并以 `outside_jail` 走既有一次性上报；WatchManager 准入同时拒绝，绝不订阅/枚举敏感根，每 60 秒本地重验、每个代际只上报一次。ADR-010 决策 25 记录全部规则；**Issue 保持 OPEN，待独立复审按关闭条件核销**。
-  - 片 5 生产启用（ADR-010 决策 16）：daemon 声明 `artifact-sync-v1` 并按 Poll 下发的 watch 集合持续同步；`prepareDaemon` 构造恰好一个 transport/缓存/同步客户端/WatchManager（实例闸即全局闸），构造零 fs 副作用、收到 watch 前不开 watcher；AD4 daemon 半 pin 按其实际解除范围重写。片 5 新增三个加法接缝：`ArtifactSyncInput.reuseCachedHashes`、扫描级可选 `signal`（drain 与片 6 期限可真正取消长扫描）、`reportLocalFailure`（watcher 错误走一次性三态上报）。
-  - 片 5 覆盖 AW1–AW14（真实 chokidar 事件映射 + 端到端 create/modify/delete、同大小改写、原子保存；确定性套件覆盖合并窗口、漏事件补偿、订阅与初扫交错、缓存分工、Paused/Completed 与 jail 失效重验）与 AS7/AS8/AS12；13 项变异逐项被抓（合并窗口、轮内事件、核对 tick、换代关闭顺序、移除清理、drain 计时器、事件路径缓存、摘要保留、根守卫、上报串行化、扫描 signal×2、协议规则表）。
+  - 片 5（WatchManager 与 Daemon 生命周期）已实现：`artifact-watcher`（chokidar **4.0.3**，唯一 import chokidar 的模块）与 `artifact-watch-manager`（先订阅再全扫、250 ms 固定窗口合并、60 秒完整核对、五字段换代、移除清理、粘性停止、10 秒 drain）；生命周期与缓存分工规则见 ADR-010 决策 25，生产接线与三个加法接缝见决策 16／23／25 的片 5 条目，范围见 `docs/plan/codex-phase5-batch2-plan.md` §2。
+  - 片 5 首轮独立三轨审查（2026-10-06）指出 1 项 P1 与 4 项 P2（集合更新的生命周期、轮内窗口丢失补扫、`ready` 前扫描、根消失后未关闭 watcher、roadmap 复制裁决）；修复已落地，**片 5 尚未收口**——收口以下一轮独立复审结论为准。
   - 片 5 休眠边界其余不变：不改 `packages/server`、不接 Run 最终 Report（片 6）、不做读路由与 Dashboard（片 7）；`index.ts` 导出面不变。
   - 片 6–8 未开始。
 
@@ -241,7 +239,7 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
 - [Issue #11](https://github.com/zhuabo001/loop-platform-zhb/issues/11) / [Issue #72](https://github.com/zhuabo001/loop-platform-zhb/issues/72)：Phase 6 阻塞项（真实 Postgres 多物理连接并发验收），指针见 Phase 6 节。
 - [Issue #56](https://github.com/zhuabo001/loop-platform-zhb/issues/56)：Phase 5 认证层加固（状态变更路由同源意图校验、`Content-Type` 门禁、拒绝空体）——随团队与认证层（Batch 3）处理。
 - [Issue #61](https://github.com/zhuabo001/loop-platform-zhb/issues/61)：运行时 preload 环境隔离的防回归证据与验收环境记录——随 Phase 5 后续批次处理。
-- [Issue #91](https://github.com/zhuabo001/loop-platform-zhb/issues/91)：Artifact 根自身落在 never-sync 区域（如 `.config/gcloud`）的配置面防护——片 5 已按 ADR-010 决策 25 实施（目录规则的连续段窗口判定、`syncLoop` 内结构性拒绝并映射 `outside_jail`、watcher 准入与 60 秒本地重验、真实临时目录回归）；**Issue 保持 OPEN，待独立复审按关闭条件核销**。
+- [Issue #91](https://github.com/zhuabo001/loop-platform-zhb/issues/91)：Artifact 根自身落在 never-sync 区域（如 `.config/gcloud`）的配置面防护——片 5 已按 ADR-010 决策 25 实施（`syncLoop` 内结构性拒绝并映射 `outside_jail`、watcher 准入与本地重验），实现范围见 Batch 2 权威计划；**Issue 保持 OPEN，待独立复审按关闭条件核销**。
 
 ## Phase 6 — 生产硬化（独立阶段）
 

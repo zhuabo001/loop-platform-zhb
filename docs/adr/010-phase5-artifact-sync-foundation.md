@@ -251,15 +251,17 @@ claim 的 capability 门控是**逐候选**的，不是整轮 Poll 门控：已�
 
 **freshSession。** `syncLoop(target, {freshSession: true})` 跳过抑制并强制新铸 requestId ⇒ 每次都是新会话（决策 11 的「每次最终同步使用新会话，即使内容相同」），供片 6 使用；本片只交付机制。**新铸只作用于该次调用的首次提议**：同一调用内的恢复轮（过期/丢会话重新 prepare）沿用同一身份，否则 pending 会话会被孤儿化、服务端无法原地续期（[#97](https://github.com/zhuabo001/loop-platform-zhb/issues/97)）。
 
+### 25. WatchManager 生命周期与生产接线（片 5）
+
 **生产启用与 capability（片 5）。** 片 5 起 Daemon 在生产声明 `artifact-sync-v1`（`machineIdentity()` = `terminal-journal-v1` + `artifact-sync-v1`），并按 Poll 下发的 watch 集合为每个已配置 Loop 启动 watcher；`prepareDaemon` 构造**恰好一个** artifact transport、hash 缓存、同步客户端与 WatchManager（单实例 ⇒ 实例级上传闸即 daemon 全局闸）。休眠边界按实际解除范围重写（决策 16）：AD4 daemon 半的 capability pin 与 poll body pin 故意更新，保留「构造零 fs 副作用」「收到 watch 前不开 watcher」「runtime→wire 只走 poll/report」三条断言。
 
 **watcher adapter 与冻结选项。** 锁定 chokidar **4.0.3**（engines ≥14.16；不用要求 Node ≥22.22 的 v6），选项 `{ignoreInitial:true, followSymlinks:false, ignorePermissionErrors:false, persistent:true}`；**不设 `awaitWriteFinish`**——文件稳定性由扫描器判定（决策 23）。chokidar 只出现在 `artifact-watcher.ts`、CLI 装配及其测试，不进入 wrapper bundle 图与 `index.ts` 导出面。
 
-**事件合并与订阅顺序。** **先订阅再全扫描**：打开 watcher → `ready` → 全量扫描；`ready` 前与扫描期间的事件一律置脏，事件不丢。事件按 **250 ms 固定窗口**（自首个事件起算，不做 debounce 重置——重置在分块写入下会饥饿）合并；一轮扫描结束时仍脏则开新窗口立即重扫。`ignoreInitial:true` 使订阅不产生首轮事件洪峰，初扫由管理器自己执行。
+**事件合并与订阅顺序。** **先订阅再全扫描**：打开 watcher → `ready` → 全量扫描；`ready` 前与扫描期间的事件一律记为待办，事件不丢。**`ready` 之前任何扫描都不允许执行**（订阅尚未建立，提前扫描会在订阅与首扫之间留下遗漏窗口，且提前的轮次会走事件路径的缓存复用）；准入/订阅期间只记录待办，`ready` 后的全量重哈希首扫先执行，待办事件再由同一驱动链的下一轮处理。事件按 **250 ms 固定窗口**（自首个事件起算，不做 debounce 重置——重置在分块写入下会饥饿）合并。**每个 Loop 的轮次由一条驱动链保证跑完**：在途轮结束时若仍有待办事件或核对请求，该轮自己立即发起补扫，因此「窗口在轮内到期」不会丢失；待办按请求强度取强（核对请求等价全量重哈希，绝不因同时有事件而退化为缓存复用）。`ignoreInitial:true` 使订阅不产生首轮事件洪峰，初扫由管理器自己执行。
 
-**两条扫描路径的分工（消费决策 23）。** 启动首扫、每 60 秒完整核对与片 6 的 Run 最终同步一律全量重哈希（`reuseCachedHashes:false`）；**只有事件路径**显式 `reuseCachedHashes:true`（片 4 客户端新增加法输入，默认 false）。60 秒核对由 WatchManager 的单实例计时器驱动（与 Poll 心跳互不阻塞）；在途扫描时核对只置脏。
+**两条扫描路径的分工（消费决策 23）。** 启动首扫、每 60 秒完整核对与片 6 的 Run 最终同步一律全量重哈希（`reuseCachedHashes:false`）；**只有事件路径**显式 `reuseCachedHashes:true`（片 4 客户端新增加法输入，默认 false）。60 秒核对由 WatchManager 的单实例计时器驱动（与 Poll 心跳互不阻塞）；在途扫描时核对记为待办（保持全量重哈希强度），由在途轮的驱动链补跑。watcher 已被拒绝或关闭的 Loop（jail/never-sync 根、以及**根消失 `directory_missing`**）在 tick 只做零网络的本地重验：`directory_missing` 与 `outside_jail` 同样关闭订阅、不再发起网络同步，根恢复后重新订阅并全量扫描。
 
-**配置换代、移除与摘要。** 五字段（`loopId`/`artifactDir`/`workdir`/`roots`/`configRevision`）任一变化 ⇒ **先中止旧代任务、`await` 关闭旧 watcher，再解析新根、订阅并全扫**（顺序即 AS7 证据；旧代响应因中止与代际不可能写新代状态）；集合移除（含 `watch: []`）⇒ 中止 + 关闭 + 丢弃状态，不强制提交。摘要保留：`watch` 缺席 ⇒ 集合与摘要都不动；收到集合即存摘要（**在 apply 时存**，不等 watcher 起好），否则服务端每轮重发全集。
+**配置换代、移除与摘要。** 五字段（`loopId`/`artifactDir`/`workdir`/`roots`/`configRevision`）任一变化 ⇒ **先中止旧代任务、`await` 关闭旧 watcher，再解析新根、订阅并全扫**（顺序即 AS7 证据；旧代响应因中止与代际不可能写新代状态）；集合移除（含 `watch: []`）⇒ 中止 + 关闭 + 丢弃状态，不强制提交。**集合核对全同步**：`apply` 内完成整份集合的核对（无 I/O、无 `await`），因此不存在被挂起的旧集合在稍后覆盖新集合的窗口——旧的「旧代复活／覆盖」缺陷类被结构性地消除，而不是靠事后检查。可失败的工作（根解析、never-sync 守卫、订阅与扫描）全部在核对启动的准入任务里；**每 Loop 的关闭资源被保留**，新代（含移除后重新加入）在订阅前等待其前一代 watcher 关闭完成，任何时刻同一 Loop 至多一个活 watcher。移除在 `apply` 内**同步**生效（集合说移除即移除，关闭在后台完成），`apply` 仍是无 I/O 的同步记账；某个 Loop 的慢关闭或慢准入只推迟它自己，不阻塞其他 Loop 与 Poll 心跳。摘要保留：`watch` 缺席 ⇒ 集合与摘要都不动；收到集合即存摘要（**在 apply 时存**，不等 watcher 起好），否则服务端每轮重发全集。
 
 **粘性停止与恢复。** 观察到 `stopped{machine}` ⇒ 中止并关闭全部 watcher（parked）；`stopped{loop}` ⇒ 仅该 Loop（服务端当前不可达，保留作用域）；**watch 集合实质变化 ⇒ `clearStops()` 并重新准入**（呼应决策 24 的「配置换代后恢复」）。无配置变化时机器级停止保持到进程重启——片 5 无凭据轮换流程（残余）。
 
@@ -332,3 +334,10 @@ claim 的 capability 门控是**逐候选**的，不是整轮 Poll 门控：已�
 - 决策 16 更新：片 5 声明 capability 并启动 watcher；AD4 daemon 半按实际解除范围重写（capability pin 与 poll body pin 故意更新），保留「构造零 fs 副作用」「收到 watch 前不开 watcher」「runtime→wire 只走 poll/report」。
 - 决策 23 补充：事件路径的缓存复用与全量重哈希分工在片 5 落地（`ArtifactSyncInput.reuseCachedHashes?`，默认 false）；扫描新增可选 `signal`（默认 `undefined`，既有行为逐字不变），供 drain 与片 6 的最终同步期限协作取消。
 - 决策 23 的配置面 follow-up（`artifactDir` 根自身命 never-sync）在片 5 按决策 25 实施（`outside_jail` 映射、watcher 准入与真实临时目录回归）；[#91](https://github.com/zhuabo001/loop-platform-zhb/issues/91) 保持 OPEN，由独立复审按关闭条件核销。
+
+### 2026-10-06
+
+- 决策 25 修订（片 5 首轮三轨审查修复）：**集合核对改为全同步**——原先每次实质变化启动一个异步 reconcile 任务，它在 `await` 关闭旧 watcher 之后无条件写回，因此一次挂起的关闭期间后到的集合会被旧集合覆盖，被覆盖的 watcher 遗留在 `states` 之外（drain 也关不到它），移除的 Loop 也会被复活。现在 `apply` 内同步完成整份集合核对（无 I/O、无 `await`），没有任何挂起点可供旧集合回写；可失败的工作留在准入任务，**每 Loop 的关闭资源被保留**，新代（含移除后重新加入）订阅前等待前一代关闭完成，同一 Loop 任何时刻至多一个活 watcher；移除在 `apply` 内同步生效。旧集合工作被丢弃是结构性的，无需代际检查；某个 Loop 的慢关闭只推迟它自己，不阻塞其他 Loop 与 Poll 心跳。
+- 决策 25 修订（同一轮）：**轮次由驱动链跑完**——在途轮结束时若仍有待办事件或核对请求，该轮立即补扫（原先窗口在轮内到期只留一个 dirty 标记，扫描结束后无人再扫，要等到下一次事件或 60 秒核对）；待办按强度取强，核对请求绝不退化为缓存复用。
+- 决策 25 修订（同一轮）：**`ready` 前不得扫描**——准入/订阅期间的事件只记录待办，`ready` 后的全量重哈希首扫先执行，待办事件再由驱动链的下一轮处理（原先状态默认为 watching，事件窗口可在订阅建立前发起扫描并使用事件路径缓存）。
+- 决策 25 修订（同一轮）：**根消失同样关闭订阅**——`directory_missing` 与 `outside_jail` 一样进入 refused，tick 只做零网络本地重验，根恢复后重新订阅并全量扫描（原先只有 `outside_jail` 关闭 watcher，根消失期间仍持有订阅并持续发起注定失败的同步）。
