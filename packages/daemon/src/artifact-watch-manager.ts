@@ -512,10 +512,15 @@ export function createArtifactWatchManager(deps: ArtifactWatchManagerDeps): Arti
       await settled();
       await deps.sync.settled();
     })();
+    // The deadline timer MUST be cleared when the join wins: a pending ref'd
+    // timer would hold the process open for the rest of the budget after a
+    // clean shutdown (the daemon would look hung to its supervisor).
+    const deadlineCtl = new AbortController();
     const settledInTime = await Promise.race([
       join.then(() => true),
-      sleep(deadlineMs, new AbortController().signal).then(() => false),
+      sleep(deadlineMs, deadlineCtl.signal).then(() => false),
     ]);
+    deadlineCtl.abort();
     if (!settledInTime) log(`artifact watch: drain exceeded its ${deadlineMs}ms deadline`);
     return { settled: settledInTime };
   }

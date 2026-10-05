@@ -428,6 +428,10 @@ describe("artifact-watch-manager", () => {
     // Mutation: skip sync.settled() ⇒ red — the client may still hold uploads.
     expect(harness.sync.settledCalls()).toBe(1);
     expect(harness.watchers.handles[0]!.closed).toBe(true);
+    // The LOSING deadline timer must be cleared: a pending ref'd timer would
+    // hold the process open after a clean shutdown (the daemon would look
+    // hung to its supervisor).
+    expect(harness.time.pendingMs()).toEqual([]);
   });
 
   it("refuses a never-sync root at admission: no watcher, ONE report per generation (#91)", async () => {
