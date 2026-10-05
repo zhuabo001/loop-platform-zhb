@@ -13,6 +13,9 @@ importers:
       '@loopzhb/protocol':
         specifier: workspace:*
         version: link:../protocol
+      chokidar:
+        specifier: 4.0.3
+        version: 4.0.3
     devDependencies:
       '@types/node':
         specifier: ^25.9.3
@@ -723,6 +726,10 @@ packages:
     resolution: {integrity: sha512-NUPRluOfOiTKBKvWPtSD4PhFvWCqOi0BGStNWs57X9js7XGTprSmFoz5F0tWhR4WPjNeR9jXqdC7/UpSJTnlRg==}
     engines: {node: '>=18'}
 
+  chokidar@4.0.3:
+    resolution: {integrity: sha512-Qgzu8kfBvo+cA4962jnP1KkS6Dop5NS6g7R5LFYJr4b8Ub94PPQXUksCw9PvXoeXPRRddRNC5C1JQUR2SMGtnA==}
+    engines: {node: '>= 14.16.0'}
+
   convert-source-map@2.0.0:
     resolution: {integrity: sha512-Kvp459HrV2FEJ1CAsi1Ku+MY3kasH19TFykTz2xWmMeq6bk2NU3XXvfJ+Q61m0xktWwt+1HSYf3JZsTms3aRJg==}
 
@@ -975,6 +982,10 @@ packages:
   postcss@8.5.22:
     resolution: {integrity: sha512-KBDEIpLrvpv16pp3K0Fw+UCoZfopFjjgeB+0tA/aaThfEE74kKDLrgg603YvOWJyg3+WYtyq3xYsQWsIyZlPqQ==}
     engines: {node: ^10 || ^12 || >=14}
+
+  readdirp@4.1.2:
+    resolution: {integrity: sha512-GDhwkLfywWL2s6vEjyhri+eXmfH6j1L7JE27WhqLeYzoh/A3DBaYGEj2H/HFZCn/kMfim73FXxEJTw06WtxQwg==}
+    engines: {node: '>= 14.18.0'}
 
   resolve-pkg-maps@1.0.0:
     resolution: {integrity: sha512-seS2Tj26TBVOC2NIc2rOe2y2ZO7efxITtLZcGSOnHHNOQ7CkiUBfw0Iw2ck6xkIhPwLhKNLS8BO+hEpngQlqzw==}
@@ -1514,6 +1525,10 @@ snapshots:
 
   chai@6.2.2: {}
 
+  chokidar@4.0.3:
+    dependencies:
+      readdirp: 4.1.2
+
   convert-source-map@2.0.0: {}
 
   croner@10.0.1: {}
@@ -1703,6 +1718,8 @@ snapshots:
       nanoid: 3.3.16
       picocolors: 1.1.1
       source-map-js: 1.2.1
+
+  readdirp@4.1.2: {}
 
   resolve-pkg-maps@1.0.0: {}
 
