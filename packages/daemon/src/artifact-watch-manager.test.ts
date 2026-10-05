@@ -268,6 +268,27 @@ describe("artifact-watch-manager", () => {
     expect(harness.sync.calls[0]!.reuseCachedHashes).toBe(false); // startup = full rehash
   });
 
+  it("stores the digest at APPLY time, never waiting for the watchers (摘要通道)", async () => {
+    const harness = createHarness();
+    harness.watchers.autoReady.value = false;
+
+    harness.manager.apply([item()], "digest-1");
+
+    // Mutation: store the digest only after the generation is up ⇒ the server
+    // would resend the whole set on every poll until then.
+    expect(harness.manager.currentDigest()).toBe("digest-1");
+    await waitUntil(() => harness.watchers.handles.length === 1, "the watcher");
+    expect(harness.manager.currentDigest()).toBe("digest-1");
+
+    // A same-set re-apply only refreshes the digest; it starts NO new work.
+    harness.manager.apply([item()], "digest-2");
+    expect(harness.manager.currentDigest()).toBe("digest-2");
+
+    harness.watchers.handles[0]!.releaseReady();
+    await waitForFirstScan(harness);
+    expect(harness.sync.calls).toHaveLength(1);
+  });
+
   it("merges a burst of events into exactly ONE round in a fixed 250 ms window (AW10)", async () => {
     const harness = createHarness();
     harness.manager.apply([item()]);
