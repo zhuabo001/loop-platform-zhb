@@ -243,7 +243,7 @@ claim 的 capability 门控是**逐候选**的，不是整轮 Poll 门控：已�
 
 **停止按作用域，且是粘性的。** 401 ⇒ 机器级停止（该客户端全部 Loop）；403 按 code 取作用域——服务端唯一的 403 是 `artifact_attribution_missing`（机器归属级），故为机器级停止，结果联合保留 `"loop"` 选项以备将来。停止后后续调用零请求直接返回 `stopped`；`clearStops()` 供配置换代或凭据轮换后恢复。
 
-**并发、退避与预算。** 每 Loop 串行（同 Loop 排队、不同 Loop 并发）；Blob 上传经实例级闸，全局在途 ≤ 4（一个客户端实例对应一个 daemon，片 5 只构造一个）；瞬态失败退避 1、2、4、8……封顶 60 秒；预算 `ARTIFACT_SYNC_MAX_ATTEMPTS = 6`、重扫 `ARTIFACT_SYNC_MAX_RESCANS = 2`；PUT 单独 60 秒超时（≤10 MiB 的有界窗口），其余请求 10 秒。每次调用接受 `AbortSignal`：fetch、退避与排队等待都可中止；片 3 的扫描/校验不接 signal，取消在文件边界生效。
+**并发、退避与预算。** 每 Loop 串行（同 Loop 排队、不同 Loop 并发）；Blob 上传经实例级闸，全局在途 ≤ 4（一个客户端实例对应一个 daemon，片 5 只构造一个）；瞬态失败退避 1、2、4、8……封顶 60 秒；预算 `ARTIFACT_SYNC_MAX_ATTEMPTS = 6`（每次操作的尝试总数）、重扫 `ARTIFACT_SYNC_MAX_RESCANS = 2`、重新协商 `ARTIFACT_SYNC_MAX_RENEGOTIATIONS = 3`；PUT 单独 60 秒超时（≤10 MiB 的有界窗口），其余请求 10 秒。每次调用接受 `AbortSignal`：fetch、退避与排队等待都可中止；片 3 的扫描/校验不接 signal，取消在文件边界生效。
 
 **本地失败上报是一次性的。** 只有本地扫描/校验失败（决策 23 的 7 值，含重扫预算耗尽时的 `unstable`）走上报端点；网络、超时与服务端拒绝绝不走（否则等于给断网加一次注定失败的请求）。上报携带**本次尝试实际使用的** `configRevision`/`baseManifestRevision`（否则服务端双匹配门槛会记 `recorded:false`），单次发送不重试，三态结果 `recorded` / `stale`（`recorded:false`，服务端状态已前进）/ `unreported`（传输失败）。
 
