@@ -26,6 +26,7 @@ import {
   reportResponseSchema,
   apiErrorSchema,
   RUN_CAPABILITY_INVALID_CODE,
+  type ArtifactWatchItem,
   type Delivery,
   type PollRequest,
   type ReportRequest,
@@ -34,7 +35,11 @@ import {
 export const REQUEST_TIMEOUT_MS = 10_000;
 
 export type PollOutcome =
-  | { kind: "ok"; deliveries: Delivery[] }
+  /** `watch`/`watchDigest` (slice 5): ABSENT watch ⇒ no update needed,
+   *  `[]` ⇒ clear every watch; the keys are carried VERBATIM as the schema
+   *  parsed them (never defaulted to an empty array, which would mean
+   *  "clear"). The runtime hands them to the watch manager. */
+  | { kind: "ok"; deliveries: Delivery[]; watch?: ArtifactWatchItem[]; watchDigest?: string }
   | { kind: "transient"; reason: string }
   | { kind: "fatal"; reason: string };
 
@@ -133,7 +138,13 @@ export function createMachineClient(deps: MachineClientDeps): MachineClient {
         if (!parsed?.success) {
           return { kind: "fatal", reason: "malformed poll 2xx (a claim may already have happened; cannot recover)" };
         }
-        return { kind: "ok", deliveries: parsed.data.deliveries };
+        return {
+          kind: "ok",
+          deliveries: parsed.data.deliveries,
+          // Only present keys, so "absent" keeps meaning "no update".
+          ...(parsed.data.watch !== undefined ? { watch: parsed.data.watch } : {}),
+          ...(parsed.data.watchDigest !== undefined ? { watchDigest: parsed.data.watchDigest } : {}),
+        };
       }
       if (res.status === 401) return { kind: "fatal", reason: "machine credential rejected (401)" };
       if (isTransientStatus(res.status)) return { kind: "transient", reason: `poll HTTP ${res.status}` };

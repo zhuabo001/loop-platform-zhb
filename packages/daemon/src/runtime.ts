@@ -34,6 +34,7 @@
  */
 import type { Delivery, PollRequest, RunProgress } from "@loopzhb/protocol";
 
+import type { ArtifactWatchController } from "./artifact-watch-manager.js";
 import { serializeReportRequest, type MachineClient, type SerializedReportRequest } from "./client.js";
 import type { AgentRunner, RunnerReport } from "./runner.js";
 import { ProcessControlError } from "./subprocess.js";
@@ -83,6 +84,10 @@ export interface PendingReport {
 
 export type SleepFn = (ms: number, signal: AbortSignal) => Promise<void>;
 
+/** The artifact-watch drain budget on shutdown (批次计划 §2 片 5 停止边界:
+ *  取消并等待在途任务释放资源，最多 10 秒). */
+export const WATCH_DRAIN_DEADLINE_MS = 10_000;
+
 export interface DaemonRuntimeDeps {
   client: MachineClient;
   runner: AgentRunner;
@@ -90,6 +95,11 @@ export interface DaemonRuntimeDeps {
   pollMs: number;
   /** Held only to scrub it out of Runner-thrown error text. */
   machineCredential: string;
+  /** Slice-5 artifact watch channel (optional: a runtime without it is the
+   *  Phase-4-shaped daemon, and every existing call site stays unchanged).
+   *  `apply` is synchronous and zero-I/O by contract — the poll heartbeat is
+   *  never blocked by a scan or an upload. */
+  watch?: ArtifactWatchController;
   sleep?: SleepFn;
   log?: (line: string) => void;
 }
@@ -405,7 +415,16 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
     // conjunct — see executionIdle's comment).
     const availableSlots = executionIdle() && queue.length === 0 ? (1 as const) : (0 as const);
     const progress = collectProgress();
-    return { ...deps.identity, availableSlots, ...(progress.length > 0 ? { progress } : {}) };
+    // The watch digest is echoed ONLY once a watch set has been applied: the
+    // server treats a missing digest as the empty set's, so a controller-less
+    // runtime (and the very first poll) keeps the Phase-4 wire shape verbatim.
+    const watchDigest = deps.watch?.currentDigest();
+    return {
+      ...deps.identity,
+      availableSlots,
+      ...(progress.length > 0 ? { progress } : {}),
+      ...(watchDigest !== undefined ? { watchDigest } : {}),
+    };
   }
 
   async function pollOnce(): Promise<void> {
@@ -424,6 +443,11 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
       log(`poll: ${outcome.reason} — next cycle`);
       return;
     }
+    // Slice 5: hand the watch update to the manager BEFORE dispatching the
+    // deliveries. The call is synchronous bookkeeping (the manager launches
+    // its own background work), so neither a scan nor an upload can delay the
+    // poll cadence.
+    if (outcome.watch !== undefined) deps.watch?.apply(outcome.watch, outcome.watchDigest);
     const seenRunIds = new Set<string>();
     for (const delivery of outcome.deliveries) {
       // The protocol accepts a Delivery array, so defend against a duplicated
@@ -449,6 +473,7 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
       running = true;
       if (outer.aborted) stopCtl.abort();
       else outer.addEventListener("abort", onOuterAbort, { once: true });
+      deps.watch?.start();
       try {
         for (;;) {
           if (fatal) throw fatal;
@@ -459,6 +484,11 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
       } finally {
         outer.removeEventListener("abort", onOuterAbort);
         stopCtl.abort();
+        // Slice 5: stop new watch events and timers FIRST (the artifact work
+        // is not part of the execution pipeline), then the existing queue
+        // drop and pipeline join follow. The drain is deadline-bounded inside
+        // the manager and never forces a final commit.
+        await deps.watch?.drain(WATCH_DRAIN_DEADLINE_MS);
         // Never start queued work after stop: the backlog is dropped (its
         // server-side residue is the sweep's job) — but the ACTIVE pipeline
         // is joined: batch 2's real Claude subprocess must not outlive the

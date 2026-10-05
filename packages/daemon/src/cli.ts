@@ -27,6 +27,11 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
+import { createArtifactTransport } from "./artifact-client.js";
+import { createArtifactHashCache } from "./artifact-hash-cache.js";
+import { createArtifactSyncClient } from "./artifact-sync.js";
+import { createArtifactWatchManager, type ArtifactWatchController } from "./artifact-watch-manager.js";
+import { createChokidarWatcher } from "./artifact-watcher.js";
 import { createMachineClient } from "./client.js";
 import { resolveClaudeProviderEnv } from "./claude-provider-env.js";
 import { createClaudeRunner, type ClaudeRunnerDeps } from "./claude-runner.js";
@@ -83,6 +88,10 @@ export interface PrepareDaemonOptions {
    *  production runner. Production call sites never set it — the merged env
    *  carries settings-derived credentials and stays inside the composition. */
   onRunnerEnvSource?: (envSource: NodeJS.ProcessEnv) => void;
+  /** Opt-in observer for the ONE artifact WatchManager this daemon owns
+   *  (slice 5): the acceptance suites drive/observe it instead of reaching
+   *  into the runtime. */
+  onWatch?: (watch: ArtifactWatchController) => void;
 }
 
 async function releasePerStartResources(
@@ -123,6 +132,24 @@ export async function prepareDaemon(
       baseUrl: config.serverUrl,
       machineCredential: config.machineCredential,
     });
+    // Slice 5: exactly ONE artifact transport / hash cache / sync client /
+    // WatchManager per daemon (ADR-010 决策 24/25 — the instance-level upload
+    // gate IS the daemon-global bound). Construction is pure: no watcher is
+    // opened, and no filesystem entry is touched, until the first watch set
+    // arrives on a poll (AD4's daemon half).
+    const watch = createArtifactWatchManager({
+      sync: createArtifactSyncClient({
+        transport: createArtifactTransport({
+          baseUrl: config.serverUrl,
+          machineCredential: config.machineCredential,
+        }),
+        cache: createArtifactHashCache(),
+      }),
+      daemonRoots: jail.daemonRoots,
+      createWatcher: createChokidarWatcher,
+      log: (line) => console.log(line),
+    });
+    options.onWatch?.(watch);
     return createDaemonRuntime({
       client,
       runner: productionRunnerFactory({
@@ -140,6 +167,7 @@ export async function prepareDaemon(
       identity: machineIdentity(),
       pollMs: config.pollMs,
       machineCredential: config.machineCredential,
+      watch,
       log: (line) => console.log(line),
     });
   } catch (err) {

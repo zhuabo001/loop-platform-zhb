@@ -26,13 +26,57 @@ import {
 } from "./client.js";
 import type { AgentRunner, RunnerContext, RunnerReport } from "./runner.js";
 import { ProcessControlError } from "./subprocess.js";
+import type { ArtifactWatchItem } from "@loopzhb/protocol";
+
+import type { ArtifactWatchController } from "./artifact-watch-manager.js";
 import {
   ERROR_CAP,
   FatalDaemonError,
+  WATCH_DRAIN_DEADLINE_MS,
   createDaemonRuntime,
   sanitizeRunnerError,
   type SleepFn,
 } from "./runtime.js";
+
+/** The slice-5 watch channel as the runtime sees it: `apply` is synchronous
+ *  bookkeeping, everything else is the manager's own business. */
+interface WatchStub extends ArtifactWatchController {
+  applied: Array<{ items: readonly ArtifactWatchItem[]; digest?: string }>;
+  starts: number;
+  drains: number[];
+}
+
+function stubWatch(): WatchStub {
+  const applied: Array<{ items: readonly ArtifactWatchItem[]; digest?: string }> = [];
+  let digest: string | undefined;
+  return {
+    applied,
+    starts: 0,
+    drains: [],
+    currentDigest: () => digest,
+    apply: (items, next) => {
+      applied.push(next === undefined ? { items } : { items, digest: next });
+      if (next !== undefined) digest = next;
+    },
+    start() {
+      this.starts += 1;
+    },
+    drain(deadlineMs: number) {
+      this.drains.push(deadlineMs);
+      return Promise.resolve({ settled: true });
+    },
+    settled: () => Promise.resolve(),
+    watchedLoopIds: () => [],
+  };
+}
+
+const WATCH_ITEM: ArtifactWatchItem = {
+  loopId: "loop-1",
+  artifactDir: "/srv/proj",
+  workdir: null,
+  roots: [],
+  configRevision: 1,
+};
 
 const MACHINE_CRED = "dk_test_machine";
 const IDENTITY: PollRequest = { host: "h", platform: "linux", arch: "x64", version: "0.1.0" };
@@ -470,6 +514,43 @@ describe("shutdown", () => {
     await expect(rt.run(new AbortController().signal)).rejects.toThrow(/already running/);
     ctl.abort();
     await first;
+  });
+});
+
+describe("artifact watch channel (slice 5)", () => {
+  it("hands the poll's watch set to the controller verbatim on the poll path", async () => {
+    const watch = stubWatch();
+    const { rt, client } = makeRuntime({ watch });
+    client.pollQueue.push({ kind: "ok", deliveries: [], watch: [WATCH_ITEM], watchDigest: "digest-1" });
+
+    await rt.pollOnce();
+
+    expect(watch.applied).toEqual([{ items: [WATCH_ITEM], digest: "digest-1" }]);
+    expect(watch.starts).toBe(0); // pollOnce alone never starts the cadence
+  });
+
+  it("starts the cadence with run() and drains it with the 10 s budget BEFORE joining the pipeline", async () => {
+    const watch = stubWatch();
+    let release!: () => void;
+    const held = new Promise<RunnerReport>((resolve) => {
+      release = () => resolve(OK_RUNNER);
+    });
+    const { rt, client } = makeRuntime({ watch, runner: { run: () => held } });
+    client.pollQueue.push({ kind: "ok", deliveries: [delivery("run-1")] });
+
+    const ctl = new AbortController();
+    const done = rt.run(ctl.signal);
+    await flush();
+    expect(watch.starts).toBe(1);
+
+    ctl.abort();
+    await flush();
+    // The runner is still held: the watch drain already ran, i.e. it precedes
+    // the execution-pipeline join in shutdown.
+    expect(watch.drains).toEqual([WATCH_DRAIN_DEADLINE_MS]);
+
+    release();
+    await expect(done).resolves.toBeUndefined();
   });
 });
 

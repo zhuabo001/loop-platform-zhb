@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import type { Delivery } from "@loopzhb/protocol";
 import { describe, expect, it } from "vitest";
 
+import type { ArtifactWatchController } from "./artifact-watch-manager.js";
 import {
   createStartupJail,
   prepareDaemon,
@@ -17,6 +18,7 @@ import {
   type ShutdownSignalEvents,
 } from "./cli.js";
 import { ClaudeProviderEnvError } from "./claude-provider-env.js";
+import { releaseControlRoot } from "./control-root.js";
 import { JailError, type WorkdirJail } from "./jail.js";
 import { ClaudeProbeError } from "./probe-claude.js";
 import { createFakeRunner } from "./runner.js";
@@ -178,6 +180,33 @@ describe("prepareDaemon — the batch-3 composition root", () => {
     await expect(
       prepareDaemon({ ...baseConfig, allowedRoots: ["/nonexistent/loopzhb-cli-root"], claudeBin: FIXTURE }, {}),
     ).rejects.toThrow(JailError);
+  });
+
+  it("constructs exactly ONE WatchManager over the jail's roots and touches nothing until a watch set arrives", async () => {
+    const watches: ArtifactWatchController[] = [];
+    let mintedJail: WorkdirJail | undefined;
+    await prepareDaemon(
+      { ...baseConfig, allowedRoots: [realpathSync(tmpdir())], claudeBin: FIXTURE },
+      { PATH: `${path.dirname(process.execPath)}:${process.env.PATH ?? ""}` },
+      {
+        onWatch: (watch) => watches.push(watch),
+        onJail: (jail) => {
+          mintedJail = jail;
+        },
+        onControlRoot: (root) => {
+          void releaseControlRoot(root);
+        },
+      },
+    );
+    try {
+      expect(watches).toHaveLength(1); // one instance = the daemon-global upload gate
+      // Construction is PURE: no watch set applied, no watcher opened, no digest.
+      expect(watches[0]!.watchedLoopIds()).toEqual([]);
+      expect(watches[0]!.currentDigest()).toBeUndefined();
+      expect(mintedJail).toBeDefined();
+    } finally {
+      await mintedJail?.dispose();
+    }
   });
 
   it("a healthy probe assembles the runtime (jail → probe → client → Claude runner)", async () => {
