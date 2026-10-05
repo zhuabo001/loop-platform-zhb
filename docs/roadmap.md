@@ -220,7 +220,10 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
   - 片 1 三轨审查唯一须处理项 [#83](https://github.com/zhuabo001/loop-platform-zhb/issues/83)（读取失败域遗漏 `attribution_missing`）已修复（`0a0b5a9`，变异验证），并经第二轮独立复审核销关闭（2026-10-04）。
   - 片 2（Server 配置、同步 HTTP 与 Poll 接线）已完成：生产 ArtifactHome 经 `bootstrapServer` 接线、6 条路由挂载（配置 PATCH、machine 读取、prepare／流式 PUT／commit、同步错误上报；读取端 4 条留片 7）；真实 HTTP prepare → 多块流式 PUT → commit 全通且落盘 `<dataDir>/blobs`，幂等重放返回固定回执；Create 的可选 `artifactDir` 经同一 planner 与创建同语句落库（初始代际 1）；Poll 向声明 `artifact-sync-v1` 的 Machine 下发 watch（缺 digest ≡ 空集合摘要，busy Poll 同样处理），claim 对已配置 Loop 做逐候选 capability 门控并在 Delivery 携带配置代际；AD1／AD2(a)／AD2(b)／AD4 守卫按实际解除范围重写，AD3 与 daemon 零改动。
   - 片 2 三轨审查两项 P2：[#85](https://github.com/zhuabo001/loop-platform-zhb/issues/85)（认证与读取归属的可恢复 SQLSTATE 漏稳定错误码）已修复（`c139168`，操作级 `withStorageError` + facade／路由双份故障注入回归）、[#86](https://github.com/zhuabo001/loop-platform-zhb/issues/86)（prepare schema 拒绝无码 400）已修复（`6b81de8`，coded 400 `artifact_validation_failed`），AH8 路由级 base 漂移证据已补（`85fbf5a`）；三项均经变异验证并经第二轮独立复审核销关闭（2026-10-05）。
-  - 片 3–8 未开始。
+  - 片 3（Artifact 安全扫描器）已完成：daemon 新增四个本地库模块——`artifact-jail`（复用 jail roots 交集且零 scratch；相对路径只在显式 workdir 下解析、绝不落到进程 cwd；realpath 先于容器检查，故根 symlink 跟随判落点，树内 symlink 一律整扫失败且不读目标）、`artifact-scan`（never-sync 剪枝先于一切 I/O；路径不可 wire 表示时整扫失败、绝不跳过或截断；无跟随有界读取 + 读后身份五元组与字节数复验；目录子树终检；标脏整轮丢弃重扫、三次仍脏判 `unstable`；容量在读取前判定、另有本地 dirent 防 DoS 上限；收口由共享 policy 唯一完成）、`artifact-hash-cache`（dev/ino/size/mtime/ctime 五元组全等才可复用、FIFO 上界、调用方持有）与 `artifact-verify`（上传前一律重读重算、越界路径不读盘、只在验证成功后写回缓存）；`jail.ts` 仅新增两处 `export`（零逻辑改动，`jail.test.ts` 零修改全绿）。扫描要么返回完整可提交 manifest，要么返回封闭失败类——**结构上不存在部分清单**（失败结果无 entries 字段）。
+  - 片 3 变异验证六项全部被对应用例抓住（删 never-sync 剪枝、删条目数早停、删目录终检、身份比较退化为 size-only、删读后复验、删包含守卫）；缓存快路径变异暴露一处弱用例（只钉身份失效、未钉「身份匹配但缓存撒谎」），已补齐并复验。
+  - 片 3 休眠边界不变：不接线 `runtime.ts`/`cli.ts`/`index.ts`、不声明 `artifact-sync-v1`、不启动 watcher、不访问网络、零新依赖、server/protocol 零改动；AD4 的 daemon 半（`identity.test.ts`）零修改全绿。
+  - 片 4–8 未开始。
 
 ### 右移项
 
