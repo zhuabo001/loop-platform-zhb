@@ -41,10 +41,10 @@ Batch 1 错误映射在 HTTP 接线时补齐：revision 耗尽使用新增 `arti
 
 ### 扫描、重试与最终 Report
 
-- 遍历前排除共享 never-sync 规则。合法空目录可以提交空 manifest；可同步区域出现 symlink 或特殊文件时整次扫描失败，不读取其目标或内容。扫描失败、目录缺失、文件不稳定或超限均不得提交截断 manifest。
+- 遍历前排除共享 never-sync 规则。合法空目录可以提交空 manifest；**根自身**是 symlink 时按 `realpath` 落点做 jail 判定（落点在有效 roots 内即通过），**树内**出现 symlink 或特殊文件时整次扫描失败，不读取其目标或内容。扫描失败、目录缺失、文件不稳定或超限均不得提交截断 manifest。
 - Artifact jail 复用 Daemon roots ∩ Server roots 计算规则，不创建 Run scratch。相对路径以显式 workdir 解析；无 workdir 时只接受绝对路径。
-- 文件读取使用无跟随打开、同 fd 校验及读取前后路径／身份复验。保证范围与现有 Task File 一致；不宣称能在跨平台 Node 路径 API 下防御同 UID 恶意进程并发替换中间目录。
-- 启动、每 60 秒及 Run 最终同步执行完整核对并重新哈希；事件路径也重新哈希。其他缓存需比较 size/mtime/ctime 与文件身份，不能仅凭大小复用。
+- 文件读取使用无跟随且非阻塞的打开（终端组件在检查后被换成 FIFO 也不能挂起 open，仍由同 fd 的 `fstat` 拒绝非普通文件）、同 fd 校验及读取前后路径／身份复验。保证范围与现有 Task File 一致；不宣称能在跨平台 Node 路径 API 下防御同 UID 恶意进程并发替换中间目录。
+- 启动、每 60 秒及 Run 最终同步执行完整核对并一律重哈希；事件路径**仅**当缓存条目与当前文件的 `dev/ino/size/mtimeMs/ctimeMs` 五元组全等时才可复用其 hash，否则重算——绝不 size-only。读取后的复检把「路径移动」（`ENOENT`/`ENOTDIR`/`ELOOP`）与「内核拒绝」（`EACCES`/`EPERM` 及其余）分开：前者有界重扫，后者立即按确定性 `unreadable` 返回。
 - 每 Loop 同步串行，Daemon 全局 Blob 上传并发最多 4。上传前重新读取并验证 hash/size；内容变化时重新扫描，不提交旧清单。
 - 瞬态错误按 1、2、4、8……最多 60 秒退避；响应丢失使用原 requestId/session 恢复。配置或 base 冲突以新 requestId 重新协商。401 停止该 Machine 同步，403 停止对应作用域；均不能丢弃合法 Run Report。
 - Agent 退出后强制扫描及同步。30 秒总期限包含每 Loop 排队、扫描、上传和重试；到期取消最终同步，冻结稳定错误后提交原 Run 结果。
@@ -74,7 +74,7 @@ Batch 1 错误映射在 HTTP 接线时补齐：revision 耗尽使用新增 `arti
 
 - **前置：**Slice 1。
 - **交付及范围：**Daemon 路径解析、完整扫描、hash 缓存和上传前验证。
-- **步骤：**复用 jail roots 交集，不复用 Task File 的 symlink 跟随行为；遍历前过滤 never-sync；对普通文件有界读取并校验共享 policy；扫描期间文件增删或身份变化时丢弃结果并重新扫描。
+- **步骤：**复用 jail roots 交集（根自身是 symlink 时按 `realpath` 落点判定；**树内** symlink 不复用 Task File 的跟随行为，一律使整次扫描失败）；遍历前过滤 never-sync；对普通文件非阻塞无跟随有界读取并校验共享 policy；扫描期间文件增删或身份变化时丢弃结果并重新扫描。
 - **验收：**AJ1–AJ10 覆盖路径、roots、symlink、特殊文件、缺失目录、空目录、读取失败、文件不稳定、never-sync 和容量上限；失败扫描永远不能产出可提交的部分 manifest。
 - **停止边界：**只返回扫描结果，不监听事件、不访问 Server。
 
@@ -187,6 +187,12 @@ Batch 1 错误映射在 HTTP 接线时补齐：revision 耗尽使用新增 `arti
 | AJ10 | never-sync 与容量：`.git`/`node_modules`/`.config/gcloud` 不下降、`.env`/`id_rsa*`/`*.pem` 及大小写变体不读（枚举/`open` 日志为证），纯 never-sync 树 ⇒ `ok []`；单文件超 10 MiB 由 `lstat` 早检拒绝；条目数／聚合字节／已访问 dirent 超限 ⇒ `too_large` 且早停；>1024 UTF-8 字节路径 ⇒ `too_large`；反斜杠与盘符路径 ⇒ `unreadable` | 同上 |
 
 编号外证据：hash 缓存的五元组逐字段失效、FIFO 驱逐与 `clear()`（`daemon/src/artifact-hash-cache.test.ts`）；上传前验证的包含守卫、失败分类、一律重读重算与成功写回缓存（`daemon/src/artifact-verify.test.ts`）。
+
+片 3 首轮三轨审查修复后的回归（编号外；裁决见 ADR-010 决策 23 的 2026-10-05 修订）：
+
+- [#87](https://github.com/zhuabo001/loop-platform-zhb/issues/87)：真实 FIFO 在 `lstat` 与 `open` 之间替换 ⇒ 共享有界读取、扫描与上传前验证都必须**及时**返回（带截止期断言，卡住即失败）`special_file`，且被拒绝的句柄已关闭（`daemon/src/bounded-read.test.ts`、`artifact-scan.test.ts`、`artifact-verify.test.ts`）。
+- [#88](https://github.com/zhuabo001/loop-platform-zhb/issues/88)：读后 `lstat` 与目录终检的 `EACCES`/`EPERM` ⇒ 确定性 `unreadable`（单次尝试、单次打开；上传前验证同为 `unreadable`），不再三次重扫后报 `unstable`；`ENOENT` 与身份变化仍走有界重扫（`daemon/src/artifact-scan.test.ts`）。
+- [#89](https://github.com/zhuabo001/loop-platform-zhb/issues/89)：server root 在 realpath 成功后 stat 失败（`ENOENT`/`EACCES`/`EPERM`）与非目录 ⇒ 根解析返回封闭结果 `outside_jail`，不抛原异常（`daemon/src/artifact-jail.test.ts`）。
 
 额外覆盖配置 no-op、Create 原子性、busy Poll 的 watch 更新、capability 与 claim 交错、错误 taxonomy、8 MiB 请求边界和迟到错误不得覆盖新状态。
 

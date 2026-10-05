@@ -222,6 +222,7 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
   - 片 2 三轨审查两项 P2：[#85](https://github.com/zhuabo001/loop-platform-zhb/issues/85)（认证与读取归属的可恢复 SQLSTATE 漏稳定错误码）已修复（`c139168`，操作级 `withStorageError` + facade／路由双份故障注入回归）、[#86](https://github.com/zhuabo001/loop-platform-zhb/issues/86)（prepare schema 拒绝无码 400）已修复（`6b81de8`，coded 400 `artifact_validation_failed`），AH8 路由级 base 漂移证据已补（`85fbf5a`）；三项均经变异验证并经第二轮独立复审核销关闭（2026-10-05）。
   - 片 3（Artifact 安全扫描器）已完成：daemon 新增四个本地库模块——`artifact-jail`（复用 jail roots 交集且零 scratch；相对路径只在显式 workdir 下解析、绝不落到进程 cwd；realpath 先于容器检查，故根 symlink 跟随判落点，树内 symlink 一律整扫失败且不读目标）、`artifact-scan`（never-sync 剪枝先于一切 I/O；路径不可 wire 表示时整扫失败、绝不跳过或截断；无跟随有界读取 + 读后身份五元组与字节数复验；目录子树终检；标脏整轮丢弃重扫、三次仍脏判 `unstable`；容量在读取前判定、另有本地 dirent 防 DoS 上限；收口由共享 policy 唯一完成）、`artifact-hash-cache`（dev/ino/size/mtime/ctime 五元组全等才可复用、FIFO 上界、调用方持有）与 `artifact-verify`（上传前一律重读重算、越界路径不读盘、只在验证成功后写回缓存）；`jail.ts` 仅新增两处 `export`（零逻辑改动，`jail.test.ts` 零修改全绿）。扫描要么返回完整可提交 manifest，要么返回封闭失败类——**结构上不存在部分清单**（失败结果无 entries 字段）。
   - 片 3 变异验证六项全部被对应用例抓住（删 never-sync 剪枝、删条目数早停、删目录终检、身份比较退化为 size-only、删读后复验、删包含守卫）；缓存快路径变异暴露一处弱用例（只钉身份失效、未钉「身份匹配但缓存撒谎」），已补齐并复验。
+  - 片 3 三轨审查 Round 1 四项须处理项已修复（待下一轮独立复审核销）：[#87](https://github.com/zhuabo001/loop-platform-zhb/issues/87) 终端在检查后换成 FIFO 会挂起 `open`（共享有界读取增加 `O_NONBLOCK`，仍由同 fd `fstat` 拒绝）、[#88](https://github.com/zhuabo001/loop-platform-zhb/issues/88) 读后与目录终检把权限拒绝误报为 `unstable`（改为确定性 `unreadable`，`ENOENT` 与身份变化仍有界重扫）、[#89](https://github.com/zhuabo001/loop-platform-zhb/issues/89) server root 的 realpath 后 stat 故障逃出封闭失败域（一律转 `JailError` ⇒ `outside_jail`）、[#90](https://github.com/zhuabo001/loop-platform-zhb/issues/90) 计划口径同步（根 symlink 例外、树内拒绝、事件 hash 缓存复用条件与全量／上传前必重读边界）。前三项均有对应回归并经变异验证（去掉修复即失败），#90 为文档口径同步。
   - 片 3 休眠边界不变：不接线 `runtime.ts`/`cli.ts`/`index.ts`、不声明 `artifact-sync-v1`、不启动 watcher、不访问网络、零新依赖、server/protocol 零改动；AD4 的 daemon 半（`identity.test.ts`）零修改全绿。
   - 片 4–8 未开始。
 
@@ -230,6 +231,7 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
 - [Issue #11](https://github.com/zhuabo001/loop-platform-zhb/issues/11) / [Issue #72](https://github.com/zhuabo001/loop-platform-zhb/issues/72)：Phase 6 阻塞项（真实 Postgres 多物理连接并发验收），指针见 Phase 6 节。
 - [Issue #56](https://github.com/zhuabo001/loop-platform-zhb/issues/56)：Phase 5 认证层加固（状态变更路由同源意图校验、`Content-Type` 门禁、拒绝空体）——随团队与认证层（Batch 3）处理。
 - [Issue #61](https://github.com/zhuabo001/loop-platform-zhb/issues/61)：运行时 preload 环境隔离的防回归证据与验收环境记录——随 Phase 5 后续批次处理。
+- [Issue #91](https://github.com/zhuabo001/loop-platform-zhb/issues/91)：Artifact 根自身落在 never-sync 区域（如 `.config/gcloud`）的配置面防护——启用生产持续同步前明确配置面责任、处理阶段与根／祖先／根 symlink 指向敏感区域的规则；片 3 已按裁决不拓宽冻结失败域。
 
 ## Phase 6 — 生产硬化（独立阶段）
 
