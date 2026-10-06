@@ -230,7 +230,7 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
   - 片 4 第三轮独立三轨复核通过（2026-10-05），已收口；同步与恢复规则见 ADR-010 决策 24。
   - Artifact 根与敏感祖先的本地防护已完成，规则见 ADR-010 决策 25。
   - 片 5（WatchManager 与 Daemon 生命周期）已实现：`artifact-watcher`（chokidar **4.0.3**，唯一 import chokidar 的模块）与 `artifact-watch-manager`（先订阅再全扫、250 ms 固定窗口合并、60 秒完整核对、五字段换代、移除清理、粘性停止、10 秒 drain）；生命周期与缓存分工规则见 ADR-010 决策 25，生产接线与三个加法接缝见决策 16／23／25 的片 5 条目，范围见 `docs/plan/codex-phase5-batch2-plan.md` §2。
-  - **片 5 尚未收口**；阻塞项：[#102](https://github.com/zhuabo001/loop-platform-zhb/issues/102)、[#103](https://github.com/zhuabo001/loop-platform-zhb/issues/103)、[#104](https://github.com/zhuabo001/loop-platform-zhb/issues/104)。
+  - **片 5 已完成并收口**。
   - 片 5 休眠边界其余不变：不改 `packages/server`、不接 Run 最终 Report（片 6）、不做读路由与 Dashboard（片 7）；`index.ts` 导出面不变。
   - 片 6–8 未开始。
 
