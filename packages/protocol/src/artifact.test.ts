@@ -159,7 +159,7 @@ describe("poll additive fields (Phase 5, ADR-010)", () => {
   });
 });
 
-describe("report additive fields (declared, Batch 1 does not consume)", () => {
+describe("report additive fields (declared in Batch 1, consumed by the Batch 2 report wiring)", () => {
   it("artifactSnapshotId / artifactSyncError round-trip and stay absent on old reports", () => {
     const withFields = reportRequestSchema.parse({
       ok: true,
@@ -174,7 +174,7 @@ describe("report additive fields (declared, Batch 1 does not consume)", () => {
   });
 });
 
-describe("admin artifactDir fields (declared, routes mount in Batch 2)", () => {
+describe("admin artifactDir fields (declared in Batch 1, routes mounted in Batch 2 slices 2/7)", () => {
   it("create: artifactDir is optional; explicit null is rejected at creation", () => {
     expect(createLoopRequestSchema.parse({ machineId: "m-0123456789abcdef", artifactDir: "dist" })).toEqual({
       machineId: "m-0123456789abcdef",
