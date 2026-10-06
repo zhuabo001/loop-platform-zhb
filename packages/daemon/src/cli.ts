@@ -29,6 +29,7 @@ import { pathToFileURL } from "node:url";
 
 import { createArtifactTransport } from "./artifact-client.js";
 import { createArtifactHashCache } from "./artifact-hash-cache.js";
+import { createFinalArtifactSync } from "./artifact-final-sync.js";
 import { createArtifactSyncClient } from "./artifact-sync.js";
 import { createArtifactWatchManager, type ArtifactWatchController } from "./artifact-watch-manager.js";
 import { createChokidarWatcher } from "./artifact-watcher.js";
@@ -134,17 +135,21 @@ export async function prepareDaemon(
     });
     // Slice 5: exactly ONE artifact transport / hash cache / sync client /
     // WatchManager per daemon (ADR-010 决策 24/25 — the instance-level upload
-    // gate IS the daemon-global bound). Construction is pure: no watcher is
-    // opened, and no filesystem entry is touched, until the first watch set
-    // arrives on a poll (AD4's daemon half).
-    const watch = createArtifactWatchManager({
-      sync: createArtifactSyncClient({
-        transport: createArtifactTransport({
-          baseUrl: config.serverUrl,
-          machineCredential: config.machineCredential,
-        }),
-        cache: createArtifactHashCache(),
+    // gate IS the daemon-global bound). Slice 6: the SAME sync client also
+    // backs the run-final sync, so the per-loop serial queue and the upload
+    // gate are structurally shared between watcher traffic and final syncs.
+    // Construction is pure: no watcher is opened, and no filesystem entry is
+    // touched, until the first watch set arrives on a poll (AD4's daemon
+    // half).
+    const artifactSync = createArtifactSyncClient({
+      transport: createArtifactTransport({
+        baseUrl: config.serverUrl,
+        machineCredential: config.machineCredential,
       }),
+      cache: createArtifactHashCache(),
+    });
+    const watch = createArtifactWatchManager({
+      sync: artifactSync,
       daemonRoots: jail.daemonRoots,
       createWatcher: createChokidarWatcher,
       log: (line) => console.log(line),
@@ -168,6 +173,11 @@ export async function prepareDaemon(
       pollMs: config.pollMs,
       machineCredential: config.machineCredential,
       watch,
+      finalSync: createFinalArtifactSync({
+        sync: artifactSync,
+        daemonRoots: jail.daemonRoots,
+        log: (line) => console.log(line),
+      }),
       log: (line) => console.log(line),
     });
   } catch (err) {
