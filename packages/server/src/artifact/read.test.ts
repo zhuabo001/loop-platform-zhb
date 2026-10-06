@@ -258,6 +258,53 @@ describe("read facade over real PGlite (frozen evaluation order, AV1/AV2/AV7)", 
     it("unknown run ⇒ run_not_found", async () => {
       expect(await readRunArtifactsView(home, "run-nope")).toEqual({ ok: false, failure: "run_not_found" });
     });
+
+    it("#111: the nested page's expected parent folds a mismatch into run_not_found at the IDENTITY step", async () => {
+      await seedBoundLoop();
+      await seedRun(db, { id: "run-1", loopId: "loop-1", machineId: "m-1", artifactSnapshotId: "amf-1" });
+      // Wrong / nonexistent parent: indistinguishable from a run that never
+      // existed — bound state and (below) missing state alike.
+      expect(await readRunArtifactsView(home, "run-1", "loop-OTHER")).toEqual({ ok: false, failure: "run_not_found" });
+      expect(await readRunArtifactsView(home, "run-1", "loop-nope")).toEqual({ ok: false, failure: "run_not_found" });
+      expect(await readRunArtifactsView(home, "run-nope", "loop-1")).toEqual({ ok: false, failure: "run_not_found" });
+      // The matching parent keeps the domain result.
+      const bound = await readRunArtifactsView(home, "run-1", "loop-1");
+      if (!bound.ok) throw new Error(`fixture must succeed: ${JSON.stringify(bound)}`);
+      expect(bound.response.state).toBe("bound");
+      // No expected parent (the flat JSON route): the unscoped legacy read.
+      const legacy = await readRunArtifactsView(home, "run-1");
+      if (!legacy.ok) throw new Error(`fixture must succeed: ${JSON.stringify(legacy)}`);
+      expect(legacy.response.state).toBe("bound");
+      // …and the missing state folds the same way.
+      await seedRun(db, { id: "run-2", loopId: "loop-1", machineId: "m-1", artifactSnapshotId: null });
+      expect(await readRunArtifactsView(home, "run-2", "loop-OTHER")).toEqual({ ok: false, failure: "run_not_found" });
+      const missing = await readRunArtifactsView(home, "run-2", "loop-1");
+      if (!missing.ok) throw new Error(`fixture must succeed: ${JSON.stringify(missing)}`);
+      expect(missing.response.state).toBe("missing");
+    });
+
+    it("#111 round 2: the parent check precedes ATTRIBUTION — a wrong parent never leaks 403-vs-404 across scopes", async () => {
+      // The run's loop resolves to NO namespace (its machine row is gone from
+      // the resolver's mapping — the review's parent-failure probe).
+      await seedLoop(db, { id: "loop-1", machineId: "m-1" });
+      await seedRun(db, { id: "run-1", loopId: "loop-1", machineId: "m-1", artifactSnapshotId: null });
+      const unmapped = { ...home, attribution: staticAttribution({}) };
+      // Correct parent: attribution_missing is the preserved 403 control.
+      expect(await readRunArtifactsView(unmapped, "run-1", "loop-1")).toEqual({
+        ok: false,
+        failure: "attribution_missing",
+      });
+      // Wrong / nonexistent parent: run_not_found — the domain failure must
+      // not leak the run's existence under a foreign scope (决策 13/27).
+      expect(await readRunArtifactsView(unmapped, "run-1", "loop-OTHER")).toEqual({
+        ok: false,
+        failure: "run_not_found",
+      });
+      expect(await readRunArtifactsView(unmapped, "run-1", "loop-nope")).toEqual({
+        ok: false,
+        failure: "run_not_found",
+      });
+    });
   });
 
   describe("openArtifactDownload", () => {

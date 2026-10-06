@@ -132,36 +132,28 @@ function contentDispositionValue(manifestPath: string): string {
   return `attachment; filename="${asciiName}"; filename*=UTF-8''${encoded}`;
 }
 
-/** The AV8 stream pump. The client-abort hook fires `close()` (idempotent);
- *  the loop stops pulling on abort; the `finally` close is a no-op after
- *  natural EOF (the adapter auto-closes on exhaustion). A terminal mid-stream
- *  `storage_error` element (决策 14's two-phase channel — the iterator never
- *  throws) truncates the body: headers incl. status and Content-Length are
- *  already sent, so the truncation is the only honest ending (决策 27). */
+/** The AV8 chunk forwarder. RELEASE IS NOT THIS GENERATOR'S JOB (#109, round
+ *  2): a lazy generator's body — its finally included — does not exist until
+ *  the first `next()`, so no cleanup registered here can cover a consumer
+ *  that cancels before the first pull. The response builder below owns the
+ *  one idempotent close() (eager abort hook + ReadableStream cancel). This
+ *  loop only forwards chunks, stops pulling on abort, and — for a terminal
+ *  mid-stream `storage_error` element (决策 14's two-phase channel — the
+ *  iterator never throws) — truncates the body: headers incl. status and
+ *  Content-Length are already sent, so the truncation is the only honest
+ *  ending (决策 27). */
 async function* pumpArtifactDownload(
   bytes: AsyncIterable<BlobStreamChunk>,
-  close: () => Promise<void>,
   signal: AbortSignal | undefined,
-  onSettled: () => void,
 ): AsyncGenerator<Uint8Array> {
-  const onAbort = (): void => {
-    void close().catch(() => {});
-  };
-  signal?.addEventListener("abort", onAbort, { once: true });
-  try {
-    for await (const chunk of bytes) {
-      if (signal?.aborted) break; // client gone: stop pulling
-      if (chunk.ok) {
-        yield chunk.chunk;
-        continue;
-      }
-      console.error("[http] artifact download mid-stream storage error");
-      break;
+  for await (const chunk of bytes) {
+    if (signal?.aborted) return; // client gone: stop pulling
+    if (chunk.ok) {
+      yield chunk.chunk;
+      continue;
     }
-  } finally {
-    signal?.removeEventListener("abort", onAbort);
-    onSettled();
-    await close().catch(() => {});
+    console.error("[http] artifact download mid-stream storage error");
+    return;
   }
 }
 
@@ -191,18 +183,64 @@ function artifactDownloadResponse(
     void opened.close().catch(() => {});
     return new Response(null, { status: 200, headers });
   }
-  // #109 (cancel before first pull): the abort hook lives EAGERLY here, NOT
-  // inside the generator — a generator body does not run until its first
-  // `next()`, so a client canceling between the headers and the first chunk
-  // would never reach a hook registered there. close() is idempotent; the
-  // pump's own finally-collapse is a no-op afterwards.
-  const onAbort = (): void => {
+  // #109 (round 2): the release responsibility is established HERE, at
+  // response-build time — a lazy generator's finally can never cover the
+  // not-yet-started cases.
+  //  1. The signal may ALREADY be aborted (the client left during the async
+  //     open, or before the request reached us): addEventListener on an
+  //     aborted signal never fires, so release immediately and answer the
+  //     headers with no body — the client is gone.
+  if (signal?.aborted) {
+    void opened.close().catch(() => {});
+    return new Response(null, { status: 200, headers });
+  }
+  //  2. The EAGER hook covers every abort from here on — even while the
+  //     source's first read hangs, since close() is not gated on a pull
+  //     resolving.
+  //  3. The body is a ReadableStream whose cancel() the consumer reaches
+  //     WITHOUT any pull: a direct `body.cancel()` before the first read
+  //     releases, where a generator's finally never ran.
+  // `settled` collapses abort / cancel / EOF / mid-stream truncation onto the
+  // one idempotent close() and drops the listener exactly once.
+  let settled = false;
+  const release = (): void => {
+    if (settled) return;
+    settled = true;
+    signal?.removeEventListener("abort", onAbort);
     void opened.close().catch(() => {});
   };
+  const onAbort = (): void => release();
   signal?.addEventListener("abort", onAbort, { once: true });
-  const body = pumpArtifactDownload(opened.bytes, opened.close, signal, () =>
-    signal?.removeEventListener("abort", onAbort),
-  );
+  const iterator = pumpArtifactDownload(opened.bytes, signal)[Symbol.asyncIterator]();
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (settled) {
+        // Released while idle (aborted between pulls): answer EOF, never
+        // start or resume the source.
+        controller.close();
+        return;
+      }
+      let next: IteratorResult<Uint8Array>;
+      try {
+        next = await iterator.next();
+      } catch {
+        // 决策 14's channel never throws; a defensive release + EOF if it did.
+        release();
+        controller.close();
+        return;
+      }
+      if (settled) return; // cancelled while this pull was in flight — touch nothing
+      if (next.done) {
+        release(); // natural EOF or the mid-stream truncation
+        controller.close();
+        return;
+      }
+      controller.enqueue(next.value);
+    },
+    cancel() {
+      release();
+    },
+  });
   return new Response(body, { status: 200, headers });
 }
 
@@ -601,13 +639,17 @@ export function createServerApp(
 
     // ---- slice 7 read routes (ADR-010 决策 27) ----
     // The query-string precedent: raw values, EMPTY STRING normalized to
-    // undefined (an HTML form's empty option submits `key=` — `from` for the
-    // empty baseline AND `to` alike, review #112), then the FROZEN query
-    // schema. Malformed ⇒ the code-less 400.
+    // undefined (an HTML form's empty option submits `key=`), then the FROZEN
+    // query schema. Malformed ⇒ the code-less 400. The normalization covers
+    // the diff `from`/`to` (review #112) AND the download `snapshotId`/`path`
+    // (#112 round 2): a required key submitted empty is the malformed 400,
+    // never a shape-valid empty string sailing into a downstream 404.
     const parseDownloadQuery = (c: Context): { snapshotId: string; path: string } | undefined => {
+      const snapshotId = c.req.query("snapshotId");
+      const path = c.req.query("path");
       const parsed = artifactDownloadQuerySchema.safeParse({
-        snapshotId: c.req.query("snapshotId"),
-        path: c.req.query("path"),
+        snapshotId: snapshotId === "" ? undefined : snapshotId,
+        path: path === "" ? undefined : path,
       });
       return parsed.success ? parsed.data : undefined;
     };

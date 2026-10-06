@@ -309,16 +309,15 @@ export function createDashboardRoutes(deps: DashboardRouteDeps): DashboardRoutes
     artifacts &&
     (async (c) => {
       try {
-        const result = await artifacts.runArtifacts(c.req.param("runId") ?? "");
+        // #111: the run page is NESTED under its parent loop — the parent path
+        // rides the facade's IDENTITY step (no route-level DB side channel),
+        // so a mismatched or nonexistent parent is the same 404 as a run that
+        // never existed on EVERY path (round 2: the attribution-missing
+        // failure included — a 403 under a foreign parent would leak the
+        // run's existence across scopes, 决策 13/27). The correct parent's
+        // attribution_missing stays the 403 control.
+        const result = await artifacts.runArtifacts(c.req.param("id") ?? "", c.req.param("runId") ?? "");
         if (!result.ok) return artifactPageFailure(c, result.failure);
-        // #111: the run page is NESTED under its parent loop — the run is
-        // visible only from the loop it belongs to. A mismatched parent path
-        // is one 404, indistinguishable from "never existed" (决策 13:
-        // existence never leaks across scopes, and another loop's file table
-        // must never render under the wrong parent).
-        if (result.response.loopId !== (c.req.param("id") ?? "")) {
-          return artifactPageFailure(c, "run_not_found");
-        }
         return new Response(renderRunArtifactsPage(buildRunArtifactsPageModel({ response: result.response })), {
           status: 200,
           headers: securityHeaders({ "content-type": "text/html; charset=UTF-8" }),

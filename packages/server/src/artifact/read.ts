@@ -121,10 +121,26 @@ export async function readLoopArtifactsView(home: ArtifactReadHome, loopId: stri
 /** GET /api/runs/:id/artifacts — the bound snapshot, or the EXPLICIT missing
  *  state. `missing` is frozen to mean "no snapshot was ever bound": a bound
  *  Run whose manifest row vanished out-of-band is a 404 `snapshot_not_found`
- *  (V3 — rewriting a bound Run to missing would fabricate history). */
-export async function readRunArtifactsView(home: ArtifactReadHome, runId: string): Promise<ReadRunArtifactsResult> {
+ *  (V3 — rewriting a bound Run to missing would fabricate history).
+ *
+ *  `expectedLoopId` is the NESTED page's parent path (Dashboard). The check
+ *  rides the IDENTITY step — right after the run row, BEFORE the loop,
+ *  attribution and snapshot resolution (#111 round 2): a mismatched parent
+ *  must stay indistinguishable from never-existed on EVERY path, including
+ *  the `attribution_missing` failure — otherwise 403-vs-404 under a foreign
+ *  parent leaks the run's existence across scopes (决策 13/27). With the
+ *  matching parent the failure domain is unchanged; absent (the flat JSON
+ *  route) the read is unscoped. */
+export async function readRunArtifactsView(
+  home: ArtifactReadHome,
+  runId: string,
+  expectedLoopId?: string,
+): Promise<ReadRunArtifactsResult> {
   const run = await getRun(home.db, runId);
   if (!run) return { ok: false, failure: "run_not_found" };
+  if (expectedLoopId !== undefined && run.loopId !== expectedLoopId) {
+    return { ok: false, failure: "run_not_found" };
+  }
   const loop = (await home.db.select().from(loops).where(eq(loops.id, run.loopId)).limit(1))[0];
   if (!loop) return { ok: false, failure: "loop_not_found" }; // defensive: FK makes this unreachable
   const resolved = await home.attribution.resolve({ machineId: loop.machineId });

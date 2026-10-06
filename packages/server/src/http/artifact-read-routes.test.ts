@@ -344,6 +344,76 @@ describe("GET /api/loops/:id/artifacts/download (AV4/AV5/AV8, R3)", () => {
     await res.body?.cancel().catch(() => {});
   });
 
+  it("#109 round 2: a DIRECT body.cancel() before the first pull releases the handle (no abort signal)", async () => {
+    await fresh();
+    await boundLoop();
+    const res = await app.request(downloadPath);
+    expect(res.status).toBe(200);
+    // No AbortController at all: the consumer cancels the response body
+    // itself. The ReadableStream's cancel() reaches the release WITHOUT any
+    // pull — the round-1 generator body was never started by a bare cancel,
+    // so its finally never ran and this leaked (opens 1, releases 0).
+    await res.body?.cancel();
+    expect(storeLog).toEqual({ opens: 1, releases: 1 });
+  });
+
+  it("#109 round 2: an already-aborted signal releases at response build (the listener would never fire)", async () => {
+    await fresh();
+    await boundLoop();
+    const ctl = new AbortController();
+    ctl.abort(); // aborted BEFORE the request: addEventListener never fires
+    const res = await app.request(downloadPath, { signal: ctl.signal });
+    expect(res.status).toBe(200);
+    expect(storeLog).toEqual({ opens: 1, releases: 1 });
+    await res.body?.cancel().catch(() => {});
+  });
+
+  it("#109 round 2: an abort DURING the async open still releases the handle it returns", async () => {
+    await fresh();
+    await boundLoop();
+    // The store's read() pends on a gate: the client aborts while the open is
+    // in flight, so the signal is already aborted when the handle arrives —
+    // the build-time check must release it (a listener would never fire).
+    let openGate: (() => void) | null = null;
+    const gatedOpenStore: BlobStore = {
+      writeVerified: (input) => store.writeVerified(input),
+      has: (key) => store.has(key),
+      read: async (key: BlobKey): Promise<BlobReadResult> => {
+        await new Promise<void>((resolve) => {
+          openGate = resolve;
+        });
+        return store.read(key);
+      },
+    };
+    const clock = new FakeClock();
+    const gatedApp = createServerApp(
+      createRunCoordinator(testDeps(db, clock)),
+      createLoopAdmin({ db, clock, newLoopId: () => "loop-x" }),
+      createLifecycleAdmin({ db, clock }),
+      createScheduleAdmin({ db, clock }),
+      createOwnerControl({ db, clock }),
+      undefined,
+      undefined,
+      createArtifactApi({
+        db,
+        clock,
+        ids: { syncId: () => "sync-1", manifestId: () => "amf-1" },
+        blobStore: gatedOpenStore,
+        attribution: staticAttribution({ [machineId]: "ns-1" }),
+      }),
+    );
+    const ctl = new AbortController();
+    const pending = gatedApp.request(downloadPath, { signal: ctl.signal });
+    await new Promise((resolve) => setTimeout(resolve, 20)); // the handler is parked in the open
+    expect(openGate).not.toBeNull();
+    ctl.abort(); // the client is gone BEFORE the open resolves
+    openGate!();
+    const res = await pending;
+    expect(res.status).toBe(200);
+    expect(storeLog).toEqual({ opens: 1, releases: 1 });
+    await res.body?.cancel().catch(() => {});
+  });
+
   it("R3: blob gone from disk ⇒ 404 path_not_found, byte-identical to /nope (never the table's 409)", async () => {
     await fresh();
     await seedManifest();
@@ -388,6 +458,25 @@ describe("GET /api/loops/:id/artifacts/download (AV4/AV5/AV8, R3)", () => {
     expect(await missingPath.json()).toEqual({ error: "invalid request" });
     const missingBoth = await app.request("/api/loops/loop-1/artifacts/download");
     expect(missingBoth.status).toBe(400);
+  });
+
+  it("#112 round 2: an EMPTY required value (snapshotId= / path=) is the same 400, never a downstream 404", async () => {
+    await fresh();
+    await boundLoop();
+    // An HTML form's empty option submits `key=` — the route normalizes the
+    // empty string to ABSENT (the diff query's convention), so the frozen
+    // shape-only schema rejects it here instead of a shape-valid "" sailing
+    // into a snapshot/path lookup that answers 404.
+    for (const query of ["snapshotId=&path=a.txt", "snapshotId=amf-1&path=", "snapshotId=&path="]) {
+      const res = await app.request(`/api/loops/loop-1/artifacts/download?${query}`);
+      expect(res.status, query).toBe(400);
+      expect(await res.json(), query).toEqual({ error: "invalid request" });
+    }
+    // The legal call is untouched: exactly one open, released at EOF.
+    const ok = await app.request(downloadPath);
+    expect(ok.status).toBe(200);
+    await ok.arrayBuffer();
+    expect(storeLog).toEqual({ opens: 1, releases: 1 });
   });
 
   it("AV8: client abort mid-stream releases the handle exactly once", async () => {

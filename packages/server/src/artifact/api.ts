@@ -82,8 +82,11 @@ export interface ArtifactApi {
   updateConfig(loopId: string, command: { artifactDir: string | null }): Promise<UpdateArtifactConfigResult>;
   /** GET /api/loops/:id/artifacts — management read: the current file view. */
   readLoop(loopId: string): Promise<ReadLoopArtifactsResult>;
-  /** GET /api/runs/:id/artifacts — management read: bound snapshot or explicit missing. */
-  readRun(runId: string): Promise<ReadRunArtifactsResult>;
+  /** GET /api/runs/:id/artifacts — management read: bound snapshot or explicit
+   *  missing. `expectedLoopId` is the nested Dashboard page's parent path: a
+   *  mismatch folds into `run_not_found` at the identity step, BEFORE any
+   *  attribution/snapshot failure could leak the run's existence (#111). */
+  readRun(runId: string, expectedLoopId?: string): Promise<ReadRunArtifactsResult>;
   /** GET /api/loops/:id/artifacts/diff — management read: structural diff of two same-loop snapshots. */
   diffSnapshots(loopId: string, query: { from?: string; to: string }): Promise<ReadDiffResult>;
   /** GET /api/loops/:id/artifacts/download — opens the verified blob stream
@@ -124,9 +127,9 @@ export function createArtifactApi(home: ArtifactHomeDeps): ArtifactApi {
       );
     },
 
-    readRun(runId) {
+    readRun(runId, expectedLoopId) {
       return withStorageError(
-        () => readRunArtifactsView(reads, runId),
+        () => readRunArtifactsView(reads, runId, expectedLoopId),
         (cause) => ({ ok: false, failure: "storage_error", cause }),
       );
     },

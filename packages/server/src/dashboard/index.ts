@@ -193,7 +193,10 @@ export interface DashboardBoundSnapshotRef extends DashboardSnapshotRef {
  *  form consumes — no credential, the loopback boundary. */
 export interface DashboardArtifactRead {
   loopArtifacts(loopId: string): Promise<ReadLoopArtifactsResult>;
-  runArtifacts(runId: string): Promise<ReadRunArtifactsResult>;
+  /** The nested run page: `loopId` is the PARENT PATH, folded into the
+   *  facade's identity step (#111 — a mismatched parent is `run_not_found`
+   *  before any domain failure, so failure paths leak nothing across scopes). */
+  runArtifacts(loopId: string, runId: string): Promise<ReadRunArtifactsResult>;
   diff(loopId: string, query: { from?: string; to: string }): Promise<ReadDiffResult>;
   updateConfig(loopId: string, command: { artifactDir: string | null }): Promise<UpdateArtifactConfigResult>;
   /** Runs of the loop with a bound snapshot, joined to their manifest rows,
@@ -216,7 +219,7 @@ export function createDashboardArtifactRead(deps: {
 }): DashboardArtifactRead {
   return {
     loopArtifacts: (loopId) => deps.api.readLoop(loopId),
-    runArtifacts: (runId) => deps.api.readRun(runId),
+    runArtifacts: (loopId, runId) => deps.api.readRun(runId, loopId),
     diff: (loopId, query) => deps.api.diffSnapshots(loopId, query),
     updateConfig: (loopId, command) => deps.api.updateConfig(loopId, command),
 

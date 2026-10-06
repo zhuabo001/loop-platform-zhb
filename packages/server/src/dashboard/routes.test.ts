@@ -666,7 +666,7 @@ describe("slice 7 artifact pages (决策 27)", () => {
   it("the run page renders the bound file table; the missing state is explicit", async () => {
     await fresh({
       artifacts: fakeArtifacts({
-        runArtifacts: (runId): Promise<ReadRunArtifactsResult> =>
+        runArtifacts: (_loopId, runId): Promise<ReadRunArtifactsResult> =>
           Promise.resolve({
             ok: true,
             response: {
@@ -692,7 +692,7 @@ describe("slice 7 artifact pages (决策 27)", () => {
 
     await fresh({
       artifacts: fakeArtifacts({
-        runArtifacts: (runId): Promise<ReadRunArtifactsResult> =>
+        runArtifacts: (_loopId, runId): Promise<ReadRunArtifactsResult> =>
           Promise.resolve({ ok: true, response: { runId, loopId: "loop-1", state: "missing" } }),
       }),
     });
@@ -796,22 +796,26 @@ describe("slice 7 artifact pages (决策 27)", () => {
   it("#111: the run page is nested under its parent loop — a mismatched parent path is the same 404", async () => {
     await fresh({
       artifacts: fakeArtifacts({
-        runArtifacts: (runId): Promise<ReadRunArtifactsResult> =>
-          Promise.resolve({
-            ok: true,
-            response: {
-              runId,
-              loopId: "loop-1", // the run really belongs to loop-1…
-              state: "bound",
-              snapshotId: "amf-1",
-              manifestRevision: 1,
-              configRevision: 1,
-              committedAt: "2026-10-06T00:00:00.000Z",
-              fileCount: 1,
-              totalBytes: 3,
-              files: [{ path: "a.txt", hash: "b".repeat(64), size: 3 }],
-            },
-          }),
+        // The fake emulates the facade's identity-step fold (pinned for real
+        // in artifact/read.test.ts): a parent mismatch is run_not_found.
+        runArtifacts: (loopId, runId): Promise<ReadRunArtifactsResult> =>
+          loopId !== "loop-1"
+            ? Promise.resolve({ ok: false, failure: "run_not_found" })
+            : Promise.resolve({
+                ok: true,
+                response: {
+                  runId,
+                  loopId: "loop-1", // the run really belongs to loop-1…
+                  state: "bound",
+                  snapshotId: "amf-1",
+                  manifestRevision: 1,
+                  configRevision: 1,
+                  committedAt: "2026-10-06T00:00:00.000Z",
+                  fileCount: 1,
+                  totalBytes: 3,
+                  files: [{ path: "a.txt", hash: "b".repeat(64), size: 3 }],
+                },
+              }),
       }),
     });
     const res = await getArtifactPage(app, "/dashboard/loops/loop-OTHER/artifacts/runs/run-1"); // …not loop-OTHER
@@ -819,6 +823,42 @@ describe("slice 7 artifact pages (决策 27)", () => {
     const html = await res.text();
     expect(html).toContain("不存在或不可见");
     expect(html).not.toContain("a.txt"); // another loop's file table/download links never render
+  });
+
+  it("#111 round 2: the failure paths fold too — attribution-missing under a wrong parent is the SAME 404 as an unknown run (never 403)", async () => {
+    // The review's residual: the round-1 check only inspected SUCCESS results,
+    // so a run whose loop's attribution is unmapped answered 403 under a
+    // wrong/nonexistent parent while an unknown run answered 404 — an
+    // existence leak across scopes. The parent path now rides the facade's
+    // identity step; this fake emulates that fold (the real ordering is
+    // pinned in artifact/read.test.ts).
+    const seen: string[] = [];
+    await fresh({
+      artifacts: fakeArtifacts({
+        runArtifacts: (loopId, runId): Promise<ReadRunArtifactsResult> => {
+          seen.push(`${loopId}/${runId}`);
+          if (runId === "run-nope") return Promise.resolve({ ok: false, failure: "run_not_found" });
+          if (loopId !== "loop-1") return Promise.resolve({ ok: false, failure: "run_not_found" });
+          return Promise.resolve({ ok: false, failure: "attribution_missing" });
+        },
+      }),
+    });
+    // The never-existed run's page is the canonical shape.
+    const unknown = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts/runs/run-nope");
+    expect(unknown.status).toBe(404);
+    const canonical = await unknown.text();
+    // Wrong / nonexistent parent with the attribution-missing run: byte-identical 404.
+    for (const parent of ["loop-OTHER", "loop-nope"]) {
+      const res = await getArtifactPage(app, `/dashboard/loops/${parent}/artifacts/runs/run-1`);
+      expect(res.status, parent).toBe(404);
+      expect(await res.text(), parent).toBe(canonical);
+    }
+    // The parent path reached the facade as the FIRST argument (identity step).
+    expect(seen).toContain("loop-OTHER/run-1");
+    // The correct parent's attribution_missing stays the 403 control.
+    const control = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts/runs/run-1");
+    expect(control.status).toBe(403);
+    expect(await control.text()).toContain("归属缺失");
   });
 
   it("#113: the snapshot list is read only AFTER the domain verdict — a faulting list never masks 403 into 500", async () => {
