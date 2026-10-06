@@ -232,7 +232,10 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
   - 片 5（WatchManager 与 Daemon 生命周期）已实现：`artifact-watcher`（chokidar **4.0.3**，唯一 import chokidar 的模块）与 `artifact-watch-manager`（先订阅再全扫、250 ms 固定窗口合并、60 秒完整核对、五字段换代、移除清理、粘性停止、10 秒 drain）；生命周期与缓存分工规则见 ADR-010 决策 25，生产接线与三个加法接缝见决策 16／23／25 的片 5 条目，范围见 `docs/plan/codex-phase5-batch2-plan.md` §2。
   - **片 5 已完成并收口**。
   - 片 5 休眠边界其余不变：不改 `packages/server`、不接 Run 最终 Report（片 6）、不做读路由与 Dashboard（片 7）；`index.ts` 导出面不变。
-  - 片 6–8 未开始。
+  - 片 6（Run 最终同步与 Report 原子绑定）已实现：daemon `artifact-final-sync`（30 秒总期限、`freshSession` 强制新会话铸快照、全量重哈希、U1 的 10 秒 `timeout` 补报）与 runtime 接线（最终同步在 in-flight 槽内执行、`runnerActive` 双门、字段合并进只序列化一次的 Report）；server 在 Report 事务资格判定后绑定 Report 携带的 snapshot/error（planner 资格参数落地、ambiguous 短路、绑定守卫并入 CAS 单次重试吸收集）。规则见 ADR-010 决策 26，范围见 `docs/plan/codex-phase5-batch2-plan.md` §2。
+  - **片 6 已完成（已验证，待三轨审查收口）**。
+  - 片 6 休眠边界其余不变：不做读路由与 Dashboard（片 7）；不改 watch/event 路径；#72 的真实多连接行锁验收归 Phase 6，片 6 不关闭它。
+  - 片 7–8 未开始。
 
 ### 右移项
 

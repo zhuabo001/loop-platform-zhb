@@ -240,6 +240,25 @@ Batch 1 错误映射在 HTTP 接线时补齐：revision 耗尽使用新增 `arti
 
 片 5 以编号外证据覆盖：根 never-sync 防护（协议加法导出 `isNeverSyncDirectoryPath`、`syncLoop` 内 `outside_jail` 拒绝与真实临时目录回归、watcher 准入与 60 秒本地重验）、`reportLocalFailure` 三态与停止记录、扫描级 `signal` 中止无部分清单、粘性停止的作用域处置与 `clearStops()` 恢复、poll 摘要通道（apply 时保留、缺席保持、`[]` 清空）、AD4 daemon 半重写（capability pin、构造零 fs 副作用、收到 watch 前不开 watcher、无直接 outbound）。
 
+片 6 的 AR 编号逐项对应（规则见 ADR-010 决策 26）：
+
+| ID | 场景 | 主要证据 |
+|---|---|---|
+| AR1 | 最终快照：`freshSession` + 全量重哈希 ⇒ 即使内容相同也铸新 snapshot；Report 携带 `artifactSnapshotId` 并在 Report 事务内绑定 | `daemon/src/artifact-final-sync.test.ts`（两次 run 两个 session/requestId 与 snap id）、`server/src/coordinator/report.test.ts`（绑定落库）、`phase5-batch2-slice6-e2e.test.ts`（dist daemon + 真实 HTTP + 真实临时目录，`runs.artifactSnapshotId` == manifest id） |
+| AR2 | 固定 Report 重试：含 artifact 字段的 body 只序列化一次，重试字节一致；重试不再触发最终同步 | `daemon/src/runtime.test.ts`（`reportJson[1] === reportJson[0]`、finalSync 恰一次） |
+| AR3 | 快照不随后续编辑改变：report 后修改文件并再次 Run/同步，旧 Run 的绑定列与旧 manifest entries 不变 | `phase5-batch2-slice6-e2e.test.ts`（两次 Run 两个快照，旧 manifest 冻结） |
+| AR4 | 30 秒总期限：期限覆盖排队（同 Loop 串行队列被占用时到期即取消、零自有请求）、扫描/上传（挂起 PUT 到期取消）；到期冻结 `timeout`，Run 终态照常提交 | `artifact-final-sync.test.ts`（注入期限 + manualSleep）、`runtime.test.ts`（错误字段上 Report） |
+| AR5 | 同步失败不丢报告：`failed`/`unavailable`/`stopped` 等 ⇒ Report 仍发送且 `artifactSyncError` 落库，Run 终态合法 | `runtime.test.ts`（daemon 半）、`coordinator/report.test.ts`（server 半落库断言） |
+| AR6 | 非法 snapshot 引用：伪造/跨 Loop/跨 namespace/旧代际 ⇒ 终态合法提交 + 对应拒绝字面量落 `runs.artifactSyncError`、不绑定 | `coordinator/report.test.ts`、`artifact/binding-plan.test.ts` |
+| AR7 | 取消／supersede：取消后迟到 report ⇒ 401 零写，artifact 列保持 null | `coordinator/report.test.ts` |
+| AR8 | 无 Report 的 reclaimed Run：从不报告的 swept Run 两列 null；宽限期过后迟到 report ⇒ 401 且不绑定 | `coordinator/report.test.ts` |
+| AR9 | 合法迟到 reconcile：terminal-grace + error 行的 wake report 携带合法 snapshot ⇒ `reconciled:true` + 绑定成功（eligibility `"reconcile"`） | `coordinator/report.test.ts`、`binding-plan.test.ts`（资格矩阵） |
+| AR10 | 配置与绑定竞争：resolve 窗口内配置换代 ⇒ `stale_config_generation` 落错不绑定；守卫丢失并入单次重试吸收集，二次仍失 ⇒ 500 | `coordinator/report.test.ts`（`afterReportResolve` 交错）、`store/report.test.ts`（合成守卫丢失） |
+| AR11 | Finish/Report 原子回滚：`insideReportTx` 抛错 ⇒ phase/终态/绑定/lease 全回滚（绑定 UPDATE 在 hook 点之前 ⇒ 被同一回滚覆盖） | `coordinator/report.test.ts` |
+| AR12 | 旧协议兼容：不带字段的 report 行为逐字不变（既有回归零修改通过）；v0 lease 带字段 ⇒ 共享路径同样绑定；`phase5-compat.test.ts` reader 剥离钉不变 | 既有回归 + `coordinator/report.test.ts`（v0 绑定例） |
+
+片 6 以编号外证据覆盖：Report 字段映射表穷尽（`failed`→taxonomy 字面值、到期取消→`"timeout"`、`terminal{code}`→wire code、`unavailable`/`config_changed`/`stopped`→固定字面量、内部异常→`"internal_error"`、`unchanged` 防御臂无字段）、U1 超时补报三态与 10 秒预算（超预算放弃但 Report 字段不变）、commit 与期限擦肩的 `synced` 仍绑定、并发 1 不变式（最终同步期间槽不释放、queued Run 不启动）、`runnerActive` 双门（最终同步期间的迟到 runner 事件被忽略）、ProcessControlError 升级前仍执行最终同步、不可序列化兜底体同样携带字段、关闭中最终同步快路径返回空字段且 Report 滞留不发送、无 `finalSync` 依赖的 runtime 与未配置 Loop 零行为变化、dist 探针（常数导出值、字段合并、容量门）。
+
 额外覆盖配置 no-op、Create 原子性、busy Poll 的 watch 更新、capability 与 claim 交错、错误 taxonomy、8 MiB 请求边界和迟到错误不得覆盖新状态。
 
 质量门：

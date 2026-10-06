@@ -173,7 +173,7 @@ fsync 只覆盖 Blob 文件，不做目录 fsync。目录项崩溃丢失由决�
 
 本批不挂载任何 Artifact HTTP 路由、不启动 watcher、Daemon 不声明 `artifact-sync-v1`、Report 不消费 `artifactSnapshotId`/`artifactSyncError`、Run claim 条件不变、旧 Loop 默认未配置 Artifact 目录且不开始上传、生产装配不构造 BlobStore。
 
-Daemon 的 poll 出站体仅包含既有五个静态字段与 `availableSlots`，不发送 `watchDigest`；poll/report 请求仅使用 `/api/machine/poll` 与 `/api/machine/report`。Batch 2 watcher 接线时须显式更新该边界。AD1–AD4 休眠守卫覆盖路由、Create/Poll/Report、出站请求及启动装配，长期验收要求以 Batch 1 计划为准。Batch 2 按批次计划逐切片解除该边界：片 1 只冻结契约与生产门面（AD1–AD4 仍全绿），片 2 挂 6 条路由与生产装配并解除 Create/Poll/claim/Delivery 的相关休眠，片 5 声明 capability 并启动 watcher，片 6 消费 Report 字段。片 2 之后休眠仍覆盖：Report Artifact 字段（片 6）、Daemon watcher 与 `artifact-sync-v1` 声明（片 5）、读路由与 Dashboard（片 7）；对应守卫按各片的实际解除范围重写（AD1 拆为已挂/未挂两半、AD2(a)/(b) 反转为启用语义、AD4 保留「启动零 fs 副作用、无 watcher」并新增装配断言）。片 3 只新增 Daemon 本地库模块（决策 23），不改任何装配与 wire 面：休眠边界与片 2 之后逐字相同，AD4 的 daemon 半（`identity.test.ts`）零修改全绿即其可执行证据。
+Daemon 的 poll 出站体仅包含既有五个静态字段与 `availableSlots`，不发送 `watchDigest`；poll/report 请求仅使用 `/api/machine/poll` 与 `/api/machine/report`。Batch 2 watcher 接线时须显式更新该边界。AD1–AD4 休眠守卫覆盖路由、Create/Poll/Report、出站请求及启动装配，长期验收要求以 Batch 1 计划为准。Batch 2 按批次计划逐切片解除该边界：片 1 只冻结契约与生产门面（AD1–AD4 仍全绿），片 2 挂 6 条路由与生产装配并解除 Create/Poll/claim/Delivery 的相关休眠，片 5 声明 capability 并启动 watcher，片 6 消费 Report 字段（决策 26：AD3 重写为激活语义，coordinator 报告测试默认注入绑定归属解析）。片 6 之后休眠仍覆盖：读路由与 Dashboard（片 7）；对应守卫按各片的实际解除范围重写（AD1 拆为已挂/未挂两半、AD2(a)/(b) 反转为启用语义、AD3 反转为绑定/落错语义、AD4 保留「启动零 fs 副作用、无 watcher」并新增装配断言）。片 3 只新增 Daemon 本地库模块（决策 23），不改任何装配与 wire 面：休眠边界与片 2 之后逐字相同，AD4 的 daemon 半（`identity.test.ts`）零修改全绿即其可执行证据。
 
 ### 17. 共享 policy 的 ADR-002 窄例外记录
 
@@ -187,7 +187,7 @@ Daemon 的 poll 出站体仅包含既有五个静态字段与 `availableSlots`�
 
 ### 19. Run 快照绑定与配置互斥
 
-绑定资格以 Report 事务显式确认的 finalize/reconcile 结果为准（Batch 1 的 planner 当前仅接受 `run.phase === "running"`；Batch 2 片 6 落地资格参数，规则见本节末段）。canceled/superseded 不绑定，reclaimed（terminal-grace 唤醒报告）路径在 Batch 1 保守排除，Batch 2 按本节末段裁决。
+绑定资格以 Report 事务显式确认的 finalize/reconcile 结果为准（资格参数 `eligibility: "finalize" | "reconcile"` 已由片 6 落地，规则见本节末段）。canceled/superseded 不绑定，reclaimed（terminal-grace 唤醒报告）路径按本节末段裁决。
 
 绑定必须确认已提交 manifest 的 `id === snapshotId`，namespace 匹配可信归属，manifest / Run / Loop / 可信归属四方 machineId 相等，manifest / Run / Loop 的 Loop ID 一致，manifest 配置代际等于当前 Loop 代际。写入已验证的 `manifest.id`。内部拒绝分类为 `snapshot_not_committed` / `cross_namespace` / `cross_machine` / `cross_loop` / `stale_config_generation`；Batch 2 拥有最终接线分类法。
 
@@ -195,7 +195,7 @@ bind 计划携带解析时的 `guardConfigRevision`。落库的 Run UPDATE 守�
 
 守卫零行抛 `ArtifactBindingGuardLostError`，调用方须重解析、重计划；代际前进后转为 `stale_config_generation`。`record_error` 仍守卫 Run `(id, phase)`，但不锁 Loop、不加代际守卫：`cross_*` 与 `snapshot_not_committed` 不受配置代际影响，`stale_config_generation` 在代际单调递增下仍成立。
 
-Batch 2 裁决 reconcile 绑定资格：合法 finalize 与合法 terminal-grace reconcile 都可以绑定 Report 明确携带且通过校验的 snapshot（资格由 Report 事务显式确认，而不是放宽 phase 检查）；取消、superseded 以及没有合法最终 Report 的 reclaimed Run 不绑定。绑定 planner 的资格参数在 Batch 2 片 6 落地。
+Batch 2 裁决 reconcile 绑定资格：合法 finalize 与合法 terminal-grace reconcile 都可以绑定 Report 明确携带且通过校验的 snapshot（资格由 Report 事务显式确认，而不是放宽 phase 检查）；取消、superseded 以及没有合法最终 Report 的 reclaimed Run 不绑定。绑定 planner 的资格参数已在片 6 落地（决策 26）。
 
 ### 20. Delivery Artifact 配置与最终同步代际
 
@@ -273,6 +273,18 @@ claim 的 capability 门控是**逐候选**的，不是整轮 Poll 门控：已�
 
 **片 5 残余。** chokidar 自身遍历无 depth 上限（扫描器的容量上限只管自己的遍历）；roots 重叠的多个 Loop 各自订阅（不共享 watcher，事件冗余）；`directory_missing` 期间不常开 watcher（按 60 秒 tick 重验恢复，最长 60 秒延迟）。
 
+### 26. Run 最终同步与 Report 原子绑定（片 6）
+
+**最终同步编排（Daemon）。** Runner 落定后、Report 序列化前，凡 Delivery 携带 `artifact` 配置的 Run 都执行一次最终同步（`artifact-final-sync.ts`）：目标由 Delivery 组装（决策 20 的代际固定），`freshSession: true`（决策 11——即使内容相同也铸新快照）、`reuseCachedHashes: false`（决策 25——一律全量重哈希）。整个尝试——每 Loop 排队、扫描、上传和重试——共享一个 **30 秒总期限**（`FINAL_SYNC_DEADLINE_MS`），以调用方 AbortSignal 组合实现（既有取消点生效：排队等待、fetch、扫描边界），测试经注入 sleep 确定性驱动。到期取消后**等待该次调用落定**再冻结字段：落定若是 `synced`（commit 与期限真实擦肩）仍绑定该合法快照（绑定校验在服务端）。30 秒之外另设 10 秒补报预算（`FINAL_SYNC_TIMEOUT_REPORT_BUDGET_MS`）：到期取消向 Loop 补报一次 `reportLocalFailure({failure: "timeout"})`（taxonomy 预留值），超预算放弃上报但 Report 字段不变。
+
+**Report 字段映射。** 两字段在 Daemon 侧互斥：`synced` ⇒ `artifactSnapshotId`；其余分支映射为稳定字符串——`failed{failure}` ⇒ taxonomy 字面值；到期取消 ⇒ `"timeout"`；`terminal{code}` ⇒ wire code（无 code 时 `"terminal"`）；`unavailable` ⇒ `"unavailable"`；`config_changed` ⇒ `"config_changed"`；`stopped` ⇒ `"stopped"`；内部程序异常 ⇒ `"internal_error"`（free-form 列，不进 taxonomy、不上报 loops 端点）。字段在序列化前合并进 Report 体（含不可序列化 runner 返回的兜底体），Report 只序列化一次、重试字节一致（决策 24 的镜像语义）。
+
+**容量与关闭语义（runtime）。** 最终同步在 in-flight 槽内执行：槽在 runner 落定后保持占用，`pendingReports.set` 之后**同步**释放（set 与 delete 之间无 await ⇒ 并发 1 不变式不因最终同步开窗口）；runner 的 onProgress 汇以 `runnerActive` 布尔 + inFlight 双门（runner 落定后的事件——包括最终同步期间——一律忽略）。关闭中最终同步快路径返回空字段，Report 滞留内存不发送（既有契约，不改）。
+
+**Report 事务绑定（Server，落地决策 19 末段）。** 绑定逻辑在资格判定（finalize/reconcile）之后、v0/v1 分岔之前的**共享位置**执行（v0 从不携带字段 ⇒ 行为不变）。planner 显式接受事务确认的 `eligibility` 参数，不再从 `run.phase` 推导资格。评估序（第一命中胜）：两字段皆缺席 ⇒ skip；同现 ⇒ `ambiguous_artifact_report`（短路，不读 manifest，存在性不在校验前泄漏）；仅 syncError ⇒ daemon 分类原文落 `runs.artifactSyncError`；归属缺失 ⇒ `attribution_missing`（fail-closed）；仅 snapshotId ⇒ 原五连校验 ⇒ bind。绑定是**独立 guarded UPDATE**（只写 artifact 两列，不与终态 writeSet 合并），在 Run phase 写入之前执行，与其及 Lease 消费同一事务提交或回滚。`ArtifactBindingGuardLostError` 并入 `withReportCasRetry` 吸收集：整事务重跑一次，重跑重读 Loop 重计划（代际前进 ⇒ `stale_config_generation` ⇒ `record_error`），二次仍失 ⇒ `ReportRaceLostError`（非 401 的 500，daemon 保留未消费报告）。可信归属以事务句柄逐调用重新解析。绑定拒绝只记录 Artifact 错误，永不改变合法 Run 终态。
+
+**片 6 残余。** 关闭中 Report 滞留内存丢失是既有契约（最终同步取消只是让字段缺席）；PGlite 单连接下 bind 的 FOR UPDATE 代际互斥只能经 hooks 交错证明语义，真实多物理连接行锁验收归 [#72](https://github.com/zhuabo001/loop-platform-zhb/issues/72)（片 6 不关闭它）；`internal_error` 字面量只落 Run 字段（不进 taxonomy）。
+
 ## 后果
 
 - 片 2/3 可以并行：表结构与 BlobStore adapter 都只对本文档与已编译接口负责。
@@ -342,3 +354,6 @@ claim 的 capability 门控是**逐候选**的，不是整轮 Poll 门控：已�
 - 决策 25 修订（同一轮）：**`ready` 前不得扫描**——准入/订阅期间的事件只记录待办，`ready` 后的全量重哈希首扫先执行，待办事件再由驱动链的下一轮处理（原先状态默认为 watching，事件窗口可在订阅建立前发起扫描并使用事件路径缓存）。
 - 决策 25 修订（同一轮）：**根消失同样关闭订阅**——`directory_missing` 与 `outside_jail` 一样进入 refused，tick 只做零网络本地重验，根恢复后重新订阅并全量扫描（原先只有 `outside_jail` 关闭 watcher，根消失期间仍持有订阅并持续发起注定失败的同步）。
 - 决策 25 补充：机器停止只关闭停止时的集合快照，所有目标在异步关闭前同步 parked 和中止；恢复为新状态对象，旧关闭任务与迟到同步结果不能改动恢复代。事件窗口与可执行请求分开：仅到期窗口可进入驱动链待办，轮末立即补扫只消费已到期事件或核对请求，固定 250 ms 窗口及全量核对优先级不变。驱动链在返回前同步释放在途标记，防止到期窗口在「链已返回、标记尚未释放」的微任务间隙中仅记待办而失去执行者。
+- 新增决策 26（片 6）：Run 最终同步编排（30 秒总期限以调用方 signal 组合、`freshSession` 强制新会话铸快照、全量重哈希、到期取消后等待落定再冻结字段、U1 的 10 秒 `timeout` 补报预算）、Report 字段映射表与两字段互斥、runtime 容量槽在最终同步期间保持占用（`pendingReports.set` 后同步释放）与 `runnerActive` 双门、Report 事务内的绑定接线（共享 v0/v1 位置、ambiguous 短路不读 manifest、归属缺失 fail-closed、绑定 UPDATE 与终态/Lease 消费同事务）、绑定守卫丢失并入 `withReportCasRetry` 的单次重跑吸收集（重跑重计划，代际前进降级为 `stale_config_generation`）。
+- 决策 19 落地：planner 的 `eligibility` 资格参数替换 `run.phase` 硬门（合法 finalize 与合法 terminal-grace reconcile 均可绑定），正文表述更新为现行契约。
+- 决策 16 更新：片 6 消费 Report 的 `artifactSnapshotId`/`artifactSyncError` 字段，AD3 休眠守卫重写为激活语义；片 6 之后休眠仍覆盖读路由与 Dashboard（片 7）。
