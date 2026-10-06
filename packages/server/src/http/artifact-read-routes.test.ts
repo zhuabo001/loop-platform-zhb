@@ -286,6 +286,64 @@ describe("GET /api/loops/:id/artifacts/download (AV4/AV5/AV8, R3)", () => {
     expect(storeLog).toEqual({ opens: 1, releases: 1 }); // natural EOF: released exactly once
   });
 
+  it("non-ASCII basename composes RFC 6266 filename* instead of a ByteString 500 (#110)", async () => {
+    await fresh();
+    const UNICODE_NAME = "报告.txt";
+    await seedManifest({ entries: [{ path: UNICODE_NAME, hash: HASH_A, size: CONTENT_A.length }] });
+    await seedLoop(db, {
+      id: "loop-1",
+      machineId,
+      artifactDir: "/data/out",
+      artifactConfigRevision: 1,
+      artifactManifestRevision: 1,
+      artifactManifestId: "amf-1",
+    });
+    const put = await store.writeVerified({
+      namespaceId: "ns-1",
+      hash: HASH_A,
+      expectedSize: CONTENT_A.length,
+      bytes: (async function* () {
+        yield new TextEncoder().encode(CONTENT_A);
+      })(),
+    });
+    if (!put.ok) throw new Error(`blob fixture must succeed: ${JSON.stringify(put)}`);
+    const res = await app.request(
+      `/api/loops/loop-1/artifacts/download?snapshotId=amf-1&path=${encodeURIComponent(UNICODE_NAME)}`,
+    );
+    expect(res.status).toBe(200); // pre-#110 this threw at Headers (ByteString) → 500
+    expect(res.headers.get("content-disposition")).toBe(
+      `attachment; filename=".txt"; filename*=UTF-8''${encodeURIComponent(UNICODE_NAME)}`,
+    );
+    expect(new TextDecoder().decode(await res.arrayBuffer())).toBe(CONTENT_A);
+    expect(storeLog).toEqual({ opens: 1, releases: 1 });
+  });
+
+  it("HEAD: headers answer, the never-pulled stream is released exactly once (#109)", async () => {
+    await fresh();
+    await boundLoop();
+    const res = await app.request(downloadPath, { method: "HEAD" });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-length")).toBe(String(CONTENT_B.length));
+    expect(res.headers.get("content-disposition")).toBe('attachment; filename="b.txt"');
+    expect(await res.text()).toBe(""); // Hono answers HEAD with the GET response's headers, null body
+    expect(storeLog).toEqual({ opens: 1, releases: 1 }); // pre-#109: { opens: 1, releases: 0 }
+  });
+
+  it("AV8/#109: a client cancel BEFORE the first pull still releases the handle", async () => {
+    await fresh();
+    await boundLoop();
+    const ctl = new AbortController();
+    const res = await app.request(downloadPath, { signal: ctl.signal });
+    expect(res.status).toBe(200);
+    // The body is NEVER read: the pump never starts, so the release can only
+    // come from the EAGER abort hook. Pre-#109 the hook lived inside the
+    // generator → this leaked (opens 1, releases 0).
+    ctl.abort();
+    await new Promise((resolve) => setTimeout(resolve, 20)); // let the hook run
+    expect(storeLog).toEqual({ opens: 1, releases: 1 });
+    await res.body?.cancel().catch(() => {});
+  });
+
   it("R3: blob gone from disk ⇒ 404 path_not_found, byte-identical to /nope (never the table's 409)", async () => {
     await fresh();
     await seedManifest();
@@ -532,6 +590,11 @@ describe("GET /api/loops/:id/artifacts/diff (AV6)", () => {
     const missingTo = await app.request("/api/loops/loop-1/artifacts/diff");
     expect(missingTo.status).toBe(400);
     expect(await missingTo.json()).toEqual({ error: "invalid request" });
+    // #112: an HTML form's empty option submits `to=` — normalized like `from=`
+    // at the route, NOT passed shape-valid into a downstream snapshot_not_found.
+    const emptyTo = await app.request("/api/loops/loop-1/artifacts/diff?from=amf-1&to=");
+    expect(emptyTo.status).toBe(400);
+    expect(await emptyTo.json()).toEqual({ error: "invalid request" });
     const crossLoop = await app.request("/api/loops/loop-1/artifacts/diff?to=amf-other");
     expect(crossLoop.status).toBe(404);
     expect(await crossLoop.text()).toBe(await notFoundBody());

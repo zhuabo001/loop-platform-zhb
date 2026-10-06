@@ -793,6 +793,79 @@ describe("slice 7 artifact pages (决策 27)", () => {
     }
   });
 
+  it("#111: the run page is nested under its parent loop — a mismatched parent path is the same 404", async () => {
+    await fresh({
+      artifacts: fakeArtifacts({
+        runArtifacts: (runId): Promise<ReadRunArtifactsResult> =>
+          Promise.resolve({
+            ok: true,
+            response: {
+              runId,
+              loopId: "loop-1", // the run really belongs to loop-1…
+              state: "bound",
+              snapshotId: "amf-1",
+              manifestRevision: 1,
+              configRevision: 1,
+              committedAt: "2026-10-06T00:00:00.000Z",
+              fileCount: 1,
+              totalBytes: 3,
+              files: [{ path: "a.txt", hash: "b".repeat(64), size: 3 }],
+            },
+          }),
+      }),
+    });
+    const res = await getArtifactPage(app, "/dashboard/loops/loop-OTHER/artifacts/runs/run-1"); // …not loop-OTHER
+    expect(res.status).toBe(404);
+    const html = await res.text();
+    expect(html).toContain("不存在或不可见");
+    expect(html).not.toContain("a.txt"); // another loop's file table/download links never render
+  });
+
+  it("#113: the snapshot list is read only AFTER the domain verdict — a faulting list never masks 403 into 500", async () => {
+    // Direct reproduction of the review probe: attribution is missing (domain
+    // verdict 403) AND the bare list read fails. Promise.all ran both in
+    // parallel, the rejection won, and the page was a 500 with listCalls 1.
+    let listCalls = 0;
+    const faultingSeam = (): DashboardArtifactRead =>
+      fakeArtifacts({
+        loopArtifacts: () => Promise.resolve({ ok: false, failure: "attribution_missing" }),
+        diff: () => Promise.resolve({ ok: false, failure: "attribution_missing" }),
+        boundSnapshots: () => {
+          listCalls += 1;
+          return Promise.reject(new Error("injected list-read storage fault"));
+        },
+      });
+    await fresh({ artifacts: faultingSeam() });
+    const page = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts");
+    expect(page.status).toBe(403);
+    expect(await page.text()).toContain("归属缺失");
+    expect(listCalls).toBe(0); // the list read never started — domain verdict first
+
+    await fresh({ artifacts: faultingSeam() });
+    const diff = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts/diff?from=amf-1&to=amf-2");
+    expect(diff.status).toBe(403);
+    expect(listCalls).toBe(0);
+  });
+
+  it("P3: banner tokens are OWN-KEY lookups — __proto__/constructor/toString render no banner", async () => {
+    await fresh({
+      artifacts: fakeArtifacts({
+        loopArtifacts: () => Promise.resolve(VIEW_FIXTURE as ReadLoopArtifactsResult),
+        boundSnapshots: () => Promise.resolve([]),
+      }),
+    });
+    for (const token of ["__proto__", "constructor", "toString"]) {
+      const res = await getArtifactPage(app, `/dashboard/loops/loop-1/artifacts?config=${token}`);
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).not.toContain("Artifact 目录已更新。"); // prototype props are not banner labels
+      expect(html).not.toContain("[object Object]");
+    }
+    // The known-token path is untouched.
+    const known = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts?config=updated");
+    expect(await known.text()).toContain("Artifact 目录已更新。");
+  });
+
   describe("the config form POST", () => {
     it("valid token saves and redirects with the outcome banner token", async () => {
       const calls: Array<{ loopId: string; command: { artifactDir: string | null } }> = [];

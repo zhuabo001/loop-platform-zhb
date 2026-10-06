@@ -491,4 +491,14 @@ describe("slice 7 page models (AV3)", () => {
     expect(html).toContain("同步失败：timeout");
     expect(html).toContain("Artifact 目录已更新。");
   });
+
+  it("P3: the banner lookup is own-key — prototype property names are not labels", () => {
+    for (const token of ["__proto__", "constructor", "toString", "hasOwnProperty"]) {
+      const model = buildLoopArtifactsPageModel({ loopId: "loop-1", view: ARTIFACT_VIEW, bound: [], configToken: token });
+      expect(model.configBanner).toBeNull();
+      const html = renderLoopArtifactsPage(model, { csrfToken: "tok" });
+      expect(html).not.toContain("[object Object]");
+      expect(html).not.toContain("function");
+    }
+  });
 });

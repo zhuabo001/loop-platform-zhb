@@ -453,7 +453,10 @@ export function buildLoopArtifactsPageModel(input: {
   return {
     loopId,
     configAction: dashboardArtifactConfigPath(loopId),
-    configBanner: configToken === null ? null : (CONFIG_BANNER_LABELS[configToken] ?? null),
+    configBanner:
+      configToken === null || !Object.hasOwn(CONFIG_BANNER_LABELS, configToken)
+        ? null
+        : CONFIG_BANNER_LABELS[configToken]!,
     artifactDirLabel: view.artifactDir ?? ARTIFACT_UNCONFIGURED_TEXT,
     artifactDirValue: view.artifactDir ?? "",
     stale: view.stale,

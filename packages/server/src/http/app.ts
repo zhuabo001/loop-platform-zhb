@@ -111,17 +111,25 @@ async function parseJsonBody(c: Context): Promise<unknown> {
   }
 }
 
-/** The Content-Disposition filename: the manifest path's LAST segment only
- *  (manifest paths are server-written policy-validated relative paths —
- *  defense in depth), control chars stripped, `"` and `\` backslash-escaped
- *  per RFC 6266; empty ⇒ the fixed `artifact`. */
-function contentDispositionBasename(manifestPath: string): string {
-  const base = manifestPath.split("/").pop() ?? "";
-  const cleaned = base
-    .replace(/[\x00-\x1f\x7f]/g, "")
-    .replace(/\\/g, "\\\\")
-    .replace(/"/g, '\\"');
-  return cleaned === "" ? "artifact" : cleaned;
+/** The Content-Disposition value (RFC 6266): a quoted `filename` fallback
+ *  carrying printable ASCII only, plus `filename*=UTF-8''…` whenever the
+ *  basename has non-ASCII characters. `Headers` is ByteString — a raw CJK
+ *  basename throws at composition (review #110: a 500 AFTER a successful
+ *  open, handle-close path working, client still got no file). The basename
+ *  is the manifest path's LAST segment only (server-written policy-validated
+ *  relative paths — defense in depth); control chars stripped, `"` and `\`
+ *  backslash-escaped in the quoted fallback. Empty fallback ⇒ `artifact`. */
+function contentDispositionValue(manifestPath: string): string {
+  const base = (manifestPath.split("/").pop() ?? "").replace(/[\x00-\x1f\x7f]/g, "");
+  const fallback = base.replace(/[^\x20-\x7e]/g, "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const asciiName = fallback === "" ? "artifact" : fallback;
+  if (/^[\x20-\x7e]*$/.test(base)) return `attachment; filename="${asciiName}"`;
+  // RFC 5987 encoding: encodeURIComponent leaves `!'()*` unescaped, which
+  // attr-char does not allow.
+  const encoded = encodeURIComponent(base).replace(/[!'()*]/g, (ch) =>
+    `%${ch.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+  return `attachment; filename="${asciiName}"; filename*=UTF-8''${encoded}`;
 }
 
 /** The AV8 stream pump. The client-abort hook fires `close()` (idempotent);
@@ -134,6 +142,7 @@ async function* pumpArtifactDownload(
   bytes: AsyncIterable<BlobStreamChunk>,
   close: () => Promise<void>,
   signal: AbortSignal | undefined,
+  onSettled: () => void,
 ): AsyncGenerator<Uint8Array> {
   const onAbort = (): void => {
     void close().catch(() => {});
@@ -151,6 +160,7 @@ async function* pumpArtifactDownload(
     }
   } finally {
     signal?.removeEventListener("abort", onAbort);
+    onSettled();
     await close().catch(() => {});
   }
 }
@@ -166,12 +176,34 @@ function artifactDownloadResponse(
 ): Response {
   const headers = new Headers({
     "content-type": "application/octet-stream",
-    "content-disposition": `attachment; filename="${contentDispositionBasename(entryPath)}"`,
+    "content-disposition": contentDispositionValue(entryPath),
     "content-length": String(opened.size),
     "x-content-type-options": "nosniff",
     "cache-control": "no-store",
   });
-  return new Response(pumpArtifactDownload(opened.bytes, opened.close, c.req.raw.signal), { status: 200, headers });
+  const signal = c.req.raw.signal;
+  // #109 (HEAD): Hono answers HEAD by running the GET handler and discarding
+  // the body (hono-base #dispatch wraps the response in `new Response(null,
+  // …)`) — the stream is NEVER pulled and the signal never aborts, so the
+  // opened handle would leak. Answer with the headers (incl. Content-Length,
+  // which is what HEAD is for) and no body; release immediately.
+  if (c.req.method === "HEAD") {
+    void opened.close().catch(() => {});
+    return new Response(null, { status: 200, headers });
+  }
+  // #109 (cancel before first pull): the abort hook lives EAGERLY here, NOT
+  // inside the generator — a generator body does not run until its first
+  // `next()`, so a client canceling between the headers and the first chunk
+  // would never reach a hook registered there. close() is idempotent; the
+  // pump's own finally-collapse is a no-op afterwards.
+  const onAbort = (): void => {
+    void opened.close().catch(() => {});
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+  const body = pumpArtifactDownload(opened.bytes, opened.close, signal, () =>
+    signal?.removeEventListener("abort", onAbort),
+  );
+  return new Response(body, { status: 200, headers });
 }
 
 /** The manual trigger takes NO business params: an EMPTY body normalizes to
@@ -569,8 +601,9 @@ export function createServerApp(
 
     // ---- slice 7 read routes (ADR-010 决策 27) ----
     // The query-string precedent: raw values, EMPTY STRING normalized to
-    // undefined (an HTML form's empty baseline submits `from=`), then the
-    // FROZEN query schema. Malformed ⇒ the code-less 400.
+    // undefined (an HTML form's empty option submits `key=` — `from` for the
+    // empty baseline AND `to` alike, review #112), then the FROZEN query
+    // schema. Malformed ⇒ the code-less 400.
     const parseDownloadQuery = (c: Context): { snapshotId: string; path: string } | undefined => {
       const parsed = artifactDownloadQuerySchema.safeParse({
         snapshotId: c.req.query("snapshotId"),
@@ -580,9 +613,10 @@ export function createServerApp(
     };
     const parseDiffQuery = (c: Context): { from?: string; to: string } | undefined => {
       const from = c.req.query("from");
+      const to = c.req.query("to");
       const parsed = artifactDiffQuerySchema.safeParse({
         from: from === undefined || from === "" ? undefined : from,
-        to: c.req.query("to"),
+        to: to === undefined || to === "" ? undefined : to,
       });
       return parsed.success ? parsed.data : undefined;
     };

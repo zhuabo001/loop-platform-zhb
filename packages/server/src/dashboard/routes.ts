@@ -282,8 +282,13 @@ export function createDashboardRoutes(deps: DashboardRouteDeps): DashboardRoutes
     (async (c) => {
       try {
         const loopId = c.req.param("id") ?? "";
-        const [view, bound] = await Promise.all([artifacts.loopArtifacts(loopId), artifacts.boundSnapshots(loopId)]);
+        // 决策 27's evaluation order holds for the page too (review #113):
+        // the domain verdict comes FIRST, the bare snapshot-list read only
+        // after it — a list-read fault must never mask attribution_missing
+        // (403) into a 500. Sequential, not Promise.all.
+        const view = await artifacts.loopArtifacts(loopId);
         if (!view.ok) return artifactPageFailure(c, view.failure);
+        const bound = await artifacts.boundSnapshots(loopId);
         const model = buildLoopArtifactsPageModel({
           loopId,
           view: view.response,
@@ -306,6 +311,14 @@ export function createDashboardRoutes(deps: DashboardRouteDeps): DashboardRoutes
       try {
         const result = await artifacts.runArtifacts(c.req.param("runId") ?? "");
         if (!result.ok) return artifactPageFailure(c, result.failure);
+        // #111: the run page is NESTED under its parent loop — the run is
+        // visible only from the loop it belongs to. A mismatched parent path
+        // is one 404, indistinguishable from "never existed" (决策 13:
+        // existence never leaks across scopes, and another loop's file table
+        // must never render under the wrong parent).
+        if (result.response.loopId !== (c.req.param("id") ?? "")) {
+          return artifactPageFailure(c, "run_not_found");
+        }
         return new Response(renderRunArtifactsPage(buildRunArtifactsPageModel({ response: result.response })), {
           status: 200,
           headers: securityHeaders({ "content-type": "text/html; charset=UTF-8" }),
@@ -334,8 +347,11 @@ export function createDashboardRoutes(deps: DashboardRouteDeps): DashboardRoutes
             headers: securityHeaders({ location: dashboardArtifactsPath(loopId) }),
           });
         }
-        const [result, bound] = await Promise.all([artifacts.diff(loopId, { from, to }), artifacts.boundSnapshots(loopId)]);
+        // Same domain-first sequencing as the artifacts page (#113): the
+        // diff verdict precedes the bare snapshot-list read.
+        const result = await artifacts.diff(loopId, { from, to });
         if (!result.ok) return artifactPageFailure(c, result.failure);
+        const bound = await artifacts.boundSnapshots(loopId);
         const model = buildArtifactDiffPageModel({
           loopId,
           response: result.response,
