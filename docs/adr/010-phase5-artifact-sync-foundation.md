@@ -285,6 +285,24 @@ claim 的 capability 门控是**逐候选**的，不是整轮 Poll 门控：已�
 
 **片 6 残余。** 关闭中 Report 滞留内存丢失是既有契约（最终同步取消只是让字段缺席）；PGlite 单连接下 bind 的 FOR UPDATE 代际互斥只能经 hooks 交错证明语义，真实多物理连接行锁验收归 [#72](https://github.com/zhuabo001/loop-platform-zhb/issues/72)（片 6 不关闭它）；`internal_error` 字面量只落 Run 字段（不进 taxonomy）。
 
+### 27. 管理读路由与 Dashboard 文件视图（片 7）
+
+**读路由激活（决策 16 解除）。** 片 7 起四个只读管理端点挂载：`GET /api/loops/:id/artifacts`（当前文件视图）、`GET /api/runs/:id/artifacts`（绑定快照或显式 missing）、`GET /api/loops/:id/artifacts/download`（按 snapshotId + manifest path 查表下载）、`GET /api/loops/:id/artifacts/diff`（同 Loop 两快照结构 diff）。读取走 `ArtifactApi` 的扩展管理方法（与 `updateConfig` 同为无凭据 loopback 边界），纯域读收敛在新模块 `artifact/read.ts`，复用 `readCurrentArtifactView`（决策 8 的过期读取时计算）与 `readArtifactSnapshot`（决策 12）。AD1 读路由半的休眠守卫据此翻转为激活语义。
+
+**管理读求值序。** 无凭据管理读的机器身份从 loop 行发现：**loop 行查找即身份发现步**，归属（决策 7）在任何 snapshot/path/blob 解析之前重新解析，任何数据离开之前完成。跨 scope 的 snapshot/path/run 引用与「从未存在」不可区分（无码 404 家族，决策 13）；归属缺失是 403 `artifact_attribution_missing`。
+
+**下载路由组合规则（用户裁决 R3）。** 下载端点开流失败的 `blob_missing`（manifest 有条目、磁盘字节被越外删除）映射为 **404 `path_not_found`**（无码 404 家族，body 与 `app.notFound` 逐字节一致），**不**使用通用冻结表的 `blob_missing → 409 artifact_blob_missing`——客户端视角「该 manifest path 的字节不在了」与 path 缺失不可区分，留在无码 404 家族保持存在性不泄漏。此组合仅属下载路由；通用映射表保持冻结。开流异常 `invalid_key`/`not_regular_file`（凭 resolver 形成的 namespace 与策略校验的 manifest hash 下不可达）防御性归 `storage_error`（500），绝不洗成重传类 409。下载按 **snapshotId + manifest 条目查表**，绝不从 URL 路径拼磁盘路径；blob 键的 namespace 出自归属解析器，不取自 manifest 行。响应固定五头：`application/octet-stream`、`Content-Disposition: attachment`（filename 取 manifest path 末段，控制字符剥离 + RFC 6266 引号转义）、`Content-Length`（真实大小）、`X-Content-Type-Options: nosniff`、`Cache-Control: no-store`。**忽略 Range 请求**（始终完整 200；本地回环管理面无断点续传需求）。中流存储失败以终结流元素到达：头发出后状态不可改，响应按截断收尾——HTTP 层唯一剩余的完整性信号是 `Content-Length`，需要确定性的客户端将所收字节与 manifest hash 对摘要。客户端中止（连接关闭）经请求 signal 触发 `close()`，句柄释放与流泵同属路由层职责。
+
+**Run 快照视图判别（用户裁决 V3）。** `missing` 冻结为「从未绑定」：已绑定 Run 的 manifest 行被越外删除（无任何删除 API，纯防御路径）返回 404 `snapshot_not_found`，绝不改写为 missing——把已绑定 Run 呈现为未绑定等于伪造历史。
+
+**结构 diff（用户裁决 V1）。** diff 是纯方向性集合代数，按传入计算（before=from、after=to），冻结失败域不新增乱序拒绝字面量；同快照 ⇒ 全 unchanged ⇒ 空 diff。条目只含新增/删除（完整 path/hash/size）与修改（前后 hash/size），同 hash 条目省略，**不含内容**。省略 `from`（路由层把空串规范化为缺席——HTML 表单空基线项提交 `from=`）= 空集合基线（首个快照约定）。页面默认基线 = revision 更小的最近已绑定 Run 快照，操作者侧顺序由页面默认保证。
+
+**Loop 视图与未配置语义。** 未配置 Loop 不是错误：冻结视图形状的 `artifactDir` 可空，照服 null/零值视图（Dashboard 渲染未配置态）；`artifact_dir_unconfigured` 保持读取失败联合成员，本片无路由返回它（机器侧读取继续返回它）。
+
+**Dashboard。** 四个 SSR 路由（配置表单+当前视图页、Run 快照页、diff 页、CSRF 配置 POST）零客户端 JS：diff 选择是纯 GET 表单，下载是普通链接（query 值服务端百分号编码）。CSRF 原语泛化为 `checkCsrfFormFields`（白名单字段），`checkCsrfForm` 成为其 `allowedFields=[]` 的委托单实现——既有 run 表单的冻结判定逐字不变。配置表单的业务结局镜像 run 表单「一切皆 303」，拒绝经固定 token 映射为固定中文横幅；抛错绝不伪装（500）。无 artifacts 装配时页面不注册、404 不可区分（既有休眠形状对 Dashboard 侧本就是「路由不存在」，片 7 新增激活证据而非翻转守卫）。
+
+**片 7 残余。** 中流截断在 HTTP 层不可检（见下载组合规则）；PGlite 单连接下读路径无行锁需求（只读），下载流式期间不持有 DB 连接；Dashboard 未绑定 Run 的 `artifactSyncError`（free-form 列）不在冻结 run 视图形状内，页面只显示固定「未绑定」文案。
+
 ## 后果
 
 - 片 2/3 可以并行：表结构与 BlobStore adapter 都只对本文档与已编译接口负责。
@@ -359,3 +377,4 @@ claim 的 capability 门控是**逐候选**的，不是整轮 Poll 门控：已�
 - 决策 16 更新：片 6 消费 Report 的 `artifactSnapshotId`/`artifactSyncError` 字段，AD3 休眠守卫重写为激活语义；片 6 之后休眠仍覆盖读路由与 Dashboard（片 7）。
 - 决策 26 修订（片 6 首轮三轨审查修复，[#105](https://github.com/zhuabo001/loop-platform-zhb/issues/105)）：**两字段互斥按原始可选字段的出现性判定**——原先服务端先按存储政策清洗 `artifactSyncError` 再据此判同现，空串／纯空白／纯 NUL 被视为缺席，双字段畸形 Report 反而走 snapshot 校验链并绑定合法 snapshot。现在出现性只看原始 wire 字段（清洗仅决定 error-only 报告记录的文本；清洗后无可用文本时什么都不写），双字段短路保持在任何 manifest 查询之前。
 - 决策 26 修订（同一轮，[#106](https://github.com/zhuabo001/loop-platform-zhb/issues/106)）：**期限到期由 watcher 自行记录，不由落定结果推断**——原先只有 `cancelled` 落定进入 timeout 分支，扫描挂起越期后才以 `failed{unreadable}` 落定的 Run 会携带后续结果且缺失 U1 补报。现在正常完成经 done 信号解除 watcher（绝不误判到期），其余任何到期落定冻结 `"timeout"` 并在独立 10 秒预算内补报一次；watcher 解除在所有落定路径（含内部异常）统一执行，不留越期计时器。
+- 新增决策 27（片 7）：管理读路由激活（决策 16 的读路由与 Dashboard 休眠解除）与求值序（loop 行=身份发现、归属先行）、下载路由的组合规则（R3：开流 `blob_missing` ⇒ 404 `path_not_found`，仅该路由，通用映射表冻结不动；异常开流归 `storage_error`；五头固定；忽略 Range；中流截断语义）、Run 快照视图判别（V3：绑定行越外消失 ⇒ 404 绝不改写 missing）、结构 diff 按传入计算（V1）与空基线约定、未配置 Loop 照服 null 视图（`artifact_dir_unconfigured` 本片无路由返回）、Dashboard 四路由与 CSRF 字段白名单泛化（`checkCsrfForm` 成为委托单实现）。
