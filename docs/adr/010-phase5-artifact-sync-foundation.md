@@ -387,3 +387,10 @@ claim 的 capability 门控是**逐候选**的，不是整轮 Poll 门控：已�
 - 决策 27 修订（片 7 二轮三轨审查修复，[#109](https://github.com/zhuabo001/loop-platform-zhb/issues/109)）：**释放责任整体建立在响应构建阶段**——首轮的急挂钩只覆盖 signal 路径；直接 `body.cancel()`（不触发请求 signal）与 signal 已 aborted/异步 open 期间中止（监听器永不补发）仍泄漏。下载体改为 `ReadableStream`：`cancel()` 回调不经任何拉取即可触达释放（惰性生成器的 finally 对未启动场景不存在）；open 返回后先查 `signal.aborted` 即时释放；`settled` 把 abort/cancel/EOF/中流截断折叠到唯一幂等 `close()`，泵退化为纯转发。
 - 决策 27 修订（同一轮，[#111](https://github.com/zhuabo001/loop-platform-zhb/issues/111)）：**父 Loop 校验上移到 Run 身份发现步骤**——首轮只在成功结果上核对 `response.loopId`，归属解析失败（`attribution_missing`）在错父/不存在父路径下答 403，与未知 Run 的 404 构成跨 scope 存在性泄漏（决策 13）。`readRun`/`runArtifacts` 收预期父 `loopId`，在归属解析之前把错配折叠为 `run_not_found`；合法父路径的归属缺失仍是 403 对照；路由不新增 DB 旁路，单 ArtifactApi 门面与既有错误域不变（扁平 JSON 路由 `/api/runs/:id/artifacts` 无父路径，行为不变）。
 - 决策 27 修订（同一轮，[#112](https://github.com/zhuabo001/loop-platform-zhb/issues/112)）：**下载必填键同规格空串规范化**——`snapshotId=`/`path=` 空串在路由层归 undefined，冻结 shape-only schema 拒绝 ⇒ 400；缺席/空串/合法值三类回归建立；protocol/error-mapping 保持零改动。
+
+### 2026-10-07
+
+- 片 8（故障集成验收与批次收口）登记：27 条决策全部落地。集成验收 AI1–AI7 以真实 HTTP + 文件型 PGlite + 本地 BlobStore + 生产形态 Daemon runtime + Fake Runner + 真实临时目录完成（证据：`docs/tests/phase5-acceptance.md` Batch 2 段）；片 4 假服务端与真实服务端的语义平价以行为级重放建立（AI5），平价表与已知分歧（`dropSessions` 建模更弱服务端）记录在同处。
+- 决策 16 终态：AD1–AD4 已逐片翻转为激活断言（片 2/5/6/7），片 8 新增 AI7「生产启用 + 旧 Loop 不上传」e2e 守卫取代 Batch 1 休眠守卫套件；基础回归（旧 Loop 不上传单元钉四处、runtime 可选依赖组合钉）全部保留。
+- 片 3 的 [#91](https://github.com/zhuabo001/loop-platform-zhb/issues/91) 已经片 5 第二轮独立复审核销关闭；2026-10-05 条目的「#91 保持 OPEN」为历史记录，不改写。
+- 残余如实登记：U2（等价内容重启首轮铸一次 revision，AS6 已记录）在真实 HTTP 集成面复现，AI6(a) 钉为恰 +1 且零 PUT；决策 27 的三项残余（中流截断不可检、忽略 Range、`artifact_dir_unconfigured` 无路由返回）不变；#11/#72 的真实 Postgres 多物理连接验收继续归 Phase 6。

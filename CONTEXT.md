@@ -148,3 +148,28 @@ _Avoid_: Ignore list, blacklist
 The guarded link between a Run and a committed manifest whose identity chain and config
 generation were verified at write time.
 _Avoid_: Snapshot attach, reference update
+
+**Watch Set**:
+The poll-delivered list of per-Loop artifact watch items the daemon subscribes to; the server
+re-sends the full set only on material change.
+_Avoid_: Subscription list, watcher config
+
+**Watch Digest**:
+The opaque digest of the applied Watch Set the daemon echoes on the next poll, so the server can
+skip re-delivery when nothing moved.
+_Avoid_: Watch hash, config version
+
+**Sync Client**:
+The daemon's artifact synchronization state machine: idempotent session identity, recovery,
+sticky stops, and the global upload gate.
+_Avoid_: Uploader, sync service
+
+**Final Sync**:
+The per-Run conclusive synchronization, run after the runner settles and before the report is
+serialized, that mints a fresh snapshot even when the content is unchanged.
+_Avoid_: Final upload, run commit
+
+**Attribution Resolver**:
+The server-side derivation of the trusted Storage Namespace from the authenticated Machine; the
+wire can never name one.
+_Avoid_: Tenant lookup, namespace parameter
