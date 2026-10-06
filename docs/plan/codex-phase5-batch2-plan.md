@@ -261,6 +261,19 @@ Batch 1 错误映射在 HTTP 接线时补齐：revision 耗尽使用新增 `arti
 
 额外覆盖配置 no-op、Create 原子性、busy Poll 的 watch 更新、capability 与 claim 交错、错误 taxonomy、8 MiB 请求边界和迟到错误不得覆盖新状态。
 
+片 7 的 AV 编号逐项对应（场景不依赖 handoff 记录；规则见 ADR-010 决策 27）：
+
+| ID | 场景 | 主要证据 |
+|---|---|---|
+| AV1 | 读取接线：四个读取端点经真实 facade 挂载；当前视图 JSON 与冻结 schema 一致（sync 状态、stale、files） | `server/src/http/artifact-read-routes.test.ts`（mounted-with-facade 200 族）、`phase5-batch2-slice7-e2e.test.ts`（真实同步后当前视图含编辑后文件集） |
+| AV2 | 跨资源拒绝：跨 Loop 的 snapshot/run/path 一律无码 404、body 与 `app.notFound` 逐字节一致；attribution 缺失 ⇒ 403 | `server/src/http/artifact-read-routes.test.ts`（loop B 快照经 loop A 查询；manifest 外 path；poisoned attribution ⇒ 403） |
+| AV3 | HTML/XSS：恶意 loopId/artifactDir/manifest path 在文本与属性位全部转义；下载链接 query 百分号编码；无 script | `server/src/dashboard/page.test.ts` 新增（hostile 串渲染）、`dashboard/routes.test.ts` 新增（线上转义） |
+| AV4 | attachment/响应头：`application/octet-stream`、`Content-Disposition: attachment`（filename 转义）、`X-Content-Type-Options: nosniff`、`Content-Length` = 真实 blob 大小 | `server/src/http/artifact-read-routes.test.ts`（内存 store 头钉）、e2e 对真实本地 store 重钉 |
+| AV5 | 二进制下载：下载字节 == 磁盘 blob 字节（非 UTF-8 内容、sha256/字节比对） | `phase5-batch2-slice7-e2e.test.ts`（`dataDir/blobs/<machineId>/<hash>` 直读比对） |
+| AV6 | 结构 diff：added/modified/removed + 前后 hash/size；省略 from = 空基线；同快照 = 空 diff；跨 Loop 拒绝；乱序按传入计算 | `server/src/artifact/read.test.ts`（纯 `diffManifestEntries` 矩阵）、`artifact-read-routes.test.ts`（冻结响应形） |
+| AV7 | 缺失/过期：未绑定 Run ⇒ `{state:"missing"}`；绑定行越外消失 ⇒ `snapshot_not_found` 404；配置换代 ⇒ `stale:true` 视图照服；未配置 Loop ⇒ null 视图 | `artifact-read-routes.test.ts`（missing/stale/unconfigured 探针）、e2e（配置变更后 stale 旗标） |
+| AV8 | 句柄与中断：中止 ⇒ `close()` 恰一次；自然 EOF 无泄漏；未迭代即放弃 ⇒ `close()`；中流 storage_error ⇒ 截断 + 清理 | `artifact-read-routes.test.ts`（计数假 BlobStore + `AbortController` 经 `app.request(..., { signal })` 注入） |
+
 质量门：
 
 ```bash
