@@ -313,27 +313,34 @@ export function createArtifactWatchManager(deps: ArtifactWatchManagerDeps): Arti
    *  round at a time; a request that arrives mid-chain only extends it. */
   async function driveRounds(state: LoopWatch, first: SyncMode): Promise<void> {
     let mode = first;
-    for (;;) {
-      if (!canRun(state)) return;
-      const generation = state.generation;
-      const target = state.item;
-      const outcome = await deps.sync.syncLoop({
-        target,
-        daemonRoots: deps.daemonRoots,
-        signal: state.ctl.signal,
-        // The EVENT path is the only one allowed to reuse cached hashes
-        // (决策 23/25); startup, this 60 s tick and slice 6 keep rehashing.
-        reuseCachedHashes: mode === "event",
-      });
-      // A round that belongs to a REPLACED generation is void: its abort
-      // raced its completion, and acting on it could close the successor's
-      // watcher or park a healthy loop.
-      if (state.generation !== generation || !isCurrent(state)) return;
-      await handleOutcome(state, outcome);
-      const followUp = state.pending;
-      if (followUp === null) return;
-      state.pending = null;
-      mode = followUp;
+    try {
+      for (;;) {
+        if (!canRun(state)) return;
+        const generation = state.generation;
+        const target = state.item;
+        const outcome = await deps.sync.syncLoop({
+          target,
+          daemonRoots: deps.daemonRoots,
+          signal: state.ctl.signal,
+          // The EVENT path is the only one allowed to reuse cached hashes
+          // (决策 23/25); startup, this 60 s tick and slice 6 keep rehashing.
+          reuseCachedHashes: mode === "event",
+        });
+        // A round that belongs to a REPLACED generation is void: its abort
+        // raced its completion, and acting on it could close the successor's
+        // watcher or park a healthy loop.
+        if (state.generation !== generation || !isCurrent(state)) return;
+        await handleOutcome(state, outcome);
+        const followUp = state.pending;
+        if (followUp === null) return;
+        state.pending = null;
+        mode = followUp;
+      }
+    } finally {
+      // Release ownership before this async function returns. A separately
+      // queued Promise.finally would leave a microtask gap: an expired window
+      // could record pending work after the driver had already stopped.
+      state.inFlight = null;
     }
   }
 
@@ -346,10 +353,7 @@ export function createArtifactWatchManager(deps: ArtifactWatchManagerDeps): Arti
       return Promise.resolve();
     }
     if (!canRun(state)) return Promise.resolve();
-    let run: Promise<void> | null = null;
-    run = driveRounds(state, mode).finally(() => {
-      if (state.inFlight === run) state.inFlight = null;
-    });
+    const run = driveRounds(state, mode);
     state.inFlight = run;
     return run;
   }

@@ -836,6 +836,31 @@ describe("artifact-watch-manager", () => {
     expect(harness.sync.calls[2]!.reuseCachedHashes).toBe(false);
   });
 
+  it("keeps an event window that expires exactly as the previous driver returns (#103)", async () => {
+    const harness = createHarness();
+    harness.manager.apply([item()]);
+    await harness.manager.settled();
+    let release!: (outcome: ArtifactSyncOutcome) => void;
+    const held = new Promise<ArtifactSyncOutcome>((resolve) => { release = resolve; });
+    harness.sync.client.syncLoop = (input) => {
+      harness.sync.calls.push(input);
+      return harness.sync.calls.length === 2 ? held : Promise.resolve({ kind: "unchanged" });
+    };
+    harness.watchers.handles[0]!.emit();
+    await fireWindow(harness);
+    harness.watchers.handles[0]!.emit();
+
+    release({ kind: "unchanged" });
+    // The round's continuation is already queued. Resolve the next window
+    // one microtask later, at the driver's return / cleanup boundary.
+    queueMicrotask(() => harness.time.fire(ARTIFACT_WATCH_EVENT_MERGE_MS));
+    await tick();
+    await harness.manager.settled();
+    expect(harness.sync.calls).toHaveLength(3);
+    expect(harness.sync.calls[2]!.reuseCachedHashes).toBe(true);
+    expect(await harness.manager.drain(1_000)).toEqual({ settled: true });
+  });
+
   it("never scans before `ready`: a pre-ready event is only recorded (P2/AW12)", async () => {
     const harness = createHarness();
     harness.watchers.autoReady.value = false;
