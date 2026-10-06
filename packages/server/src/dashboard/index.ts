@@ -20,14 +20,17 @@
  *    separately-truncated machine list, and never by comparing version strings
  *    (ADR-009 决策 7: membership only).
  */
-import { and, asc, desc, inArray } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull } from "drizzle-orm";
 
 import { hasTerminalJournalV1, type LoopSummary, type RunRole, type RunSummary } from "@loopzhb/protocol";
 
 import { LOOP_LIST_CAP, runSummaryColumns, type LoopAdmin } from "../admin/index.js";
 import { toRunSummary } from "../admin/views.js";
+import type { UpdateArtifactConfigResult } from "../artifact/config.js";
+import type { ArtifactApi } from "../artifact/api.js";
+import type { ReadDiffResult, ReadLoopArtifactsResult, ReadRunArtifactsResult } from "../artifact/read.js";
 import type { Db } from "../db/index.js";
-import { machines, runs } from "../db/schema.js";
+import { artifactManifests, machines, runs } from "../db/schema.js";
 import type { Clock } from "../time.js";
 import { classifyDisplayLifecycle } from "./view.js";
 
@@ -164,6 +167,90 @@ export function createDashboardRead(deps: DashboardReadDeps): DashboardRead {
           };
         }),
       };
+    },
+  };
+}
+
+/** One committed snapshot of a loop, as the pages list it. */
+export interface DashboardSnapshotRef {
+  snapshotId: string;
+  manifestRevision: number;
+  committedAt: string;
+}
+
+/** A snapshot BOUND to a Run — the run-snapshot list and the diff dropdowns
+ *  operate on these (the plan's default baseline is the most recent bound
+ *  Run snapshot). */
+export interface DashboardBoundSnapshotRef extends DashboardSnapshotRef {
+  runId: string;
+}
+
+/** The artifact read seam for the slice-7 Dashboard pages (ADR-010 决策 27).
+ *  The three view reads DELEGATE to the `ArtifactApi` (one door, the frozen
+ *  evaluation order and failure domain); the two snapshot-list reads are
+ *  plain batched selects, because the facade deliberately has no "list"
+ *  operation. `updateConfig` is the existing management write the config
+ *  form consumes — no credential, the loopback boundary. */
+export interface DashboardArtifactRead {
+  loopArtifacts(loopId: string): Promise<ReadLoopArtifactsResult>;
+  runArtifacts(runId: string): Promise<ReadRunArtifactsResult>;
+  diff(loopId: string, query: { from?: string; to: string }): Promise<ReadDiffResult>;
+  updateConfig(loopId: string, command: { artifactDir: string | null }): Promise<UpdateArtifactConfigResult>;
+  /** Runs of the loop with a bound snapshot, joined to their manifest rows,
+   *  newest revision first. */
+  boundSnapshots(loopId: string): Promise<DashboardBoundSnapshotRef[]>;
+  /** Every committed snapshot of the loop, newest revision first. */
+  loopSnapshots(loopId: string): Promise<DashboardSnapshotRef[]>;
+}
+
+/** The narrow slice of `ArtifactApi` the dashboard pages consume — the same
+ *  narrowing pattern as `DashboardReadDeps.admin`. */
+export type DashboardArtifactReadSource = Pick<
+  ArtifactApi,
+  "readLoop" | "readRun" | "diffSnapshots" | "updateConfig"
+>;
+
+export function createDashboardArtifactRead(deps: {
+  db: Db;
+  api: DashboardArtifactReadSource;
+}): DashboardArtifactRead {
+  return {
+    loopArtifacts: (loopId) => deps.api.readLoop(loopId),
+    runArtifacts: (runId) => deps.api.readRun(runId),
+    diff: (loopId, query) => deps.api.diffSnapshots(loopId, query),
+    updateConfig: (loopId, command) => deps.api.updateConfig(loopId, command),
+
+    async boundSnapshots(loopId): Promise<DashboardBoundSnapshotRef[]> {
+      const rows = await deps.db
+        .select({
+          runId: runs.id,
+          snapshotId: runs.artifactSnapshotId,
+          manifestRevision: artifactManifests.manifestRevision,
+          committedAt: artifactManifests.committedAt,
+        })
+        .from(runs)
+        .innerJoin(artifactManifests, eq(artifactManifests.id, runs.artifactSnapshotId))
+        .where(and(eq(runs.loopId, loopId), isNotNull(runs.artifactSnapshotId)))
+        .orderBy(desc(artifactManifests.manifestRevision));
+      return rows.map((row) => ({
+        runId: row.runId,
+        snapshotId: row.snapshotId!,
+        manifestRevision: row.manifestRevision,
+        committedAt: row.committedAt,
+      }));
+    },
+
+    async loopSnapshots(loopId): Promise<DashboardSnapshotRef[]> {
+      const rows = await deps.db
+        .select({
+          snapshotId: artifactManifests.id,
+          manifestRevision: artifactManifests.manifestRevision,
+          committedAt: artifactManifests.committedAt,
+        })
+        .from(artifactManifests)
+        .where(eq(artifactManifests.loopId, loopId))
+        .orderBy(desc(artifactManifests.manifestRevision));
+      return rows;
     },
   };
 }

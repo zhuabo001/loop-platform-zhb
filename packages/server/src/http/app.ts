@@ -41,7 +41,13 @@
 import { bodyLimit } from "hono/body-limit";
 import { Hono, type Context } from "hono";
 import type { DashboardRoutes } from "../dashboard/routes.js";
-import { DASHBOARD_RUN_PATH } from "../dashboard/routes.js";
+import {
+  DASHBOARD_ARTIFACT_CONFIG_PATH,
+  DASHBOARD_ARTIFACT_DIFF_PATH,
+  DASHBOARD_LOOP_ARTIFACTS_PATH,
+  DASHBOARD_RUN_ARTIFACTS_PATH,
+  DASHBOARD_RUN_PATH,
+} from "../dashboard/routes.js";
 
 import {
   ARTIFACT_PREPARE_REQUEST_MAX_UTF8_BYTES,
@@ -761,9 +767,17 @@ export function createServerApp(
   // The Dashboard's two HTML routes. Registered last, but their gate is the
   // global middleware above — registering the gate here would leave `/` and
   // the POST reachable with a hostile Host, and would not protect the API.
+  // Slice 7 adds the four artifact page routes, present only when the
+  // dashboard was built WITH the artifact seam (decision 27).
   if (dashboard !== undefined) {
     app.get("/", dashboard.index);
     app.post(DASHBOARD_RUN_PATH, dashboard.formContentType, dashboard.bodyCap, dashboard.run);
+    if (dashboard.loopArtifacts !== undefined) {
+      app.get(DASHBOARD_LOOP_ARTIFACTS_PATH, dashboard.loopArtifacts);
+      app.get(DASHBOARD_RUN_ARTIFACTS_PATH, dashboard.runArtifacts!);
+      app.get(DASHBOARD_ARTIFACT_DIFF_PATH, dashboard.artifactDiff!);
+      app.post(DASHBOARD_ARTIFACT_CONFIG_PATH, dashboard.formContentType, dashboard.bodyCap, dashboard.artifactConfig!);
+    }
   }
 
   return app;

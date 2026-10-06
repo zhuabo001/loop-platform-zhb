@@ -32,8 +32,57 @@ export type CsrfVerdict =
   | "token_duplicate"
   | "token_mismatch";
 
+export type CsrfFieldVerdict =
+  | { ok: true; values: Map<string, string> }
+  | { ok: false; verdict: Exclude<CsrfVerdict, "ok"> | "field_duplicate" };
+
 /**
- * Pure verdict for an `application/x-www-form-urlencoded` body.
+ * Pure verdict for an `application/x-www-form-urlencoded` body carrying the
+ * CSRF token PLUS a caller-declared field whitelist (Batch 2 slice 7's
+ * artifact-config form). `checkCsrfForm` is EXACTLY this function with an
+ * empty whitelist — one implementation, so the run form's frozen verdicts
+ * can never drift from the generalized form.
+ *
+ * A field outside the whitelist is `bad_form`, exactly as an unknown field
+ * always was: it means this is not the form we rendered. A whitelisted field
+ * appearing twice is the new `field_duplicate` (400, not a token verdict).
+ */
+export function checkCsrfFormFields(
+  body: string,
+  expected: string,
+  allowedFields: readonly string[],
+): CsrfFieldVerdict {
+  if (!isWellFormedFormBody(body)) return { ok: false, verdict: "bad_form" };
+
+  const params = new URLSearchParams(body);
+  // Pass 1 — the FROZEN order of the original single-field check: a stray
+  // field means "not the form we rendered" and is judged before ANY token
+  // verdict. (A merged single pass would classify `csrf=WRONG&extra=1` as
+  // token_mismatch — a behavior change the run-form pin catches.)
+  for (const key of new Set(params.keys())) {
+    if (key !== CSRF_FIELD && !allowedFields.includes(key)) return { ok: false, verdict: "bad_form" };
+  }
+
+  const submitted = params.getAll(CSRF_FIELD);
+  if (submitted.length === 0) return { ok: false, verdict: "token_missing" };
+  if (submitted.length > 1) return { ok: false, verdict: "token_duplicate" };
+  if (!tokensEqual(submitted[0]!, expected)) return { ok: false, verdict: "token_mismatch" };
+
+  // Pass 2 — the whitelisted fields: single occurrence each, values for the
+  // caller. A repeat is the new `field_duplicate` (400, not a token verdict).
+  const values = new Map<string, string>();
+  for (const key of new Set(params.keys())) {
+    if (key === CSRF_FIELD) continue;
+    const all = params.getAll(key);
+    if (all.length > 1) return { ok: false, verdict: "field_duplicate" };
+    values.set(key, all[0]!);
+  }
+  return { ok: true, values };
+}
+
+/**
+ * Pure verdict for an `application/x-www-form-urlencoded` body carrying ONLY
+ * the CSRF token (the run form's frozen contract).
  *
  * A stray field is `bad_form` rather than a token verdict: it means this is
  * not the form we rendered, and the distinction keeps 400 (malformed) and 403
@@ -49,18 +98,11 @@ export type CsrfVerdict =
  * renders contains no escapes at all.
  */
 export function checkCsrfForm(body: string, expected: string): CsrfVerdict {
-  if (!isWellFormedFormBody(body)) return "bad_form";
-
-  const params = new URLSearchParams(body);
-  for (const key of params.keys()) {
-    if (key !== CSRF_FIELD) return "bad_form";
-  }
-
-  const submitted = params.getAll(CSRF_FIELD);
-  if (submitted.length === 0) return "token_missing";
-  if (submitted.length > 1) return "token_duplicate";
-
-  return tokensEqual(submitted[0]!, expected) ? "ok" : "token_mismatch";
+  const verdict = checkCsrfFormFields(body, expected, []);
+  if (verdict.ok) return "ok";
+  // `field_duplicate` is unreachable with an empty whitelist (no whitelisted
+  // field exists to repeat) — the cast narrows the type, not the runtime.
+  return verdict.verdict as Exclude<CsrfVerdict, "ok">;
 }
 
 function isWellFormedFormBody(body: string): boolean {

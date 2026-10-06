@@ -24,7 +24,7 @@ import { createProductionArtifactHome } from "./artifact/production.js";
 import { createRunCoordinator, mintRunCredential, newUuidRunId, type CoordinatorHooks, type RunCoordinator } from "./coordinator/index.js";
 import { isLoopbackHost, loadServerConfig, unauthenticatedExposureWarning, type ServerConfig } from "./config.js";
 import { mintCsrfToken } from "./dashboard/csrf.js";
-import { createDashboardRead } from "./dashboard/index.js";
+import { createDashboardArtifactRead, createDashboardRead } from "./dashboard/index.js";
 import { createDashboardRoutes } from "./dashboard/routes.js";
 import { closeDb, openMigratedDb, type DbHandle } from "./db/index.js";
 import { createServerApp } from "./http/app.js";
@@ -126,6 +126,12 @@ export async function bootstrapServer(
       clock,
       cronFactory,
     });
+    // Phase 5 Batch 2 slice 2: the production ArtifactHome (ADR-010 决策 21)
+    // mounted through its narrow HTTP facade. Pure construction — the blob
+    // root appears only on the first verified write, and no watcher exists on
+    // the server side at all. Built BEFORE the Dashboard because the slice-7
+    // artifact pages read through the SAME facade instance.
+    const artifacts = createArtifactApi(createProductionArtifactHome({ db: handle.db, dataDir: config.dataDir, clock }));
     // The Dashboard exists ONLY on a loopback bind (Batch 3 plan §2): the
     // mount decision is made HERE, from config, so no request header can ever
     // turn it on. Its presence also arms the global loopback-Host gate — on a
@@ -135,6 +141,10 @@ export async function bootstrapServer(
     const dashboard = isLoopbackHost(config.host)
       ? createDashboardRoutes({
           read: createDashboardRead({ admin, db: handle.db, clock }),
+          // Batch 2 slice 7 (决策 27): the artifact pages read through the
+          // dashboard's narrow artifact seam, which delegates to the SAME
+          // facade instance — one read domain, one evaluation order.
+          artifacts: createDashboardArtifactRead({ db: handle.db, api: artifacts }),
           // The Dashboard is the ONE caller that must not supersede: a button
           // click can never replace a run the operator already queued. The
           // policy rides this closure, so `dashboard/routes.ts` stays a plain
@@ -145,12 +155,6 @@ export async function bootstrapServer(
           csrfToken: overrides.csrfToken?.trim() ? overrides.csrfToken : mintCsrfToken(),
         })
       : undefined;
-
-    // Phase 5 Batch 2 slice 2: the production ArtifactHome (ADR-010 决策 21)
-    // mounted through its narrow HTTP facade. Pure construction — the blob
-    // root appears only on the first verified write, and no watcher exists on
-    // the server side at all.
-    const artifacts = createArtifactApi(createProductionArtifactHome({ db: handle.db, dataDir: config.dataDir, clock }));
 
     return {
       app: createServerApp(
