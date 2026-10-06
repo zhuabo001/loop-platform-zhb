@@ -113,9 +113,9 @@ interface LoopWatch {
   /** True once this generation's admission refusal has been reported (one
    *  report per generation, never one per tick). */
   reportedRefusal: boolean;
-  /** Work that no in-flight round covers: events seen before `ready`, and
-   *  events or reconcile requests that arrived while a round was running. The
-   *  running round's driver consumes it the moment that round ends. */
+  /** Runnable work: events seen before `ready`, expired event windows, or
+   *  reconcile requests. Events in an unexpired window are not pending yet;
+   *  the running round's driver only consumes work already due. */
   pending: SyncMode | null;
   windowCtl: AbortController | null;
   errorWindowCtl: AbortController | null;
@@ -363,13 +363,10 @@ export function createArtifactWatchManager(deps: ArtifactWatchManagerDeps): Arti
         await sleep(ARTIFACT_WATCH_EVENT_MERGE_MS, ctl.signal);
         if (ctl.signal.aborted || draining || state.generation !== generation) return;
         state.windowCtl = null;
-        const mode = state.pending;
-        if (mode === null) return;
-        state.pending = null;
         // Events that arrive DURING this round re-arm through markDirty: the
         // window controller is already null here, so the next event opens a
         // FRESH window instead of being folded into the finished one (AW12).
-        await runSync(state, mode);
+        await runSync(state, "event");
       } finally {
         if (state.windowCtl === ctl) state.windowCtl = null;
       }
@@ -386,7 +383,6 @@ export function createArtifactWatchManager(deps: ArtifactWatchManagerDeps): Arti
       return;
     }
     if (state.status !== "watching") return;
-    notePending(state, "event");
     if (state.windowCtl !== null) return; // a fixed window is already running
     openWindow(state);
   }
@@ -496,12 +492,20 @@ export function createArtifactWatchManager(deps: ArtifactWatchManagerDeps): Arti
   }
 
   async function parkLoop(state: LoopWatch): Promise<void> {
-    await stopLoop(state);
+    // Publish the stop before close can suspend: apply may already restore
+    // this loop while its predecessor's watcher is still closing.
     state.status = "parked";
+    await stopLoop(state);
   }
 
   async function parkAll(): Promise<void> {
-    for (const state of states.values()) await parkLoop(state);
+    // Cancel the entire stopped generation synchronously, then join its
+    // closes. Never traverse a live map after awaiting an old close.
+    const stopped = [...states.values()];
+    const results = await Promise.allSettled(stopped.map((state) => parkLoop(state)));
+    for (const result of results) {
+      if (result.status === "rejected") throw result.reason;
+    }
   }
 
   function launchAdmission(state: LoopWatch): void {
@@ -550,11 +554,10 @@ export function createArtifactWatchManager(deps: ArtifactWatchManagerDeps): Arti
       }
       if (state.status === "parked") {
         // The set changed materially, which clears the stops — a parked loop
-        // gets a fresh generation (and a fresh controller: the parked one
-        // was aborted).
-        state.generation += 1;
-        state.ctl = new AbortController();
-        launchAdmission(state);
+        // gets a fresh object too: its old driver may still be in flight.
+        const restored = newState(item, state.generation + 1);
+        states.set(item.loopId, restored);
+        launchAdmission(restored);
       }
     }
   }

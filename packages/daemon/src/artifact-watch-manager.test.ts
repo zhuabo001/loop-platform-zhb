@@ -357,6 +357,9 @@ describe("artifact-watch-manager", () => {
     harness.watchers.handles[0]!.emit();
     releaseHold();
     await tick();
+    // Ending a round does not mature the next fixed window (#103).
+    expect(harness.sync.calls).toHaveLength(2);
+    harness.watchers.handles[0]!.emit(); // another event in that same window
     await fireWindow(harness);
 
     expect(harness.sync.calls).toHaveLength(3);
@@ -544,6 +547,32 @@ describe("artifact-watch-manager", () => {
     await waitUntil(() => harness.watchers.handles.length === 4, "the re-admitted watchers");
   });
 
+  it("restores an unchanged loop and a newly added loop while the old machine-stop close is held (#102)", async () => {
+    const harness = createHarness();
+    mkdirSync(path.join(base, "two"));
+    harness.manager.apply([item()], "d1");
+    await waitForFirstScan(harness);
+    const old = harness.watchers.handles[0]!;
+    old.holdClose();
+    harness.sync.setOutcome({ kind: "stopped", scope: "machine", status: 401, detail: "401" });
+    old.emit();
+    await fireWindow(harness);
+    await waitUntil(() => old.closing, "the old machine-stop close");
+
+    harness.sync.setOutcome({ kind: "unchanged" });
+    harness.manager.apply([item(), item({ loopId: "loop-2", artifactDir: path.join(base, "two") })], "d2");
+    await waitUntil(() => harness.sync.calls.some((call) => call.target.loopId === "loop-2"), "the new loop's scan");
+    old.releaseClose();
+    await harness.manager.settled();
+
+    // The old stop owns only its snapshot. It must neither park the successor
+    // nor miss restoring loop-1 just because its close was still pending.
+    expect(harness.watchers.handles.filter((handle) => !handle.closed)).toHaveLength(2);
+    expect(harness.sync.calls.filter((call) => call.target.loopId === "loop-1")).toHaveLength(3);
+    expect(harness.manager.currentDigest()).toBe("d2");
+    expect(await harness.manager.drain(1_000)).toEqual({ settled: true });
+  });
+
   it("closes only the affected loop on a loop-scope stop", async () => {
     const harness = createHarness();
     mkdirSync(path.join(base, "two"));
@@ -556,6 +585,68 @@ describe("artifact-watch-manager", () => {
     await waitUntil(() => harness.watchers.handles[0]!.closed, "the stopped loop's watcher");
 
     expect(harness.watchers.handles[1]!.closed).toBe(false); // the other loop keeps watching
+  });
+
+  it.each([false, true])("keeps recovered peers alive across an old machine stop (replace peer: %s, #102)", async (replacePeer) => {
+    const harness = createHarness();
+    const peer = item({ loopId: "loop-2", artifactDir: path.join(base, "two") });
+    mkdirSync(peer.artifactDir!);
+    harness.manager.apply([item(), peer]);
+    await harness.manager.settled();
+    const old = harness.watchers.handles.find((handle) => handle.root === base)!;
+    old.holdClose();
+    harness.sync.setOutcome({ kind: "stopped", scope: "machine", status: 401, detail: "401" });
+    old.emit();
+    await fireWindow(harness);
+    await waitUntil(() => old.closing, "the machine-stop close");
+
+    harness.sync.setOutcome({ kind: "unchanged" });
+    harness.manager.apply([item({ configRevision: 2 }), { ...peer, configRevision: replacePeer ? 2 : 1 }]);
+    await waitUntil(() => harness.watchers.handles.filter((handle) => handle.root === peer.artifactDir).length === 2, "the recovered peer");
+    old.releaseClose();
+    await harness.manager.settled();
+    expect(harness.watchers.handles.filter((handle) => !handle.closed)).toHaveLength(2);
+    expect(harness.sync.calls.filter((call) => call.target.loopId === "loop-2").map((call) => call.target.configRevision)).toEqual([1, replacePeer ? 2 : 1]);
+    expect(await harness.manager.drain(1_000)).toEqual({ settled: true });
+  });
+
+  it("restores a stopped peer independently of its aborted in-flight driver (#102)", async () => {
+    const harness = createHarness();
+    const peer = item({ loopId: "loop-2", artifactDir: path.join(base, "two") });
+    mkdirSync(peer.artifactDir!);
+    harness.manager.apply([item(), peer]);
+    await harness.manager.settled();
+    let releasePeer!: () => void;
+    const heldPeer = new Promise<void>((resolve) => { releasePeer = resolve; });
+    harness.sync.client.syncLoop = async (input) => {
+      harness.sync.calls.push(input);
+      if (input.target.loopId === "loop-2" && input.target.configRevision === 1) {
+        await heldPeer;
+        return { kind: "stopped", scope: "machine", status: 401, detail: "late 401" };
+      }
+      return input.target.configRevision === 1
+        ? { kind: "stopped", scope: "machine", status: 401, detail: "401" }
+        : { kind: "unchanged" };
+    };
+    harness.watchers.handles.find((handle) => handle.root === peer.artifactDir)!.emit();
+    await fireWindow(harness);
+    harness.watchers.handles.find((handle) => handle.root === base)!.emit();
+    await fireWindow(harness);
+    await waitUntil(() => harness.watchers.handles.every((handle) => handle.closed), "both stopped watchers");
+
+    // The unchanged peer must start a full scan despite its old held driver.
+    // Returning a stale machine stop afterward must not park the new set.
+    harness.sync.client.syncLoop = async (input) => {
+      harness.sync.calls.push(input);
+      return { kind: "unchanged" };
+    };
+    harness.manager.apply([item({ configRevision: 2 }), peer]);
+    await waitUntil(() => harness.sync.calls.length === 6, "both recovery scans without the old driver");
+    releasePeer();
+    await harness.manager.settled();
+    expect(harness.watchers.handles.filter((handle) => !handle.closed)).toHaveLength(2);
+    expect(harness.sync.calls.slice(-2).every((call) => call.reuseCachedHashes === false)).toBe(true);
+    expect(await harness.manager.drain(1_000)).toEqual({ settled: true });
   });
 
   it("coalesces watcher errors into ONE reportLocalFailure per window", async () => {
@@ -763,6 +854,48 @@ describe("artifact-watch-manager", () => {
     expect(harness.sync.calls[0]!.reuseCachedHashes).toBe(false); // the first scan rehashes
     await waitUntil(() => harness.sync.calls.length === 2, "the follow-up round for the pre-ready event");
     expect(harness.sync.calls[1]!.reuseCachedHashes).toBe(true);
+  });
+
+  it.each([false, true])("preserves FULL priority with a concurrent event window (expired: %s, #103)", async (expired) => {
+    const harness = createHarness();
+    harness.manager.start();
+    harness.manager.apply([item()]);
+    await waitForFirstScan(harness);
+    const release = harness.sync.hold();
+    harness.watchers.handles[0]!.emit();
+    await fireWindow(harness);
+    harness.time.fire(ARTIFACT_WATCH_RECONCILE_MS);
+    await tick();
+    harness.watchers.handles[0]!.emit();
+    if (expired) await fireWindow(harness);
+    release();
+    await waitUntil(() => harness.sync.calls.length === 3, "the queued full reconcile");
+    expect(harness.sync.calls[2]!.reuseCachedHashes).toBe(false);
+    if (!expired) {
+      await tick();
+      expect(harness.sync.calls).toHaveLength(3);
+      await fireWindow(harness);
+      await waitUntil(() => harness.sync.calls.length === 4, "the later event window");
+      expect(harness.sync.calls[3]!.reuseCachedHashes).toBe(true);
+    }
+    expect(await harness.manager.drain(1_000)).toEqual({ settled: true });
+  });
+
+  it("waits for a first-scan event window to expire and cancels an unexpired window on drain (#103)", async () => {
+    const harness = createHarness();
+    const release = harness.sync.hold();
+    harness.manager.apply([item()]);
+    await waitForFirstScan(harness);
+    harness.watchers.handles[0]!.emit();
+    release();
+    await tick();
+    expect(harness.sync.calls).toHaveLength(1);
+    await fireWindow(harness);
+    expect(harness.sync.calls).toHaveLength(2);
+    harness.watchers.handles[0]!.emit();
+    expect(await harness.manager.drain(1_000)).toEqual({ settled: true });
+    expect(harness.time.fire(ARTIFACT_WATCH_EVENT_MERGE_MS)).toBe(0);
+    expect(harness.sync.calls).toHaveLength(2);
   });
 
   it("catches up when a window expires while the FIRST scan is in flight (P2)", async () => {

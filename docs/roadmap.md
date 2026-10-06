@@ -228,9 +228,9 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
   - 片 4 验收：AS1–AS6、AS9–AS11 全覆盖（daemon 新增 63 项 = 状态机 35 + 传输 18 + 两个加法导出 10），配套 test-only 假服务端 `src/testkit/artifact-sync-fake.ts`（真实 protocol schema + 真实 policy 与指纹函数，经 `tsconfig.build.json` 排除出 dist）；七项变异全部被对应用例抓住（删无变化抑制 ⇒ 3 项红、删失效规则 1、上传闸改无界 1、去 requestId 复用 4、跳过上传前校验 1、退避封顶改 30 秒 1、停止改为不粘 1），失效规则用例还在开发中抓出一处真实缺口；dist 探针 10 项断言全过（真实 dist 导入、完整同步、无变化零请求、只传变更文件、401 粘性停止、jail 越界失败）。全量五门 exit=0（tip `fc4dc15`）：protocol **285** / daemon **675 + 7 skipped** / server **894 + 3 skipped** / `pnpm typecheck` / `pnpm build` / `db:check` 无 drift（零 migration）/ `git diff --check` 干净。
   - 片 4 休眠边界不变：不接线 `runtime.ts`/`cli.ts`/`index.ts`、不声明 `artifact-sync-v1`、不启动 watcher、不接 Run 最终 Report、零新依赖、server/protocol 零改动；AD4 daemon 半（`identity.test.ts`）零修改全绿。
   - 片 4 第三轮独立三轨复核通过（2026-10-05），已收口；同步与恢复规则见 ADR-010 决策 24。
-  - [#91](https://github.com/zhuabo001/loop-platform-zhb/issues/91) 仍须在片 5 启用生产持续同步前处理。
+  - Artifact 根与敏感祖先的本地防护已完成，规则见 ADR-010 决策 25。
   - 片 5（WatchManager 与 Daemon 生命周期）已实现：`artifact-watcher`（chokidar **4.0.3**，唯一 import chokidar 的模块）与 `artifact-watch-manager`（先订阅再全扫、250 ms 固定窗口合并、60 秒完整核对、五字段换代、移除清理、粘性停止、10 秒 drain）；生命周期与缓存分工规则见 ADR-010 决策 25，生产接线与三个加法接缝见决策 16／23／25 的片 5 条目，范围见 `docs/plan/codex-phase5-batch2-plan.md` §2。
-  - 片 5 首轮独立三轨审查（2026-10-06）指出 1 项 P1 与 4 项 P2（集合更新的生命周期、轮内窗口丢失补扫、`ready` 前扫描、根消失后未关闭 watcher、roadmap 复制裁决）；修复已落地，**片 5 尚未收口**——收口以下一轮独立复审结论为准。
+  - **片 5 尚未收口**；阻塞项：[#102](https://github.com/zhuabo001/loop-platform-zhb/issues/102)、[#103](https://github.com/zhuabo001/loop-platform-zhb/issues/103)、[#104](https://github.com/zhuabo001/loop-platform-zhb/issues/104)。
   - 片 5 休眠边界其余不变：不改 `packages/server`、不接 Run 最终 Report（片 6）、不做读路由与 Dashboard（片 7）；`index.ts` 导出面不变。
   - 片 6–8 未开始。
 
@@ -239,7 +239,6 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
 - [Issue #11](https://github.com/zhuabo001/loop-platform-zhb/issues/11) / [Issue #72](https://github.com/zhuabo001/loop-platform-zhb/issues/72)：Phase 6 阻塞项（真实 Postgres 多物理连接并发验收），指针见 Phase 6 节。
 - [Issue #56](https://github.com/zhuabo001/loop-platform-zhb/issues/56)：Phase 5 认证层加固（状态变更路由同源意图校验、`Content-Type` 门禁、拒绝空体）——随团队与认证层（Batch 3）处理。
 - [Issue #61](https://github.com/zhuabo001/loop-platform-zhb/issues/61)：运行时 preload 环境隔离的防回归证据与验收环境记录——随 Phase 5 后续批次处理。
-- [Issue #91](https://github.com/zhuabo001/loop-platform-zhb/issues/91)：Artifact 根自身落在 never-sync 区域（如 `.config/gcloud`）的配置面防护——片 5 已按 ADR-010 决策 25 实施（`syncLoop` 内结构性拒绝并映射 `outside_jail`、watcher 准入与本地重验），实现范围见 Batch 2 权威计划；**Issue 保持 OPEN，待独立复审按关闭条件核销**。
 
 ## Phase 6 — 生产硬化（独立阶段）
 
