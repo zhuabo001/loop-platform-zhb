@@ -262,11 +262,17 @@ describe("the sync attempt", () => {
 
 describe("the U2 outcome mapping (every non-synced arm carries a stable literal)", () => {
   it("failed maps to the scan taxonomy value itself", async () => {
-    const { sync } = stubSync({
+    const { sync, reportInputs } = stubSync({
       syncLoop: () => Promise.resolve({ kind: "failed", failure: "unreadable", detail: "EACCES", reported: "recorded" }),
     });
-    const finalSync = finalSyncWith(sync, manualSleep());
-    await expect(finalSync.run(delivery(), new AbortController().signal)).resolves.toEqual({ artifactSyncError: "unreadable" });
+    const time = manualSleep();
+    await expect(finalSyncWith(sync, time).run(delivery(), new AbortController().signal)).resolves.toEqual({
+      artifactSyncError: "unreadable",
+    });
+    // A settle inside the budget is the OUTCOME's call: the deadline watcher
+    // was disarmed (not fired) and nothing was reported to the loop endpoint.
+    expect(time.pendingMs()).toEqual([]);
+    expect(reportInputs).toEqual([]);
   });
 
   it("terminal maps to the wire code (or the bare literal without one)", async () => {
@@ -312,10 +318,71 @@ describe("the U2 outcome mapping (every non-synced arm carries a stable literal)
     const { sync } = stubSync({
       syncLoop: () => Promise.reject(new Error("boom: the gate bookkeeping broke")),
     });
-    await expect(finalSyncWith(sync, manualSleep()).run(delivery(), new AbortController().signal)).resolves.toEqual({
+    const time = manualSleep();
+    await expect(finalSyncWith(sync, time).run(delivery(), new AbortController().signal)).resolves.toEqual({
       artifactSyncError: "internal_error",
     });
     expect(logs.some((l) => l.includes("boom"))).toBe(true);
+    // The throw path disarms the deadline watcher too — no timer outlives the
+    // call (#106/P3).
+    expect(time.pendingMs()).toEqual([]);
+  });
+
+  it("a sync that fails LATE (past the deadline) still freezes timeout and gets the bounded report (#106)", async () => {
+    // The reviewer's counterexample: the scan's lstat hangs past the deadline
+    // and only THEN rejects EACCES, so the client settles as
+    // failed{unreadable}. The expiry is recorded by the deadline watcher, not
+    // inferred from the outcome — the report must carry "timeout", and the U1
+    // report must go out on its OWN budget (the client's own local-failure
+    // report could only try an already-aborted signal).
+    let enteredStat!: () => void;
+    const statEntered = new Promise<void>((resolve) => {
+      enteredStat = resolve;
+    });
+    let rejectStat!: (error: Error) => void;
+    const reports: { failure: string; signalAborted: boolean }[] = [];
+    const sync: ArtifactSyncClient = createArtifactSyncClient({
+      cache: createArtifactHashCache(),
+      transport: {
+        readLoop: async () => ({
+          kind: "ok",
+          value: { loopId: LOOP_ID, configRevision: 1, manifestRevision: 0, artifactDir: base },
+        }),
+        reportSyncError: async (_loopId, body, signal) => {
+          reports.push({ failure: body.failure, signalAborted: signal?.aborted === true });
+          return signal?.aborted === true
+            ? { kind: "unreachable", reason: "request aborted" }
+            : { kind: "ok", value: { ok: true, recorded: true } };
+        },
+        prepare: async () => ({ kind: "unreachable", reason: "unexpected prepare" }),
+        putBlob: async () => ({ kind: "unreachable", reason: "unexpected put" }),
+        commit: async () => ({ kind: "unreachable", reason: "unexpected commit" }),
+      },
+      io: {
+        lstat: () => {
+          enteredStat();
+          return new Promise<never>((_resolve, reject) => {
+            rejectStat = reject;
+          });
+        },
+      },
+      sleep: async () => {},
+    });
+    write("dist/app.js", "v1");
+    const time = manualSleep();
+    const pending = finalSyncWith(sync, time).run(delivery(), new AbortController().signal);
+
+    await statEntered; // the scan is parked inside its lstat
+    expect(time.pendingMs()).toEqual([DEADLINE_MS]);
+    time.fire(DEADLINE_MS); // the deadline expires FIRST
+    rejectStat(Object.assign(new Error("controlled EACCES after the deadline"), { code: "EACCES" }));
+
+    await expect(pending).resolves.toEqual({ artifactSyncError: "timeout" });
+    expect(reports).toEqual([
+      { failure: "unreadable", signalAborted: true }, // the client's own late, aborted attempt
+      { failure: "timeout", signalAborted: false }, // …then the independent-budget U1 report
+    ]);
+    expect(time.pendingMs()).toEqual([]); // no watcher left armed
   });
 });
 

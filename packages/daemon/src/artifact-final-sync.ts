@@ -16,14 +16,19 @@
  *  - the WHOLE attempt — the per-loop queue wait, the scan, the uploads and
  *    the retries — lives under ONE 30 s deadline (批次计划 §1), composed as
  *    an AbortSignal so the existing cancellation points (queue wait, fetch,
- *    scan boundaries) do the cancel; expiry freezes the stable `"timeout"`
- *    classification and the report still carries the run's own outcome;
+ *    scan boundaries) do the cancel; the deadline watcher RECORDS its own
+ *    expiry (a normal completion disarms it) and that record — never the
+ *    settled outcome — decides the classification (#106): the abort races the
+ *    client's own late failure classification, so a scan that hangs past the
+ *    deadline and then fails still freezes `"timeout"`, and the report still
+ *    carries the run's own outcome;
  *  - the two report fields stay MUTUALLY EXCLUSIVE at the source: a synced
  *    outcome carries `artifactSnapshotId`, every other outcome maps to a
  *    stable `artifactSyncError` literal (the U2 table below).
  *
- * On timeout the loop additionally gets ONE bounded `reportLocalFailure`
- * (`failure: "timeout"` — the taxonomy value reserved for this path), so the
+ * When the deadline expires the loop additionally gets ONE bounded
+ * `reportLocalFailure` (`failure: "timeout"` — the taxonomy value reserved
+ * for this path), whichever non-synced outcome the attempt settled as, so the
  * loop-level sync state reflects the stall; the report budget is independent
  * of the 30 s deadline, and an over-budget or failed report NEVER changes
  * the frozen report fields.
@@ -80,7 +85,9 @@ export interface FinalArtifactSyncDeps {
 
 /** The U2 mapping table: every non-synced outcome → the stable literal the
  *  report carries. `failed` maps to the scan taxonomy value itself; the rest
- *  are fixed strings (the report column is deliberately free-form). */
+ *  are fixed strings (the report column is deliberately free-form). Consulted
+ *  ONLY when the deadline did not expire — an expired attempt freezes
+ *  `"timeout"` whatever it settled as (#106). */
 function outcomeToError(outcome: ArtifactSyncOutcome): string | undefined {
   switch (outcome.kind) {
     case "synced":
@@ -96,6 +103,8 @@ function outcomeToError(outcome: ArtifactSyncOutcome): string | undefined {
     case "stopped":
       return "stopped";
     case "cancelled":
+      // Defensive: with no observed expiry and no caller abort there is no
+      // cancel source left (the deadline branch owns the real cancellation).
       return "timeout";
     case "unchanged":
       // Unreachable with freshSession (suppression is bypassed) — defensive:
@@ -128,23 +137,36 @@ export function createFinalArtifactSync(deps: FinalArtifactSyncDeps): FinalArtif
         };
         const deadlineCtl = new AbortController();
         const deadlineWatchDone = new AbortController();
-        // The deadline watcher: resolves on schedule OR on caller shutdown,
-        // then cancels the sync through the composed signal. Cancellation is
-        // structurally bounded (queue wait, fetch, scan boundaries), so the
-        // awaited settle below cannot hang.
+        // The deadline watcher: resolves on schedule OR on cancellation (the
+        // caller's shutdown, or `deadlineWatchDone` after the sync settled).
+        // ONLY a scheduled expiry — caller alive, sync still in flight — flips
+        // `deadlineFired` and cancels the sync: a normal completion must never
+        // be misread as an expiry, and the flag is recorded HERE rather than
+        // inferred from the settled outcome (#106) — the abort races the
+        // client's own late failure classification.
+        let deadlineFired = false;
         const deadlineWatch = (async () => {
           await sleep(deadlineMs, AbortSignal.any([signal, deadlineWatchDone.signal]));
+          if (deadlineWatchDone.signal.aborted || signal.aborted) return;
+          deadlineFired = true;
           deadlineCtl.abort();
         })();
-        const outcome = await deps.sync.syncLoop({
-          target,
-          daemonRoots: deps.daemonRoots,
-          signal: AbortSignal.any([signal, deadlineCtl.signal]),
-          freshSession: true,
-          reuseCachedHashes: false,
-        });
-        deadlineWatchDone.abort();
-        await deadlineWatch;
+        let outcome: ArtifactSyncOutcome;
+        try {
+          outcome = await deps.sync.syncLoop({
+            target,
+            daemonRoots: deps.daemonRoots,
+            signal: AbortSignal.any([signal, deadlineCtl.signal]),
+            freshSession: true,
+            reuseCachedHashes: false,
+          });
+        } finally {
+          // ONE cleanup for every settle, a throw included: disarming the
+          // watcher here is what keeps a normal completion from looking like
+          // an expiry, and it never leaves the timer armed (#106/P3).
+          deadlineWatchDone.abort();
+          await deadlineWatch;
+        }
 
         if (signal.aborted) return {}; // shutting down — the report stays unsent
         if (outcome.kind === "synced") {
@@ -152,23 +174,32 @@ export function createFinalArtifactSync(deps: FinalArtifactSyncDeps): FinalArtif
           // snapshot — bind it (the server validates the reference).
           return { artifactSnapshotId: outcome.artifactSnapshotId };
         }
-        if (outcome.kind === "unchanged") {
-          log(`run ${runId}: final sync returned unchanged under freshSession — no snapshot minted`);
-          return {};
+        if (!deadlineFired) {
+          // The attempt settled on its own inside the budget: the outcome's
+          // own classification is the report field (U2).
+          if (outcome.kind === "unchanged") {
+            log(`run ${runId}: final sync returned unchanged under freshSession — no snapshot minted`);
+            return {};
+          }
+          return { artifactSyncError: outcomeToError(outcome) ?? "internal_error" };
         }
-        const error = outcomeToError(outcome) ?? "internal_error";
-        if (outcome.kind === "cancelled") {
-          // The deadline (or a defensive spontaneous cancel) stopped the sync
-          // — freeze "timeout" and give the loop ONE bounded local-failure
-          // report (U1). The report's budget is its own; its result never
-          // changes the frozen fields.
-          const budgetCtl = new AbortController();
-          const budgetWatchDone = new AbortController();
-          const budgetWatch = (async () => {
-            await sleep(timeoutReportMs, AbortSignal.any([signal, budgetWatchDone.signal]));
-            budgetCtl.abort();
-          })();
-          const reported = await deps.sync
+        // The deadline ITSELF expired. Whatever the sync settled as — its own
+        // late failure classification, a queued cancellation — the attempt blew
+        // its budget, so the stable "timeout" is frozen (#106) and the loop
+        // gets ONE bounded local-failure report (U1). The report's budget is
+        // its own; its result never changes the frozen fields.
+        if (outcome.kind === "unchanged") {
+          log(`run ${runId}: final sync settled unchanged after the ${deadlineMs}ms deadline — freezing timeout`);
+        }
+        const budgetCtl = new AbortController();
+        const budgetWatchDone = new AbortController();
+        const budgetWatch = (async () => {
+          await sleep(timeoutReportMs, AbortSignal.any([signal, budgetWatchDone.signal]));
+          budgetCtl.abort();
+        })();
+        let reported: ArtifactSyncOutcome | undefined;
+        try {
+          reported = await deps.sync
             .reportLocalFailure({
               target,
               failure: "timeout",
@@ -179,15 +210,16 @@ export function createFinalArtifactSync(deps: FinalArtifactSyncDeps): FinalArtif
               log(`run ${runId}: timeout reportLocalFailure threw: ${err instanceof Error ? err.message : String(err)}`);
               return undefined;
             });
+        } finally {
           budgetWatchDone.abort();
           await budgetWatch;
-          if (signal.aborted) return {};
-          if (reported !== undefined) {
-            const state = reported.kind === "failed" ? reported.reported : reported.kind;
-            log(`run ${runId}: final sync timed out after ${deadlineMs}ms — loop-level timeout report: ${state}`);
-          }
         }
-        return { artifactSyncError: error };
+        if (signal.aborted) return {};
+        if (reported !== undefined) {
+          const state = reported.kind === "failed" ? reported.reported : reported.kind;
+          log(`run ${runId}: final sync exceeded the ${deadlineMs}ms deadline — loop-level timeout report: ${state}`);
+        }
+        return { artifactSyncError: "timeout" };
       } catch (err) {
         log(`run ${runId}: final sync failed internally: ${err instanceof Error ? err.message : String(err)}`);
         if (signal.aborted) return {};
