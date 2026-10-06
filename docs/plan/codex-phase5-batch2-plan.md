@@ -278,12 +278,12 @@ Batch 1 错误映射在 HTTP 接线时补齐：revision 耗尽使用新增 `arti
 
 | ID | 场景 | 主要证据 |
 |---|---|---|
-| AI1 | idle 编辑与删除：生产形态 daemon（真实 chokidar、poll 路径 watch apply）启动全扫提交 revision 1；创建/修改/删除逐次收敛且路径精确；静默窗口零 prepare/commit（无变化抑制）；已提交 manifest 的 blob 全部落盘（无部分 manifest） | `server/src/phase5-batch2-slice8-e2e.test.ts` |
+| AI1 | idle 编辑与删除：生产形态 daemon（真实 chokidar、poll 路径 watch apply）启动全扫提交 revision 1；创建/修改/删除逐次收敛且路径精确；静默窗口零 prepare/commit；同内容改写触发事件但零请求（客户端抑制）；已提交 manifest 的 blob 全部落盘（无部分 manifest） | `server/src/phase5-batch2-slice8-e2e.test.ts` |
 | AI2 | 两次 Run 经真实 socket 绑定两个不同快照；Run 1 行与 snap1 entries 冻结；snap1 下载字节与原始磁盘内容逐字节一致；diff 三类变化 | 同上 |
 | AI3 | 配置换代：PATCH 新根 ⇒ 旧 watcher 先关闭、新根后订阅并以 `configRevision:2` 提交；PATCH null ⇒ watch 清空、watcher 关闭、旧目录再编辑零流量零 revision 变化；旧视图 `stale:true` | 同上 |
 | AI4 | 断网：offline 窗口内观测到失败尝试，恢复后恰一个新 revision、一次 commit、无卡死，后续编辑照常同步 | 同上 |
 | AI5 | 响应丢失三腿（真实服务端已应用、客户端丢响应）：prepare 丢 ⇒ 同 requestId 重试得同一 syncId；PUT 丢 ⇒ 重 PUT 得 `published:false` 且 blob 去重；commit 丢 ⇒ 重 commit 取回同一冻结回执、revision 恰进一；会话过期：prepare 后过期 ⇒ commit 得 `artifact_session_expired` ⇒ 同载荷原地续期（同 syncId、`needHashes:[]`）⇒ commit 成功 | 同上 |
-| AI6 | 进程重启：daemon 重启（全新实例、内存缓存丢失）⇒ 等价抑制、零伪 revision；server 重启（生产序关闭、同 dataDir 重 boot）⇒ 旧快照行级相等、下载字节逐字节一致、新编辑经新监听同步、blob 根零 `.tmp-*` 残留、无旧代际提交 | 同上 |
+| AI6 | 进程重启：daemon 重启（全新实例、内存缓存丢失）⇒ 基线读自服务端、零 PUT（只传缺失内容）、恰一轮 prepare/commit、revision 至多 +1（AS6 记录的 U2 残余：等价内容重启首轮可能铸一次 revision）、条目与重启前一致、随后静默零请求；server 重启（生产序关闭、同 dataDir 重 boot）⇒ 旧快照行级相等、下载字节逐字节一致、新编辑经新监听同步、blob 根零 `.tmp-*` 残留、无旧代际提交 | 同上 |
 | AI7 | 生产启用与旧 Loop 不上传守卫：生产形态 daemon（capability 齐全、artifact 依赖全接线）对未配置 Loop 零 `/api/machine/sync*`／blob 流量、Report 无 artifact 字段、Run 正常完结、不进 watch set | 同上 |
 
 质量门：
