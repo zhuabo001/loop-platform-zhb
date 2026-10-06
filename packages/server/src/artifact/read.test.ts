@@ -319,6 +319,33 @@ describe("read facade over real PGlite (frozen evaluation order, AV1/AV2/AV7)", 
       const result = await openArtifactDownload(anomalous, "loop-1", { snapshotId: "amf-1", path: "a.txt" });
       expect(result).toEqual({ ok: false, failure: "storage_error" });
     });
+
+    it("attribution is resolved BEFORE the snapshot read (决策 27 order): a poisoned attribution never touches the snapshot stage", async () => {
+      await seedLoop(db, { id: "loop-1", machineId: "m-1" });
+      // The 2nd top-level select is the snapshot read. Original order stops
+      // at attribution (one select); an order flip walks into the fault.
+      let n = 0;
+      const faulting = new Proxy(db, {
+        get(target, prop, receiver) {
+          if (prop !== "select") {
+            const value = Reflect.get(target, prop, receiver);
+            return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+          }
+          return (...args: unknown[]) => {
+            n += 1;
+            if (n === 2) throw Object.assign(new Error("injected storage fault"), { code: "08006" });
+            return (target.select as (...a: unknown[]) => unknown).apply(target, args);
+          };
+        },
+      }) as Db;
+      const poisoned: ArtifactReadHome = {
+        db: faulting,
+        attribution: staticAttribution({}),
+        blobStore: createMemoryBlobStore(),
+      };
+      const result = await openArtifactDownload(poisoned, "loop-1", { snapshotId: "amf-1", path: "a.txt" });
+      expect(result).toEqual({ ok: false, failure: "attribution_missing" });
+    });
   });
 
   describe("diffLoopSnapshots", () => {

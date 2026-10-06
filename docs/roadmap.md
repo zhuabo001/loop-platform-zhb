@@ -235,7 +235,9 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
   - 片 6（Run 最终同步与 Report 原子绑定）已实现：daemon `artifact-final-sync`（30 秒总期限、`freshSession` 强制新会话铸快照、全量重哈希、U1 的 10 秒 `timeout` 补报）与 runtime 接线（最终同步在 in-flight 槽内执行、`runnerActive` 双门、字段合并进只序列化一次的 Report）；server 在 Report 事务资格判定后绑定 Report 携带的 snapshot/error（planner 资格参数落地、ambiguous 短路、绑定守卫并入 CAS 单次重试吸收集）。规则见 ADR-010 决策 26，范围见 `docs/plan/codex-phase5-batch2-plan.md` §2。
   - **片 6 已完成并收口**。
   - 片 6 休眠边界其余不变：不做读路由与 Dashboard（片 7）；不改 watch/event 路径；#72 的真实多连接行锁验收归 Phase 6，片 6 不关闭它。
-  - 片 7–8 未开始。
+  - 片 7（文件读取、下载、快照与 SSR 页面）已实现：server `artifact/read.ts` 管理读门面（复用 `readCurrentArtifactView` 与 `readArtifactSnapshot`，归属先行、跨 scope 无码 404）经 `ArtifactApi` 四个管理读方法挂出四条只读路由（当前视图 / run bound-missing 判别 / snapshotId+manifest path 下载 / 同 Loop 两快照结构 diff）；下载为路由层流式组合（octet-stream/attachment/nosniff/Content-Length/no-store 五头，客户端中止经请求 signal 释放句柄，中流存储失败截断收尾），R3 裁决落地——磁盘 blob 缺失归 404 `path_not_found`（仅该路由，通用映射表冻结不动）；Dashboard 新增四个零客户端 JS 路由（配置表单带 CSRF 字段白名单泛化、当前视图、Run 快照页、diff 页，默认基线=revision 更小的最近已绑定 Run 快照），无 artifacts 装配时页面不注册、404 不可区分；AD1 读路由半翻转为激活语义。规则见 ADR-010 决策 27，范围见 `docs/plan/codex-phase5-batch2-plan.md` §2。
+  - 片 7 残余：中流截断在 HTTP 层不可检（完整性信号仅剩 Content-Length，需要确定性的客户端比对所收字节与 manifest hash）；下载忽略 Range（决策 27 记录）；`artifact_dir_unconfigured` 读取域本片无路由返回（联合成员保留）。
+  - **片 8 未开始**。
 
 ### 右移项
 

@@ -220,6 +220,16 @@ describe("GET /api/loops/:id/artifacts (AV1/AV7)", () => {
     const res = await app.request("/api/loops/loop-1/artifacts");
     expect(res.status).toBe(403);
     expect(await res.json()).toEqual({ error: "artifact attribution missing", code: "artifact_attribution_missing" });
+
+    // Order pin (决策 27): attribution is judged BEFORE any snapshot/path
+    // resolution — a poisoned attribution wins over a nonexistent snapshot
+    // (an order flip would surface the snapshot's 404 first).
+    const download = await app.request(
+      "/api/loops/loop-1/artifacts/download?snapshotId=amf-ghost&path=a.txt",
+    );
+    expect(download.status).toBe(403);
+    const diff = await app.request("/api/loops/loop-1/artifacts/diff?to=amf-ghost");
+    expect(diff.status).toBe(403);
   });
 });
 
@@ -325,14 +335,61 @@ describe("GET /api/loops/:id/artifacts/download (AV4/AV5/AV8, R3)", () => {
   it("AV8: client abort mid-stream releases the handle exactly once", async () => {
     await fresh();
     await boundLoop();
+    // A store whose second chunk never arrives until the handle is released:
+    // the ONLY way the pump unwinds after an abort is the abort hook's
+    // close() — the finally-in-finally path never runs while the stream hangs.
+    const gatedLog = { opens: 0, releases: 0 };
+    let releaseGate: (() => void) | null = null;
+    let released = false;
+    const gatedStore: BlobStore = {
+      writeVerified: (input) => store.writeVerified(input),
+      has: (key) => store.has(key),
+      read: async (): Promise<BlobReadResult> => {
+        gatedLog.opens += 1;
+        return {
+          ok: true,
+          size: CONTENT_B.length * 2,
+          bytes: (async function* () {
+            yield { ok: true as const, chunk: new TextEncoder().encode(CONTENT_B) };
+            await new Promise<void>((resolve) => {
+              releaseGate = resolve;
+            });
+          })(),
+          close: async () => {
+            if (!released) {
+              released = true;
+              gatedLog.releases += 1;
+              releaseGate?.();
+            }
+          },
+        };
+      },
+    };
+    const clock = new FakeClock();
+    const gatedApp = createServerApp(
+      createRunCoordinator(testDeps(db, clock)),
+      createLoopAdmin({ db, clock, newLoopId: () => "loop-x" }),
+      createLifecycleAdmin({ db, clock }),
+      createScheduleAdmin({ db, clock }),
+      createOwnerControl({ db, clock }),
+      undefined,
+      undefined,
+      createArtifactApi({
+        db,
+        clock,
+        ids: { syncId: () => "sync-1", manifestId: () => "amf-1" },
+        blobStore: gatedStore,
+        attribution: staticAttribution({ [machineId]: "ns-1" }),
+      }),
+    );
     const ctl = new AbortController();
-    const res = await app.request(downloadPath, { signal: ctl.signal });
+    const res = await gatedApp.request(downloadPath, { signal: ctl.signal });
     expect(res.status).toBe(200);
     const reader = res.body!.getReader();
-    await reader.read(); // pump starts, registers the abort listener
-    ctl.abort(); // the client is gone: the abort hook releases the handle
-    await reader.read(); // the pump observes the abort and unwinds
-    expect(storeLog).toEqual({ opens: 1, releases: 1 });
+    await reader.read(); // chunk 1 delivered; the pump now hangs on chunk 2
+    ctl.abort(); // client gone: the abort hook must release the handle
+    await new Promise((resolve) => setTimeout(resolve, 20)); // let the pump unwind
+    expect(gatedLog).toEqual({ opens: 1, releases: 1 });
     await reader.cancel().catch(() => {});
   });
 
@@ -468,6 +525,10 @@ describe("GET /api/loops/:id/artifacts/diff (AV6)", () => {
   it("missing to / cross-loop snapshot ⇒ 400 / the code-less 404 (AV2)", async () => {
     await fresh();
     await twoSnapshots();
+    // A REAL snapshot belonging to ANOTHER loop: the cross-scope refusal must
+    // come from the loopId check, not from mere absence.
+    await seedManifest({ id: "amf-other", loopId: "loop-2" });
+    await seedLoop(db, { id: "loop-2", machineId });
     const missingTo = await app.request("/api/loops/loop-1/artifacts/diff");
     expect(missingTo.status).toBe(400);
     expect(await missingTo.json()).toEqual({ error: "invalid request" });
