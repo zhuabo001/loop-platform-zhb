@@ -1060,11 +1060,12 @@ describe("the taxonomy pin (review STD-5) — the adapter's full (status, code) 
   });
 });
 
-describe("AD1: the six slice-2 artifact routes are mounted; the slice-7 read routes stay dormant", () => {
-  // Batch 1's dormancy guard, rewritten DELIBERATELY by Batch 2 slice 2: the
-  // machine routes now answer 401 (mounted, real facade) instead of the flat
-  // 404, and the config route parses its frozen DTO. The read routes keep
-  // their flat 404 until slice 7 — that half is the stop-boundary evidence.
+describe("AD1: the six slice-2 artifact routes AND the four slice-7 read routes are mounted", () => {
+  // Batch 1's dormancy guard, rewritten DELIBERATELY by Batch 2 slice 2 (the
+  // machine routes answer 401, the config route parses its frozen DTO) and
+  // completed by slice 7 (the read routes now answer through the REAL facade —
+  // unknown ids stay in the code-less 404 family byte-identical to /nope,
+  // malformed queries are a 400, which a dormant route could never return).
   // The shared `fresh()` fixture wires NO facade; this guard builds its own
   // app around a REAL createArtifactApi over a memory BlobStore.
   let artifactApp: ReturnType<typeof createServerApp>;
@@ -1111,21 +1112,35 @@ describe("AD1: the six slice-2 artifact routes are mounted; the slice-7 read rou
     await expectJsonError(badBody, 400, { error: "invalid request" });
   });
 
-  it("the four FINAL slice-7 read paths and the wrong-method control stay the flat 404", async () => {
+  it("the four slice-7 read paths answer through the facade; the wrong-method control stays a 401", async () => {
     await freshWithArtifacts();
     const canonicalBody = await (await artifactApp.request("/nope")).text();
+    // Unknown ids: the facade's code-less 404 family — byte-identical to the
+    // notFound body (existence never leaks across scopes).
     const probes: ReadonlyArray<readonly [string, string]> = [
       ["GET", "/api/loops/loop-1/artifacts"], // current-view file list
       ["GET", `/api/loops/loop-1/artifacts/download?snapshotId=amf-1&path=a.txt`], // download
       ["GET", "/api/loops/loop-1/artifacts/diff?to=amf-1"], // structural diff
       ["GET", "/api/runs/run-1/artifacts"], // run snapshot view
-      ["GET", "/api/machine/sync"], // wrong-method control: no half-mount
     ];
     for (const [method, path] of probes) {
       const res = await artifactApp.request(path, { method });
       expect(res.status, `${method} ${path}`).toBe(404);
       expect(await res.text(), `${method} ${path}`).toBe(canonicalBody);
     }
+    // Mounted-ness proof: malformed queries are the route's own 400 — a
+    // dormant path would still be the flat 404 above.
+    const badDownload = await artifactApp.request(`/api/loops/loop-1/artifacts/download?snapshotId=amf-1`, {
+      method: "GET",
+    });
+    await expectJsonError(badDownload, 400, { error: "invalid request" });
+    const badDiff = await artifactApp.request("/api/loops/loop-1/artifacts/diff", { method: "GET" });
+    await expectJsonError(badDiff, 400, { error: "invalid request" });
+    // Wrong-method control: GET on the POST-only machine surface matches no
+    // route at all — the flat 404, never a half-mounted 401.
+    const wrongMethod = await artifactApp.request("/api/machine/sync", { method: "GET" });
+    expect(wrongMethod.status).toBe(404);
+    expect(await wrongMethod.text()).toBe(canonicalBody);
   });
 });
 

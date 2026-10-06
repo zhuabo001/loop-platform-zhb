@@ -19,6 +19,12 @@
  * 决策 13 assigns to the stable `storage_error` result. Each machine method
  * therefore wraps its WHOLE flow, so the failure code and the retry class can
  * no longer depend on which query failed.
+ *
+ * Batch 2 slice 7 adds the four MANAGEMENT reads (决策 27): no credential
+ * (loopback boundary, like `updateConfig`), the machine identity discovered
+ * from the loop row, attribution re-resolved before any snapshot/path/blob
+ * resolution. `openDownload` returns a structured stream HANDLE — response
+ * composition, the mid-stream pump and abort cleanup belong to the route.
  */
 import { eq } from "drizzle-orm";
 
@@ -32,6 +38,17 @@ import { InvalidMachineCredentialError } from "../coordinator/errors.js";
 import { loops } from "../db/schema.js";
 import { verifyMachineCredential } from "../store/machines.js";
 import type { TrustedMachineIdentity } from "./attribution.js";
+import {
+  diffLoopSnapshots,
+  openArtifactDownload,
+  readLoopArtifactsView,
+  readRunArtifactsView,
+  type ArtifactReadHome,
+  type OpenArtifactDownloadResult,
+  type ReadDiffResult,
+  type ReadLoopArtifactsResult,
+  type ReadRunArtifactsResult,
+} from "./read.js";
 import type { ArtifactHomeDeps } from "./sync.js";
 import { commitArtifactSync, prepareArtifactSync, putArtifactBlob, type CommitArtifactSyncResult, type PrepareArtifactSyncResult, type PutArtifactBlobResult } from "./sync.js";
 import { recordArtifactSyncError, type RecordArtifactSyncErrorResult } from "./sync-error.js";
@@ -63,6 +80,16 @@ export type MachineLoopArtifactsReadResult =
 export interface ArtifactApi {
   /** PATCH /api/loops/:id/artifact-dir — management, no credential. */
   updateConfig(loopId: string, command: { artifactDir: string | null }): Promise<UpdateArtifactConfigResult>;
+  /** GET /api/loops/:id/artifacts — management read: the current file view. */
+  readLoop(loopId: string): Promise<ReadLoopArtifactsResult>;
+  /** GET /api/runs/:id/artifacts — management read: bound snapshot or explicit missing. */
+  readRun(runId: string): Promise<ReadRunArtifactsResult>;
+  /** GET /api/loops/:id/artifacts/diff — management read: structural diff of two same-loop snapshots. */
+  diffSnapshots(loopId: string, query: { from?: string; to: string }): Promise<ReadDiffResult>;
+  /** GET /api/loops/:id/artifacts/download — opens the verified blob stream
+   *  for one manifest entry; the ROUTE owns response composition, the
+   *  mid-stream pump and abort cleanup (决策 27). */
+  openDownload(loopId: string, query: { snapshotId: string; path: string }): Promise<OpenArtifactDownloadResult>;
   /** GET /api/machine/loops/:id/artifacts — the restart/conflict recovery read. */
   readMachineLoop(token: string, loopId: string): Promise<MachineLoopArtifactsReadResult>;
   /** POST /api/machine/sync. */
@@ -76,7 +103,8 @@ export interface ArtifactApi {
 }
 
 export function createArtifactApi(home: ArtifactHomeDeps): ArtifactApi {
-  const { db, clock, attribution } = home;
+  const { db, clock, attribution, blobStore } = home;
+  const reads: ArtifactReadHome = { db, attribution, blobStore };
 
   async function authenticate(token: string): Promise<TrustedMachineIdentity> {
     const machine = await verifyMachineCredential(db, token);
@@ -87,6 +115,34 @@ export function createArtifactApi(home: ArtifactHomeDeps): ArtifactApi {
   return {
     updateConfig(loopId, command) {
       return updateArtifactConfig({ db, clock }, loopId, { artifactDir: command.artifactDir });
+    },
+
+    readLoop(loopId) {
+      return withStorageError(
+        () => readLoopArtifactsView(reads, loopId),
+        (cause) => ({ ok: false, failure: "storage_error", cause }),
+      );
+    },
+
+    readRun(runId) {
+      return withStorageError(
+        () => readRunArtifactsView(reads, runId),
+        (cause) => ({ ok: false, failure: "storage_error", cause }),
+      );
+    },
+
+    diffSnapshots(loopId, query) {
+      return withStorageError(
+        () => diffLoopSnapshots(reads, loopId, query),
+        (cause) => ({ ok: false, failure: "storage_error", cause }),
+      );
+    },
+
+    openDownload(loopId, query) {
+      return withStorageError(
+        () => openArtifactDownload(reads, loopId, query),
+        (cause) => ({ ok: false, failure: "storage_error", cause }),
+      );
     },
 
     readMachineLoop(token, loopId) {

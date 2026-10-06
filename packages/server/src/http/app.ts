@@ -46,6 +46,8 @@ import { DASHBOARD_RUN_PATH } from "../dashboard/routes.js";
 import {
   ARTIFACT_PREPARE_REQUEST_MAX_UTF8_BYTES,
   ARTIFACT_SYNC_ID_HEADER,
+  artifactDiffQuerySchema,
+  artifactDownloadQuerySchema,
   artifactSyncErrorReportRequestSchema,
   cancelRunRequestSchema,
   createLoopRequestSchema,
@@ -68,6 +70,7 @@ import { ArtifactDirValidationError, LoopValidationError } from "../admin/errors
 import { LOOP_PATH_CAP, type LoopAdmin } from "../admin/index.js";
 import type { ArtifactApi } from "../artifact/api.js";
 import { mapArtifactFailure, type ArtifactInternalFailure } from "../artifact/error-mapping.js";
+import type { BlobStreamChunk } from "../artifact/blob-store.js";
 import { InvalidMachineCredentialError, RunCapabilityInvalidError } from "../coordinator/errors.js";
 import type { RunCoordinator } from "../coordinator/index.js";
 import type { Loop } from "../db/schema.js";
@@ -100,6 +103,69 @@ async function parseJsonBody(c: Context): Promise<unknown> {
   } catch {
     return undefined;
   }
+}
+
+/** The Content-Disposition filename: the manifest path's LAST segment only
+ *  (manifest paths are server-written policy-validated relative paths —
+ *  defense in depth), control chars stripped, `"` and `\` backslash-escaped
+ *  per RFC 6266; empty ⇒ the fixed `artifact`. */
+function contentDispositionBasename(manifestPath: string): string {
+  const base = manifestPath.split("/").pop() ?? "";
+  const cleaned = base
+    .replace(/[\x00-\x1f\x7f]/g, "")
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"');
+  return cleaned === "" ? "artifact" : cleaned;
+}
+
+/** The AV8 stream pump. The client-abort hook fires `close()` (idempotent);
+ *  the loop stops pulling on abort; the `finally` close is a no-op after
+ *  natural EOF (the adapter auto-closes on exhaustion). A terminal mid-stream
+ *  `storage_error` element (决策 14's two-phase channel — the iterator never
+ *  throws) truncates the body: headers incl. status and Content-Length are
+ *  already sent, so the truncation is the only honest ending (决策 27). */
+async function* pumpArtifactDownload(
+  bytes: AsyncIterable<BlobStreamChunk>,
+  close: () => Promise<void>,
+  signal: AbortSignal | undefined,
+): AsyncGenerator<Uint8Array> {
+  const onAbort = (): void => {
+    void close().catch(() => {});
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    for await (const chunk of bytes) {
+      if (signal?.aborted) break; // client gone: stop pulling
+      if (chunk.ok) {
+        yield chunk.chunk;
+        continue;
+      }
+      console.error("[http] artifact download mid-stream storage error");
+      break;
+    }
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
+    await close().catch(() => {});
+  }
+}
+
+/** Compose the download response. EVERY header is explicit on the bare
+ *  `Response`: Hono drops prepared headers on a returned Response
+ *  (dashboard/routes.ts's baked-in lesson). Range requests are deliberately
+ *  ignored (决策 27): always the full 200. */
+function artifactDownloadResponse(
+  c: Context,
+  opened: { bytes: AsyncIterable<BlobStreamChunk>; size: number; close(): Promise<void> },
+  entryPath: string,
+): Response {
+  const headers = new Headers({
+    "content-type": "application/octet-stream",
+    "content-disposition": `attachment; filename="${contentDispositionBasename(entryPath)}"`,
+    "content-length": String(opened.size),
+    "x-content-type-options": "nosniff",
+    "cache-control": "no-store",
+  });
+  return new Response(pumpArtifactDownload(opened.bytes, opened.close, c.req.raw.signal), { status: 200, headers });
 }
 
 /** The manual trigger takes NO business params: an EMPTY body normalizes to
@@ -493,6 +559,67 @@ export function createServerApp(
       const loopSummary = await admin.getLoopSummary(result.loop.id);
       if (!loopSummary) return jsonError(c, 404, "not found");
       return c.json({ loop: loopSummary }, 200);
+    });
+
+    // ---- slice 7 read routes (ADR-010 决策 27) ----
+    // The query-string precedent: raw values, EMPTY STRING normalized to
+    // undefined (an HTML form's empty baseline submits `from=`), then the
+    // FROZEN query schema. Malformed ⇒ the code-less 400.
+    const parseDownloadQuery = (c: Context): { snapshotId: string; path: string } | undefined => {
+      const parsed = artifactDownloadQuerySchema.safeParse({
+        snapshotId: c.req.query("snapshotId"),
+        path: c.req.query("path"),
+      });
+      return parsed.success ? parsed.data : undefined;
+    };
+    const parseDiffQuery = (c: Context): { from?: string; to: string } | undefined => {
+      const from = c.req.query("from");
+      const parsed = artifactDiffQuerySchema.safeParse({
+        from: from === undefined || from === "" ? undefined : from,
+        to: c.req.query("to"),
+      });
+      return parsed.success ? parsed.data : undefined;
+    };
+
+    app.get("/api/loops/:id/artifacts", async (c) => {
+      const result = await artifacts.readLoop(c.req.param("id"));
+      if (!result.ok) return artifactError(c, result.failure);
+      return c.json(result.response);
+    });
+
+    app.get("/api/runs/:id/artifacts", async (c) => {
+      const result = await artifacts.readRun(c.req.param("id"));
+      if (!result.ok) return artifactError(c, result.failure);
+      return c.json(result.response);
+    });
+
+    app.get("/api/loops/:id/artifacts/diff", async (c) => {
+      const query = parseDiffQuery(c);
+      if (query === undefined) return jsonError(c, 400, "invalid request");
+      const result = await artifacts.diffSnapshots(c.req.param("id"), query);
+      if (!result.ok) return artifactError(c, result.failure);
+      return c.json(result.response);
+    });
+
+    app.get("/api/loops/:id/artifacts/download", async (c) => {
+      const query = parseDownloadQuery(c);
+      if (query === undefined) return jsonError(c, 400, "invalid request");
+      const result = await artifacts.openDownload(c.req.param("id"), query);
+      if (!result.ok) {
+        // R3 (决策 27): at THIS route only, a blob gone from disk under a live
+        // manifest entry means the path's bytes are missing — the code-less
+        // 404 family, never the generic table's 409. Every other failure
+        // rides the frozen table verbatim.
+        return artifactError(c, result.failure === "blob_missing" ? "path_not_found" : result.failure);
+      }
+      try {
+        return artifactDownloadResponse(c, result.stream, result.entry.path);
+      } catch (err) {
+        // Composition failed after the open: release the handle before the
+        // error escapes to app.onError.
+        await result.stream.close().catch(() => {});
+        throw err;
+      }
     });
 
     app.get("/api/machine/loops/:id/artifacts", async (c) => {
