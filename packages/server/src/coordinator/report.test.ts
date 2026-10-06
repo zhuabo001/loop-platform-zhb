@@ -14,10 +14,11 @@
  * Everything Phase 1 doesn't consume (cursor, taskFileContent, artifacts,
  * transcript, cost, attempts, non-exec outcome) parses but never writes.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 
 import type { Delivery, ReportRequest } from "@loopzhb/protocol";
+import { reportRequestSchema } from "@loopzhb/protocol";
 import { sha256 } from "@loopzhb/protocol/node";
 
 import { createMachineAttributionResolver } from "../artifact/attribution-machine.js";
@@ -608,6 +609,86 @@ describe("slice 6: report-carried artifact binding (ADR-010 决策 16 片 6 条�
       artifactSnapshotId: null,
       artifactSyncError: "ambiguous_artifact_report",
     });
+  });
+
+  it("an empty/whitespace/NUL-only error is a CARRIED field: the report stays ambiguous and no manifest is read (#105)", async () => {
+    // The reviewer's counterexample: cleaning the error FIRST made a dirty
+    // dual-field report look snapshot-only — it read the manifest and bound.
+    // Presence is judged on the RAW wire fields; the values below are legal
+    // on the wire (reportRequestSchema only types the field as a string).
+    const readSpy = vi.spyOn(await import("../artifact/sync.js"), "readArtifactSnapshot");
+    try {
+      const dirty = ["", "   ", "\0\0", " \0\t "];
+      for (const [index, value] of dirty.entries()) {
+        await fresh({ artifactBinding });
+        await seedBindableLoop();
+        await seedCommittedManifest(); // a VALID reference — ambiguity still wins
+        const token = await seedActiveRun({ id: `run-${index}` }, `rk_dirty_${index}`);
+        // Parsed by the REAL wire schema before it reaches the transaction.
+        const body = reportRequestSchema.parse({
+          ok: true,
+          artifactSnapshotId: "amf-1",
+          artifactSyncError: value,
+        });
+
+        await coordinator.report(token, body);
+        const run = (await snapshotRuns(db)).find((r) => r.id === `run-${index}`)!;
+        expect(run).toMatchObject({
+          phase: "done",
+          outcome: "exec",
+          artifactSnapshotId: null,
+          artifactSyncError: "ambiguous_artifact_report",
+        });
+      }
+      // The short-circuit even precedes the existence question: every dirty
+      // report is decided WITHOUT the manifest lookup.
+      expect(readSpy).not.toHaveBeenCalled();
+      // …and the spy really does intercept the report's call site, so the
+      // negative assertion above is not vacuous.
+      const soleToken = await seedActiveRun({ id: "run-sole" }, "rk_dirty_sole");
+      await coordinator.report(soleToken, { ok: true, artifactSnapshotId: "amf-1" });
+      expect(readSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+
+  it("ambiguity is decided before manifest existence: a dirty dual-field report with NO committed row is still ambiguous (#105)", async () => {
+    await fresh({ artifactBinding });
+    await seedBindableLoop(); // no manifest row at all
+    const token = await seedActiveRun();
+
+    await coordinator.report(token, { ok: true, artifactSnapshotId: "amf-ghost", artifactSyncError: "  " });
+    const run = (await snapshotRuns(db))[0]!;
+    // NOT snapshot_not_committed — the ambiguity arm wins, so the manifest's
+    // existence was never consulted.
+    expect(run).toMatchObject({ phase: "done", artifactSnapshotId: null, artifactSyncError: "ambiguous_artifact_report" });
+  });
+
+  it("a legal terminal-grace reconcile applies the SAME raw-presence ambiguity rule (#105)", async () => {
+    await fresh({ artifactBinding });
+    await seedBindableLoop();
+    await seedCommittedManifest();
+    const token = await seedSweptRun();
+
+    const result = await coordinator.report(
+      token,
+      reportRequestSchema.parse({ ok: true, artifactSnapshotId: "amf-1", artifactSyncError: "\0" }),
+    );
+    expect(result).toEqual({ ok: true, reconciled: true });
+    const run = (await snapshotRuns(db))[0]!;
+    expect(run).toMatchObject({ phase: "done", artifactSnapshotId: null, artifactSyncError: "ambiguous_artifact_report" });
+    expect(await snapshotLeases(db)).toEqual([]);
+  });
+
+  it("an error-only value with no usable text records nothing — the columns stay null, the outcome still commits (#105)", async () => {
+    await fresh({ artifactBinding });
+    await seedBindableLoop();
+    const token = await seedActiveRun();
+
+    await coordinator.report(token, { ok: true, artifactSyncError: "   " });
+    const run = (await snapshotRuns(db))[0]!;
+    expect(run).toMatchObject({ phase: "done", outcome: "exec", artifactSnapshotId: null, artifactSyncError: null });
   });
 
   it("illegal snapshot references record their stable rejection and never bind (AR6)", async () => {

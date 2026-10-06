@@ -94,6 +94,7 @@ function input(overrides: Partial<ArtifactBindingInput> = {}): ArtifactBindingIn
     manifest: baseManifest(),
     snapshotId: "amf-1",
     syncError: undefined,
+    syncErrorText: undefined,
     eligibility: "finalize",
     attribution: { ok: true, namespaceId: "ns-1", machineId: "m-1" },
     ...overrides,
@@ -118,7 +119,7 @@ describe("plan (pure): the fixed evaluation order", () => {
   });
 
   it("BOTH artifact fields present → record_error/ambiguous_artifact_report, short-circuiting the snapshot checks", () => {
-    const plan = planArtifactSnapshotBinding(input({ syncError: "timeout" }));
+    const plan = planArtifactSnapshotBinding(input({ syncError: "timeout", syncErrorText: "timeout" }));
     expect(plan).toEqual({
       kind: "record_error",
       reason: "ambiguous_artifact_report",
@@ -126,18 +127,44 @@ describe("plan (pure): the fixed evaluation order", () => {
     });
     // The manifest input is irrelevant — the caller skips the lookup for an
     // ambiguous report (no existence leak before validation).
-    const withManifest = planArtifactSnapshotBinding(input({ syncError: "timeout", manifest: null }));
+    const withManifest = planArtifactSnapshotBinding(
+      input({ syncError: "timeout", syncErrorText: "timeout", manifest: null }),
+    );
     expect(withManifest).toEqual(plan);
+  });
+
+  it("ambiguity is judged on the RAW carried field (#105): a value that cleans to nothing is still a conflict", () => {
+    // The exact counterexample: a valid snapshot id plus an error field whose
+    // text normalizes away. Presence — not cleaning — decides.
+    for (const raw of ["", "   ", "\0\0", " \0\t "]) {
+      const plan = planArtifactSnapshotBinding(input({ syncError: raw, syncErrorText: undefined }));
+      expect(plan).toEqual({
+        kind: "record_error",
+        reason: "ambiguous_artifact_report",
+        runWrites: { artifactSnapshotId: null, artifactSyncError: "ambiguous_artifact_report" },
+      });
+    }
   });
 
   it("syncError only → record_error carrying the daemon's classification verbatim (no manifest read)", () => {
     for (const syncError of ["timeout", "unreadable", "unavailable", "stopped"]) {
-      const plan = planArtifactSnapshotBinding(input({ snapshotId: undefined, syncError, manifest: null }));
+      const plan = planArtifactSnapshotBinding(
+        input({ snapshotId: undefined, syncError, syncErrorText: syncError, manifest: null }),
+      );
       expect(plan).toEqual({
         kind: "record_error",
         reason: syncError,
         runWrites: { artifactSnapshotId: null, artifactSyncError: syncError },
       });
+    }
+  });
+
+  it("an error-only value with no usable text records NOTHING — never an invented literal", () => {
+    for (const raw of ["", "   ", "\0", " \0 "]) {
+      const plan = planArtifactSnapshotBinding(
+        input({ snapshotId: undefined, syncError: raw, syncErrorText: undefined, manifest: null }),
+      );
+      expect(plan).toEqual({ kind: "skip" });
     }
   });
 

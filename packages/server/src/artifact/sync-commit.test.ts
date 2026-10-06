@@ -1376,6 +1376,7 @@ describe("commit (real PGlite + memory BlobStore)", () => {
       manifest,
       snapshotId: receipt.artifactSnapshotId,
       syncError: undefined,
+      syncErrorText: undefined,
       eligibility: "finalize",
       attribution: { ok: true, namespaceId: "ns-1", machineId: "m-1" },
     });
@@ -1391,6 +1392,7 @@ describe("commit (real PGlite + memory BlobStore)", () => {
       manifest,
       snapshotId: manifest.id,
       syncError: undefined,
+      syncErrorText: undefined,
       eligibility: "finalize",
       attribution: { ok: true, namespaceId: "ns-other", machineId: "m-1" },
     });
@@ -1403,6 +1405,7 @@ describe("commit (real PGlite + memory BlobStore)", () => {
       manifest: await readArtifactSnapshot(db, "amf-ghost"),
       snapshotId: "amf-ghost",
       syncError: undefined,
+      syncErrorText: undefined,
       eligibility: "finalize",
       attribution: { ok: true, namespaceId: "ns-1", machineId: "m-1" },
     });
@@ -1417,6 +1420,7 @@ describe("commit (real PGlite + memory BlobStore)", () => {
       manifest,
       snapshotId: manifest.id,
       syncError: undefined,
+      syncErrorText: undefined,
       eligibility: "finalize",
       attribution: { ok: true, namespaceId: "ns-1", machineId: "m-1" },
     });

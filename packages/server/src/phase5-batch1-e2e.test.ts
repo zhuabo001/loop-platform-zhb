@@ -259,6 +259,7 @@ describe("Phase 5 Batch 1 internal integration acceptance (plan §4 slice 6)", (
       manifest: manifest1,
       snapshotId: "amf-1",
       syncError: undefined,
+      syncErrorText: undefined,
       eligibility: "finalize",
       attribution: { ok: true, namespaceId: "ns-1", machineId: "m-1" },
     });

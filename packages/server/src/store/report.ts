@@ -298,26 +298,34 @@ async function runReportTx(
     // degrades the bind to stale_config_generation). A missing loop row
     // (v1 orphan damage) skips binding — the four-party chain cannot be
     // verified and the run still settles via invalid_loop_state.
-    const artifactSyncError = cleanError(input.body.artifactSyncError);
+    // Presence is judged on the RAW wire fields (#105): cleaning is a STORAGE
+    // policy, never a presence test. An empty / whitespace-only / NUL-only
+    // artifactSyncError is still a CARRIED field — a report carrying a
+    // snapshot id AND such a value is AMBIGUOUS and short-circuits BEFORE any
+    // manifest read (existence must not leak in front of validation), and the
+    // error-only arm stores the cleaned text only when it is usable.
+    const carriedSnapshotId = input.body.artifactSnapshotId;
+    const carriedSyncError = input.body.artifactSyncError;
     if (
       deps.artifactBinding !== undefined &&
       state.loop !== null &&
-      (input.body.artifactSnapshotId !== undefined || artifactSyncError !== undefined)
+      (carriedSnapshotId !== undefined || carriedSyncError !== undefined)
     ) {
-      const ambiguous = input.body.artifactSnapshotId !== undefined && artifactSyncError !== undefined;
+      const ambiguous = carriedSnapshotId !== undefined && carriedSyncError !== undefined;
       const attribution = await deps.artifactBinding.resolveAttribution(run.machineId, tx);
       // An ambiguous report never triggers a manifest read — existence must
       // not leak before validation (the planner short-circuits regardless).
       const manifest =
-        !ambiguous && input.body.artifactSnapshotId !== undefined
-          ? await readArtifactSnapshot(tx, input.body.artifactSnapshotId)
+        !ambiguous && carriedSnapshotId !== undefined
+          ? await readArtifactSnapshot(tx, carriedSnapshotId)
           : null;
       const bindingPlan = planArtifactSnapshotBinding({
         run,
         loop: state.loop,
         manifest,
-        snapshotId: input.body.artifactSnapshotId,
-        syncError: artifactSyncError,
+        snapshotId: carriedSnapshotId,
+        syncError: carriedSyncError,
+        syncErrorText: cleanError(carriedSyncError),
         eligibility: finalize ? "finalize" : "reconcile",
         attribution,
       });

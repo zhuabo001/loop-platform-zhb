@@ -81,9 +81,16 @@ export interface ArtifactBindingInput {
   /** The report-carried snapshot reference; undefined = the report carries
    *  none. */
   snapshotId: string | undefined;
-  /** The report-carried stable sync-error classification, caller-normalized
-   *  (cleaned, capped, non-empty); undefined = the report carries none. */
+  /** The RAW report-carried sync-error field. Its PRESENCE decides ambiguity
+   *  and the record path: an empty, whitespace-only or NUL-only string is
+   *  still a CARRIED field (#105) — text cleaning is a STORAGE policy, never
+   *  a presence test. undefined = the report carries no error field. */
   syncError: string | undefined;
+  /** The storage text for `syncError`, normalized by the caller (NUL-stripped,
+   *  trimmed, capped); undefined when the raw value carries no usable text.
+   *  Only the error-only arm consults it: a value that normalizes to nothing
+   *  records NOTHING (skip) — never an invented literal. */
+  syncErrorText: string | undefined;
   /** The binding eligibility the report transaction EXPLICITLY confirmed
    *  (ADR-010 决策 19 末段): "finalize" = active lease + running run;
    *  "reconcile" = the ONE terminal-grace wake-report for a swept run. Both
@@ -97,16 +104,21 @@ export interface ArtifactBindingInput {
 }
 
 /**
- * Fixed evaluation order (first match wins): neither field → skip → BOTH
- * fields → record_error/ambiguous_artifact_report (short-circuit, no manifest
- * read) → syncError only → record_error with the daemon's classification
- * verbatim → attribution missing → record_error/attribution_missing → no
- * manifest row OR the row is not the referenced id →
- * record_error/snapshot_not_committed → namespace → machine → loop → stale
- * generation → bind.
+ * Fixed evaluation order (first match wins): neither field CARRIED → skip →
+ * BOTH fields carried → record_error/ambiguous_artifact_report (short-circuit,
+ * no manifest read) → syncError only → record_error with the daemon's
+ * classification verbatim (skip when the raw value normalizes to nothing) →
+ * attribution missing → record_error/attribution_missing → no manifest row OR
+ * the row is not the referenced id → record_error/snapshot_not_committed →
+ * namespace → machine → loop → stale generation → bind.
+ *
+ * Presence is judged on the RAW wire fields, never on the cleaned text: a
+ * report carrying a snapshot id plus an empty/whitespace/NUL-only error is
+ * AMBIGUOUS (#105) — cleaning only decides what TEXT an error-only report
+ * records.
  */
 export function planArtifactSnapshotBinding(input: ArtifactBindingInput): ArtifactBindingPlan {
-  const { run, loop, manifest, snapshotId, syncError, attribution } = input;
+  const { run, loop, manifest, snapshotId, syncError, syncErrorText, attribution } = input;
   if (snapshotId === undefined && syncError === undefined) return { kind: "skip" };
   if (snapshotId !== undefined && syncError !== undefined) {
     return {
@@ -116,10 +128,15 @@ export function planArtifactSnapshotBinding(input: ArtifactBindingInput): Artifa
     };
   }
   if (syncError !== undefined) {
+    // The field was CARRIED (raw presence above); only its stored text follows
+    // the text policy. No usable text ⇒ no classification to record: write
+    // nothing rather than invent a literal (the run outcome is unaffected
+    // either way).
+    if (syncErrorText === undefined) return { kind: "skip" };
     return {
       kind: "record_error",
-      reason: syncError,
-      runWrites: { artifactSnapshotId: null, artifactSyncError: syncError },
+      reason: syncErrorText,
+      runWrites: { artifactSnapshotId: null, artifactSyncError: syncErrorText },
     };
   }
   if (!attribution.ok) {
