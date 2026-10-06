@@ -274,6 +274,18 @@ Batch 1 错误映射在 HTTP 接线时补齐：revision 耗尽使用新增 `arti
 | AV7 | 缺失/过期：未绑定 Run ⇒ `{state:"missing"}`；绑定行越外消失 ⇒ `snapshot_not_found` 404；配置换代 ⇒ `stale:true` 视图照服；未配置 Loop ⇒ null 视图 | `artifact-read-routes.test.ts`（missing/stale/unconfigured 探针）、e2e（配置变更后 stale 旗标） |
 | AV8 | 句柄与中断：中止 ⇒ `close()` 恰一次；自然 EOF 无泄漏；未迭代即放弃 ⇒ `close()`；中流 storage_error ⇒ 截断 + 清理 | `artifact-read-routes.test.ts`（计数假 BlobStore + `AbortController` 经 `app.request(..., { signal })` 注入） |
 
+片 8 的 AI 编号逐项对应（场景不依赖 handoff 记录；真实 HTTP + 文件型 PGlite + 本地 BlobStore + 生产形态 Daemon runtime + Fake Runner + 真实临时目录）：
+
+| ID | 场景 | 主要证据 |
+|---|---|---|
+| AI1 | idle 编辑与删除：生产形态 daemon（真实 chokidar、poll 路径 watch apply）启动全扫提交 revision 1；创建/修改/删除逐次收敛且路径精确；静默窗口零 prepare/commit（无变化抑制）；已提交 manifest 的 blob 全部落盘（无部分 manifest） | `server/src/phase5-batch2-slice8-e2e.test.ts` |
+| AI2 | 两次 Run 经真实 socket 绑定两个不同快照；Run 1 行与 snap1 entries 冻结；snap1 下载字节与原始磁盘内容逐字节一致；diff 三类变化 | 同上 |
+| AI3 | 配置换代：PATCH 新根 ⇒ 旧 watcher 先关闭、新根后订阅并以 `configRevision:2` 提交；PATCH null ⇒ watch 清空、watcher 关闭、旧目录再编辑零流量零 revision 变化；旧视图 `stale:true` | 同上 |
+| AI4 | 断网：offline 窗口内观测到失败尝试，恢复后恰一个新 revision、一次 commit、无卡死，后续编辑照常同步 | 同上 |
+| AI5 | 响应丢失三腿（真实服务端已应用、客户端丢响应）：prepare 丢 ⇒ 同 requestId 重试得同一 syncId；PUT 丢 ⇒ 重 PUT 得 `published:false` 且 blob 去重；commit 丢 ⇒ 重 commit 取回同一冻结回执、revision 恰进一；会话过期：prepare 后过期 ⇒ commit 得 `artifact_session_expired` ⇒ 同载荷原地续期（同 syncId、`needHashes:[]`）⇒ commit 成功 | 同上 |
+| AI6 | 进程重启：daemon 重启（全新实例、内存缓存丢失）⇒ 等价抑制、零伪 revision；server 重启（生产序关闭、同 dataDir 重 boot）⇒ 旧快照行级相等、下载字节逐字节一致、新编辑经新监听同步、blob 根零 `.tmp-*` 残留、无旧代际提交 | 同上 |
+| AI7 | 生产启用与旧 Loop 不上传守卫：生产形态 daemon（capability 齐全、artifact 依赖全接线）对未配置 Loop 零 `/api/machine/sync*`／blob 流量、Report 无 artifact 字段、Run 正常完结、不进 watch set | 同上 |
+
 质量门：
 
 ```bash
