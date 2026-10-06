@@ -1,16 +1,18 @@
 /**
  * Artifact snapshot binding — pure plan matrix + guarded persistence
- * (ADR-010 决策 12, plan §3 "Run 快照边界"; slice 2 AM4 关联约束 evidence).
+ * (ADR-010 决策 12, plan §3 "Run 快照边界"; slice 2 AM4 关联约束 evidence;
+ * slice 6 eligibility + report-carried error arms).
  *
- *  plan (pure):   the fixed evaluation order (skip → skip-on-phase →
+ *  plan (pure):   the fixed evaluation order (skip → ambiguous short-circuit
+ *                 → sync-error verbatim → attribution_missing →
  *                 snapshot_not_committed → cross_namespace → cross_machine →
- *                 cross_loop → stale_config_generation → bind); the write
- *                 shapes are exactly the artifact columns, never the run's
- *                 outcome.
+ *                 cross_loop → stale_config_generation → bind); eligibility is
+ *                 the caller-confirmed contract parameter (决策 19 末段), the
+ *                 planner never reads run.phase; the write shapes are exactly
+ *                 the artifact columns, never the run's outcome.
  *  persistence:   bind / record_error / skip against the real PGlite, the
  *                 phase-guarded CAS write, and the transaction-handle
- *                 acceptance Batch 2 will use to embed the plan in the
- *                 report transaction.
+ *                 acceptance the report transaction uses (slice 6).
  *
  * Nothing here wires into the production report path (决策 16).
  */
@@ -91,20 +93,61 @@ function input(overrides: Partial<ArtifactBindingInput> = {}): ArtifactBindingIn
     loop: baseLoop(),
     manifest: baseManifest(),
     snapshotId: "amf-1",
-    attribution: { namespaceId: "ns-1", machineId: "m-1" },
+    syncError: undefined,
+    eligibility: "finalize",
+    attribution: { ok: true, namespaceId: "ns-1", machineId: "m-1" },
     ...overrides,
   };
 }
 
 describe("plan (pure): the fixed evaluation order", () => {
-  it("no snapshotId in the report → skip (zero writes)", () => {
+  it("neither artifact field in the report → skip (zero writes)", () => {
     expect(planArtifactSnapshotBinding(input({ snapshotId: undefined }))).toEqual({ kind: "skip" });
   });
 
-  it("a non-running run never binds — canceled/error/done/pending all skip", () => {
-    for (const phase of ["canceled", "error", "done", "pending"] as const) {
-      expect(planArtifactSnapshotBinding(input({ run: baseRun({ phase }) }))).toEqual({ kind: "skip" });
+  it("eligibility is the caller-confirmed contract — the planner never reads run.phase (决策 19 末段)", () => {
+    // A terminal-grace reconcile plans against an error-phase run; the
+    // pre-slice-6 phase gate would have skipped it.
+    const reconciled = planArtifactSnapshotBinding(input({ run: baseRun({ phase: "error" }), eligibility: "reconcile" }));
+    expect(reconciled).toEqual({ kind: "bind", runWrites: { artifactSnapshotId: "amf-1" }, guardConfigRevision: 2 });
+    // …and the planner does not police the caller: even a canceled row binds
+    // when the caller asserts eligibility (canceled/superseded runs simply
+    // never reach the planner — the report transaction denies them first).
+    const trusted = planArtifactSnapshotBinding(input({ run: baseRun({ phase: "canceled" }), eligibility: "finalize" }));
+    expect(trusted.kind).toBe("bind");
+  });
+
+  it("BOTH artifact fields present → record_error/ambiguous_artifact_report, short-circuiting the snapshot checks", () => {
+    const plan = planArtifactSnapshotBinding(input({ syncError: "timeout" }));
+    expect(plan).toEqual({
+      kind: "record_error",
+      reason: "ambiguous_artifact_report",
+      runWrites: { artifactSnapshotId: null, artifactSyncError: "ambiguous_artifact_report" },
+    });
+    // The manifest input is irrelevant — the caller skips the lookup for an
+    // ambiguous report (no existence leak before validation).
+    const withManifest = planArtifactSnapshotBinding(input({ syncError: "timeout", manifest: null }));
+    expect(withManifest).toEqual(plan);
+  });
+
+  it("syncError only → record_error carrying the daemon's classification verbatim (no manifest read)", () => {
+    for (const syncError of ["timeout", "unreadable", "unavailable", "stopped"]) {
+      const plan = planArtifactSnapshotBinding(input({ snapshotId: undefined, syncError, manifest: null }));
+      expect(plan).toEqual({
+        kind: "record_error",
+        reason: syncError,
+        runWrites: { artifactSnapshotId: null, artifactSyncError: syncError },
+      });
     }
+  });
+
+  it("unresolved attribution fails CLOSED — record_error/attribution_missing before any manifest check", () => {
+    const plan = planArtifactSnapshotBinding(input({ attribution: { ok: false, failure: "attribution_missing" } }));
+    expect(plan).toEqual({
+      kind: "record_error",
+      reason: "attribution_missing",
+      runWrites: { artifactSnapshotId: null, artifactSyncError: "attribution_missing" },
+    });
   });
 
   it("an unknown snapshot id → record_error/snapshot_not_committed", () => {
@@ -237,12 +280,12 @@ describe("persistence (real PGlite)", () => {
     ]);
   });
 
-  it("skip performs zero writes (canceled/superseded runs stay item-equal)", async () => {
+  it("skip performs zero writes (a report carrying neither artifact field leaves the row item-equal)", async () => {
     await fresh();
     await db.update(runs).set({ phase: "canceled", outcome: "silent" }).where(eq(runs.id, "run-1"));
     const before = await getRun();
 
-    const plan = planArtifactSnapshotBinding(input({ run: before }));
+    const plan = planArtifactSnapshotBinding(input({ run: before, snapshotId: undefined, manifest: null }));
     expect(plan).toEqual({ kind: "skip" });
     await applyArtifactBindingPlan(db, before, plan);
     expect(await getRun()).toEqual(before);

@@ -258,7 +258,9 @@ describe("Phase 5 Batch 1 internal integration acceptance (plan §4 slice 6)", (
       loop: loopBefore,
       manifest: manifest1,
       snapshotId: "amf-1",
-      attribution: { namespaceId: "ns-1", machineId: "m-1" },
+      syncError: undefined,
+      eligibility: "finalize",
+      attribution: { ok: true, namespaceId: "ns-1", machineId: "m-1" },
     });
     expect(plan).toEqual({ kind: "bind", runWrites: { artifactSnapshotId: "amf-1" }, guardConfigRevision: 1 });
     await db.transaction(async (tx) => {

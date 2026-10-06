@@ -1375,7 +1375,9 @@ describe("commit (real PGlite + memory BlobStore)", () => {
       loop,
       manifest,
       snapshotId: receipt.artifactSnapshotId,
-      attribution: { namespaceId: "ns-1", machineId: "m-1" },
+      syncError: undefined,
+      eligibility: "finalize",
+      attribution: { ok: true, namespaceId: "ns-1", machineId: "m-1" },
     });
     expect(bind).toMatchObject({ kind: "bind", runWrites: { artifactSnapshotId: "amf-1" } });
     await applyArtifactBindingPlan(db, run, bind);
@@ -1388,7 +1390,9 @@ describe("commit (real PGlite + memory BlobStore)", () => {
       loop,
       manifest,
       snapshotId: manifest.id,
-      attribution: { namespaceId: "ns-other", machineId: "m-1" },
+      syncError: undefined,
+      eligibility: "finalize",
+      attribution: { ok: true, namespaceId: "ns-other", machineId: "m-1" },
     });
     expect(crossNamespace).toMatchObject({ kind: "record_error", reason: "cross_namespace" });
 
@@ -1398,7 +1402,9 @@ describe("commit (real PGlite + memory BlobStore)", () => {
       loop,
       manifest: await readArtifactSnapshot(db, "amf-ghost"),
       snapshotId: "amf-ghost",
-      attribution: { namespaceId: "ns-1", machineId: "m-1" },
+      syncError: undefined,
+      eligibility: "finalize",
+      attribution: { ok: true, namespaceId: "ns-1", machineId: "m-1" },
     });
     expect(ghost).toMatchObject({ kind: "record_error", reason: "snapshot_not_committed" });
 
@@ -1410,7 +1416,9 @@ describe("commit (real PGlite + memory BlobStore)", () => {
       loop: staleLoop,
       manifest,
       snapshotId: manifest.id,
-      attribution: { namespaceId: "ns-1", machineId: "m-1" },
+      syncError: undefined,
+      eligibility: "finalize",
+      attribution: { ok: true, namespaceId: "ns-1", machineId: "m-1" },
     });
     expect(stale).toMatchObject({ kind: "record_error", reason: "stale_config_generation" });
 
