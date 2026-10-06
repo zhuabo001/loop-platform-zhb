@@ -29,11 +29,26 @@
  *    pending and retries into the winner's now-stable state.
  * (Single-connection PGlite serializes the window away — the CAS never loses
  * here; the real interleaving proof stays with Phase 6.)
+ *
+ * Slice 6 (ADR-010 决策 19): between the eligibility gate and the terminal
+ * write, the report-carried artifact fields (`artifactSnapshotId` /
+ * `artifactSyncError`) are validated and bound by artifact/binding-plan.ts —
+ * an independent guarded UPDATE on the artifact columns ONLY, in the SAME
+ * transaction as the phase write and the lease consumption. A binding
+ * rejection records the stable error and never changes the run's outcome;
+ * a binding guard loss joins the CAS-retry absorption set above.
  */
 import { and, eq, ne, sql } from "drizzle-orm";
 
 import type { ReportRequest } from "@loopzhb/protocol";
 
+import type { ArtifactAttribution } from "../artifact/attribution.js";
+import {
+  applyArtifactBindingPlan,
+  ArtifactBindingGuardLostError,
+  planArtifactSnapshotBinding,
+} from "../artifact/binding-plan.js";
+import { readArtifactSnapshot } from "../artifact/sync.js";
 import { ReportRaceLostError, RunCapabilityInvalidError } from "../coordinator/errors.js";
 import type { Db } from "../db/index.js";
 import { loops, runLeases, runs, type Loop, type NewLoop, type NewRun, type Run } from "../db/schema.js";
@@ -48,6 +63,14 @@ import type { Clock } from "../time.js";
 export interface ReportStoreDeps {
   db: Db;
   clock: Clock;
+  /** Slice 6 (ADR-010 决策 19): trusted-attribution resolution for the
+   *  report-carried artifact binding — re-derived per call on the
+   *  CALLER-SUPPLIED handle (the live transaction), never from wire input.
+   *  Absent ⇒ the report's artifact fields are not consumed at all (the
+   *  pre-slice-6 dormant behavior; the store's own tests stay unwired). */
+  artifactBinding?: {
+    resolveAttribution(machineId: string, db: Db): Promise<ArtifactAttribution>;
+  };
 }
 
 /** Text caps for daemon-supplied columns (mirror the reference). */
@@ -138,8 +161,12 @@ export class ReportCasLostError extends Error {
 
 /**
  * The bounded re-resolve driver (module header's race protocol): run the
- * report transaction; on a lost CAS, retry EXACTLY ONCE so the branch table
- * re-resolves against the winner's committed state. A second loss means the
+ * report transaction; on a lost CAS — a ReportCasLostError from a guarded
+ * run/loop/lease write OR an ArtifactBindingGuardLostError from the slice-6
+ * snapshot binding's (id, phase) + generation guard — retry EXACTLY ONCE so
+ * the branch table AND the binding plan re-resolve against the winner's
+ * committed state (a committed config bump turns the bind into the stable
+ * stale_config_generation rejection on re-plan). A second loss means the
  * state is still moving — fail closed with ReportRaceLostError (a NON-401
  * 500) so the daemon keeps the unconsumed report pending.
  *
@@ -149,14 +176,16 @@ export class ReportCasLostError extends Error {
  * via the coordinator's interleaving hooks).
  */
 export async function withReportCasRetry(fn: () => Promise<ReportTxResult>): Promise<ReportTxResult> {
+  const isGuardLoss = (err: unknown): err is ReportCasLostError | ArtifactBindingGuardLostError =>
+    err instanceof ReportCasLostError || err instanceof ArtifactBindingGuardLostError;
   try {
     return await fn();
   } catch (err) {
-    if (!(err instanceof ReportCasLostError)) throw err;
+    if (!isGuardLoss(err)) throw err;
     try {
       return await fn();
     } catch (retryErr) {
-      if (retryErr instanceof ReportCasLostError) throw new ReportRaceLostError(retryErr.runId);
+      if (isGuardLoss(retryErr)) throw new ReportRaceLostError(retryErr.runId);
       throw retryErr;
     }
   }
@@ -252,6 +281,47 @@ async function runReportTx(
       // no legitimate source: drop the residual lease, zero Run/Loop writes.
       await deleteObservedLease();
       return { kind: "denied", reason: "stale_phase" };
+    }
+
+    // ---- Artifact snapshot binding (ADR-010 决策 19; slice 6) ----
+    // Shared by the v0/v1 paths (v0 never carries the fields): the report
+    // transaction has EXPLICITLY confirmed finalize/reconcile eligibility
+    // above, and that confirmation — not run.phase — is what the planner
+    // trusts. The binding plan is a pure function of THIS coherent snapshot
+    // plus attribution resolved on the tx handle; its guarded write lands
+    // BEFORE the terminal phase write and commits or rolls back WITH it
+    // (Run phase, terminal state, binding, lease consumption = one
+    // transaction — AR11). A rejection only records the stable artifact
+    // error; it never changes the legal run outcome. A guard loss throws
+    // ArtifactBindingGuardLostError → withReportCasRetry re-runs the whole
+    // transaction, re-reads the loop and RE-PLANS (a committed config bump
+    // degrades the bind to stale_config_generation). A missing loop row
+    // (v1 orphan damage) skips binding — the four-party chain cannot be
+    // verified and the run still settles via invalid_loop_state.
+    const artifactSyncError = cleanError(input.body.artifactSyncError);
+    if (
+      deps.artifactBinding !== undefined &&
+      state.loop !== null &&
+      (input.body.artifactSnapshotId !== undefined || artifactSyncError !== undefined)
+    ) {
+      const ambiguous = input.body.artifactSnapshotId !== undefined && artifactSyncError !== undefined;
+      const attribution = await deps.artifactBinding.resolveAttribution(run.machineId, tx);
+      // An ambiguous report never triggers a manifest read — existence must
+      // not leak before validation (the planner short-circuits regardless).
+      const manifest =
+        !ambiguous && input.body.artifactSnapshotId !== undefined
+          ? await readArtifactSnapshot(tx, input.body.artifactSnapshotId)
+          : null;
+      const bindingPlan = planArtifactSnapshotBinding({
+        run,
+        loop: state.loop,
+        manifest,
+        snapshotId: input.body.artifactSnapshotId,
+        syncError: artifactSyncError,
+        eligibility: finalize ? "finalize" : "reconcile",
+        attribution,
+      });
+      await applyArtifactBindingPlan(tx, run, bindingPlan);
     }
 
     // CAS over the whole write window (ADR-001:36 / ADR-003:80 — review #3):

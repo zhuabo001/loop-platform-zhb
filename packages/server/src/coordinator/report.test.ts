@@ -15,14 +15,17 @@
  * transcript, cost, attempts, non-exec outcome) parses but never writes.
  */
 import { afterEach, describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
 
 import type { Delivery, ReportRequest } from "@loopzhb/protocol";
 import { sha256 } from "@loopzhb/protocol/node";
 
+import { createMachineAttributionResolver } from "../artifact/attribution-machine.js";
+import { updateArtifactConfig } from "../artifact/config.js";
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
-import type { NewRun, Run } from "../db/schema.js";
+import { artifactManifests, loops, runLeases, type NewArtifactManifest, type NewRun, type Run } from "../db/schema.js";
 import { buildReportWriteSet, GENERIC_RUN_ERROR } from "../store/report.js";
-import { RECLAIM_RUN_ERROR } from "../store/runs.js";
+import { cancelRunTx, RECLAIM_RUN_ERROR } from "../store/runs.js";
 import {
   FakeClock,
   seedLease,
@@ -34,7 +37,7 @@ import {
   snapshotRuns,
   testDeps,
 } from "../testkit/index.js";
-import { createRunCoordinator, type RunCoordinator } from "./index.js";
+import { createRunCoordinator, type RunCoordinator, type RunCoordinatorDependencies } from "./index.js";
 
 const TOKEN = "dk_test_machine_alpha";
 const BARE_UUID_TOKEN = "9f0b2c4d-1a2b-4c3d-8e9f-0123456789ab";
@@ -71,8 +74,9 @@ async function claimViaPoll(runId: string): Promise<Delivery> {
 
 /** Direct fixture: a running run + its active lease (bypasses poll). */
 async function seedActiveRun(runOverrides: Partial<NewRun> = {}, token = "rk_seed_token"): Promise<string> {
-  await seedRun(db, { id: "run-1", machineId, phase: "running", ...runOverrides });
-  await seedLease(db, { tokenHash: sha256(token), runId: "run-1", machineId });
+  const id = runOverrides.id ?? "run-1";
+  await seedRun(db, { id, machineId, phase: "running", ...runOverrides });
+  await seedLease(db, { tokenHash: sha256(token), runId: id, machineId });
   return token;
 }
 
@@ -521,70 +525,248 @@ describe("report: race + transaction integrity", () => {
   });
 });
 
-describe("AD3: report ignores the Phase 5 artifact fields (ADR-010 决策 16)", () => {
-  it("an ok report carrying artifactSnapshotId/artifactSyncError finalizes exactly as Phase 4 — the fields never persist", async () => {
-    await fresh();
+describe("slice 6: report-carried artifact binding (ADR-010 决策 16 片 6 条目 / 决策 19)", () => {
+  /** The production attribution seam (start.ts), re-derived on the tx handle. */
+  const artifactBinding: RunCoordinatorDependencies["artifactBinding"] = {
+    resolveAttribution: (id, handle) => createMachineAttributionResolver({ db: handle }).resolve({ machineId: id }),
+  };
+
+  /** Arm loop-1 for binding: the attribution chain needs loop.machineId ==
+   *  the run's machine, and the bind guard needs a config generation. */
+  async function seedBindableLoop(configRevision = 1): Promise<void> {
+    await db
+      .update(loops)
+      .set({ machineId, artifactDir: "/data", artifactConfigRevision: configRevision })
+      .where(eq(loops.id, "loop-1"));
+  }
+
+  async function seedCommittedManifest(overrides: Partial<NewArtifactManifest> = {}) {
+    const row: NewArtifactManifest = {
+      id: "amf-1",
+      namespaceId: machineId,
+      machineId,
+      loopId: "loop-1",
+      configRevision: 1,
+      manifestRevision: 1,
+      entries: [],
+      fileCount: 0,
+      totalBytes: 0,
+      committedAt: clock.iso(),
+      ...overrides,
+    };
+    await db.insert(artifactManifests).values(row);
+    return row;
+  }
+
+  it("a legal finalize carrying a committed snapshot id binds it in the report transaction (AR1 server half)", async () => {
+    await fresh({ artifactBinding });
+    await seedBindableLoop();
+    await seedCommittedManifest();
     const token = await seedActiveRun();
-    const result = await coordinator.report(token, {
-      ok: true,
-      durationMs: 42,
-      artifactSnapshotId: "amf-1",
-      artifactSyncError: "artifact_storage_error",
-    });
+
+    const result = await coordinator.report(token, { ok: true, durationMs: 42, artifactSnapshotId: "amf-1" });
     expect(result).toEqual({ ok: true });
     const run = (await snapshotRuns(db))[0]!;
     expect(run).toMatchObject({
       phase: "done",
       outcome: "exec",
       durationMs: 42,
-      artifactSnapshotId: null,
+      artifactSnapshotId: "amf-1",
       artifactSyncError: null,
       ts: clock.iso(),
     });
     expect(await snapshotLeases(db)).toEqual([]);
   });
 
-  it("a failure report carrying the fields is byte-identical in effect to a fieldless failure", async () => {
-    await fresh();
-    // Paired on ONE database (the missing-error fallback precedent above).
-    await seedRun(db, { id: "run-bare", machineId, phase: "running" });
-    await seedLease(db, { tokenHash: sha256("rk_bare"), runId: "run-bare", machineId });
-    await seedRun(db, { id: "run-fields", machineId, phase: "running" });
-    await seedLease(db, { tokenHash: sha256("rk_fields"), runId: "run-fields", machineId });
+  it("a sync-error-only report records the daemon's classification verbatim — the run outcome is unaffected (AR5 server half)", async () => {
+    await fresh({ artifactBinding });
+    await seedBindableLoop();
+    const token = await seedActiveRun();
 
-    await coordinator.report("rk_bare", { ok: false });
-    await coordinator.report("rk_fields", {
-      ok: false,
-      artifactSnapshotId: "amf-9",
-      artifactSyncError: "artifact_blob_missing",
-    });
+    await coordinator.report(token, { ok: true, artifactSyncError: "timeout" });
+    const run = (await snapshotRuns(db))[0]!;
+    expect(run).toMatchObject({ phase: "done", outcome: "exec", artifactSnapshotId: null, artifactSyncError: "timeout" });
 
-    const all = await snapshotRuns(db);
-    const bare = all.find((r) => r.id === "run-bare")!;
-    const withFields = all.find((r) => r.id === "run-fields")!;
-    expect(withFields).toMatchObject({ phase: "error", outcome: "error", error: GENERIC_RUN_ERROR });
-    // The ONLY difference between the two rows is the id.
-    expect({ ...withFields, id: bare.id }).toEqual(bare);
+    // …and on a failure report the classification lands beside the legal
+    // terminal error (sync failure never rewrites the run outcome).
+    const token2 = await seedActiveRun({ id: "run-2" }, "rk_seed_token_2");
+    await coordinator.report(token2, { ok: false, error: "agent crashed", artifactSyncError: "unreadable" });
+    const failed = (await snapshotRuns(db)).find((r) => r.id === "run-2")!;
+    expect(failed).toMatchObject({ phase: "error", outcome: "error", error: "agent crashed", artifactSyncError: "unreadable" });
   });
 
-  it("a swept-run reconcile carrying the fields keeps T5 behavior and never persists them", async () => {
-    await fresh();
-    const token = await seedSweptRun();
-    const result = await coordinator.report(token, {
-      ok: true,
-      artifactSnapshotId: "amf-1",
-      artifactSyncError: "artifact_storage_error",
-    });
-    expect(result).toEqual({ ok: true, reconciled: true }); // T5's wake-report marker, unchanged
+  it("a report carrying BOTH fields records ambiguous_artifact_report, binds nothing, and still commits the legal terminal state", async () => {
+    await fresh({ artifactBinding });
+    await seedBindableLoop();
+    await seedCommittedManifest(); // a VALID reference — ambiguity still wins
+    const token = await seedActiveRun();
+
+    await coordinator.report(token, { ok: true, artifactSnapshotId: "amf-1", artifactSyncError: "timeout" });
     const run = (await snapshotRuns(db))[0]!;
-    expect(run).toMatchObject({ phase: "done", outcome: "exec", artifactSnapshotId: null, artifactSyncError: null });
+    expect(run).toMatchObject({
+      phase: "done",
+      artifactSnapshotId: null,
+      artifactSyncError: "ambiguous_artifact_report",
+    });
+  });
+
+  it("illegal snapshot references record their stable rejection and never bind (AR6)", async () => {
+    await fresh({ artifactBinding });
+    await seedBindableLoop();
+    await seedCommittedManifest(); // the consistent "amf-1" for contrast
+    await db.insert(artifactManifests).values({
+      id: "amf-other-loop",
+      namespaceId: machineId,
+      machineId,
+      loopId: "loop-other",
+      configRevision: 1,
+      manifestRevision: 1,
+      entries: [],
+      fileCount: 0,
+      totalBytes: 0,
+      committedAt: clock.iso(),
+    });
+    await db.insert(artifactManifests).values({
+      id: "amf-stale",
+      namespaceId: machineId,
+      machineId,
+      loopId: "loop-1",
+      configRevision: 0, // behind the loop's generation 1
+      manifestRevision: 2,
+      entries: [],
+      fileCount: 0,
+      totalBytes: 0,
+      committedAt: clock.iso(),
+    });
+
+    const cases: Array<[string, string, string]> = [
+      // [runId, referenced id, expected rejection]
+      ["run-ghost", "amf-ghost", "snapshot_not_committed"],
+      ["run-loop", "amf-other-loop", "cross_loop"],
+      ["run-ns", "amf-foreign", "snapshot_not_committed"], // no row at all — existence never leaks
+      ["run-stale", "amf-stale", "stale_config_generation"],
+    ];
+    for (const [runId, snapshotId, expected] of cases) {
+      const token = await seedActiveRun({ id: runId }, `rk_${runId}`);
+      await coordinator.report(token, { ok: true, artifactSnapshotId: snapshotId });
+      const run = (await snapshotRuns(db)).find((r) => r.id === runId)!;
+      expect(run).toMatchObject({ phase: "done", outcome: "exec", artifactSnapshotId: null, artifactSyncError: expected });
+    }
+  });
+
+  it("a legal terminal-grace reconcile binds the carried snapshot (AR9, 决策 19 末段)", async () => {
+    await fresh({ artifactBinding });
+    await seedBindableLoop();
+    await seedCommittedManifest();
+    const token = await seedSweptRun();
+
+    const result = await coordinator.report(token, { ok: true, artifactSnapshotId: "amf-1" });
+    expect(result).toEqual({ ok: true, reconciled: true });
+    const run = (await snapshotRuns(db))[0]!;
+    expect(run).toMatchObject({ phase: "done", outcome: "exec", artifactSnapshotId: "amf-1", artifactSyncError: null });
     expect(await snapshotLeases(db)).toEqual([]);
   });
 
-  it("a second report carrying the fields gets the unified 401 with zero side effects", async () => {
-    await fresh();
+  it("a config generation committed in the resolve window turns the bind into stale_config_generation (AR10)", async () => {
+    await fresh({
+      artifactBinding,
+      hooks: {
+        afterReportResolve: async () => {
+          await updateArtifactConfig({ db, clock }, "loop-1", { artifactDir: "/data/moved" });
+        },
+      },
+    });
+    await seedBindableLoop();
+    await seedCommittedManifest();
     const token = await seedActiveRun();
-    await coordinator.report(token, { ok: true, artifactSnapshotId: "amf-1", artifactSyncError: "x" });
+
+    // The hook commits generation 2 between the read-side resolve and the
+    // write transaction; the tx's coherent snapshot sees it, so the plan
+    // records the stable rejection — the run still finalizes.
+    await coordinator.report(token, { ok: true, artifactSnapshotId: "amf-1" });
+    const run = (await snapshotRuns(db))[0]!;
+    expect(run).toMatchObject({ phase: "done", artifactSnapshotId: null, artifactSyncError: "stale_config_generation" });
+  });
+
+  it("the binding write rolls back WITH the run phase write (AR11)", async () => {
+    await fresh({
+      artifactBinding,
+      hooks: {
+        insideReportTx: () => {
+          throw new Error("injected finalize failure");
+        },
+      },
+    });
+    await seedBindableLoop();
+    await seedCommittedManifest();
+    const token = await seedActiveRun();
+
+    await expect(coordinator.report(token, { ok: true, artifactSnapshotId: "amf-1" })).rejects.toThrow(
+      "injected finalize failure",
+    );
+    const run = (await snapshotRuns(db))[0]!;
+    // The binding UPDATE lands BEFORE the hook seam; the rollback covers it.
+    expect(run).toMatchObject({ phase: "running", artifactSnapshotId: null, artifactSyncError: null });
+    expect(await snapshotLeases(db)).toHaveLength(1);
+  });
+
+  it("a canceled run's late report is denied and the artifact columns stay null (AR7)", async () => {
+    await fresh({ artifactBinding });
+    await seedBindableLoop();
+    await seedCommittedManifest();
+    const token = await seedActiveRun();
+
+    const canceled = await cancelRunTx({ db, clock }, "run-1");
+    expect(canceled).toBe(true);
+    await expect(coordinator.report(token, { ok: true, artifactSnapshotId: "amf-1" })).rejects.toMatchObject({
+      name: "RunCapabilityInvalidError",
+    });
+    const run = (await snapshotRuns(db))[0]!;
+    expect(run).toMatchObject({ phase: "canceled", artifactSnapshotId: null, artifactSyncError: null });
+  });
+
+  it("a reclaimed run never binds without its ONE wake-report — and after the grace window the late report is denied (AR8)", async () => {
+    await fresh({ artifactBinding });
+    await seedBindableLoop();
+    await seedCommittedManifest();
+    await seedSweptRun(); // never reported
+    let run = (await snapshotRuns(db))[0]!;
+    expect(run).toMatchObject({ phase: "error", artifactSnapshotId: null, artifactSyncError: null });
+
+    // Grace expired: the wake-report arrives too late — 401, columns stay null.
+    await fresh({ artifactBinding });
+    await seedBindableLoop();
+    await seedCommittedManifest();
+    const token = await seedSweptRun({}, "rk_expired_grace");
+    await db
+      .update(runLeases)
+      .set({ expiresAt: new Date(clock.now().getTime() - 1000).toISOString() })
+      .where(eq(runLeases.tokenHash, sha256(token)));
+    await expect(coordinator.report(token, { ok: true, artifactSnapshotId: "amf-1" })).rejects.toMatchObject({
+      name: "RunCapabilityInvalidError",
+    });
+    run = (await snapshotRuns(db))[0]!;
+    expect(run).toMatchObject({ phase: "error", artifactSnapshotId: null, artifactSyncError: null });
+  });
+
+  it("a v0 lease carrying the fields binds through the SAME shared path (U3/AR12)", async () => {
+    await fresh({ artifactBinding });
+    await seedBindableLoop();
+    await seedCommittedManifest();
+    await seedRun(db, { id: "run-1", machineId, phase: "running" });
+    await seedLease(db, { tokenHash: sha256("rk_v0"), runId: "run-1", machineId, terminalProtocolVersion: 0 });
+
+    await coordinator.report("rk_v0", { ok: true, artifactSnapshotId: "amf-1" });
+    const run = (await snapshotRuns(db))[0]!;
+    expect(run).toMatchObject({ phase: "done", outcome: "exec", artifactSnapshotId: "amf-1", artifactSyncError: null });
+  });
+
+  it("a second report carrying the fields gets the unified 401 with zero side effects", async () => {
+    await fresh({ artifactBinding });
+    await seedBindableLoop();
+    await seedCommittedManifest();
+    const token = await seedActiveRun();
+    await coordinator.report(token, { ok: true, artifactSnapshotId: "amf-1" });
     const runsBefore = await snapshotRuns(db);
     const loopsBefore = await snapshotLoops(db);
     await expect(
@@ -594,7 +776,7 @@ describe("AD3: report ignores the Phase 5 artifact fields (ADR-010 决策 16)", 
     expect(await snapshotLoops(db)).toEqual(loopsBefore);
   });
 
-  it("unit pin: the report write-set never carries the artifact keys", () => {
+  it("unit pin: the report write-set never carries the artifact keys (the binding writes them through its OWN guarded UPDATE)", () => {
     const ws = buildReportWriteSet(
       { ok: true, artifactSnapshotId: "amf-1", artifactSyncError: "artifact_storage_error" },
       {} as unknown as Run,

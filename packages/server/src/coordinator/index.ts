@@ -51,7 +51,7 @@ import {
   getMachine,
   registerMachineOnPoll,
 } from "../store/machines.js";
-import { executeReportTx, type ReportTxResult } from "../store/report.js";
+import { executeReportTx, type ReportStoreDeps, type ReportTxResult } from "../store/report.js";
 import {
   applyRunProgress,
   claimRunWithLeaseTx,
@@ -123,6 +123,11 @@ export interface RunCoordinatorDependencies extends RunStoreDeps {
   /** Store-layer invariant-violation lines (NEVER credentials). */
   log?: (line: string) => void;
   hooks?: CoordinatorHooks;
+  /** Slice 6 (ADR-010 决策 19): trusted-attribution resolution for the
+   *  report-carried artifact binding (store/report.ts consumes it inside
+   *  the report transaction). Absent ⇒ the report's artifact fields are not
+   *  consumed (the dormant behavior). */
+  artifactBinding?: ReportStoreDeps["artifactBinding"];
 }
 
 /** Production run-id factory (wired by src/start.ts). */
