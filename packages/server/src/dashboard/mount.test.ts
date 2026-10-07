@@ -20,7 +20,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { closeDb, type DbHandle } from "../db/index.js";
 import { bootstrapServer, type BootedServer } from "../start.js";
-import { seedLoop, seedMachine, seedRun, snapshotRuns } from "../testkit/index.js";
+import { makeTestAuthConfig, seedLoop, seedMachine, seedRun, snapshotRuns } from "../testkit/index.js";
 
 const handles: DbHandle[] = [];
 const dirs: string[] = [];
@@ -38,7 +38,7 @@ async function tmpDataDir(): Promise<string> {
 }
 
 async function boot(host: string, dataDir: string): Promise<BootedServer> {
-  const booted = await bootstrapServer({ host, port: 0, dataDir });
+  const booted = await bootstrapServer({ auth: makeTestAuthConfig(), host, port: 0, dataDir });
   handles.push(booted.handle);
   return booted;
 }

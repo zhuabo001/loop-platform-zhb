@@ -29,7 +29,7 @@ import { machineIdFromToken } from "@loopzhb/protocol/node";
 import { closeDb, type DbHandle } from "./db/index.js";
 import { loops, runLeases, runs } from "./db/schema.js";
 import { bootstrapServer, waitForListening, type BootedServer } from "./start.js";
-import { FakeClock, FakeCronFactory } from "./testkit/index.js";
+import { FakeClock, FakeCronFactory, makeTestAuthConfig } from "./testkit/index.js";
 import type { Clock } from "./time.js";
 
 const TOKEN = "dk_restart_e2e";
@@ -79,7 +79,7 @@ async function attachListener(
  *  scheduler starts), fully injectable clock/cron. */
 async function boot(dataDir: string, clock: FakeClock): Promise<RunningServer> {
   const cronFactory = new FakeCronFactory();
-  const booted = await bootstrapServer({ host: "127.0.0.1", port: 0, dataDir }, { clock, cronFactory });
+  const booted = await bootstrapServer({ auth: makeTestAuthConfig(), host: "127.0.0.1", port: 0, dataDir }, { clock, cronFactory });
   const rs = await attachListener(booted, clock, cronFactory);
   try {
     await rs.scheduler.start();
@@ -387,7 +387,7 @@ describe("E-group: file-backed DB + real HTTP restart E2E", () => {
     let gateUsed = false;
     const secondCronFactory = new FakeCronFactory();
     const booted = await bootstrapServer(
-      { host: "127.0.0.1", port: 0, dataDir: dir },
+      { auth: makeTestAuthConfig(), host: "127.0.0.1", port: 0, dataDir: dir },
       {
         clock,
         cronFactory: secondCronFactory,

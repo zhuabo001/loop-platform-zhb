@@ -42,6 +42,7 @@ import { closeDb, type DbHandle } from "./db/index.js";
 import { runLeases } from "./db/schema.js";
 import { DaemonControlObserver, DaemonLogObserver, DetachedProcessSupervisor } from "./real-claude-e2e-harness.js";
 import { bootstrapServer, waitForListening } from "./start.js";
+import { makeTestAuthConfig } from "./testkit/index.js";
 
 const ENABLED = process.env.LOOPZHB_REAL_CLAUDE_E2E === "1";
 const SUCCESS_MARKER = "PHASE2_BATCH4_E2E_OK";
@@ -114,7 +115,7 @@ describe.skipIf(!ENABLED)("real Claude E2E (opt-in)", () => {
       // 2. Start production server with real HTTP listener on random port
       const dataDir = await mkdtemp(path.join(tmpdir(), `loopzhb-e2e-data-${process.pid}-`));
       tempDirs.push(dataDir);
-      const booted = await bootstrapServer({ host: "127.0.0.1", port: 0, dataDir });
+      const booted = await bootstrapServer({ auth: makeTestAuthConfig(), host: "127.0.0.1", port: 0, dataDir });
       handles.push(booted.handle);
 
       const server = serve({ fetch: booted.app.fetch, port: 0, hostname: "127.0.0.1" });

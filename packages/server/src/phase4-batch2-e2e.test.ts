@@ -52,6 +52,7 @@ import { closeDb, type DbHandle } from "./db/index.js";
 import { loops, runLeases } from "./db/schema.js";
 import { DaemonControlObserver, DaemonLogObserver, DetachedProcessSupervisor } from "./real-claude-e2e-harness.js";
 import { bootstrapServer, waitForListening } from "./start.js";
+import { makeTestAuthConfig } from "./testkit/index.js";
 
 const TOKEN = "dk_e2e_batch2_machine";
 /** Planted provider secret: the agent env legitimately carries it, so it must
@@ -129,7 +130,7 @@ describe("Phase 4 Batch 2 deterministic E2E: production daemon + fake Claude, tw
       // 2. Production server: file PGlite + real HTTP listener.
       const dataDir = await mkdtemp(path.join(tmpdir(), `loopzhb-b2e2e-data-${process.pid}-`));
       tempDirs.push(dataDir);
-      const booted = await bootstrapServer({ host: "127.0.0.1", port: 0, dataDir });
+      const booted = await bootstrapServer({ auth: makeTestAuthConfig(), host: "127.0.0.1", port: 0, dataDir });
       handles.push(booted.handle);
       const server = serve({ fetch: booted.app.fetch, port: 0, hostname: "127.0.0.1" });
       servers.push(server);

@@ -67,7 +67,7 @@ import { closeDb } from "./db/index.js";
 import { loops, runLeases, runs } from "./db/schema.js";
 import { AcceptedReportCostObserver, DaemonControlObserver, DaemonLogObserver, DetachedProcessSupervisor } from "./real-claude-e2e-harness.js";
 import { bootstrapServer, waitForListening, type BootedServer } from "./start.js";
-import { FakeClock, FakeCronFactory } from "./testkit/index.js";
+import { FakeClock, FakeCronFactory, makeTestAuthConfig } from "./testkit/index.js";
 import { assertBatch3StateSource, buildBatch3AcceptanceTask } from "./phase4-batch3-acceptance-task.js";
 
 const ENABLED = process.env.LOOPZHB_REAL_CLAUDE_E2E === "1";
@@ -182,7 +182,7 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 3 real Claude E2E (opt-in)", () => {
       const reportCosts = new AcceptedReportCostObserver();
       const bootOne = async (): Promise<{ booted: BootedServer; url: string }> => {
         const booted = await bootstrapServer(
-          { host: "127.0.0.1", port: 0, dataDir },
+          { auth: makeTestAuthConfig(), host: "127.0.0.1", port: 0, dataDir },
           { clock, cronFactory: new FakeCronFactory() },
         );
         bootedServers.push(booted);

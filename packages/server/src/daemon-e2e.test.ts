@@ -31,6 +31,7 @@ import { machineIdFromToken } from "@loopzhb/protocol/node";
 import { closeDb, type DbHandle } from "./db/index.js";
 import { runLeases } from "./db/schema.js";
 import { bootstrapServer, type BootedServer } from "./start.js";
+import { makeTestAuthConfig } from "./testkit/index.js";
 
 const TOKEN = "dk_e2e_machine";
 const handles: DbHandle[] = [];
@@ -41,7 +42,7 @@ afterEach(async () => {
 
 async function boot(): Promise<BootedServer> {
   const dataDir = await mkdtemp(path.join(tmpdir(), `loopzhb-e2e-${process.pid}-`));
-  const b = await bootstrapServer({ host: "127.0.0.1", port: 3000, dataDir });
+  const b = await bootstrapServer({ auth: makeTestAuthConfig(), host: "127.0.0.1", port: 3000, dataDir });
   handles.push(b.handle);
   return b;
 }

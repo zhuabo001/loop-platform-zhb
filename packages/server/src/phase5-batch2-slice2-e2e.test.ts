@@ -35,7 +35,7 @@ import { machineIdFromToken } from "@loopzhb/protocol/node";
 
 import { closeDb, type DbHandle } from "./db/index.js";
 import { artifactManifests, loops } from "./db/schema.js";
-import { FakeClock } from "./testkit/index.js";
+import { FakeClock, makeTestAuthConfig } from "./testkit/index.js";
 import { bootstrapServer, waitForListening } from "./start.js";
 
 const TOKEN = "dk_e2e_batch2_slice2_token";
@@ -56,7 +56,7 @@ interface Harness {
 async function bootRealServer(): Promise<Harness> {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "loopzhb-slice2-e2e-"));
   const booted = await bootstrapServer(
-    { host: "127.0.0.1", port: 0, dataDir },
+    { auth: makeTestAuthConfig(), host: "127.0.0.1", port: 0, dataDir },
     { clock: new FakeClock() },
   );
   const server: ServerType = serve({ fetch: booted.app.fetch, port: 0, hostname: "127.0.0.1" });

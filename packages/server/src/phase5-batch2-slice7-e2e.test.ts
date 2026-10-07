@@ -47,6 +47,7 @@ import { createArtifactTransport } from "../../daemon/dist/artifact-client.js";
 import { closeDb, type Db, type DbHandle } from "./db/index.js";
 import { artifactManifests, loops, runs } from "./db/schema.js";
 import { bootstrapServer, type BootedServer } from "./start.js";
+import { makeTestAuthConfig } from "./testkit/index.js";
 
 const TOKEN = "dk_slice7_e2e_machine";
 const V1 = "console.log('v1')";
@@ -67,7 +68,7 @@ let dataDir: string;
 async function boot(): Promise<BootedServer> {
   dataDir = await mkdtemp(path.join(tmpdir(), `loopzhb-slice7-e2e-${process.pid}-`));
   dirs.push(dataDir);
-  const b = await bootstrapServer({ host: "127.0.0.1", port: 3000, dataDir });
+  const b = await bootstrapServer({ auth: makeTestAuthConfig(), host: "127.0.0.1", port: 3000, dataDir });
   handles.push(b.handle);
   return b;
 }

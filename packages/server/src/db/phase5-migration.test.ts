@@ -14,7 +14,7 @@
  *       capability gate is unchanged. Old loops stay unconfigured.
  *  AM5  Close/reopen, repeated migration and session recovery: an
  *       artifact_sync_sessions row survives restart cycles item-equal, the
- *       journal stays at six entries, tables/indexes are never duplicated.
+ *       journal stays at seven entries, tables/indexes are never duplicated.
  *
  * AM3 (fresh-DB round-trips) and AM4 (unique keys) live in
  * phase5-schema.test.ts; AM6 (config transaction) in artifact/config.test.ts.
@@ -225,11 +225,11 @@ describe("AM: Phase 5 migration 0005 and dormancy", () => {
       expect(Number(rows[0]!.count)).toBe(0);
     }
 
-    // Journal: 0000–0005, each applied once.
+    // Journal: 0000–0006, each applied once.
     const journal = await upgraded.client.query<{ count: string }>(
       'SELECT COUNT(*) AS count FROM "drizzle"."__drizzle_migrations"',
     );
-    expect(Number(journal.rows[0]!.count)).toBe(6);
+    expect(Number(journal.rows[0]!.count)).toBe(7);
   });
 
   test("AM1-freeze: the phase4 fixture is byte-identical to the committed 0000–0004 migrations", async () => {
@@ -323,12 +323,12 @@ describe("AM: Phase 5 migration 0005 and dormancy", () => {
     const [back] = await upgraded.db.select().from(artifactSyncSessions);
     expect(back).toEqual({ ...session, receipt: null });
 
-    // Journal stays at six; artifact tables and pre-existing indexes are
+    // Journal stays at seven; artifact tables and pre-existing indexes are
     // never duplicated.
     const journal = await upgraded.client.query<{ count: string }>(
       'SELECT COUNT(*) AS count FROM "drizzle"."__drizzle_migrations"',
     );
-    expect(Number(journal.rows[0]!.count)).toBe(6);
+    expect(Number(journal.rows[0]!.count)).toBe(7);
     const tables = await upgraded.client.query<{ count: string }>(
       "SELECT COUNT(*) AS count FROM pg_tables WHERE schemaname = 'public' AND tablename = 'artifact_sync_sessions'",
     );

@@ -210,3 +210,51 @@ Round1 复审修复提交 `1886409` 复跑五门全绿（protocol 288 / daemon 7
 ## 结论（Batch 2）
 
 Batch 2 全部编组（AT/AH/AJ/AS/AW/AR/AV）与 AI1–AI7 故障集成验收通过，五道质量门全绿；片 1–7 三轨复核全部收口；片 8 三轨复核 Round1 的 3 项 P2（#114/#115/#116）修复后经独立复审核销关闭，**Batch 2 至此全部完成（2026-10-07）**；**Phase 5 未收口**（Batch 3 认证未启动，本记录不声明 Phase 5 完成）。
+
+# Batch 3 — GitHub 登录、个人团队与旧数据认领
+
+> 权威计划：`docs/plan/codex-phase5-batch3-slices-plan.md`；长期决策：`docs/adr/011-phase5-identity-and-legacy-claim.md`。
+
+## 测试环境（Batch 3）
+
+- **日期**: 2026-10-07
+- **平台**: macOS (Darwin 27.0.0)
+- **Node.js**: v22.17.0
+- **pnpm**: 10.6.1
+- **分支**: `feat/phase5-batch3-dev`
+- **批次基线**: `4ff517a`（Batch 2 合入后的 main）
+- **长期决策**: `docs/adr/011-phase5-identity-and-legacy-claim.md`（片 1 冻结决策 1–7）
+
+## 验收范围（Batch 3 完成定义复述，plan §1）
+
+GitHub 用户登录后获得个人团队；管理 API 和 Dashboard 只显示该团队资源；未知或未认领机器不能通过 poll 注册；运维可在 Server 停止后将旧机器及其 Artifact 历史显式认领给已登录用户。管理面认证与机器自注册关闭是不可拆分的合入与部署单元。
+
+## 片 1 — 身份模型、数据库迁移与认证配置
+
+### 测试编组与结果（片 1）
+
+| 编组 | 主要证据（文件） | 覆盖 |
+|---|---|---|
+| LM1 | `server/src/db/phase5-batch3-migration.test.ts` | Batch 2（0005）旧库无损升级：7 张旧表全部旧列 item-equal；旧 machines 行 `team_id`/`revoked_at` 落 null（不自动认领）；4 张身份新表存在且为空；artifact 引用链（snapshotId、manifest entries、已提交 session receipt）逐项保持；journal 精确 7 条 |
+| LM1-freeze | 同上 | `test-fixtures/phase5-migrations/` 与 committed 0000–0005 字节相等、journal idx [0..5] |
+| LM2 | 同上 | 身份行（user+team+membership+session+已认领机器）与旧业务行经两轮 close/reopen + 重复迁移 item-equal；journal 保持 7；表/索引不重复 |
+| SC-RT/UQ/CK/ENUM | `server/src/db/phase5-batch3-schema.test.ts`（20 项） | 四表 round-trip；machines 三形态（unclaimed/claimed/revoked）；users PK / teams 部分唯一 / memberships 复合 PK / auth_sessions hash PK 各自仲裁范围；id 格式 CHECK 负例；`TEAM_KINDS`/`MEMBERSHIP_ROLES` server 内部枚举 pin（ADR-011 决策 6 例外） |
+| DB-IDX | `server/src/db/index.test.ts` | 新库建表精确 11 张；索引 14 个名称+定义 pin（含 `teams_personal_owner_idx` 的 `WHERE kind='personal'` 谓词）；重复迁移幂等 |
+| CF-* | `server/src/config.test.ts`（42 项） | origin 规则全集（https 任意 host、http 仅 loopback、拒绝凭据/path/query/fragment、尾斜杠规范化、loopback 缺省派生、非 loopback 无显式 origin 拒绝）；OAuth 双密钥缺失/全空白合并点名报错；callback URL = origin + 固定路径 |
+| ST-FAIL | `server/src/start.test.ts` | 缺 OAuth 配置或非 loopback 绑定无显式 origin 时 `main()` 在创建 dataDir 之前 rejects（生产启动流程不可进入）；存量 boot/e2e 携带 `makeTestAuthConfig()` 后回归绿 |
+
+### 显式边界核对（片 1）
+
+- **停止边界**：未开放登录路由（`/login`、`/auth/*`、`/api/session` 均不存在）；未实现 ConnectKey；迁移不自动认领（旧机器一律 `team_id=null`）；无生产身份注册入口——身份行只能由 testkit fixture 或未来的片 2 登录事务产生。
+- **protocol 包零改动**；daemon 包零改动。
+- **既有 pin 的同步更新**：`phase4-migration.test.ts` M5 与 `phase5-migration.test.ts` AM1/AM5 的 journal 计数 6→7（0006 落库的正常结果，注释同步注明 0006 来源）。
+- **存量测试改造**：12 个测试文件 19 处 `bootstrapServer` 调用点统一携带 `auth: makeTestAuthConfig()`；`ServerConfig.auth` 为必选字段，遗漏由 typecheck 结构性列全。
+- **已知边界**（ADR-011）：users.id 与 GitHub 耦合（多身份提供商需未来迁移）；Session 级 CSRF 列不进 0006（片 2 落地时 0007 加列）；`unauthenticatedExposureWarning` 文案本片不动（启动提示更新是片 7 条目）。
+
+### 复审与 Issue 收口（片 1）
+
+（片级三轨复核在切片完成后进行，发现项走 Issue Tracker 流程。）
+
+### 结论（片 1）
+
+待片级复核后收口。

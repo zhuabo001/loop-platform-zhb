@@ -64,7 +64,7 @@ import { createChokidarWatcher, type ArtifactWatcherFactory } from "../../daemon
 import { closeDb } from "./db/index.js";
 import { artifactManifests, loops, runs } from "./db/schema.js";
 import { bootstrapServer, waitForListening, type BootedServer } from "./start.js";
-import { FakeClock, FakeCronFactory } from "./testkit/index.js";
+import { FakeClock, FakeCronFactory, makeTestAuthConfig } from "./testkit/index.js";
 
 const TOKEN = "dk_slice8_e2e_machine";
 const MACHINE_ID = machineIdFromToken(TOKEN);
@@ -152,7 +152,7 @@ async function shutdown(rs: RunningServer): Promise<void> {
  *  override seam so nothing fires autonomously. */
 async function bootServer(dataDir: string, clock: FakeClock): Promise<RunningServer> {
   const cronFactory = new FakeCronFactory();
-  const booted = await bootstrapServer({ host: "127.0.0.1", port: 0, dataDir }, { clock, cronFactory });
+  const booted = await bootstrapServer({ auth: makeTestAuthConfig(), host: "127.0.0.1", port: 0, dataDir }, { clock, cronFactory });
   const server = serve({ fetch: booted.app.fetch, port: 0, hostname: "127.0.0.1" });
   try {
     await waitForListening(server);

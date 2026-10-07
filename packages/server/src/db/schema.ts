@@ -123,8 +123,21 @@ export const machines = pgTable("machines", {
    *  this column write-closed — poll parses capabilities but does not persist
    *  them (ADR-009 决策 11). */
   capabilities: jsonb("capabilities").$type<string[]>(),
+  /** Phase 5 Batch 3 (ADR-011): the owning Team (teams.id — no FK, by
+   *  convention). NULL = Unclaimed Machine: every pre-Batch-3 row lands here
+   *  and stays invisible to every team until an offline Claim (slice 4). The
+   *  migration never auto-claims. */
+  teamId: text("team_id"),
+  /** Phase 5 Batch 3: the ONE revocation fact (ISO). Null = not revoked; a
+   *  revoked machine's credential is dead regardless of team. */
+  revokedAt: text("revoked_at"),
   createdAt: text("created_at").notNull(),
-});
+  },
+  (t) => [
+    /** Team-scoped listing/filtering hot path (slice 5 admin queries). */
+    index("machines_team_idx").on(t.teamId),
+  ],
+);
 
 // ---- loops: a scheduled behavior bound to one machine ----
 
@@ -479,5 +492,123 @@ export type NewArtifactManifest = typeof artifactManifests.$inferInsert;
 export type ArtifactBlobRow = typeof artifactBlobs.$inferSelect;
 export type NewArtifactBlob = typeof artifactBlobs.$inferInsert;
 
+// ---- Phase 5 Batch 3 identity (ADR-011) ----
+//
+// Four tables: users (GitHub numeric id AS the primary key), teams (one
+// personal team per user), memberships ((user, team) composite PK), and
+// auth_sessions (Login Sessions — the hash-only browser credential). The two
+// value sets below are SERVER-INTERNAL: they never go on the wire, so they
+// are declared here rather than in `@loopzhb/protocol` — an explicit,
+// ADR-recorded exception (ADR-011 决策 6) to the file-header rule that enum
+// value lists are single-sourced in the protocol package.
+
+/** ADR-011 决策 1: a GitHub.com numeric user id is a decimal string. Exported
+ *  for fixtures and the slice-2 login path; the DB CHECK below carries the
+ *  same rule. */
+export const GITHUB_USER_ID_RE = /^[0-9]+$/;
+
+/** Server-internal team kinds (ADR-011 决策 6). Batch 3 has exactly one. */
+export const TEAM_KINDS = ["personal"] as const;
+
+/** Server-internal membership roles (ADR-011 决策 6). Batch 3 has exactly one. */
+export const MEMBERSHIP_ROLES = ["owner"] as const;
+
+/** A GitHub.com account known to the server. The immutable numeric user id
+ *  (decimal string) IS the primary key — the unique external identity key
+ *  (ADR-011 决策 1); `username` is mutable display info only. */
+export const users = pgTable(
+  "users",
+  {
+    /** GitHub.com numeric user id, decimal string. Immutable. */
+    id: text("id").primaryKey(),
+    /** Mutable display name, refreshed at every login (slice 2). */
+    username: text("username").notNull(),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (t) => [check("users_id_github_numeric_ck", sql`${t.id} ~ '^[0-9]+$'`)],
+);
+
+/** The unit of resource ownership. `t-<16 lowercase hex>` ids satisfy the
+ *  BlobStore namespace-key rule, so slice 3/4 can switch artifact attribution
+ *  to `namespaceId = teamId` without touching storage-key rules (ADR-011
+ *  决策 2); the CHECK below pins that invariant at the DB level. */
+export const teams = pgTable(
+  "teams",
+  {
+    /** `t-<16 hex>`; minted by deterministic derivation in the slice-2 login
+     *  transaction (ADR-011 决策 2). */
+    id: text("id").primaryKey(),
+    name: text("name").notNull(),
+    /** Server-internal kind (TEAM_KINDS); Batch 3 creates only personal teams. */
+    kind: text("kind", { enum: [...TEAM_KINDS] }).notNull().default("personal"),
+    /** The owning user (users.id — no FK, by convention). Immutable in Batch 3. */
+    ownerUserId: text("owner_user_id").notNull(),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (t) => [
+    check("teams_id_namespace_ck", sql`${t.id} ~ '^[a-z0-9][a-z0-9-]{0,63}$'`),
+    /** One personal team per user (ADR-011 决策 3). Partial, so future team
+     *  kinds are not blocked by it. */
+    uniqueIndex("teams_personal_owner_idx").on(t.ownerUserId).where(sql`${t.kind} = 'personal'`),
+  ],
+);
+
+/** The (user, team) grant recording a user's role in a team. The composite PK
+ *  IS the "no duplicate membership" constraint (ADR-011 决策 3). */
+export const memberships = pgTable(
+  "memberships",
+  {
+    userId: text("user_id").notNull(),
+    teamId: text("team_id").notNull(),
+    role: text("role", { enum: [...MEMBERSHIP_ROLES] }).notNull(),
+    createdAt: text("created_at").notNull(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.userId, t.teamId], name: "memberships_pkey" }),
+    index("memberships_team_idx").on(t.teamId),
+  ],
+);
+
+/** Login Sessions (ADR-011 决策 4): the browser credential for the management
+ *  surface. Only the sha256 of the random credential is stored — and the hash
+ *  IS the primary key (the run_leases precedent: a DB leak must not hand out
+ *  live credentials). Absolute 7-day lifetime, writer-stamped from the
+ *  injected Clock; no sliding renewal. Logout DELETES the row. */
+export const authSessions = pgTable(
+  "auth_sessions",
+  {
+    /** sha256 hex of the random session credential. HASH ONLY. */
+    credentialHash: text("credential_hash").primaryKey(),
+    userId: text("user_id").notNull(),
+    createdAt: text("created_at").notNull(),
+    /** Absolute expiry = createdAt + 7 days, computed at creation. */
+    expiresAt: text("expires_at").notNull(),
+  },
+  (t) => [index("auth_sessions_user_idx").on(t.userId)],
+);
+
+export type User = typeof users.$inferSelect;
+export type NewUser = typeof users.$inferInsert;
+export type Team = typeof teams.$inferSelect;
+export type NewTeam = typeof teams.$inferInsert;
+export type Membership = typeof memberships.$inferSelect;
+export type NewMembership = typeof memberships.$inferInsert;
+export type AuthSessionRow = typeof authSessions.$inferSelect;
+export type NewAuthSession = typeof authSessions.$inferInsert;
+
 /** Drizzle table bag (single schema object shared by the db handle). */
-export const businessSchema = { machines, loops, runs, runLeases, artifactSyncSessions, artifactManifests, artifactBlobs };
+export const businessSchema = {
+  machines,
+  loops,
+  runs,
+  runLeases,
+  artifactSyncSessions,
+  artifactManifests,
+  artifactBlobs,
+  users,
+  teams,
+  memberships,
+  authSessions,
+};

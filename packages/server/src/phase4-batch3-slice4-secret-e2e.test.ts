@@ -87,6 +87,7 @@ import { closeDb, type DbHandle } from "./db/index.js";
 import { loops, runs } from "./db/schema.js";
 import { DaemonLogObserver, DetachedProcessSupervisor } from "./real-claude-e2e-harness.js";
 import { bootstrapServer, waitForListening } from "./start.js";
+import { makeTestAuthConfig } from "./testkit/index.js";
 
 const TOKEN = "dk_e2e_slice4_machine";
 /** The planted provider credential. It lives ONLY in the temp settings
@@ -260,7 +261,7 @@ describe("Phase 4 Batch 3 slice 4 (Issue #53): the settings-derived provider sec
       // 2. Production server: file PGlite + real HTTP listener.
       const dataDir = await mkdtemp(path.join(tmpdir(), `loopzhb-s4e2e-data-${process.pid}-`));
       tempDirs.push(dataDir);
-      const booted = await bootstrapServer({ host: "127.0.0.1", port: 0, dataDir });
+      const booted = await bootstrapServer({ auth: makeTestAuthConfig(), host: "127.0.0.1", port: 0, dataDir });
       handles.push(booted.handle);
       // The daemon's own traffic, captured at the listener (round-1 review):
       // cloning the request BEFORE the app reads it observes the exact bytes

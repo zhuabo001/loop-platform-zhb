@@ -10,7 +10,7 @@
  *  - a data dir that can't be created fails boot fast;
  *  - the production mint issues shape-valid `rk_` credentials.
  */
-import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -22,7 +22,7 @@ import { isRunTokenShape, pollResponseSchema } from "@loopzhb/protocol";
 import { machineIdFromToken } from "@loopzhb/protocol/node";
 
 import { mintRunCredential } from "./coordinator/index.js";
-import { FakeClock } from "./testkit/index.js";
+import { FakeClock, makeTestAuthConfig } from "./testkit/index.js";
 import type { CronFactory, CronJob } from "./scheduler/index.js";
 import { closeDb, openMigratedDb, type DbHandle } from "./db/index.js";
 import { loops, machines, runs } from "./db/schema.js";
@@ -47,7 +47,7 @@ async function tmpDataDir(): Promise<string> {
 }
 
 async function boot(dataDir: string): Promise<BootedServer> {
-  const b = await bootstrapServer({ host: "127.0.0.1", port: 3000, dataDir });
+  const b = await bootstrapServer({ auth: makeTestAuthConfig(), host: "127.0.0.1", port: 3000, dataDir });
   handles.push(b.handle);
   return b;
 }
@@ -110,7 +110,7 @@ describe("bootstrapServer", () => {
     const dir = await tmpDataDir();
     const blocker = path.join(dir, "blocker");
     await writeFile(blocker, "a file, not a dir");
-    await expect(bootstrapServer({ host: "127.0.0.1", port: 3000, dataDir: path.join(blocker, "sub") })).rejects.toThrow();
+    await expect(bootstrapServer({ auth: makeTestAuthConfig(), host: "127.0.0.1", port: 3000, dataDir: path.join(blocker, "sub") })).rejects.toThrow();
   });
 
   it("fails fast AND closes the DB when the port is already taken (review #8)", async () => {
@@ -122,11 +122,15 @@ describe("bootstrapServer", () => {
 
     process.env.LOOPZHB_PORT = String(port);
     process.env.LOOPZHB_DATA_DIR = dir;
+    process.env.LOOPZHB_GITHUB_CLIENT_ID = "test-gh-client-id";
+    process.env.LOOPZHB_GITHUB_CLIENT_SECRET = "test-gh-client-secret";
     try {
       await expect(main()).rejects.toThrow(/EADDRINUSE|address already in use/i);
     } finally {
       delete process.env.LOOPZHB_PORT;
       delete process.env.LOOPZHB_DATA_DIR;
+      delete process.env.LOOPZHB_GITHUB_CLIENT_ID;
+      delete process.env.LOOPZHB_GITHUB_CLIENT_SECRET;
       await new Promise<void>((resolve) => blocker.close(() => resolve()));
     }
     // The failed boot CLOSED its DB handle: a fresh bootstrap on the same
@@ -135,9 +139,44 @@ describe("bootstrapServer", () => {
     expect(second.handle.dataDir).toBe(dir);
   });
 
+  it("fails fast on missing GitHub OAuth config BEFORE any resource opens (ADR-011 决策 5: no anonymous fallback)", async () => {
+    const dir = await tmpDataDir();
+    await rm(dir, { recursive: true, force: true });
+    process.env.LOOPZHB_DATA_DIR = dir;
+    try {
+      await expect(main()).rejects.toThrow(/LOOPZHB_GITHUB_CLIENT_ID/);
+      await expect(main()).rejects.toThrow(/LOOPZHB_GITHUB_CLIENT_SECRET/);
+    } finally {
+      delete process.env.LOOPZHB_DATA_DIR;
+    }
+    // loadServerConfig threw before mkdir/openMigratedDb: the data dir was
+    // never created, and a properly configured boot on the same path works.
+    await expect(access(dir)).rejects.toThrow();
+    const second = await boot(dir);
+    expect(second.handle.dataDir).toBe(dir);
+  });
+
+  it("fails fast on a non-loopback bind without an explicit origin (ADR-011 决策 5)", async () => {
+    const dir = await tmpDataDir();
+    await rm(dir, { recursive: true, force: true });
+    process.env.LOOPZHB_DATA_DIR = dir;
+    process.env.LOOPZHB_HOST = "0.0.0.0";
+    process.env.LOOPZHB_GITHUB_CLIENT_ID = "test-gh-client-id";
+    process.env.LOOPZHB_GITHUB_CLIENT_SECRET = "test-gh-client-secret";
+    try {
+      await expect(main()).rejects.toThrow(/LOOPZHB_ORIGIN/);
+    } finally {
+      delete process.env.LOOPZHB_DATA_DIR;
+      delete process.env.LOOPZHB_HOST;
+      delete process.env.LOOPZHB_GITHUB_CLIENT_ID;
+      delete process.env.LOOPZHB_GITHUB_CLIENT_SECRET;
+    }
+    await expect(access(dir)).rejects.toThrow();
+  });
+
   it("scheduler scan failure fails boot: drains scheduler, closes listener, rethrows (Batch 2 plan §2)", async () => {
     const dir = await tmpDataDir();
-    const b = await bootstrapServer({ host: "127.0.0.1", port: 3000, dataDir: dir });
+    const b = await bootstrapServer({ auth: makeTestAuthConfig(), host: "127.0.0.1", port: 3000, dataDir: dir });
     // Break the scheduler's startup scan by closing the DB underneath it.
     // (Not via boot() — we close this handle ourselves.)
     await closeDb(b.handle);
@@ -166,7 +205,7 @@ describe("bootstrapServer", () => {
 
   it("scheduler scan failure waits for IN-FLIGHT HTTP requests before the DB may close", async () => {
     const dir = await tmpDataDir();
-    const b = await bootstrapServer({ host: "127.0.0.1", port: 0, dataDir: dir });
+    const b = await bootstrapServer({ auth: makeTestAuthConfig(), host: "127.0.0.1", port: 0, dataDir: dir });
 
     // A route that hangs until the test releases it — the in-flight request
     // the drain must wait for.
@@ -421,7 +460,7 @@ describe("bootstrapServer", () => {
     const clock = new FakeClock(new Date("2026-08-27T09:00:00.000Z"));
     const cronFactory = new FakeCronFactory();
     const b = await bootstrapServer(
-      { host: "127.0.0.1", port: 3000, dataDir: dir },
+      { auth: makeTestAuthConfig(), host: "127.0.0.1", port: 3000, dataDir: dir },
       { clock, cronFactory },
     );
     handles.push(b.handle);
