@@ -215,7 +215,7 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
   - 生产休眠：AD1–AD4 全部在测——Artifact 路由未挂载、Create/Poll 行为不变、Report 忽略新字段、启动不构造 BlobStore、Daemon 不发同步请求。
   - 收口：内部集成链（文件型 PGlite + 本地 BlobStore 的真实磁盘路径）与五道质量门全绿；收口三轨复审零阻断，唯一 P3 证据措辞项经定点复核核销。
   - 批次 PR #68（分支 `feat/phase5-batch1-dev`）已于 2026-10-03 转待合入；Batch 3（认证）另行规划。
-- **Batch 2 — Artifact 持续同步、Run 快照与文件视图：进行中**（分支 `feat/phase5-batch2-dev`，8 切片共用 PR [#84](https://github.com/zhuabo001/loop-platform-zhb/pull/84)，权威计划 `docs/plan/codex-phase5-batch2-plan.md`）
+- **Batch 2 — Artifact 持续同步、Run 快照与文件视图：已完成**（2026-10-07，分支 `feat/phase5-batch2-dev`，8 切片共用 PR [#84](https://github.com/zhuabo001/loop-platform-zhb/pull/84)，ADR-010 与 ADR-002 修订；权威计划 `docs/plan/codex-phase5-batch2-plan.md`；验收证据 `docs/tests/phase5-acceptance.md` Batch 2 段）
   - 片 1（契约、归属与生产边界）已完成：错误码 11 与重试类 5、客户端失败分类法与落库域、Delivery Artifact 配置、10 个端点的 wire 形状（含读取端 DTO）冻结；Machine namespace 归属解析器与生产门面（Blob 根 `<dataDir>/blobs`）实现但不接线；HTTP 失败映射矩阵逐操作域固定。AD1–AD4 休眠守卫零修改全绿。
   - 片 1 三轨审查唯一须处理项 [#83](https://github.com/zhuabo001/loop-platform-zhb/issues/83)（读取失败域遗漏 `attribution_missing`）已修复（`0a0b5a9`，变异验证），并经第二轮独立复审核销关闭（2026-10-04）。
   - 片 2（Server 配置、同步 HTTP 与 Poll 接线）已完成：生产 ArtifactHome 经 `bootstrapServer` 接线、6 条路由挂载（配置 PATCH、machine 读取、prepare／流式 PUT／commit、同步错误上报；读取端 4 条留片 7）；真实 HTTP prepare → 多块流式 PUT → commit 全通且落盘 `<dataDir>/blobs`，幂等重放返回固定回执；Create 的可选 `artifactDir` 经同一 planner 与创建同语句落库（初始代际 1）；Poll 向声明 `artifact-sync-v1` 的 Machine 下发 watch（缺 digest ≡ 空集合摘要，busy Poll 同样处理），claim 对已配置 Loop 做逐候选 capability 门控并在 Delivery 携带配置代际；AD1／AD2(a)／AD2(b)／AD4 守卫按实际解除范围重写，AD3 与 daemon 零改动。
@@ -239,7 +239,7 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
   - 片 7 残余：中流截断在 HTTP 层不可检（完整性信号仅剩 Content-Length，需要确定性的客户端比对所收字节与 manifest hash）；下载忽略 Range（决策 27 记录）；`artifact_dir_unconfigured` 读取域本片无路由返回（联合成员保留）。
   - **片 7 已完成并收口**。
   - 片 8（故障集成验收与批次收口）已实现：`phase5-batch2-slice8-e2e.test.ts` 为本批首个「真实 HTTP + 文件型 PGlite + 本地 BlobStore + 生产形态 Daemon runtime（cli.ts 组合根逐字段镜像，仅换 Fake Runner 与记录/改写型 fetch dial）+ 真实 chokidar + 真实临时目录」集成面——AI1 idle 编辑/删除收敛与同内容改写抑制、AI2 真实 socket 双 Run 快照绑定与冻结、AI3 配置换代/移除的 watcher 换代与旧根零流量、AI4 断网退避恢复、AI5 真实服务端响应丢失三腿 + 会话过期原地续期（片 4 假服务端的语义平价核心）、AI6 daemon/server 双重启后旧快照与下载字节稳定（U2 残余钉为恰 +1 revision、零 PUT、无部分 manifest/旧代际提交/句柄残留）、AI7 生产启用 + 旧 Loop 不上传 e2e 守卫（取代 Batch 1 休眠守卫套件，基础回归保留）；变异验证 M1–M7 全部转红。批次文档收口：`docs/tests/phase5-acceptance.md` Batch 2 段、ADR-010/ADR-002 修订记录、CONTEXT.md 词汇 +5、本状态块；验收证据见该验收记录。
-  - **片 8 集成验收完成，收口三轨复核待进行**。
+  - **片 8 已完成并收口**（2026-10-07）：收口三轨复核 Round1 产生 3 项 P2——[#114](https://github.com/zhuabo001/loop-platform-zhb/issues/114)（watcher 关闭完成/顺序验收假绿）、[#115](https://github.com/zhuabo001/loop-platform-zhb/issues/115)（AI7 未验证 Report wire 键缺席）、[#116](https://github.com/zhuabo001/loop-platform-zhb/issues/116)（AI4 在 commit 响应落定前统计），均为新增验收 oracle 的检测能力缺口而非产品缺陷；修复提交 `1886409`/`54e17cf`（测试 oracle 加固与验收记录修订，变异验证 M8–M11），经独立复审核销，三项已全部 CLOSED；2 项 P3 措辞项已在验收记录定点修正。**Batch 2 全部 8 片收口，批次完成；批次 PR #84 保持 OPEN，合入另行授权**。
 
 ### 右移项
 

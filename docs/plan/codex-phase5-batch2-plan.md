@@ -1,6 +1,6 @@
 # Phase 5 Batch 2 开发计划：持续同步、Run 快照与文件视图
 
-- 状态：片 1–8 交付完成，批次收口三轨复核待进行（2026-10-07；验收证据 `docs/tests/phase5-acceptance.md` Batch 2 段）
+- 状态：已完成（2026-10-07，片 1–8 全部交付并收口；批次收口三轨复核 Round1 的 #114/#115/#116 修复后经独立复审核销关闭；批次 PR [#84](https://github.com/zhuabo001/loop-platform-zhb/pull/84)；验收证据 `docs/tests/phase5-acceptance.md` Batch 2 段）
 - 调查基线：`a0bc7c8`（分支 `feat/phase5-batch2-dev`，Batch 1 已通过 PR #68 合入）
 - 上位计划：[codex-phase5-dev-roadmap.md](codex-phase5-dev-roadmap.md)
 - 前置决策：[ADR-010](../adr/010-phase5-artifact-sync-foundation.md)
