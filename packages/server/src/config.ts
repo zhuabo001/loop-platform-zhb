@@ -68,27 +68,29 @@ export function isLoopbackHost(host: string): boolean {
 
 /** Parse and validate LOOPZHB_ORIGIN: a bare http(s) origin — no credentials,
  *  no path/query/fragment; http is accepted for loopback hosts only (ADR-011
- *  决策 5). Returns the normalized `URL.origin`. */
+ *  决策 5). Returns the normalized `URL.origin`.
+ *
+ *  Rejection messages name the variable and the failure reason ONLY — never
+ *  the raw input: an origin can embed credentials or sensitive query params,
+ *  and the boot path prints the message to stderr (review #118). */
 function parseOrigin(raw: string): string {
   let url: URL;
   try {
     url = new URL(raw);
   } catch {
-    throw new ServerConfigError(`LOOPZHB_ORIGIN is not a valid URL: ${JSON.stringify(raw)}`);
+    throw new ServerConfigError("LOOPZHB_ORIGIN is not a valid URL");
   }
   if (url.protocol !== "https:" && url.protocol !== "http:") {
-    throw new ServerConfigError(`LOOPZHB_ORIGIN must use the http or https protocol: ${JSON.stringify(raw)}`);
+    throw new ServerConfigError("LOOPZHB_ORIGIN must use the http or https protocol");
   }
   if (url.username !== "" || url.password !== "") {
-    throw new ServerConfigError(`LOOPZHB_ORIGIN must not embed credentials: ${JSON.stringify(raw)}`);
+    throw new ServerConfigError("LOOPZHB_ORIGIN must not embed credentials");
   }
   if (url.pathname !== "/" || url.search !== "" || url.hash !== "") {
-    throw new ServerConfigError(`LOOPZHB_ORIGIN must be a bare origin without path, query or fragment: ${JSON.stringify(raw)}`);
+    throw new ServerConfigError("LOOPZHB_ORIGIN must be a bare origin without path, query or fragment");
   }
   if (url.protocol === "http:" && !isLoopbackHost(url.hostname)) {
-    throw new ServerConfigError(
-      `LOOPZHB_ORIGIN with the http protocol is accepted for a loopback host only: ${JSON.stringify(raw)}`,
-    );
+    throw new ServerConfigError("LOOPZHB_ORIGIN with the http protocol is accepted for a loopback host only");
   }
   return url.origin;
 }

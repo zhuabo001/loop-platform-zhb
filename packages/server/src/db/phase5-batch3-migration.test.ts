@@ -13,9 +13,10 @@
  *       entries, session receipt) survives byte-identical.
  *  LM1-freeze  The fixture is byte-identical to the committed 0000–0005
  *       migrations — "不修改历史迁移" is machine-checked.
- *  LM2  Identity rows and old business rows survive two close/reopen cycles
- *       plus a repeated migration item-equal; the journal stays at seven
- *       entries; tables/indexes are never duplicated.
+ *  LM2  Identity rows (EVERY column, full-row snapshots) and all seven old
+ *       business tables survive two close/reopen cycles plus a repeated
+ *       migration item-equal; the journal stays at seven entries;
+ *       tables/indexes are never duplicated.
  *
  * Fresh-DB round-trips and constraint arbitration live in
  * phase5-batch3-schema.test.ts (SC group).
@@ -24,7 +25,6 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { eq } from "drizzle-orm";
 import { migrate } from "drizzle-orm/pglite/migrator";
 import { afterEach, describe, expect, test } from "vitest";
 
@@ -322,17 +322,43 @@ describe("LM: Batch 3 migration 0006 — identity schema without touching histor
   test("LM2: identity rows and old business rows survive restart cycles and repeated migration item-equal", async () => {
     let handle = await openBatch2Db();
     await seedBatch2Data(handle);
+    // Pre-upgrade snapshots of the six UNCHANGED-ROW-COUNT old tables (old
+    // columns only). machines is deliberately NOT here: seeding below adds
+    // the claimed machine, and its old columns — legacy row included — are
+    // covered by the full-row seeded.machines comparison (a superset: every
+    // old column plus team_id/revoked_at, for both machines).
     const before = {
       loops: await selectColumns(handle, "loops", BATCH2_LOOP_COLUMNS),
+      runs: await selectColumns(handle, "runs", BATCH2_RUN_COLUMNS),
+      leases: await selectColumns(handle, "run_leases", BATCH2_LEASE_COLUMNS),
       sessions: await selectColumns(handle, "artifact_sync_sessions", BATCH2_SESSION_COLUMNS),
+      manifests: await selectColumns(handle, "artifact_manifests", BATCH2_MANIFEST_COLUMNS),
+      blobs: await selectColumns(handle, "artifact_blobs", BATCH2_BLOB_COLUMNS),
     };
     let upgraded = await upgradeInPlace(handle);
 
     // Seed the identity chain a slice-2 login transaction will produce, plus a
     // claimed machine (slice 4's product) — via the testkit fixtures.
     const identity = await seedPersonalIdentity(upgraded.db, { githubUserId: "424242", username: "tester" });
-    const { credentialHash } = await seedSession(upgraded.db, { userId: identity.userId });
-    const claimedId = await seedClaimedMachine(upgraded.db, "dk_claimed_machine", identity.teamId);
+    await seedSession(upgraded.db, { userId: identity.userId });
+    await seedClaimedMachine(upgraded.db, "dk_claimed_machine", identity.teamId);
+
+    // FULL-ROW snapshots of the seeded world (review #117): every column of
+    // the four identity tables and both machines (claimed + legacy). The
+    // post-restart comparison below is item-equal on EVERY field — a restart
+    // or repeated migration that rewrites any column fails here.
+    const seeded = {
+      users: await upgraded.db.select().from(users),
+      teams: await upgraded.db.select().from(teams),
+      memberships: await upgraded.db.select().from(memberships),
+      authSessions: await upgraded.db.select().from(authSessions),
+      machines: await upgraded.db.select().from(machines).orderBy(machines.id),
+    };
+    // The seeded shape the snapshots imply: the claimed machine is bound to
+    // the personal team; the legacy machine stays unclaimed and unrevoked.
+    expect(seeded.machines.find((m) => m.id !== MACHINE_ID)!.teamId).toBe(identity.teamId);
+    const legacySeeded = seeded.machines.find((m) => m.id === MACHINE_ID)!;
+    expect([legacySeeded.teamId, legacySeeded.revokedAt]).toEqual([null, null]);
 
     // Two full restart cycles, plus an extra migrate on the live handle.
     for (let i = 0; i < 2; i++) {
@@ -340,26 +366,21 @@ describe("LM: Batch 3 migration 0006 — identity schema without touching histor
     }
     await runMigrations(upgraded);
 
-    // Identity rows survived item-equal.
-    const [user] = await upgraded.db.select().from(users);
-    expect(user).toEqual({ id: "424242", username: "tester", createdAt: expect.any(String), updatedAt: expect.any(String) });
-    expect(user!.id).toBe(identity.userId);
-    const [team] = await upgraded.db.select().from(teams);
-    expect(team!.id).toBe(identity.teamId);
-    expect(team!.ownerUserId).toBe(identity.userId);
-    const [membership] = await upgraded.db.select().from(memberships);
-    expect([membership!.userId, membership!.teamId, membership!.role]).toEqual([identity.userId, identity.teamId, "owner"]);
-    const [session] = await upgraded.db.select().from(authSessions);
-    expect(session!.credentialHash).toBe(credentialHash);
-    const [claimed] = await upgraded.db.select().from(machines).where(eq(machines.id, claimedId));
-    expect(claimed!.teamId).toBe(identity.teamId);
-    // The legacy machine stays unclaimed.
-    const [legacy] = await upgraded.db.select().from(machines).where(eq(machines.id, MACHINE_ID));
-    expect([legacy!.teamId, legacy!.revokedAt]).toEqual([null, null]);
+    // Identity rows survived item-equal — every column, not a pinned subset.
+    expect(await upgraded.db.select().from(users)).toEqual(seeded.users);
+    expect(await upgraded.db.select().from(teams)).toEqual(seeded.teams);
+    expect(await upgraded.db.select().from(memberships)).toEqual(seeded.memberships);
+    expect(await upgraded.db.select().from(authSessions)).toEqual(seeded.authSessions);
+    expect(await upgraded.db.select().from(machines).orderBy(machines.id)).toEqual(seeded.machines);
 
-    // Old business rows survived item-equal.
+    // Old business rows survived item-equal — every old column of the six
+    // unchanged-row-count tables (machines covered above, row superset).
     expect(await selectColumns(upgraded, "loops", BATCH2_LOOP_COLUMNS)).toEqual(before.loops);
+    expect(await selectColumns(upgraded, "runs", BATCH2_RUN_COLUMNS)).toEqual(before.runs);
+    expect(await selectColumns(upgraded, "run_leases", BATCH2_LEASE_COLUMNS)).toEqual(before.leases);
     expect(await selectColumns(upgraded, "artifact_sync_sessions", BATCH2_SESSION_COLUMNS)).toEqual(before.sessions);
+    expect(await selectColumns(upgraded, "artifact_manifests", BATCH2_MANIFEST_COLUMNS)).toEqual(before.manifests);
+    expect(await selectColumns(upgraded, "artifact_blobs", BATCH2_BLOB_COLUMNS)).toEqual(before.blobs);
 
     // Journal stays at seven; tables/indexes are never duplicated.
     const journal = await upgraded.client.query<{ count: string }>(

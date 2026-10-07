@@ -174,6 +174,33 @@ describe("bootstrapServer", () => {
     await expect(access(dir)).rejects.toThrow();
   });
 
+  it("an origin rejection reaches the boot log WITHOUT the raw input — embedded credentials never hit stderr (review #118)", async () => {
+    const dir = await tmpDataDir();
+    await rm(dir, { recursive: true, force: true });
+    process.env.LOOPZHB_DATA_DIR = dir;
+    process.env.LOOPZHB_ORIGIN = "https://ops:SENTINEL_PASSWORD@loop.example.com";
+    process.env.LOOPZHB_GITHUB_CLIENT_ID = "test-gh-client-id";
+    process.env.LOOPZHB_GITHUB_CLIENT_SECRET = "test-gh-client-secret";
+    try {
+      // start.ts's exit path prints `err.message` to stderr — the rejection
+      // message IS the log boundary, so it must not carry the raw origin.
+      const err: unknown = await main().then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(Error);
+      const message = (err as Error).message;
+      expect(message).toMatch(/LOOPZHB_ORIGIN/);
+      expect(message).not.toContain("SENTINEL_PASSWORD");
+    } finally {
+      delete process.env.LOOPZHB_DATA_DIR;
+      delete process.env.LOOPZHB_ORIGIN;
+      delete process.env.LOOPZHB_GITHUB_CLIENT_ID;
+      delete process.env.LOOPZHB_GITHUB_CLIENT_SECRET;
+    }
+    await expect(access(dir)).rejects.toThrow();
+  });
+
   it("scheduler scan failure fails boot: drains scheduler, closes listener, rethrows (Batch 2 plan §2)", async () => {
     const dir = await tmpDataDir();
     const b = await bootstrapServer({ auth: makeTestAuthConfig(), host: "127.0.0.1", port: 3000, dataDir: dir });

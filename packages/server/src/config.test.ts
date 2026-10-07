@@ -209,4 +209,33 @@ describe("origin policy (ADR-011 决策 5)", () => {
     expect(config.auth.origin).toBe("https://loop.example.com");
     expect(config.auth.githubCallbackUrl).toBe("https://loop.example.com/auth/github/callback");
   });
+
+  // Review #118: an origin can embed credentials or sensitive query params,
+  // and the boot path prints the rejection message to stderr — so EVERY
+  // rejection branch must name the variable and the reason, never the input.
+  describe("rejection messages never echo the raw input", () => {
+    const SENTINEL = "SENTINEL_PASSWORD";
+
+    function rejectionMessage(origin: string): string {
+      try {
+        loadServerConfig({ LOOPZHB_ORIGIN: origin, ...OAUTH_ENV }, HOME, CWD);
+      } catch (err) {
+        return err instanceof Error ? err.message : String(err);
+      }
+      throw new Error("expected the origin to be rejected");
+    }
+
+    it.each([
+      `not-a-url-${SENTINEL}`, // unparsable
+      `ftp://u:${SENTINEL}@loop.example.com`, // wrong protocol
+      `https://u:${SENTINEL}@loop.example.com`, // embedded credentials
+      `https://loop.example.com/app?code=${SENTINEL}`, // path + query
+      `https://loop.example.com/#${SENTINEL}`, // fragment
+      `http://${SENTINEL}.internal:8080`, // non-loopback http
+    ])("the rejection of %j names the reason without the input", (origin) => {
+      const message = rejectionMessage(origin);
+      expect(message).toMatch(/LOOPZHB_ORIGIN/);
+      expect(message).not.toContain(SENTINEL);
+    });
+  });
 });
