@@ -5,7 +5,12 @@
  * Declared, NOT opened (ADR-002 决策 6): Batch 1 mounts no route that consumes
  * these DTOs — the shapes freeze here so the ArtifactHome state machine
  * (Batch 1) and the watcher/HTTP adapters (Batch 2) build against a stable
- * contract. 镜像形状 ≠ 已支持语义.
+ * contract. 镜像形状 ≠ 已支持语义. Batch 2 slice 1 freezes the REST of the
+ * surface: the machine-scoped read, the client failure taxonomy with its
+ * sync-error report DTOs, the two additional wire codes
+ * (`artifact_revision_exhausted`, `artifact_session_committed`) and the fifth
+ * retry class (`recover_receipt`); the read-side views live in
+ * artifact-view.ts. Routes still mount in later slices.
  *
  * Shape only — value domains are deliberately NOT pinned at the schema layer
  * (hash stays `z.string()`, size is a TYPEOF-number check). The same manifest
@@ -90,6 +95,18 @@ export type PrepareArtifactSyncResponse = z.infer<typeof prepareArtifactSyncResp
 /** The header carrying the sync session id on blob PUTs. */
 export const ARTIFACT_SYNC_ID_HEADER = "X-Artifact-Sync-Id";
 
+/** The PUT success body (frozen in Batch 2 slice 2 — the last wire shape
+ *  Batch 2 opens). `size` is the VERIFIED byte count of the uploaded stream,
+ *  never a declared size or Content-Length; `published:false` means the key
+ *  already existed (the dedupe path) — the bytes were verified all the same,
+ *  so a duplicate PUT converges without mutating the stored blob. */
+export const putArtifactBlobResponseSchema = z.object({
+  ok: z.literal(true),
+  size: z.number().int().nonnegative(),
+  published: z.boolean(),
+});
+export type PutArtifactBlobResponse = z.infer<typeof putArtifactBlobResponseSchema>;
+
 // ---- commit (POST /api/machine/sync/:id/commit — the route mounts in Batch 2) ----
 
 export const commitArtifactSyncResponseSchema = z.object({
@@ -101,13 +118,34 @@ export const commitArtifactSyncResponseSchema = z.object({
 });
 export type CommitArtifactSyncResponse = z.infer<typeof commitArtifactSyncResponseSchema>;
 
+// ---- machine-scoped read (GET /api/machine/loops/:id/artifacts — Batch 2) ----
+
+/** The machine-scoped configuration + current-manifest snapshot the daemon
+ *  reads at start, restart or conflict recovery (Batch 2 plan §1). The loop
+ *  must be configured — an unconfigured loop refuses with
+ *  `artifact_config_conflict` (409). `manifestRevision` is the base a restart
+ *  re-negotiates from; workdir and jail roots deliberately stay in the poll
+ *  watch item, so this DTO does not duplicate them. No namespace field: the
+ *  storage namespace comes ONLY from trusted attribution (决策 7). */
+export const machineLoopArtifactsResponseSchema = z.object({
+  loopId: z.string(),
+  artifactDir: z.string(),
+  configRevision: z.number().int().nonnegative(),
+  manifestRevision: z.number().int().nonnegative(),
+});
+export type MachineLoopArtifactsResponse = z.infer<typeof machineLoopArtifactsResponseSchema>;
+
 // ---- error taxonomy (ADR-010 决策 13) ----
 
 /** The stable wire codes for artifact sync failures. Error bodies ride the
  *  shared `apiErrorSchema` `{error, code?}` — the error TEXT is not a machine
  *  contract, these codes are. `artifact_attribution_missing` sits ahead of
  *  all session logic (no valid trusted attribution ⇒ no operation at all);
- *  it is frozen now so the state machine never invents it ad hoc. */
+ *  it is frozen now so the state machine never invents it ad hoc.
+ *  Batch 2 (ADR-010 决策 13): `artifact_revision_exhausted` collapses both
+ *  internal exhaustion literals (config + manifest) into one terminal 409;
+ *  `artifact_session_committed` tells a PUT client to fetch the same
+ *  session's fixed receipt via commit (retry class `recover_receipt`). */
 export const ARTIFACT_ERROR_CODES = [
   "artifact_validation_failed",
   "artifact_config_conflict",
@@ -118,6 +156,8 @@ export const ARTIFACT_ERROR_CODES = [
   "artifact_blob_missing",
   "artifact_storage_error",
   "artifact_attribution_missing",
+  "artifact_revision_exhausted",
+  "artifact_session_committed",
 ] as const;
 export type ArtifactErrorCode = (typeof ARTIFACT_ERROR_CODES)[number];
 
@@ -125,8 +165,10 @@ export type ArtifactErrorCode = (typeof ARTIFACT_ERROR_CODES)[number];
  *  - `idempotent_retry`: safe to retry the identical request (bounded backoff)
  *  - `resume`: upload the missing blob(s), then retry the identical commit
  *  - `renegotiate`: restart from prepare with fresh config/base revisions
- *  - `terminal`: the identical request always fails — fix the cause first */
-export const ARTIFACT_ERROR_RETRY_CLASSES = ["idempotent_retry", "resume", "renegotiate", "terminal"] as const;
+ *  - `terminal`: the identical request always fails — fix the cause first
+ *  - `recover_receipt`: call commit on the SAME session to fetch its fixed
+ *    receipt (no re-upload, no re-negotiation) — `artifact_session_committed` */
+export const ARTIFACT_ERROR_RETRY_CLASSES = ["idempotent_retry", "resume", "renegotiate", "terminal", "recover_receipt"] as const;
 export type ArtifactErrorRetryClass = (typeof ARTIFACT_ERROR_RETRY_CLASSES)[number];
 
 /** code → retry class. Exhaustive by construction; the test pins every entry
@@ -143,4 +185,61 @@ export const ARTIFACT_ERROR_RETRY_CLASS: Readonly<Record<ArtifactErrorCode, Arti
   artifact_blob_missing: "resume",
   artifact_storage_error: "idempotent_retry",
   artifact_attribution_missing: "terminal",
+  artifact_revision_exhausted: "terminal",
+  artifact_session_committed: "recover_receipt",
 };
+
+// ---- client failure taxonomy and sync-error reporting (Batch 2) ----
+
+/** The client-side scan/watcher failure classes the daemon reports through
+ *  POST /api/machine/loops/:id/artifact-sync-error (Batch 2 plan §1). This
+ *  set is DISJOINT from the wire error codes above: those classify SERVER
+ *  refusals, these classify LOCAL failures that never reach an artifact
+ *  request. Client-side value domains are deliberately NOT pinned in schemas
+ *  EXCEPT here: the taxonomy is a closed contract the server stores and the
+ *  dashboard renders, and no shared policy layer classifies it (unlike
+ *  hash/size, which stay shape-only). */
+export const ARTIFACT_SYNC_FAILURES = [
+  "directory_missing",
+  "unreadable",
+  "outside_jail",
+  "symlink",
+  "special_file",
+  "unstable",
+  "too_large",
+  "watcher_error",
+  "timeout",
+] as const;
+export type ArtifactSyncFailure = (typeof ARTIFACT_SYNC_FAILURES)[number];
+
+export const artifactSyncFailureSchema = z.enum(ARTIFACT_SYNC_FAILURES);
+
+/** The loop's persisted sync-attempt error domain: server wire codes plus
+ *  client failure classes, in that order, no overlap. Widens the
+ *  loops.artifactSyncError column type (TS-only, no migration). */
+export const ARTIFACT_SYNC_STATE_ERRORS = [...ARTIFACT_ERROR_CODES, ...ARTIFACT_SYNC_FAILURES] as const;
+export type ArtifactSyncStateError = (typeof ARTIFACT_SYNC_STATE_ERRORS)[number];
+
+/** POST /api/machine/loops/:id/artifact-sync-error — a local scan/watcher
+ *  failure. The server updates the loop's sync-attempt state only when BOTH
+ *  revisions still match the loop's current values; a late report must never
+ *  overwrite a newer success. */
+export const artifactSyncErrorReportRequestSchema = z.object({
+  failure: artifactSyncFailureSchema,
+  /** The config generation the failed scan was bound to. */
+  configRevision: z.number().int().nonnegative(),
+  /** The manifest revision the failed scan based on. */
+  baseManifestRevision: z.number().int().nonnegative(),
+  /** Optional operator-facing diagnostics — NEVER a machine contract (the
+   *  error text is not a contract, the failure class is). */
+  message: z.string().optional(),
+});
+export type ArtifactSyncErrorReportRequest = z.infer<typeof artifactSyncErrorReportRequestSchema>;
+
+export const artifactSyncErrorReportResponseSchema = z.object({
+  ok: z.literal(true),
+  /** false = the report's generation/base no longer match the loop's; the
+   *  server wrote NO state (late errors never overwrite a newer success). */
+  recorded: z.boolean(),
+});
+export type ArtifactSyncErrorReportResponse = z.infer<typeof artifactSyncErrorReportResponseSchema>;

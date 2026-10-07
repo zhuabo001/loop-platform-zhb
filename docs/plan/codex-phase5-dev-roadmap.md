@@ -33,7 +33,7 @@ PATCH /api/loops/:id/artifact-dir
 { "artifactDir": "<machine-side path>" | null }
 ```
 
-相对路径基于显式 workdir 解析；没有 workdir 时要求绝对路径。Daemon 必须验证目录在有效 jail 内，不跟随目录或文件 symlink，不读取特殊文件。目录修改递增独立配置 revision，旧 watcher 和未完成同步不能提交到新配置。
+相对路径基于显式 workdir 解析；没有 workdir 时要求绝对路径。Daemon 必须验证目录在有效 jail 内：根自身是 symlink 时按 `realpath` 落点判定，树内目录或文件 symlink 一律使扫描失败；不读取特殊文件。目录修改递增独立配置 revision，旧 watcher 和未完成同步不能提交到新配置。
 
 Protocol 增加 `artifact-sync-v1` capability、Poll 的 `watch/watchDigest` 字段及同步 DTO。仅配置 Artifact 的 Loop 额外要求该 capability；未配置的 Loop 保持原领取条件。
 
@@ -109,7 +109,7 @@ Connect key 固定 24 小时有效、单次消费，仅保存哈希，创建时�
 
 - 开放 `artifactDir` 管理接口及 Poll watch 配置。
 - 实现 chokidar WatchManager：启动全扫描、事件合并、增量哈希、目录配置 reconcile、关闭 drain。
-- 文件缓存使用 size/mtime/ctime，并对时间粒度内的可疑写入重新哈希；上传前重新验内容。
+- 文件缓存以 `dev/ino/size/mtime/ctime` 五元组全等为复用条件（绝不 size-only）；启动、每 60 秒与 Run 最终同步一律全量重哈希，只有事件路径的增量扫描可复用缓存 hash；上传前一律重新读取并验证 hash/size。
 - 启动及每 60 秒执行完整目录核对，补偿遗漏事件；同步请求每 Loop 串行，Blob 上传并发最多 4。
 - 配置移除、代际变化或 jail 验证失败时关闭旧 watcher；401/403 停止相应同步，瞬态失败指数退避，最长 60 秒。
 - 接入 Run 最终快照与 Report 原子绑定。

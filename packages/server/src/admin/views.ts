@@ -43,6 +43,7 @@ export type LoopSummaryRow = Pick<
   | "taskFileSyncedAt"
   | "taskFileSyncAttemptedAt"
   | "taskFileSyncError"
+  | "artifactDir"
 >;
 
 export type RunSummaryRow = Pick<
@@ -121,6 +122,9 @@ export function toLoopSummary(
     taskFileSyncedAt: row.taskFileSyncedAt ?? null,
     taskFileSyncAttemptedAt: row.taskFileSyncAttemptedAt ?? null,
     taskFileSyncError: row.taskFileSyncError ?? null,
+    // Phase 5 (Batch 2 slice 2): emitted explicitly as null when unconfigured,
+    // like every other additive field (the wire DTO declares it optional).
+    artifactDir: row.artifactDir ?? null,
   };
 }
 

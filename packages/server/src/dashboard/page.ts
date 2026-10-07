@@ -19,8 +19,17 @@
 import { html } from "hono/html";
 
 import { CSRF_FIELD } from "./csrf.js";
-import type { DashboardPageModel, LoopActivityLine, LoopCard, LoopLastRunView } from "./view.js";
-import { NONE_TEXT } from "./view.js";
+import type {
+  ArtifactDiffPageModel,
+  DashboardPageModel,
+  DiffSelectOption,
+  LoopActivityLine,
+  LoopArtifactsPageModel,
+  LoopCard,
+  LoopLastRunView,
+  RunArtifactsPageModel,
+} from "./view.js";
+import { ARTIFACT_DIR_FIELD, NONE_TEXT } from "./view.js";
 
 export const DASHBOARD_CSS = `:root {
   color-scheme: light dark;
@@ -87,8 +96,22 @@ h2 { font-size: 16px; margin: 0; }
 .run-form button { font: inherit; padding: 4px 14px; cursor: pointer; }
 .run-form button:disabled { cursor: not-allowed; opacity: 0.6; }
 .run-note { margin: 6px 0 0; color: var(--muted); }
+.back { margin: 0 0 12px; }
+.config-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 12px 0 0; }
+.config-form input[type=text] { font: inherit; padding: 4px 8px; min-width: 24em; }
+.config-form button, .diff-form button { font: inherit; padding: 4px 14px; cursor: pointer; }
+.config-hint { margin: 4px 0 0; color: var(--muted); }
+.diff-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 12px 0 0; }
+.diff-form select { font: inherit; }
+table.files { width: 100%; margin: 12px 0 0; border-collapse: collapse; }
+table.files th, table.files td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+table.files th { color: var(--muted); font-weight: normal; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.diff-added { color: #2f7d4f; }
+.diff-removed { color: #b3261e; }
 @media (max-width: 640px) {
   .fields dt { min-width: 0; }
+  .config-form input[type=text] { min-width: 0; width: 100%; }
 }
 `;
 
@@ -208,4 +231,164 @@ ${model.loops.map((item) => card(item, csrfToken))}
   // primitive, so this is an instanceof check rather than a typeof one.)
   if (page instanceof Promise) throw new Error("dashboard template must render synchronously");
   return page.toString();
+}
+
+// ---- slice 7 artifact pages (ADR-010 决策 27) ----
+// Sibling render functions: the frozen index-page template above is untouched.
+// Same contract — zero client JS, escape-by-interpolation only (raw() never),
+// synchronous render guarded loudly. These pages carry NO meta refresh: they
+// hold a form a refresh would wipe.
+
+
+/** The shared shell: head, inline (CSP-hashed) stylesheet, header, main.
+ *  Every dynamic value is interpolated — escaped in text and attribute
+ *  position alike. */
+function artifactPageShell(title: string, body: unknown): string {
+  const page = html`<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${title}</title>
+<style>${DASHBOARD_CSS}</style>
+</head>
+<body>
+<header>
+<h1>${title}</h1>
+<p class="back"><a href="/">← 返回 Dashboard</a></p>
+</header>
+<main>
+${body}
+</main>
+</body>
+</html>`;
+  if (page instanceof Promise) throw new Error("dashboard template must render synchronously");
+  return page.toString();
+}
+
+function fileTable(files: LoopArtifactsPageModel["files"] | RunArtifactsPageModel["files"]) {
+  if (files.length === 0) return html`<p class="meta">暂无文件。</p>`;
+  return html`<table class="files">
+<thead><tr><th>路径</th><th>大小（字节）</th><th>SHA-256</th><th>下载</th></tr></thead>
+<tbody>
+${files.map(
+  (f) => html`<tr>
+<td class="wrap">${f.path}</td>
+<td>${f.size}</td>
+<td class="mono wrap">${f.hash}</td>
+<td>${f.downloadLink === null ? NONE_TEXT : html`<a href="${f.downloadLink}">下载</a>`}</td>
+</tr>`,
+)}
+</tbody>
+</table>`;
+}
+
+function configForm(model: LoopArtifactsPageModel, csrfToken: string) {
+  return html`<form class="config-form" method="post" action="${model.configAction}">
+<input type="hidden" name="${CSRF_FIELD}" value="${csrfToken}">
+<label>Artifact 目录 <input type="text" name="${ARTIFACT_DIR_FIELD}" value="${model.artifactDirValue}"></label>
+<button type="submit">保存</button>
+</form>
+<p class="config-hint">留空并保存 = 清除配置；相对路径仅在 Loop 配置 workdir 时合法。</p>
+${model.configBanner === null ? "" : html`<p class="warn">${model.configBanner}</p>`}`;
+}
+
+function diffOption(option: DiffSelectOption) {
+  return html`<option value="${option.value}"${option.selected ? html` selected` : ""}>${option.label}</option>`;
+}
+
+function diffForm(diff: { action: string; fromOptions: DiffSelectOption[]; toOptions: DiffSelectOption[] }) {
+  return html`<form class="diff-form" method="get" action="${diff.action}">
+<label>基线 <select name="from">${diff.fromOptions.map(diffOption)}</select></label>
+<label>目标 <select name="to">${diff.toOptions.map(diffOption)}</select></label>
+<button type="submit">比较</button>
+</form>
+<p class="config-hint">结构 diff 只显示新增／修改／删除与前后 hash、大小，不含文件内容。</p>`;
+}
+
+function snapshotTable(model: LoopArtifactsPageModel) {
+  if (!model.hasSnapshots) return html`<p class="meta">尚无已绑定快照的 Run。</p>`;
+  return html`<table class="files">
+<thead><tr><th>Run</th><th>快照</th><th>提交时间</th><th>操作</th></tr></thead>
+<tbody>
+${model.snapshots.map(
+  (s) => html`<tr>
+<td class="mono wrap">${s.runId}</td>
+<td>r${s.manifestRevision}</td>
+<td>${s.committedAtLabel}</td>
+<td><a href="${s.href}">查看快照文件</a></td>
+</tr>`,
+)}
+</tbody>
+</table>`;
+}
+
+export function renderLoopArtifactsPage(model: LoopArtifactsPageModel, options: DashboardPageOptions): string {
+  const { csrfToken } = options;
+  const body = html`<section class="card">
+<h2>配置</h2>
+<dl class="fields">
+${field("Loop", model.loopId)}
+${field("当前目录", model.artifactDirLabel, true)}
+${field("当前视图", `r${model.manifestRevision} · ${model.fileCountLabel} 个文件 · ${model.totalBytesLabel} 字节 · 提交于 ${model.committedAtLabel}`)}
+${field("最近同步尝试", model.sync.attemptedAtLabel)}
+${field("最近同步成功", model.sync.succeededAtLabel)}
+${model.sync.errorLabel === null ? "" : field("同步状态", model.sync.errorLabel, true)}
+</dl>
+${model.staleNotice === null ? "" : html`<p class="warn">${model.staleNotice}</p>`}
+${configForm(model, csrfToken)}
+</section>
+<section class="card">
+<h2>当前文件视图</h2>
+${fileTable(model.files)}
+</section>
+<section class="card">
+<h2>Run 快照</h2>
+${snapshotTable(model)}
+</section>
+<section class="card">
+<h2>结构 diff</h2>
+${diffForm(model.diff)}`;
+  return artifactPageShell(`Loop ${model.loopId} · Artifact`, body);
+}
+
+export function renderRunArtifactsPage(model: RunArtifactsPageModel): string {
+  const body =
+    model.state === "missing"
+      ? html`<p class="empty">该 Run 未绑定 Artifact 快照（未配置同步，或该次 Run 未携带快照）。</p>`
+      : html`<dl class="fields">
+${field("Run", model.runId)}
+${field("快照", `${model.snapshotId}（${model.manifestRevisionLabel} · ${model.fileCountLabel} 个文件 · 提交于 ${model.committedAtLabel}）`)}
+</dl>
+${fileTable(model.files)}`;
+  return artifactPageShell(`Run ${model.runId} · Artifact 快照`, body);
+}
+
+export function renderArtifactDiffPage(model: ArtifactDiffPageModel): string {
+  const body = html`<p class="meta">${model.fromLabel} → ${model.toLabel}</p>
+${model.empty ? html`<p class="empty">两个快照之间没有结构变化。</p>` : ""}
+${model.added.length === 0 ? "" : html`<h2>新增（${model.added.length}）</h2>
+<table class="files"><thead><tr><th>路径</th><th>SHA-256</th><th>大小（字节）</th></tr></thead><tbody>
+${model.added.map((e) => html`<tr class="diff-added"><td class="wrap">${e.path}</td><td class="mono wrap">${e.hash}</td><td>${e.size}</td></tr>`)}
+</tbody></table>`}
+${model.modified.length === 0 ? "" : html`<h2>修改（${model.modified.length}）</h2>
+<table class="files"><thead><tr><th>路径</th><th>前 SHA-256</th><th>前大小</th><th>后 SHA-256</th><th>后大小</th></tr></thead><tbody>
+${model.modified.map((e) => html`<tr><td class="wrap">${e.path}</td><td class="mono wrap">${e.beforeHash}</td><td>${e.beforeSize}</td><td class="mono wrap">${e.afterHash}</td><td>${e.afterSize}</td></tr>`)}
+</tbody></table>`}
+${model.removed.length === 0 ? "" : html`<h2>删除（${model.removed.length}）</h2>
+<table class="files"><thead><tr><th>路径</th><th>SHA-256</th><th>大小（字节）</th></tr></thead><tbody>
+${model.removed.map((e) => html`<tr class="diff-removed"><td class="wrap">${e.path}</td><td class="mono wrap">${e.hash}</td><td>${e.size}</td></tr>`)}
+</tbody></table>`}
+<section class="card">
+<h2>重新比较</h2>
+${diffForm(model.diff)}
+</section>`;
+  return artifactPageShell(`Loop ${model.loopId} · 结构 diff`, body);
+}
+
+/** The fixed-string error page for artifact read failures (404/403). The
+ *  message is one of the module's own constants — never failure detail from
+ *  the domain. */
+export function renderDashboardErrorPage(title: string, message: string): string {
+  return artifactPageShell(title, html`<p class="empty">${message}</p>`);
 }

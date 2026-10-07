@@ -24,6 +24,19 @@ afterEach(() => {
 const scratchBase = (): string => path.join(base, "scratch");
 
 describe("createWorkdirJail — root canonicalization", () => {
+  it("rejects NUL roots as JailError at construction and server-root resolution", async () => {
+    const invalid = path.join(base, "nul\0root");
+    await expect(createWorkdirJail({ allowedRoots: [invalid], scratchBase: scratchBase() })).rejects.toThrow(JailError);
+    const jail = await createWorkdirJail({ allowedRoots: [base], scratchBase: scratchBase() });
+    try {
+      await expect(
+        jail.resolve({ workdir: base, serverRoots: [invalid], loopId: "loop", runId: "run" }),
+      ).rejects.toThrow(JailError);
+    } finally {
+      await jail.dispose();
+    }
+  });
+
   it("J1: rejects a non-existent root and an empty roots array", async () => {
     await expect(
       createWorkdirJail({ allowedRoots: [path.join(base, "missing")], scratchBase: scratchBase() }),

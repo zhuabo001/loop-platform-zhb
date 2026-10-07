@@ -29,13 +29,28 @@ import { createHash } from "node:crypto";
 import type { Context, Handler, MiddlewareHandler } from "hono";
 import { bodyLimit } from "hono/body-limit";
 
+import type { ArtifactReadFailure } from "../artifact/error-mapping.js";
 import type { EnqueueExecRunResult } from "../store/runs.js";
 import { isLoopbackHost } from "../config.js";
 import { jsonError } from "../http/json-error.js";
-import { checkCsrfForm } from "./csrf.js";
-import type { DashboardRead } from "./index.js";
-import { DASHBOARD_CSS, renderDashboardPage } from "./page.js";
-import { buildDashboardPageModel } from "./view.js";
+import { checkCsrfForm, checkCsrfFormFields } from "./csrf.js";
+import type { DashboardArtifactRead, DashboardRead } from "./index.js";
+import {
+  DASHBOARD_CSS,
+  renderArtifactDiffPage,
+  renderDashboardErrorPage,
+  renderDashboardPage,
+  renderLoopArtifactsPage,
+  renderRunArtifactsPage,
+} from "./page.js";
+import {
+  ARTIFACT_DIR_FIELD,
+  buildArtifactDiffPageModel,
+  buildDashboardPageModel,
+  buildLoopArtifactsPageModel,
+  buildRunArtifactsPageModel,
+  dashboardArtifactsPath,
+} from "./view.js";
 
 /** The dashboard form body cap — a single token field needs ~50 bytes. */
 export const DASHBOARD_FORM_CAP_BYTES = 4096;
@@ -123,6 +138,12 @@ export function normalizeHost(authority: string): string | null {
 export interface DashboardRouteDeps {
   /** The read seam — narrow on purpose (see dashboard/index.ts). */
   read: DashboardRead;
+  /** The artifact read seam for the slice-7 pages (ADR-010 决策 27).
+   *  OPTIONAL: absent ⇒ the caller registers no artifact page routes and the
+   *  paths stay indistinguishable from any unknown route — the 11+ existing
+   *  `createDashboardRoutes` call sites (no artifacts wiring) keep working
+   *  unchanged. */
+  artifacts?: DashboardArtifactRead;
   /** The manual trigger, narrowed to its call shape. The no-supersede policy
    *  (`{ kind: "manual", pendingPolicy: "skip" }`) is wired in `start.ts`, not
    *  here: this module holds no trigger semantics, so the seam stays one
@@ -145,6 +166,12 @@ export interface DashboardRoutes {
   bodyCap: MiddlewareHandler;
   index: Handler;
   run: Handler;
+  /** The four slice-7 artifact page handlers — PRESENT ONLY when deps carried
+   *  the artifact seam; the caller registers each one it received. */
+  loopArtifacts?: Handler;
+  runArtifacts?: Handler;
+  artifactDiff?: Handler;
+  artifactConfig?: Handler;
 }
 
 export function createDashboardRoutes(deps: DashboardRouteDeps): DashboardRoutes {
@@ -220,10 +247,182 @@ export function createDashboardRoutes(deps: DashboardRouteDeps): DashboardRoutes
     }
   };
 
-  return { hostGate, formContentType, bodyCap, index, run };
+  // ---- slice 7 artifact pages (ADR-010 决策 27) ----
+  // Defined ONLY when the artifact seam was injected; the caller registers
+  // exactly what it received, so "no artifacts" keeps every artifact path the
+  // indistinguishable 404 it always was.
+  const artifacts = deps.artifacts;
+
+  /** The fixed-string page failure (404/403); storage errors stay JSON 500s.
+   *  Existence never leaks: unknown/cross-scope are one 404 text. */
+  function artifactPageFailure(c: Context, failure: ArtifactReadFailure): Response {
+    switch (failure) {
+      case "loop_not_found":
+      case "run_not_found":
+      case "snapshot_not_found":
+      case "path_not_found":
+        return new Response(renderDashboardErrorPage("Artifact", "请求的资源不存在或不可见。"), {
+          status: 404,
+          headers: securityHeaders({ "content-type": "text/html; charset=UTF-8" }),
+        });
+      case "attribution_missing":
+        return new Response(renderDashboardErrorPage("Artifact", "归属缺失，无法读取 Artifact 视图。"), {
+          status: 403,
+          headers: securityHeaders({ "content-type": "text/html; charset=UTF-8" }),
+        });
+      case "storage_error":
+        return dashboardJson(500, "internal server error");
+      default:
+        return dashboardJson(500, "internal server error");
+    }
+  }
+
+  const loopArtifacts: Handler | undefined =
+    artifacts &&
+    (async (c) => {
+      try {
+        const loopId = c.req.param("id") ?? "";
+        // 决策 27's evaluation order holds for the page too (review #113):
+        // the domain verdict comes FIRST, the bare snapshot-list read only
+        // after it — a list-read fault must never mask attribution_missing
+        // (403) into a 500. Sequential, not Promise.all.
+        const view = await artifacts.loopArtifacts(loopId);
+        if (!view.ok) return artifactPageFailure(c, view.failure);
+        const bound = await artifacts.boundSnapshots(loopId);
+        const model = buildLoopArtifactsPageModel({
+          loopId,
+          view: view.response,
+          bound,
+          configToken: c.req.query("config") ?? null,
+        });
+        return new Response(renderLoopArtifactsPage(model, { csrfToken: deps.csrfToken }), {
+          status: 200,
+          headers: securityHeaders({ "content-type": "text/html; charset=UTF-8" }),
+        });
+      } catch (err) {
+        console.error("[dashboard] artifact page error", err);
+        return dashboardJson(500, "internal server error");
+      }
+    });
+
+  const runArtifacts: Handler | undefined =
+    artifacts &&
+    (async (c) => {
+      try {
+        // #111: the run page is NESTED under its parent loop — the parent path
+        // rides the facade's IDENTITY step (no route-level DB side channel),
+        // so a mismatched or nonexistent parent is the same 404 as a run that
+        // never existed on EVERY path (round 2: the attribution-missing
+        // failure included — a 403 under a foreign parent would leak the
+        // run's existence across scopes, 决策 13/27). The correct parent's
+        // attribution_missing stays the 403 control.
+        const result = await artifacts.runArtifacts(c.req.param("id") ?? "", c.req.param("runId") ?? "");
+        if (!result.ok) return artifactPageFailure(c, result.failure);
+        return new Response(renderRunArtifactsPage(buildRunArtifactsPageModel({ response: result.response })), {
+          status: 200,
+          headers: securityHeaders({ "content-type": "text/html; charset=UTF-8" }),
+        });
+      } catch (err) {
+        console.error("[dashboard] run artifact page error", err);
+        return dashboardJson(500, "internal server error");
+      }
+    });
+
+  const artifactDiff: Handler | undefined =
+    artifacts &&
+    (async (c) => {
+      try {
+        const loopId = c.req.param("id") ?? "";
+        // Same normalization as the JSON route: an empty baseline option
+        // submits `from=`.
+        const rawFrom = c.req.query("from");
+        const from = rawFrom === undefined || rawFrom === "" ? undefined : rawFrom;
+        const to = c.req.query("to");
+        if (to === undefined || to === "") {
+          // No target chosen yet: back to the artifact page, where the diff
+          // form's defaults are pre-selected.
+          return new Response(null, {
+            status: 303,
+            headers: securityHeaders({ location: dashboardArtifactsPath(loopId) }),
+          });
+        }
+        // Same domain-first sequencing as the artifacts page (#113): the
+        // diff verdict precedes the bare snapshot-list read.
+        const result = await artifacts.diff(loopId, { from, to });
+        if (!result.ok) return artifactPageFailure(c, result.failure);
+        const bound = await artifacts.boundSnapshots(loopId);
+        const model = buildArtifactDiffPageModel({
+          loopId,
+          response: result.response,
+          bound,
+          selectedFrom: from ?? "",
+          selectedTo: to,
+        });
+        return new Response(renderArtifactDiffPage(model), {
+          status: 200,
+          headers: securityHeaders({ "content-type": "text/html; charset=UTF-8" }),
+        });
+      } catch (err) {
+        console.error("[dashboard] diff page error", err);
+        return dashboardJson(500, "internal server error");
+      }
+    });
+
+  const artifactConfig: Handler | undefined =
+    artifacts &&
+    (async (c) => {
+      try {
+        const verdict = checkCsrfFormFields(await c.req.text(), deps.csrfToken, [ARTIFACT_DIR_FIELD]);
+        if (!verdict.ok) {
+          switch (verdict.verdict) {
+            case "bad_form":
+            case "field_duplicate":
+              return dashboardJson(400, "invalid request");
+            case "token_missing":
+            case "token_duplicate":
+            case "token_mismatch":
+              return dashboardJson(403, "forbidden");
+          }
+        }
+        const loopId = c.req.param("id") ?? "";
+        // Empty input clears the config — the form's hint states exactly this.
+        const rawDir = verdict.values.get(ARTIFACT_DIR_FIELD) ?? "";
+        const result = await artifacts.updateConfig(loopId, {
+          artifactDir: rawDir.trim() === "" ? null : rawDir,
+        });
+        let token: string;
+        if (!result.ok) {
+          token =
+            result.failure === "loop_not_found"
+              ? "not_found"
+              : result.failure === "artifact_dir_invalid" || result.failure === "artifact_dir_relative_without_workdir"
+                ? "artifact_validation_failed"
+                : "artifact_config_conflict";
+        } else {
+          token = result.outcome === "noop" ? "unchanged" : result.loop.artifactDir === null ? "cleared" : "updated";
+        }
+        // The run-form precedent: every business outcome is one 303; the
+        // banner token rides the location (fixed set, inert when unknown).
+        return new Response(null, {
+          status: 303,
+          headers: securityHeaders({ location: `${dashboardArtifactsPath(loopId)}?config=${token}` }),
+        });
+      } catch (err) {
+        console.error("[dashboard] artifact config error", err);
+        return dashboardJson(500, "internal server error");
+      }
+    });
+
+  return { hostGate, formContentType, bodyCap, index, run, loopArtifacts, runArtifacts, artifactDiff, artifactConfig };
 }
 
 /** Re-exported so the composition root has ONE dashboard import for both the
- *  routes object and the path it must register. The constant itself is defined
- *  in view.ts, next to the action builder it has to agree with. */
-export { DASHBOARD_RUN_PATH } from "./view.js";
+ *  routes object and the path it must register. The constants themselves are
+ *  defined in view.ts, next to the link builders they have to agree with. */
+export {
+  DASHBOARD_ARTIFACT_CONFIG_PATH,
+  DASHBOARD_ARTIFACT_DIFF_PATH,
+  DASHBOARD_LOOP_ARTIFACTS_PATH,
+  DASHBOARD_RUN_ARTIFACTS_PATH,
+  DASHBOARD_RUN_PATH,
+} from "./view.js";

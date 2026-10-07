@@ -37,7 +37,7 @@ import {
 } from "drizzle-orm/pg-core";
 
 import {
-  ARTIFACT_ERROR_CODES,
+  ARTIFACT_SYNC_STATE_ERRORS,
   CODING_AGENTS,
   LEASE_STATES,
   RUN_OUTCOMES,
@@ -218,9 +218,12 @@ export const loops = pgTable(
     /** Last SUCCESSFUL artifact sync commit (ISO); cleared on config change. */
     artifactSyncSucceededAt: text("artifact_sync_succeeded_at"),
     /** Stable classification of the last sync failure (TS-only enum from the
-     *  protocol's ARTIFACT_ERROR_CODES single source — the taskFileSyncError
-     *  precedent). Null after a successful sync. */
-    artifactSyncError: text("artifact_sync_error", { enum: [...ARTIFACT_ERROR_CODES] }),
+     *  protocol's ARTIFACT_SYNC_STATE_ERRORS single source — the taskFileSyncError
+     *  precedent). The domain is the ordered union of the wire codes and the
+     *  client-side failure classes (Batch 2 slice 2; ADR-010 决策 13): a commit
+     *  stamp writes a wire code, an error report writes a client class. Null
+     *  after a successful sync. No migration — the column stays plain text. */
+    artifactSyncError: text("artifact_sync_error", { enum: [...ARTIFACT_SYNC_STATE_ERRORS] }),
     createdAt: text("created_at").notNull(),
     updatedAt: text("updated_at").notNull(),
     /** The unified optimistic-concurrency token (review SPEC-1/SPEC-3,

@@ -1,5 +1,6 @@
 /**
- * Phase 4 ↔ Phase 5 cross-version compatibility (Batch 1 AP12).
+ * Phase 4 ↔ Phase 5 cross-version compatibility (Batch 1 AP12; Batch 2 slice 1
+ * adds the delivery artifact config).
  *
  * The FROZEN Phase 4 readers below are self-contained zod copies of the
  * Phase 4 wire shapes. They deliberately do NOT import the current schemas —
@@ -12,7 +13,7 @@ import { describe, expect, it } from "vitest";
 import { z } from "zod";
 
 import { createLoopRequestSchema, loopSummarySchema } from "./admin.js";
-import { pollRequestSchema, pollResponseSchema } from "./poll.js";
+import { deliverySchema, pollRequestSchema, pollResponseSchema } from "./poll.js";
 import { reportRequestSchema } from "./report.js";
 
 // ---- frozen Phase 4 readers (DO NOT import the current schemas) ----
@@ -174,6 +175,26 @@ const PHASE5_REPORT = {
   artifactSyncError: "sync_failed",
 } as const;
 
+const PHASE5_DELIVERY = {
+  runId: "r_01",
+  runToken: `rk_${"b2".repeat(16)}`,
+  role: "exec",
+  loop: {
+    id: "loop-01",
+    name: "nightly",
+    workdir: "/home/dev/project",
+    taskFile: null,
+    workflow: null,
+    model: null,
+    allowControl: true,
+    artifact: { dir: "dist", configRevision: 2 },
+  },
+  prevState: null,
+  roots: ["/home/dev"],
+  systemPrompt: "",
+  task: "do the thing",
+} as const;
+
 const PHASE5_LOOP_SUMMARY = {
   id: "loop-01",
   machineId: "m-0123456789abcdef",
@@ -235,6 +256,15 @@ describe("AP12: a frozen Phase 4 reader strips every Phase 5 addition", () => {
     expect(parsed.goal).toBe("triage the issue queue");
     expect(parsed.cron).toBe("0 3 * * *");
   });
+
+  it("delivery: the loop's artifact config strips away; the rest of the delivery survives", () => {
+    const parsed = frozenPollResponse.parse({ deliveries: [PHASE5_DELIVERY] });
+    const delivery = parsed.deliveries[0];
+    expect(delivery?.loop).not.toHaveProperty("artifact");
+    expect(delivery?.loop.id).toBe("loop-01");
+    expect(delivery?.runId).toBe("r_01");
+    expect(delivery?.roots).toEqual(["/home/dev"]);
+  });
 });
 
 describe("AP12: the current reader still accepts Phase 4 goldens (fields absent)", () => {
@@ -274,5 +304,13 @@ describe("AP12: the current reader still accepts Phase 4 goldens (fields absent)
       taskFileSyncError: null,
     });
     expect(summary).not.toHaveProperty("artifactDir");
+  });
+
+  it("delivery: the current reader still accepts a Phase 4 delivery (no artifact config)", () => {
+    const { artifact: _artifact, ...phase4Loop } = PHASE5_DELIVERY.loop;
+    const parsed = deliverySchema.parse({ ...PHASE5_DELIVERY, loop: phase4Loop });
+    expect(parsed.loop).not.toHaveProperty("artifact");
+    expect(parsed.loop.id).toBe("loop-01");
+    expect(parsed.runToken).toBe(`rk_${"b2".repeat(16)}`);
   });
 });

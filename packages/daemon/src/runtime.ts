@@ -25,6 +25,12 @@
  *    is DEFENSIVE behavior only — against a Phase 1 server (which ignores
  *    `availableSlots` and progress) there is NO liveness promise for queued
  *    or long-running runs;
+ *  - slice 6 (ADR-010 决策 11/19/20): after the runner settles and BEFORE
+ *    the report body is serialized, an artifact-configured loop's run-final
+ *    sync executes INSIDE the in-flight slot (the capacity gate never opens
+ *    for it), its outcome merged into the report — `artifactSnapshotId` on
+ *    success, a stable `artifactSyncError` otherwise — so the serialized-once
+ *    body carries the frozen fields on every retry;
  *  - shutdown stops the poll sleep, in-flight HTTP and pending retries,
  *    drops the never-started queue, and JOINS the active execution pipeline
  *    (batch 2's real Claude subprocess must not outlive the daemon). It does
@@ -34,6 +40,8 @@
  */
 import type { Delivery, PollRequest, RunProgress } from "@loopzhb/protocol";
 
+import type { FinalArtifactSync } from "./artifact-final-sync.js";
+import type { ArtifactWatchController } from "./artifact-watch-manager.js";
 import { serializeReportRequest, type MachineClient, type SerializedReportRequest } from "./client.js";
 import type { AgentRunner, RunnerReport } from "./runner.js";
 import { ProcessControlError } from "./subprocess.js";
@@ -83,6 +91,10 @@ export interface PendingReport {
 
 export type SleepFn = (ms: number, signal: AbortSignal) => Promise<void>;
 
+/** The artifact-watch drain budget on shutdown (批次计划 §2 片 5 停止边界:
+ *  取消并等待在途任务释放资源，最多 10 秒). */
+export const WATCH_DRAIN_DEADLINE_MS = 10_000;
+
 export interface DaemonRuntimeDeps {
   client: MachineClient;
   runner: AgentRunner;
@@ -90,6 +102,15 @@ export interface DaemonRuntimeDeps {
   pollMs: number;
   /** Held only to scrub it out of Runner-thrown error text. */
   machineCredential: string;
+  /** Slice-5 artifact watch channel (optional: a runtime without it is the
+   *  Phase-4-shaped daemon, and every existing call site stays unchanged).
+   *  `apply` is synchronous and zero-I/O by contract — the poll heartbeat is
+   *  never blocked by a scan or an upload. */
+  watch?: ArtifactWatchController;
+  /** Slice-6 run-final artifact sync (optional; absent ⇒ the report carries
+   *  no artifact fields, the pre-slice-6 behavior). Runs INSIDE the pipeline
+   *  before the report is serialized; never throws (its contract). */
+  finalSync?: FinalArtifactSync;
   sleep?: SleepFn;
   log?: (line: string) => void;
 }
@@ -307,11 +328,14 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
   async function pipeline(delivery: Delivery): Promise<void> {
     let report: RunnerReport;
     /** The runtime-owned progress sink (plan §2.1): accepts events ONLY while
-     *  the run is inFlight — a callback that fires after the runner settled
-     *  lands past the finally's inFlight.delete and is ignored. Each accepted
-     *  event increments the run's step with its sanitized label; a label that
-     *  sanitizes to empty carries no information and costs no step. */
+     *  the runner is active — a callback that fires after the runner settled
+     *  (including DURING the slice-6 final sync, which deliberately keeps the
+     *  in-flight slot occupied) is ignored. Each accepted event increments the
+     *  run's step with its sanitized label; a label that sanitizes to empty
+     *  carries no information and costs no step. */
+    let runnerActive = true;
     const onProgress = (label: string): void => {
+      if (!runnerActive) return;
       if (!inFlight.has(delivery.runId)) return;
       const current = activities.get(delivery.runId);
       if (current === undefined) return;
@@ -329,30 +353,46 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
       if (err instanceof ProcessControlError) processControlErr = err;
       report = { ok: false, error: sanitizeRunnerError(err, [delivery.runToken, deps.machineCredential]) };
     } finally {
-      inFlight.delete(delivery.runId);
+      runnerActive = false;
     }
     // The runner settled: the run now waits on report confirmation — one more
     // step past wherever the runner's events left it, so the step NEVER
     // regresses even when events fired (batch 3: lastStep + 1, not a fixed 2).
     const settled = activities.get(delivery.runId);
     activities.set(delivery.runId, { step: (settled?.step ?? STEP_STARTING) + 1, label: "reporting result" });
-    // runId is the orchestration layer's, ALWAYS — a Runner-supplied value
-    // (only possible via a type lie) is overwritten.
-    let body: SerializedReportRequest;
+    // Slice 6: the run-final artifact sync executes INSIDE the in-flight slot
+    // — releasing `inFlight` before the report is pending would open the
+    // capacity gate (a queued run could start while this run's snapshot is
+    // still syncing). The slot is released SYNCHRONOUSLY once the entry is
+    // pending (no await between set and delete ⇒ no window), and the
+    // try/finally guarantees the release even if a field merge ever throws.
+    let entry: PendingReport;
     try {
-      body = serializeReportRequest({ ...report, runId: delivery.runId });
-    } catch {
-      // `cursor` is intentionally unknown at the protocol seam and may contain
-      // a non-JSON value. Treat an unserializable return as a Runner failure so
-      // the claimed Run still reaches a terminal report.
-      body = serializeReportRequest({
-        runId: delivery.runId,
-        ok: false,
-        error: "runner returned a report that could not be serialized",
-      });
+      const artifactFields =
+        delivery.loop.artifact !== undefined && deps.finalSync !== undefined
+          ? await deps.finalSync.run(delivery, signal)
+          : {};
+      // runId is the orchestration layer's, ALWAYS — a Runner-supplied value
+      // (only possible via a type lie) is overwritten.
+      let body: SerializedReportRequest;
+      try {
+        body = serializeReportRequest({ ...report, runId: delivery.runId, ...artifactFields });
+      } catch {
+        // `cursor` is intentionally unknown at the protocol seam and may contain
+        // a non-JSON value. Treat an unserializable return as a Runner failure so
+        // the claimed Run still reaches a terminal report.
+        body = serializeReportRequest({
+          runId: delivery.runId,
+          ok: false,
+          error: "runner returned a report that could not be serialized",
+          ...artifactFields,
+        });
+      }
+      entry = { runId: delivery.runId, credential: delivery.runToken, body, attempt: 0 };
+      pendingReports.set(entry.runId, entry);
+    } finally {
+      inFlight.delete(delivery.runId);
     }
-    const entry: PendingReport = { runId: delivery.runId, credential: delivery.runToken, body, attempt: 0 };
-    pendingReports.set(entry.runId, entry);
     if (processControlErr !== null) {
       // Escalation (round-1 review P1): record the fatal and gate ALL new
       // work NOW — `fatal` alone blocks maybeStartNext (even the confirmed
@@ -405,7 +445,16 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
     // conjunct — see executionIdle's comment).
     const availableSlots = executionIdle() && queue.length === 0 ? (1 as const) : (0 as const);
     const progress = collectProgress();
-    return { ...deps.identity, availableSlots, ...(progress.length > 0 ? { progress } : {}) };
+    // The watch digest is echoed ONLY once a watch set has been applied: the
+    // server treats a missing digest as the empty set's, so a controller-less
+    // runtime (and the very first poll) keeps the Phase-4 wire shape verbatim.
+    const watchDigest = deps.watch?.currentDigest();
+    return {
+      ...deps.identity,
+      availableSlots,
+      ...(progress.length > 0 ? { progress } : {}),
+      ...(watchDigest !== undefined ? { watchDigest } : {}),
+    };
   }
 
   async function pollOnce(): Promise<void> {
@@ -424,6 +473,11 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
       log(`poll: ${outcome.reason} — next cycle`);
       return;
     }
+    // Slice 5: hand the watch update to the manager BEFORE dispatching the
+    // deliveries. The call is synchronous bookkeeping (the manager launches
+    // its own background work), so neither a scan nor an upload can delay the
+    // poll cadence.
+    if (outcome.watch !== undefined) deps.watch?.apply(outcome.watch, outcome.watchDigest);
     const seenRunIds = new Set<string>();
     for (const delivery of outcome.deliveries) {
       // The protocol accepts a Delivery array, so defend against a duplicated
@@ -449,6 +503,7 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
       running = true;
       if (outer.aborted) stopCtl.abort();
       else outer.addEventListener("abort", onOuterAbort, { once: true });
+      deps.watch?.start();
       try {
         for (;;) {
           if (fatal) throw fatal;
@@ -459,6 +514,11 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
       } finally {
         outer.removeEventListener("abort", onOuterAbort);
         stopCtl.abort();
+        // Slice 5: stop new watch events and timers FIRST (the artifact work
+        // is not part of the execution pipeline), then the existing queue
+        // drop and pipeline join follow. The drain is deadline-bounded inside
+        // the manager and never forces a final commit.
+        await deps.watch?.drain(WATCH_DRAIN_DEADLINE_MS);
         // Never start queued work after stop: the backlog is dropped (its
         // server-side residue is the sweep's job) — but the ACTIVE pipeline
         // is joined: batch 2's real Claude subprocess must not outlive the

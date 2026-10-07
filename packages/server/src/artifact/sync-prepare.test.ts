@@ -34,8 +34,7 @@ import { preparePayloadFingerprint } from "@loopzhb/protocol/node";
 
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
 import { artifactBlobs, artifactSyncSessions, loops, type ArtifactSyncSessionRow } from "../db/schema.js";
-import { FakeClock, seedLoop, seedMachine, snapshotLoops } from "../testkit/index.js";
-import type { ArtifactAttributionResolver } from "./attribution.js";
+import { FakeClock, seedLoop, seedMachine, snapshotLoops, staticAttribution } from "../testkit/index.js";
 import { createMemoryBlobStore, type MemoryBlobStoreFaults } from "./blob-store-memory.js";
 import type { BlobStore } from "./blob-store.js";
 import { updateArtifactConfig } from "./config.js";
@@ -76,20 +75,6 @@ function makeRequest(overrides: Partial<PrepareArtifactSyncRequest> = {}): Prepa
       { path: "a.txt", hash: HASH_A, size: 3 },
     ],
     ...overrides,
-  };
-}
-
-/** The Batch 1 attribution stub (决策 7/15: tests inject the mapping). */
-function staticAttribution(map: Record<string, string>): ArtifactAttributionResolver {
-  return {
-    resolve: (machine) => {
-      const namespaceId = map[machine.machineId];
-      return Promise.resolve(
-        namespaceId
-          ? { ok: true as const, namespaceId, machineId: machine.machineId }
-          : { ok: false as const, failure: "attribution_missing" as const },
-      );
-    },
   };
 }
 

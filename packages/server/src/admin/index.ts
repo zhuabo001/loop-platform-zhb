@@ -21,13 +21,14 @@ import { and, asc, desc, eq, inArray } from "drizzle-orm";
 import type { CreateLoopRequest, LoopSummary, MachineSummary, RunSummary } from "@loopzhb/protocol";
 import { normalizeGoal } from "@loopzhb/protocol";
 
+import { planArtifactConfigUpdate } from "../artifact/config.js";
 import type { Db } from "../db/index.js";
 import { loops, machines, runs, type Loop } from "../db/schema.js";
 import { getMachine } from "../store/machines.js";
 import { getLoop } from "../store/runs.js";
 import type { Clock } from "../time.js";
 import { validateSchedule } from "../schedule/index.js";
-import { LoopValidationError } from "./errors.js";
+import { ArtifactDirValidationError, LoopValidationError } from "./errors.js";
 import {
   nextFireAtIso,
   toLoopSummary,
@@ -87,6 +88,9 @@ export const loopSummaryColumns = {
   taskFileSyncedAt: loops.taskFileSyncedAt,
   taskFileSyncAttemptedAt: loops.taskFileSyncAttemptedAt,
   taskFileSyncError: loops.taskFileSyncError,
+  // Phase 5 additive (Batch 2 slice 2): the artifact config generation is
+  // open now that the config routes exist — the PATCH response reads it back.
+  artifactDir: loops.artifactDir,
 } as const;
 
 export const runSummaryColumns = {
@@ -178,6 +182,28 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
         goal = normalized.goal;
       }
 
+      // Phase 5 (Batch 2 slice 2, ADR-010 决策 8): an initial artifactDir is
+      // evaluated by the SAME planner the PATCH route uses — one validation
+      // rule, no drift. Legal ⇒ the loop is born at config generation 1
+      // (generation 0 means "never configured"); illegal ⇒ the same coded 400
+      // as PATCH, with the whole create rejected (zero writes).
+      let artifactDir: string | null = null;
+      let artifactConfigRevision = 0;
+      if (input.artifactDir !== undefined) {
+        const plan = planArtifactConfigUpdate(
+          { artifactDir: null, artifactConfigRevision: 0, workdir: input.workdir ?? null },
+          { artifactDir: input.artifactDir },
+          deps.clock.now().toISOString(),
+        );
+        if (plan.kind !== "changed") {
+          throw new ArtifactDirValidationError(
+            plan.kind === "rejected" ? plan.reason : "artifact_dir_invalid",
+          );
+        }
+        artifactDir = plan.writes.artifactDir;
+        artifactConfigRevision = plan.writes.artifactConfigRevision;
+      }
+
       const machine = await getMachine(deps.db, input.machineId);
       if (!machine) return { created: false as const, reason: "machine_not_found" as const };
 
@@ -221,6 +247,10 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
           lastScheduledAt: null,
           goal,
           goalRevision: 0,
+          // Batch 2 slice 2: the artifact config lands in the SAME INSERT —
+          // atomic by construction (nothing to roll back, nothing to clear).
+          artifactDir,
+          artifactConfigRevision,
           createdAt: nowIso,
           updatedAt: nowIso,
         })

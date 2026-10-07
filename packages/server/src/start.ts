@@ -18,10 +18,13 @@ import { pathToFileURL } from "node:url";
 import { serve, type ServerType } from "@hono/node-server";
 
 import { createLoopAdmin, newUuidLoopId } from "./admin/index.js";
+import { createArtifactApi, type ArtifactApi } from "./artifact/api.js";
+import { createMachineAttributionResolver } from "./artifact/attribution-machine.js";
+import { createProductionArtifactHome } from "./artifact/production.js";
 import { createRunCoordinator, mintRunCredential, newUuidRunId, type CoordinatorHooks, type RunCoordinator } from "./coordinator/index.js";
 import { isLoopbackHost, loadServerConfig, unauthenticatedExposureWarning, type ServerConfig } from "./config.js";
 import { mintCsrfToken } from "./dashboard/csrf.js";
-import { createDashboardRead } from "./dashboard/index.js";
+import { createDashboardArtifactRead, createDashboardRead } from "./dashboard/index.js";
 import { createDashboardRoutes } from "./dashboard/routes.js";
 import { closeDb, openMigratedDb, type DbHandle } from "./db/index.js";
 import { createServerApp } from "./http/app.js";
@@ -42,6 +45,12 @@ export interface BootedServer {
   sweep: InactivitySweep;
   /** Phase 3 Batch 2: Scheduler instance (not yet started). */
   scheduler: Scheduler;
+  /** Phase 5 Batch 2 slice 2: the artifact facade the app consumed — the
+   *  production ArtifactHome (blob root `<dataDir>/blobs`, machine
+   *  attribution, `sync-`/`amf-` id factories) wrapped in its narrow HTTP
+   *  interface. Construction stays side-effect-free: nothing artifact-shaped
+   *  exists on disk until the first verified write. */
+  artifacts: ArtifactApi;
   handle: DbHandle;
 }
 
@@ -98,6 +107,13 @@ export async function bootstrapServer(
       newRunId: newUuidRunId,
       mintRunCredential,
       hooks: overrides.coordinatorHooks,
+      // Slice 6 (ADR-010 决策 19): the report transaction validates and binds
+      // the report-carried artifact snapshot/error. Attribution is re-derived
+      // per call on the caller-supplied (transaction) handle — never cached,
+      // never wire input.
+      artifactBinding: {
+        resolveAttribution: (machineId, db) => createMachineAttributionResolver({ db }).resolve({ machineId }),
+      },
     });
     const admin = createLoopAdmin({ db: handle.db, clock, newLoopId: newUuidLoopId });
     const lifecycle = createLifecycleAdmin({ db: handle.db, clock, hooks: overrides.lifecycleHooks });
@@ -110,6 +126,12 @@ export async function bootstrapServer(
       clock,
       cronFactory,
     });
+    // Phase 5 Batch 2 slice 2: the production ArtifactHome (ADR-010 决策 21)
+    // mounted through its narrow HTTP facade. Pure construction — the blob
+    // root appears only on the first verified write, and no watcher exists on
+    // the server side at all. Built BEFORE the Dashboard because the slice-7
+    // artifact pages read through the SAME facade instance.
+    const artifacts = createArtifactApi(createProductionArtifactHome({ db: handle.db, dataDir: config.dataDir, clock }));
     // The Dashboard exists ONLY on a loopback bind (Batch 3 plan §2): the
     // mount decision is made HERE, from config, so no request header can ever
     // turn it on. Its presence also arms the global loopback-Host gate — on a
@@ -119,6 +141,10 @@ export async function bootstrapServer(
     const dashboard = isLoopbackHost(config.host)
       ? createDashboardRoutes({
           read: createDashboardRead({ admin, db: handle.db, clock }),
+          // Batch 2 slice 7 (决策 27): the artifact pages read through the
+          // dashboard's narrow artifact seam, which delegates to the SAME
+          // facade instance — one read domain, one evaluation order.
+          artifacts: createDashboardArtifactRead({ db: handle.db, api: artifacts }),
           // The Dashboard is the ONE caller that must not supersede: a button
           // click can never replace a run the operator already queued. The
           // policy rides this closure, so `dashboard/routes.ts` stays a plain
@@ -139,10 +165,12 @@ export async function bootstrapServer(
         ownerControl,
         (loop) => scheduler.reconcile(loop),
         dashboard,
+        artifacts,
       ),
       coordinator,
       sweep,
       scheduler,
+      artifacts,
       handle,
     };
   } catch (err) {

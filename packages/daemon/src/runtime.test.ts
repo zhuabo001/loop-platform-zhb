@@ -26,13 +26,57 @@ import {
 } from "./client.js";
 import type { AgentRunner, RunnerContext, RunnerReport } from "./runner.js";
 import { ProcessControlError } from "./subprocess.js";
+import type { ArtifactWatchItem } from "@loopzhb/protocol";
+
+import type { ArtifactWatchController } from "./artifact-watch-manager.js";
 import {
   ERROR_CAP,
   FatalDaemonError,
+  WATCH_DRAIN_DEADLINE_MS,
   createDaemonRuntime,
   sanitizeRunnerError,
   type SleepFn,
 } from "./runtime.js";
+
+/** The slice-5 watch channel as the runtime sees it: `apply` is synchronous
+ *  bookkeeping, everything else is the manager's own business. */
+interface WatchStub extends ArtifactWatchController {
+  applied: Array<{ items: readonly ArtifactWatchItem[]; digest?: string }>;
+  starts: number;
+  drains: number[];
+}
+
+function stubWatch(): WatchStub {
+  const applied: Array<{ items: readonly ArtifactWatchItem[]; digest?: string }> = [];
+  let digest: string | undefined;
+  return {
+    applied,
+    starts: 0,
+    drains: [],
+    currentDigest: () => digest,
+    apply: (items, next) => {
+      applied.push(next === undefined ? { items } : { items, digest: next });
+      if (next !== undefined) digest = next;
+    },
+    start() {
+      this.starts += 1;
+    },
+    drain(deadlineMs: number) {
+      this.drains.push(deadlineMs);
+      return Promise.resolve({ settled: true });
+    },
+    settled: () => Promise.resolve(),
+    watchedLoopIds: () => [],
+  };
+}
+
+const WATCH_ITEM: ArtifactWatchItem = {
+  loopId: "loop-1",
+  artifactDir: "/srv/proj",
+  workdir: null,
+  roots: [],
+  configRevision: 1,
+};
 
 const MACHINE_CRED = "dk_test_machine";
 const IDENTITY: PollRequest = { host: "h", platform: "linux", arch: "x64", version: "0.1.0" };
@@ -470,6 +514,271 @@ describe("shutdown", () => {
     await expect(rt.run(new AbortController().signal)).rejects.toThrow(/already running/);
     ctl.abort();
     await first;
+  });
+});
+
+describe("artifact watch channel (slice 5)", () => {
+  it("hands the poll's watch set to the controller verbatim on the poll path", async () => {
+    const watch = stubWatch();
+    const { rt, client } = makeRuntime({ watch });
+    client.pollQueue.push({ kind: "ok", deliveries: [], watch: [WATCH_ITEM], watchDigest: "digest-1" });
+
+    await rt.pollOnce();
+
+    expect(watch.applied).toEqual([{ items: [WATCH_ITEM], digest: "digest-1" }]);
+    expect(watch.starts).toBe(0); // pollOnce alone never starts the cadence
+  });
+
+  it("starts the cadence with run() and drains it with the 10 s budget BEFORE joining the pipeline", async () => {
+    const watch = stubWatch();
+    let release!: () => void;
+    const held = new Promise<RunnerReport>((resolve) => {
+      release = () => resolve(OK_RUNNER);
+    });
+    const { rt, client } = makeRuntime({ watch, runner: { run: () => held } });
+    client.pollQueue.push({ kind: "ok", deliveries: [delivery("run-1")] });
+
+    const ctl = new AbortController();
+    const done = rt.run(ctl.signal);
+    await flush();
+    expect(watch.starts).toBe(1);
+
+    ctl.abort();
+    await flush();
+    // The runner is still held: the watch drain already ran, i.e. it precedes
+    // the execution-pipeline join in shutdown.
+    expect(watch.drains).toEqual([WATCH_DRAIN_DEADLINE_MS]);
+
+    release();
+    await expect(done).resolves.toBeUndefined();
+  });
+});
+
+describe("run-final artifact sync (slice 6)", () => {
+  /** The slice-6 seam as the runtime sees it: called with the delivery and
+   *  the daemon-wide signal; the scripted fields ride the report. */
+  function stubFinalSync(script: (delivery: Delivery, signal: AbortSignal) => Promise<{ artifactSnapshotId?: string; artifactSyncError?: string }>) {
+    const calls: { delivery: Delivery; signal: AbortSignal }[] = [];
+    return {
+      calls,
+      finalSync: {
+        run: (delivery: Delivery, signal: AbortSignal) => {
+          calls.push({ delivery, signal });
+          return script(delivery, signal);
+        },
+      },
+    };
+  }
+
+  function artifactDelivery(runId: string): Delivery {
+    const d = delivery(runId);
+    return { ...d, loop: { ...d.loop, artifact: { dir: "/srv/proj", configRevision: 3 } } };
+  }
+
+  it("merges the final-sync fields into the serialized-once report body (AR1 daemon half)", async () => {
+    const { finalSync, calls } = stubFinalSync(() => Promise.resolve({ artifactSnapshotId: "snap-1" }));
+    const { rt, client } = makeRuntime({ finalSync });
+    client.pollQueue.push({ kind: "ok", deliveries: [artifactDelivery("run-1")] });
+
+    await rt.pollOnce();
+    await rt.executionSettled();
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.delivery.runId).toBe("run-1");
+    const body = JSON.parse(client.reportJson[0]!) as Record<string, unknown>;
+    expect(body.artifactSnapshotId).toBe("snap-1");
+    expect(body.artifactSyncError).toBeUndefined();
+    expect(body.ok).toBe(true);
+  });
+
+  it("a sync FAILURE rides the same report — the run's own outcome is unaffected (AR5 daemon half)", async () => {
+    const { finalSync } = stubFinalSync(() => Promise.resolve({ artifactSyncError: "timeout" }));
+    const { rt, client } = makeRuntime({ finalSync });
+    client.pollQueue.push({ kind: "ok", deliveries: [artifactDelivery("run-1")] });
+
+    await rt.pollOnce();
+    await rt.executionSettled();
+
+    const body = JSON.parse(client.reportJson[0]!) as Record<string, unknown>;
+    expect(body.ok).toBe(true); // the runner's legal success stands
+    expect(body.artifactSnapshotId).toBeUndefined();
+    expect(body.artifactSyncError).toBe("timeout");
+  });
+
+  it("retries reuse the byte-identical body INCLUDING the artifact fields (AR2)", async () => {
+    const { finalSync, calls } = stubFinalSync(() => Promise.resolve({ artifactSnapshotId: "snap-7" }));
+    const { rt, client, clock } = makeRuntime({ finalSync });
+    client.pollQueue.push({ kind: "ok", deliveries: [artifactDelivery("run-1")] });
+    client.reportQueue.push({ kind: "retry", reason: "503" });
+
+    await rt.pollOnce();
+    await rt.executionSettled();
+    expect(client.reportJson).toHaveLength(1);
+    expect(calls).toHaveLength(1); // the final sync ran ONCE — retries never re-sync
+
+    clock.fireNext(); // the 1 s retry
+    await flush();
+    await flush();
+    expect(client.reportJson).toHaveLength(2);
+    expect(client.reportJson[1]).toBe(client.reportJson[0]); // byte-identical, fields frozen
+  });
+
+  it("a delivery WITHOUT artifact config never invokes the final sync (old loops keep Phase-4 behavior)", async () => {
+    const { finalSync, calls } = stubFinalSync(() => Promise.resolve({ artifactSnapshotId: "snap-x" }));
+    const { rt, client } = makeRuntime({ finalSync });
+    client.pollQueue.push({ kind: "ok", deliveries: [delivery("run-1")] });
+
+    await rt.pollOnce();
+    await rt.executionSettled();
+
+    expect(calls).toHaveLength(0);
+    const body = JSON.parse(client.reportJson[0]!) as Record<string, unknown>;
+    expect("artifactSnapshotId" in body).toBe(false);
+    expect("artifactSyncError" in body).toBe(false);
+  });
+
+  it("a runtime WITHOUT the finalSync dep sends no artifact fields even for a configured loop", async () => {
+    const { rt, client } = makeRuntime();
+    client.pollQueue.push({ kind: "ok", deliveries: [artifactDelivery("run-1")] });
+
+    await rt.pollOnce();
+    await rt.executionSettled();
+
+    const body = JSON.parse(client.reportJson[0]!) as Record<string, unknown>;
+    expect("artifactSnapshotId" in body).toBe(false);
+    expect("artifactSyncError" in body).toBe(false);
+  });
+
+  it("the final sync holds the capacity gate — a queued run never starts while it is in flight (并发 1 不变式)", async () => {
+    let releaseSync!: () => void;
+    let syncCalls = 0;
+    const { finalSync } = stubFinalSync(() => {
+      syncCalls += 1;
+      if (syncCalls > 1) return Promise.resolve({}); // run-2's sync settles immediately
+      return new Promise((resolve) => {
+        releaseSync = () => resolve({ artifactSnapshotId: "snap-1" });
+      });
+    });
+    const { rt, client, runnerCalls } = makeRuntime({ finalSync });
+    client.pollQueue.push({ kind: "ok", deliveries: [artifactDelivery("run-1")] });
+    client.pollQueue.push({ kind: "ok", deliveries: [artifactDelivery("run-2")] });
+
+    await rt.pollOnce();
+    await flush();
+    // Runner 1 settled; the final sync is held. Poll 2 enqueues run-2…
+    await rt.pollOnce();
+    await flush();
+    // …but the gate stays closed: the in-flight slot is still occupied.
+    expect(runnerCalls.map((c) => c.delivery.runId)).toEqual(["run-1"]);
+    expect(client.reportJson).toHaveLength(0); // the report waits for the sync
+
+    releaseSync();
+    await rt.executionSettled();
+    // Capacity returned only after run-1's report was CONFIRMED, then run-2
+    // started and reported.
+    expect(runnerCalls.map((c) => c.delivery.runId)).toEqual(["run-1", "run-2"]);
+    expect(client.reportJson).toHaveLength(2);
+    const body1 = JSON.parse(client.reportJson[0]!) as Record<string, unknown>;
+    expect(body1.artifactSnapshotId).toBe("snap-1");
+  });
+
+  it("a runner's late progress event DURING the final sync is ignored (the runnerActive gate)", async () => {
+    let releaseSync!: () => void;
+    const { finalSync } = stubFinalSync(
+      () =>
+        new Promise((resolve) => {
+          releaseSync = () => resolve({});
+        }),
+    );
+    let capturedCtx: RunnerContext | undefined;
+    const { rt, client } = makeRuntime({
+      finalSync,
+      runner: {
+        run: (_d, ctx) => {
+          capturedCtx = ctx;
+          return Promise.resolve(OK_RUNNER);
+        },
+      },
+    });
+    client.pollQueue.push({ kind: "ok", deliveries: [artifactDelivery("run-1")] });
+
+    await rt.pollOnce();
+    await flush();
+    // The runner settled; the final sync is held. A late runner event…
+    capturedCtx!.onProgress("late progress");
+    // …would bump the activity step IF accepted — poll again while the sync
+    // is still held to observe it. The reporting step is lastStep + 1
+    // (STEP_STARTING + 1 = 2); an accepted late event would make it 3 with
+    // the "late progress" label.
+    await rt.pollOnce();
+    const prog = client.polls.at(-1)!.progress?.find((p) => p.runId === "run-1");
+    expect(prog).toEqual({ runId: "run-1", step: 2, label: "reporting result" });
+    releaseSync();
+    await rt.executionSettled();
+
+    const body = JSON.parse(client.reportJson[0]!) as Record<string, unknown>;
+    expect(body.ok).toBe(true);
+  });
+
+  it("a ProcessControlError still runs the final sync before the owed report, then escalates", async () => {
+    const { finalSync, calls } = stubFinalSync(() => Promise.resolve({ artifactSyncError: "unavailable" }));
+    const { runner } = captureRunner(() => Promise.reject(new ProcessControlError("process control failed: kill EPERM")));
+    const { rt, client } = makeRuntime({ finalSync, runner });
+    client.pollQueue.push({ kind: "ok", deliveries: [artifactDelivery("run-1")] });
+
+    await rt.pollOnce();
+    await rt.executionSettled();
+
+    expect(calls).toHaveLength(1); // the final sync ran even on the escalation path
+    expect(client.reports).toHaveLength(1);
+    const body = JSON.parse(client.reportJson[0]!) as Record<string, unknown>;
+    expect(body.ok).toBe(false);
+    expect(body.error).toContain("process control failed");
+    expect(body.artifactSyncError).toBe("unavailable");
+    await expect(rt.pollOnce()).rejects.toThrow(FatalDaemonError);
+  });
+
+  it("the unserializable-runner fallback body still carries the artifact fields", async () => {
+    const { finalSync } = stubFinalSync(() => Promise.resolve({ artifactSyncError: "unstable" }));
+    const { rt, client } = makeRuntime({
+      finalSync,
+      runner: {
+        // A cursor holding a BigInt defeats JSON.stringify (the protocol seam
+        // types it unknown on purpose).
+        run: () => Promise.resolve({ ok: true, outcome: "exec", message: "m", durationMs: 0, cursor: 1n } as never),
+      },
+    });
+    client.pollQueue.push({ kind: "ok", deliveries: [artifactDelivery("run-1")] });
+
+    await rt.pollOnce();
+    await rt.executionSettled();
+
+    const body = JSON.parse(client.reportJson[0]!) as Record<string, unknown>;
+    expect(body.ok).toBe(false);
+    expect(body.error).toContain("could not be serialized");
+    expect(body.artifactSyncError).toBe("unstable");
+  });
+
+  it("shutdown during the final sync sends nothing and settles bounded", async () => {
+    const { finalSync, calls } = stubFinalSync((_d, signal) =>
+      // The module's contract: it listens on the caller signal and returns {}
+      // fast on shutdown.
+      new Promise((resolve) => {
+        signal.addEventListener("abort", () => resolve({}), { once: true });
+      }),
+    );
+    const { rt, client } = makeRuntime({ finalSync });
+    client.pollQueue.push({ kind: "ok", deliveries: [artifactDelivery("run-1")] });
+
+    const ctl = new AbortController();
+    const done = rt.run(ctl.signal);
+    await flush();
+    await flush();
+    expect(calls).toHaveLength(1);
+
+    ctl.abort();
+    await expect(done).resolves.toBeUndefined();
+    expect(client.reportJson).toHaveLength(0); // the report stayed pending, unsent
   });
 });
 

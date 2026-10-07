@@ -61,8 +61,7 @@ import {
   type Loop,
 } from "../db/schema.js";
 import { REVISION_INT32_MAX } from "../schedule/transition.js";
-import { FakeClock, seedLoop, seedMachine, seedRun, snapshotLoops } from "../testkit/index.js";
-import type { ArtifactAttributionResolver } from "./attribution.js";
+import { FakeClock, seedLoop, seedMachine, seedRun, snapshotLoops, staticAttribution } from "../testkit/index.js";
 import { applyArtifactBindingPlan, planArtifactSnapshotBinding } from "./binding-plan.js";
 import { createMemoryBlobStore, type MemoryBlobStoreFaults } from "./blob-store-memory.js";
 import type { BlobStore } from "./blob-store.js";
@@ -103,19 +102,6 @@ function makeRequest(overrides: Partial<PrepareArtifactSyncRequest> = {}): Prepa
       { path: "b.txt", hash: HASH_B, size: 3 },
     ],
     ...overrides,
-  };
-}
-
-function staticAttribution(map: Record<string, string>): ArtifactAttributionResolver {
-  return {
-    resolve: (machine) => {
-      const namespaceId = map[machine.machineId];
-      return Promise.resolve(
-        namespaceId
-          ? { ok: true as const, namespaceId, machineId: machine.machineId }
-          : { ok: false as const, failure: "attribution_missing" as const },
-      );
-    },
   };
 }
 
@@ -1389,7 +1375,10 @@ describe("commit (real PGlite + memory BlobStore)", () => {
       loop,
       manifest,
       snapshotId: receipt.artifactSnapshotId,
-      attribution: { namespaceId: "ns-1", machineId: "m-1" },
+      syncError: undefined,
+      syncErrorText: undefined,
+      eligibility: "finalize",
+      attribution: { ok: true, namespaceId: "ns-1", machineId: "m-1" },
     });
     expect(bind).toMatchObject({ kind: "bind", runWrites: { artifactSnapshotId: "amf-1" } });
     await applyArtifactBindingPlan(db, run, bind);
@@ -1402,7 +1391,10 @@ describe("commit (real PGlite + memory BlobStore)", () => {
       loop,
       manifest,
       snapshotId: manifest.id,
-      attribution: { namespaceId: "ns-other", machineId: "m-1" },
+      syncError: undefined,
+      syncErrorText: undefined,
+      eligibility: "finalize",
+      attribution: { ok: true, namespaceId: "ns-other", machineId: "m-1" },
     });
     expect(crossNamespace).toMatchObject({ kind: "record_error", reason: "cross_namespace" });
 
@@ -1412,7 +1404,10 @@ describe("commit (real PGlite + memory BlobStore)", () => {
       loop,
       manifest: await readArtifactSnapshot(db, "amf-ghost"),
       snapshotId: "amf-ghost",
-      attribution: { namespaceId: "ns-1", machineId: "m-1" },
+      syncError: undefined,
+      syncErrorText: undefined,
+      eligibility: "finalize",
+      attribution: { ok: true, namespaceId: "ns-1", machineId: "m-1" },
     });
     expect(ghost).toMatchObject({ kind: "record_error", reason: "snapshot_not_committed" });
 
@@ -1424,7 +1419,10 @@ describe("commit (real PGlite + memory BlobStore)", () => {
       loop: staleLoop,
       manifest,
       snapshotId: manifest.id,
-      attribution: { namespaceId: "ns-1", machineId: "m-1" },
+      syncError: undefined,
+      syncErrorText: undefined,
+      eligibility: "finalize",
+      attribution: { ok: true, namespaceId: "ns-1", machineId: "m-1" },
     });
     expect(stale).toMatchObject({ kind: "record_error", reason: "stale_config_generation" });
 

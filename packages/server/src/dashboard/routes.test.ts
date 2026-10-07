@@ -33,7 +33,7 @@ import { createScheduleAdmin } from "../schedule/index.js";
 import { waitForListening } from "../start.js";
 import { FakeClock, seedLoop, seedRun } from "../testkit/index.js";
 import { createServerApp } from "../http/app.js";
-import { createDashboardRead, type DashboardRead } from "./index.js";
+import { createDashboardRead, type DashboardArtifactRead, type DashboardRead } from "./index.js";
 import { dashboardCsp } from "./routes.js";
 import { createDashboardRoutes, type DashboardRoutes } from "./routes.js";
 import type { EnqueueExecRunResult } from "../store/runs.js";
@@ -63,6 +63,7 @@ let enqueueCalls: string[];
 interface FreshOptions {
   enqueue?: (loopId: string) => Promise<EnqueueExecRunResult>;
   read?: DashboardRead;
+  artifacts?: DashboardArtifactRead;
   csrfToken?: string;
 }
 
@@ -81,6 +82,7 @@ function appWithoutDashboard(): ReturnType<typeof createServerApp> {
 function buildApp(options: FreshOptions & { csrfToken: string }): ReturnType<typeof createServerApp> {
   const routes: DashboardRoutes = createDashboardRoutes({
     read: options.read ?? read,
+    artifacts: options.artifacts,
     enqueue:
       options.enqueue ??
       ((loopId) => {
@@ -548,5 +550,468 @@ describe("H-group (Batch 3 Dashboard HTTP): routes and security", () => {
     const realLoopback = await rawRequest(port, "/", { Host: `127.0.0.1:${port}` });
     expect(realLoopback.status).toBe(200);
     expect(realLoopback.body).toContain("Loop Dashboard");
+  });
+});
+
+// ---- Batch 2 slice 7: the artifact pages (ADR-010 决策 27) ----
+
+import type {
+  ReadDiffResult,
+  ReadLoopArtifactsResult,
+  ReadRunArtifactsResult,
+} from "../artifact/read.js";
+import type { UpdateArtifactConfigResult } from "../artifact/config.js";
+import { checkCsrfForm, checkCsrfFormFields } from "./csrf.js";
+
+const VIEW_FIXTURE = {
+  ok: true as const,
+  response: {
+    loopId: "loop-1",
+    artifactDir: "/data/out",
+    configRevision: 1,
+    manifestRevision: 2,
+    manifestId: "amf-2",
+    committedAt: "2026-10-06T00:00:00.000Z",
+    stale: false,
+    fileCount: 1,
+    totalBytes: 3,
+    sync: { attemptedAt: null, succeededAt: null, error: null },
+    files: [{ path: "dir/a.txt", hash: "a".repeat(64), size: 3 }],
+  },
+};
+
+/** The seams order newest-first (production: revision DESC). */
+const BOUND_FIXTURE = [
+  { runId: "run-2", snapshotId: "amf-2", manifestRevision: 2, committedAt: "2026-10-06T00:01:00.000Z" },
+  { runId: "run-1", snapshotId: "amf-1", manifestRevision: 1, committedAt: "2026-10-06T00:00:00.000Z" },
+];
+
+/** Every refusal by default — tests override exactly what they exercise. */
+function fakeArtifacts(overrides: Partial<DashboardArtifactRead> = {}): DashboardArtifactRead {
+  return {
+    loopArtifacts: () => Promise.resolve({ ok: false, failure: "loop_not_found" }),
+    runArtifacts: () => Promise.resolve({ ok: false, failure: "run_not_found" }),
+    diff: () => Promise.resolve({ ok: false, failure: "snapshot_not_found" }),
+    updateConfig: () => Promise.resolve({ ok: false, failure: "loop_not_found" }),
+    boundSnapshots: () => Promise.resolve([]),
+    loopSnapshots: () => Promise.resolve([]),
+    ...overrides,
+  };
+}
+
+const getArtifactPage = (target: ReturnType<typeof createServerApp>, path: string): Promise<Response> =>
+  Promise.resolve(target.request(path, { headers: { host: "127.0.0.1" } }));
+
+const postConfig = (
+  target: ReturnType<typeof createServerApp>,
+  loopId: string,
+  body: string,
+): Promise<Response> =>
+  Promise.resolve(
+    target.request(`/dashboard/loops/${encodeURIComponent(loopId)}/artifacts/config`, {
+      method: "POST",
+      headers: { "content-type": FORM, host: "127.0.0.1" },
+      body,
+    }),
+  );
+
+describe("slice 7 artifact pages (决策 27)", () => {
+  it("the artifact page renders config form, current view, snapshot list and the diff form", async () => {
+    await fresh({
+      artifacts: fakeArtifacts({
+        loopArtifacts: () => Promise.resolve(VIEW_FIXTURE as ReadLoopArtifactsResult),
+        boundSnapshots: () => Promise.resolve(BOUND_FIXTURE),
+      }),
+    });
+    const res = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("Artifact 目录");
+    expect(html).toContain("/data/out");
+    expect(html).toContain("dir/a.txt");
+    expect(html).toContain("run-1");
+    expect(html).toContain("run-2");
+    // Download link: snapshotId + manifest path as a percent-encoded query.
+    // (The `&` between query values renders escaped — correct HTML; browsers
+    // decode entities in attributes.)
+    expect(html).toContain(
+      `/api/loops/loop-1/artifacts/download?snapshotId=amf-2&amp;path=${encodeURIComponent("dir/a.txt")}`,
+    );
+    // The diff form defaults: target = newest bound snapshot (amf-2), baseline
+    // = the most recent SMALLER revision (amf-1) — both pre-selected.
+    expect(html).toContain('name="to"');
+    expect(html).toContain('value="amf-1" selected');
+    expect(html).toContain('value="amf-2" selected');
+    // Zero client JS; the CSP still pins the one inline stylesheet.
+    expect(html).not.toContain("<script");
+    expect(res.headers.get("content-security-policy")).toContain("script-src 'none'");
+    expect(res.headers.get("cache-control")).toBe("no-store");
+  });
+
+  it("the first snapshot's default baseline is the empty set (空集合 selected)", async () => {
+    await fresh({
+      artifacts: fakeArtifacts({
+        loopArtifacts: () =>
+          Promise.resolve({
+            ...VIEW_FIXTURE,
+            response: { ...VIEW_FIXTURE.response, manifestRevision: 1, manifestId: "amf-1" },
+          } as ReadLoopArtifactsResult),
+        boundSnapshots: () => Promise.resolve([BOUND_FIXTURE[1]]), // amf-1, the only snapshot
+      }),
+    });
+    const html = await (await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts")).text();
+    expect(html).toContain('value="" selected');
+  });
+
+  it("the run page renders the bound file table; the missing state is explicit", async () => {
+    await fresh({
+      artifacts: fakeArtifacts({
+        runArtifacts: (_loopId, runId): Promise<ReadRunArtifactsResult> =>
+          Promise.resolve({
+            ok: true,
+            response: {
+              runId,
+              loopId: "loop-1",
+              state: "bound",
+              snapshotId: "amf-1",
+              manifestRevision: 1,
+              configRevision: 1,
+              committedAt: "2026-10-06T00:00:00.000Z",
+              fileCount: 1,
+              totalBytes: 3,
+              files: [{ path: "a.txt", hash: "b".repeat(64), size: 3 }],
+            },
+          }),
+      }),
+    });
+    const bound = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts/runs/run-1");
+    expect(bound.status).toBe(200);
+    const boundHtml = await bound.text();
+    expect(boundHtml).toContain("a.txt");
+    expect(boundHtml).toContain("下载");
+
+    await fresh({
+      artifacts: fakeArtifacts({
+        runArtifacts: (_loopId, runId): Promise<ReadRunArtifactsResult> =>
+          Promise.resolve({ ok: true, response: { runId, loopId: "loop-1", state: "missing" } }),
+      }),
+    });
+    const missing = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts/runs/run-9");
+    expect(missing.status).toBe(200);
+    expect(await missing.text()).toContain("未绑定 Artifact 快照");
+  });
+
+  it("the diff page renders the three classes and the re-select form", async () => {
+    await fresh({
+      artifacts: fakeArtifacts({
+        diff: (): Promise<ReadDiffResult> =>
+          Promise.resolve({
+            ok: true,
+            response: {
+              loopId: "loop-1",
+              from: { snapshotId: "amf-1", manifestRevision: 1 },
+              to: { snapshotId: "amf-2", manifestRevision: 2 },
+              added: [{ path: "new.txt", hash: "c".repeat(64), size: 1 }],
+              modified: [
+                { path: "mod.txt", beforeHash: "d".repeat(64), beforeSize: 1, afterHash: "e".repeat(64), afterSize: 2 },
+              ],
+              removed: [{ path: "gone.txt", hash: "f".repeat(64), size: 1 }],
+            },
+          }),
+        boundSnapshots: () => Promise.resolve(BOUND_FIXTURE),
+      }),
+    });
+    const res = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts/diff?from=amf-1&to=amf-2");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("新增（1）");
+    expect(html).toContain("修改（1）");
+    expect(html).toContain("删除（1）");
+    expect(html).toContain("new.txt");
+    expect(html).toContain("gone.txt");
+    // No content preview, no text diff — hash+size only.
+    expect(html).not.toContain("<script");
+  });
+
+  it("the diff page with no target redirects back to the artifact page", async () => {
+    await fresh({ artifacts: fakeArtifacts() });
+    const res = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts/diff");
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/dashboard/loops/loop-1/artifacts");
+  });
+
+  it("read failures render the fixed-string error pages (404/403), never domain detail", async () => {
+    await fresh({
+      artifacts: fakeArtifacts({
+        loopArtifacts: () => Promise.resolve({ ok: false, failure: "attribution_missing" }),
+      }),
+    });
+    const forbidden = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts");
+    expect(forbidden.status).toBe(403);
+    expect(await forbidden.text()).toContain("归属缺失");
+
+    await fresh({
+      artifacts: fakeArtifacts({
+        loopArtifacts: () => Promise.resolve({ ok: false, failure: "loop_not_found" }),
+      }),
+    });
+    const gone = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts");
+    expect(gone.status).toBe(404);
+    expect(await gone.text()).toContain("不存在或不可见");
+  });
+
+  it("hostile loop ids and directory values are escaped in text and attribute position", async () => {
+    const hostile = 'loop-<script>"\'';
+    await fresh({
+      artifacts: fakeArtifacts({
+        loopArtifacts: (loopId): Promise<ReadLoopArtifactsResult> =>
+          Promise.resolve({
+            ...VIEW_FIXTURE,
+            response: { ...VIEW_FIXTURE.response, loopId, artifactDir: hostile },
+          }),
+        boundSnapshots: () => Promise.resolve([]),
+      }),
+    });
+    const res = await getArtifactPage(app, `/dashboard/loops/${encodeURIComponent(hostile)}/artifacts`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).not.toContain("<script");
+    expect(html).toContain("loop-&lt;script&gt;");
+  });
+
+  it("without the artifact seam the pages are the indistinguishable 404", async () => {
+    await fresh();
+    const canonical = await (await app.request("/nope", { headers: { host: "127.0.0.1" } })).text();
+    for (const path of [
+      "/dashboard/loops/loop-1/artifacts",
+      "/dashboard/loops/loop-1/artifacts/runs/run-1",
+      "/dashboard/loops/loop-1/artifacts/diff?to=amf-1",
+    ]) {
+      const res = await getArtifactPage(app, path);
+      expect(res.status, path).toBe(404);
+      expect(await res.text(), path).toBe(canonical);
+    }
+  });
+
+  it("#111: the run page is nested under its parent loop — a mismatched parent path is the same 404", async () => {
+    await fresh({
+      artifacts: fakeArtifacts({
+        // The fake emulates the facade's identity-step fold (pinned for real
+        // in artifact/read.test.ts): a parent mismatch is run_not_found.
+        runArtifacts: (loopId, runId): Promise<ReadRunArtifactsResult> =>
+          loopId !== "loop-1"
+            ? Promise.resolve({ ok: false, failure: "run_not_found" })
+            : Promise.resolve({
+                ok: true,
+                response: {
+                  runId,
+                  loopId: "loop-1", // the run really belongs to loop-1…
+                  state: "bound",
+                  snapshotId: "amf-1",
+                  manifestRevision: 1,
+                  configRevision: 1,
+                  committedAt: "2026-10-06T00:00:00.000Z",
+                  fileCount: 1,
+                  totalBytes: 3,
+                  files: [{ path: "a.txt", hash: "b".repeat(64), size: 3 }],
+                },
+              }),
+      }),
+    });
+    const res = await getArtifactPage(app, "/dashboard/loops/loop-OTHER/artifacts/runs/run-1"); // …not loop-OTHER
+    expect(res.status).toBe(404);
+    const html = await res.text();
+    expect(html).toContain("不存在或不可见");
+    expect(html).not.toContain("a.txt"); // another loop's file table/download links never render
+  });
+
+  it("#111 round 2: the failure paths fold too — attribution-missing under a wrong parent is the SAME 404 as an unknown run (never 403)", async () => {
+    // The review's residual: the round-1 check only inspected SUCCESS results,
+    // so a run whose loop's attribution is unmapped answered 403 under a
+    // wrong/nonexistent parent while an unknown run answered 404 — an
+    // existence leak across scopes. The parent path now rides the facade's
+    // identity step; this fake emulates that fold (the real ordering is
+    // pinned in artifact/read.test.ts).
+    const seen: string[] = [];
+    await fresh({
+      artifacts: fakeArtifacts({
+        runArtifacts: (loopId, runId): Promise<ReadRunArtifactsResult> => {
+          seen.push(`${loopId}/${runId}`);
+          if (runId === "run-nope") return Promise.resolve({ ok: false, failure: "run_not_found" });
+          if (loopId !== "loop-1") return Promise.resolve({ ok: false, failure: "run_not_found" });
+          return Promise.resolve({ ok: false, failure: "attribution_missing" });
+        },
+      }),
+    });
+    // The never-existed run's page is the canonical shape.
+    const unknown = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts/runs/run-nope");
+    expect(unknown.status).toBe(404);
+    const canonical = await unknown.text();
+    // Wrong / nonexistent parent with the attribution-missing run: byte-identical 404.
+    for (const parent of ["loop-OTHER", "loop-nope"]) {
+      const res = await getArtifactPage(app, `/dashboard/loops/${parent}/artifacts/runs/run-1`);
+      expect(res.status, parent).toBe(404);
+      expect(await res.text(), parent).toBe(canonical);
+    }
+    // The parent path reached the facade as the FIRST argument (identity step).
+    expect(seen).toContain("loop-OTHER/run-1");
+    // The correct parent's attribution_missing stays the 403 control.
+    const control = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts/runs/run-1");
+    expect(control.status).toBe(403);
+    expect(await control.text()).toContain("归属缺失");
+  });
+
+  it("#113: the snapshot list is read only AFTER the domain verdict — a faulting list never masks 403 into 500", async () => {
+    // Direct reproduction of the review probe: attribution is missing (domain
+    // verdict 403) AND the bare list read fails. Promise.all ran both in
+    // parallel, the rejection won, and the page was a 500 with listCalls 1.
+    let listCalls = 0;
+    const faultingSeam = (): DashboardArtifactRead =>
+      fakeArtifacts({
+        loopArtifacts: () => Promise.resolve({ ok: false, failure: "attribution_missing" }),
+        diff: () => Promise.resolve({ ok: false, failure: "attribution_missing" }),
+        boundSnapshots: () => {
+          listCalls += 1;
+          return Promise.reject(new Error("injected list-read storage fault"));
+        },
+      });
+    await fresh({ artifacts: faultingSeam() });
+    const page = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts");
+    expect(page.status).toBe(403);
+    expect(await page.text()).toContain("归属缺失");
+    expect(listCalls).toBe(0); // the list read never started — domain verdict first
+
+    await fresh({ artifacts: faultingSeam() });
+    const diff = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts/diff?from=amf-1&to=amf-2");
+    expect(diff.status).toBe(403);
+    expect(listCalls).toBe(0);
+  });
+
+  it("P3: banner tokens are OWN-KEY lookups — __proto__/constructor/toString render no banner", async () => {
+    await fresh({
+      artifacts: fakeArtifacts({
+        loopArtifacts: () => Promise.resolve(VIEW_FIXTURE as ReadLoopArtifactsResult),
+        boundSnapshots: () => Promise.resolve([]),
+      }),
+    });
+    for (const token of ["__proto__", "constructor", "toString"]) {
+      const res = await getArtifactPage(app, `/dashboard/loops/loop-1/artifacts?config=${token}`);
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).not.toContain("Artifact 目录已更新。"); // prototype props are not banner labels
+      expect(html).not.toContain("[object Object]");
+    }
+    // The known-token path is untouched.
+    const known = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts?config=updated");
+    expect(await known.text()).toContain("Artifact 目录已更新。");
+  });
+
+  describe("the config form POST", () => {
+    it("valid token saves and redirects with the outcome banner token", async () => {
+      const calls: Array<{ loopId: string; command: { artifactDir: string | null } }> = [];
+      await fresh({
+        artifacts: fakeArtifacts({
+          updateConfig: (loopId, command): Promise<UpdateArtifactConfigResult> => {
+            calls.push({ loopId, command });
+            return Promise.resolve({
+              ok: true,
+              outcome: "changed",
+              loop: { artifactDir: command.artifactDir } as never,
+            });
+          },
+        }),
+      });
+      const res = await postConfig(app, "loop-1", `csrf=${TOKEN_A}&artifactDir=${encodeURIComponent("/data/new")}`);
+      expect(res.status).toBe(303);
+      expect(res.headers.get("location")).toBe("/dashboard/loops/loop-1/artifacts?config=updated");
+      expect(calls).toEqual([{ loopId: "loop-1", command: { artifactDir: "/data/new" } }]);
+    });
+
+    it("empty dir clears; noop and each refusal map to their fixed banner tokens", async () => {
+      for (
+        const [outcome, expected] of [
+          [{ ok: true, outcome: "changed", loop: { artifactDir: null } }, "cleared"],
+          [{ ok: true, outcome: "noop", loop: { artifactDir: "/data" } }, "unchanged"],
+          [{ ok: false, failure: "loop_not_found" }, "not_found"],
+          [{ ok: false, failure: "artifact_dir_invalid" }, "artifact_validation_failed"],
+          [{ ok: false, failure: "artifact_dir_relative_without_workdir" }, "artifact_validation_failed"],
+          [{ ok: false, failure: "artifact_config_conflict" }, "artifact_config_conflict"],
+          [{ ok: false, failure: "artifact_revision_exhausted" }, "artifact_config_conflict"],
+        ] as const
+      ) {
+        await fresh({
+          artifacts: fakeArtifacts({
+            updateConfig: () => Promise.resolve(outcome as UpdateArtifactConfigResult),
+          }),
+        });
+        const body =
+          expected === "cleared"
+            ? `csrf=${TOKEN_A}&artifactDir=`
+            : `csrf=${TOKEN_A}&artifactDir=${encodeURIComponent("/data/x")}`;
+        const res = await postConfig(app, "loop-1", body);
+        expect(res.status).toBe(303);
+        expect(res.headers.get("location")).toBe(`/dashboard/loops/loop-1/artifacts?config=${expected}`);
+      }
+    });
+
+    it("CSRF edges: bad token 403, extra field 400, duplicate artifactDir 400 — zero writes", async () => {
+      let calls = 0;
+      await fresh({
+        artifacts: fakeArtifacts({
+          updateConfig: () => {
+            calls += 1;
+            return Promise.resolve({ ok: false, failure: "loop_not_found" });
+          },
+        }),
+      });
+      expect((await postConfig(app, "loop-1", `csrf=${TOKEN_B}&artifactDir=/x`)).status).toBe(403);
+      expect((await postConfig(app, "loop-1", `csrf=${TOKEN_A}&artifactDir=/x&extra=1`)).status).toBe(400);
+      expect(
+        (await postConfig(app, "loop-1", `csrf=${TOKEN_A}&artifactDir=/x&artifactDir=/y`)).status,
+      ).toBe(400);
+      expect(calls).toBe(0);
+    });
+
+    it("the banner renders for a known token and stays silent for an unknown one", async () => {
+      await fresh({
+        artifacts: fakeArtifacts({
+          loopArtifacts: () => Promise.resolve(VIEW_FIXTURE as ReadLoopArtifactsResult),
+          boundSnapshots: () => Promise.resolve([]),
+        }),
+      });
+      const known = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts?config=updated");
+      expect(await known.text()).toContain("Artifact 目录已更新。");
+      const unknown = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts?config=<script>alert(1)</script>");
+      const html = await unknown.text();
+      expect(html).not.toContain("<script");
+      expect(html).not.toContain("alert(1)");
+    });
+  });
+
+  describe("the CSRF generalization (checkCsrfFormFields)", () => {
+    it("checkCsrfForm keeps its frozen verdicts (delegation, not a rewrite)", () => {
+      expect(checkCsrfForm(`csrf=${TOKEN_A}`, TOKEN_A)).toBe("ok");
+      expect(checkCsrfForm("csrf=a&extra=1", TOKEN_A)).toBe("bad_form");
+      expect(checkCsrfForm("", TOKEN_A)).toBe("token_missing");
+      expect(checkCsrfForm(`csrf=${TOKEN_A}&csrf=${TOKEN_A}`, TOKEN_A)).toBe("token_duplicate");
+      expect(checkCsrfForm("csrf=nope", TOKEN_A)).toBe("token_mismatch");
+      expect(checkCsrfForm("csrf=%GG", TOKEN_A)).toBe("bad_form");
+    });
+
+    it("the whitelist admits exactly the declared fields and rejects repeats", () => {
+      const ok = checkCsrfFormFields(`csrf=${TOKEN_A}&artifactDir=%2Fdata`, TOKEN_A, ["artifactDir"]);
+      expect(ok).toEqual({ ok: true, values: new Map([["artifactDir", "/data"]]) });
+      expect(checkCsrfFormFields(`csrf=${TOKEN_A}&evil=1`, TOKEN_A, ["artifactDir"])).toEqual({
+        ok: false,
+        verdict: "bad_form",
+      });
+      expect(
+        checkCsrfFormFields(`csrf=${TOKEN_A}&artifactDir=%2Fa&artifactDir=%2Fb`, TOKEN_A, ["artifactDir"]),
+      ).toEqual({ ok: false, verdict: "field_duplicate" });
+      expect(checkCsrfFormFields("csrf=nope&artifactDir=%2Fx", TOKEN_A, ["artifactDir"])).toEqual({
+        ok: false,
+        verdict: "token_mismatch",
+      });
+    });
   });
 });

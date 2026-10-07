@@ -374,7 +374,18 @@ export interface ClaimedRun {
  */
 export async function claimRunWithLeaseTx(
   deps: ClaimStoreDeps,
-  input: { runId: string; loopId: string; machineId: string; role: RunRole },
+  input: {
+    runId: string;
+    loopId: string;
+    machineId: string;
+    role: RunRole;
+    /** Whether the claiming machine declared `artifact-sync-v1` (Batch 2
+     *  slice 2, ADR-010 决策 22). A configured loop (`artifactDir` set)
+     *  requires it; the caller computes this from the VERIFIED machine row.
+     *  Required — never defaulted, so no caller can silently open or close
+     *  the gate. */
+    artifactCapable: boolean;
+  },
 ): Promise<ClaimedRun | undefined> {
   return withGuardRetry(
     async () => {
@@ -391,6 +402,12 @@ export async function claimRunWithLeaseTx(
       }
       const loop = await getLoop(db, input.loopId);
       if (!loop || loop.completedAt !== null) throw new ClaimRefusedError(input.runId);
+      // The per-candidate artifact gate (决策 22): a configured loop needs a
+      // machine that declared artifact-sync-v1. Decided on the authoritative
+      // resolve; the in-tx `id + revision` CAS below proves this snapshot —
+      // a config write in the window loses the guard and the bounded re-run
+      // re-decides on fresh state. Refusal skips THIS candidate only.
+      if (loop.artifactDir !== null && !input.artifactCapable) throw new ClaimRefusedError(input.runId);
       await deps.hooks?.afterClaimLoopResolve?.(loop.id, input.runId);
 
       return db.transaction(async (tx) => {

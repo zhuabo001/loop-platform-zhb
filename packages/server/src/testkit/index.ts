@@ -190,3 +190,5 @@ export async function snapshotLoops(db: Db): Promise<Loop[]> {
 export async function snapshotLeases(db: Db): Promise<RunLeaseRow[]> {
   return db.select().from(runLeases).orderBy(asc(runLeases.tokenHash));
 }
+
+export { staticAttribution } from "./artifact-attribution.js";

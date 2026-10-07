@@ -217,3 +217,7 @@ Batch 3 新增本机 Dashboard 与它独有的 manual 触发策略。以下为�
 真实门入口显式使用 Vitest default reporter及silent=false，避免agent reporter抑制通过用例的provenance/费用console。成功证据必须能够持久留存，不以测试预算或fixture金额代替实际收费。
 
 第七次真实门已完整通过，两个已接受Report的费用经numeric校验且合计<=3美元；旧reporter隐藏console，精确金额无法恢复。操作者明确“接受本次收口”，接受该次记录限制作为实际费用留存要求的单次例外。例外不放宽后续验收的金额记录要求，不触发额外模型调用，不将未知精确金额补写为0或预算上限。
+
+### 2026-10-05 — 共享有界读取的非阻塞打开（Phase 5 Batch 2 片 3 审查 [#87](https://github.com/zhuabo001/loop-platform-zhb/issues/87)）
+
+`readRegularFileNoFollow` 的打开标志在 `O_NOFOLLOW` 之外增加 `O_NONBLOCK`。调用方以 `lstat` 证明常规文件后，终端组件若在 open 前被换成 FIFO，阻塞式 `O_RDONLY` 会无限等待 writer——同 fd 的 fstat 拒绝永远无法执行，扫描与上传前验证可被挂起。非阻塞打开让 FIFO 立即返回 fd，随后仍由同一 fd 的 fstat 判 `not_regular` 拒绝；该标志对普通文件读取无影响（本函数只接受常规文件）。三个既有消费者（Journal record、Task File、wrapper 的 `*-file` 参数）行为不变，各自套件全绿；2026-09-01（二）第 2 条的其余纪律与残余声明（中间目录替换超出 Node 跨平台能力）不变。

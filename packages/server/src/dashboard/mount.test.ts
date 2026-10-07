@@ -20,7 +20,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { closeDb, type DbHandle } from "../db/index.js";
 import { bootstrapServer, type BootedServer } from "../start.js";
-import { seedLoop, snapshotRuns } from "../testkit/index.js";
+import { seedLoop, seedMachine, seedRun, snapshotRuns } from "../testkit/index.js";
 
 const handles: DbHandle[] = [];
 const dirs: string[] = [];
@@ -141,5 +141,59 @@ describe("H-group (Batch 3 Dashboard mount): assembly through bootstrapServer", 
     const second = await postRun(booted.app, `csrf=${encodeURIComponent(token)}`);
     expect(second.status).toBe(303);
     expect(await runPhases(booted.handle)).toEqual(afterFirst);
+  });
+});
+
+describe("slice 7 (决策 27): the artifact pages through the REAL composition root", () => {
+  it("the loop artifact page serves, the config form round-trips, and the run page shows the missing state", async () => {
+    const booted = await boot("127.0.0.1", await tmpDataDir());
+    // The production attribution resolver reads the machines row — the loop's
+    // machine must exist or every read is the 403.
+    await seedMachine(booted.handle.db, "m-test");
+    await seedLoop(booted.handle.db, { id: "loop-1", machineId: "m-test", artifactDir: "/data/out" });
+    await seedRun(booted.handle.db, { id: "run-1", loopId: "loop-1", machineId: "m-test", artifactSnapshotId: null });
+
+    const pageRes = await booted.app.request("/dashboard/loops/loop-1/artifacts", {
+      headers: { host: "127.0.0.1" },
+    });
+    expect(pageRes.status).toBe(200);
+    const html = await pageRes.text();
+    expect(html).toContain("/data/out");
+    // run-1 is UNBOUND — it appears on its own snapshot page, not in the
+    // bound-snapshot table.
+    expect(html).toContain("尚无已绑定快照的 Run");
+    expect(html).not.toContain("<script");
+    const token = csrfFrom(html);
+
+    // The config form saves through the SAME facade and redirects with the
+    // outcome banner; following the redirect renders it.
+    const saved = await booted.app.request("/dashboard/loops/loop-1/artifacts/config", {
+      method: "POST",
+      headers: { "content-type": FORM, host: "127.0.0.1" },
+      body: `csrf=${encodeURIComponent(token)}&artifactDir=${encodeURIComponent("/data/moved")}`,
+    });
+    expect(saved.status).toBe(303);
+    expect(saved.headers.get("location")).toBe("/dashboard/loops/loop-1/artifacts?config=updated");
+    const after = await booted.app.request(saved.headers.get("location")!, { headers: { host: "127.0.0.1" } });
+    const afterHtml = await after.text();
+    expect(afterHtml).toContain("Artifact 目录已更新。");
+    expect(afterHtml).toContain("/data/moved");
+
+    // The unbound run's snapshot page is the explicit missing state.
+    const runPage = await booted.app.request("/dashboard/loops/loop-1/artifacts/runs/run-1", {
+      headers: { host: "127.0.0.1" },
+    });
+    expect(runPage.status).toBe(200);
+    expect(await runPage.text()).toContain("未绑定 Artifact 快照");
+  });
+
+  it("on a non-loopback bind the artifact pages vanish into the ordinary 404", async () => {
+    const exposed = await boot("0.0.0.0", await tmpDataDir());
+    const unknown = await exposed.app.request("/nope", { headers: { host: "127.0.0.1" } });
+    const page = await exposed.app.request("/dashboard/loops/loop-1/artifacts", {
+      headers: { host: "127.0.0.1" },
+    });
+    expect(page.status).toBe(404);
+    expect(await page.text()).toBe(await unknown.clone().text());
   });
 });

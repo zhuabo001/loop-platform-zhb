@@ -186,9 +186,9 @@ describe("poll claim: write-time eligibility guard (review #2)", () => {
     await seedExec("run-1");
     const deps = testDeps(db, clock);
     for (const wrong of [
-      { runId: "run-1", loopId: "loop-1", machineId: "m-intruder", role: "exec" as const },
-      { runId: "run-1", loopId: "loop-other", machineId, role: "exec" as const },
-      { runId: "run-1", loopId: "loop-1", machineId, role: "evolve" as const },
+      { runId: "run-1", loopId: "loop-1", machineId: "m-intruder", role: "exec" as const, artifactCapable: true },
+      { runId: "run-1", loopId: "loop-other", machineId, role: "exec" as const, artifactCapable: true },
+      { runId: "run-1", loopId: "loop-1", machineId, role: "evolve" as const, artifactCapable: true },
     ]) {
       expect(await claimRunWithLeaseTx(deps, wrong)).toBeUndefined();
     }
@@ -329,7 +329,7 @@ describe("poll claim: availableSlots capacity gating (Phase 2)", () => {
             // pglite, same pattern as beforeEnqueueTx).
             const won = await claimRunWithLeaseTx(
               { db, clock, newRunId: () => "race-run", mintRunCredential: () => "rk_race_competitor" },
-              { runId: "run-1", loopId: "loop-1", machineId, role: "exec" },
+              { runId: "run-1", loopId: "loop-1", machineId, role: "exec", artifactCapable: true },
             );
             expect(won).toBeDefined();
           },

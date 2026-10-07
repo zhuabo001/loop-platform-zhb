@@ -182,6 +182,7 @@ import { withGuardRetry } from "../store/guard-retry.js";
 import type { Clock } from "../time.js";
 import type { ArtifactAttributionResolver, TrustedMachineIdentity } from "./attribution.js";
 import type { BlobStore } from "./blob-store.js";
+import { isRecoverableStorageError } from "./storage-error.js";
 
 export interface ArtifactHomeDeps {
   db: Db;
@@ -790,30 +791,6 @@ function isUniqueViolation(err: unknown): boolean {
   let cur: unknown = err;
   while (cur !== null && typeof cur === "object") {
     if ("code" in cur && (cur as { code: unknown }).code === "23505") return true;
-    cur = (cur as { cause?: unknown }).cause;
-  }
-  return false;
-}
-
-/** The recoverable Postgres storage-failure classes (决策 13's
- *  artifact_storage_error / idempotent_retry): 08xxx connection exception,
- *  53xxx insufficient resources, 57xxx operator intervention, 58xxx
- *  system/internal I/O. */
-const RECOVERABLE_STORAGE_SQLSTATE_CLASSES = ["08", "53", "57", "58"] as const;
-
-/** Walk the cause chain for an IDENTIFIED recoverable storage failure. The
- *  classification is deliberately narrow (决策 13): only a string SQLSTATE in
- *  a recoverable class qualifies — constraint violations, serialization /
- *  deadlock codes, Node errno strings and every UNCODED error keep the
- *  raw-throw boundary, because laundering an unrecognized defect into the
- *  retryable class would loop a permanent failure. */
-function isRecoverableStorageError(err: unknown): boolean {
-  let cur: unknown = err;
-  while (cur !== null && typeof cur === "object") {
-    if ("code" in cur) {
-      const code = (cur as { code: unknown }).code;
-      if (typeof code === "string" && RECOVERABLE_STORAGE_SQLSTATE_CLASSES.some((cls) => code.startsWith(cls))) return true;
-    }
     cur = (cur as { cause?: unknown }).cause;
   }
   return false;

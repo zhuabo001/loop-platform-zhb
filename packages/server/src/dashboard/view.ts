@@ -10,9 +10,23 @@
  *  - every fixed Chinese string, with the domain terms (Open, Closed,
  *    Completed, Paused, Pending, Running, exec, done, …) kept in English.
  */
-import type { LoopSummary, RunRole, RunSummary, TaskFileSyncError } from "@loopzhb/protocol";
+import type {
+  ArtifactDiffResponse,
+  LoopArtifactsResponse,
+  LoopSummary,
+  RunArtifactsResponse,
+  RunRole,
+  RunSummary,
+  TaskFileSyncError,
+} from "@loopzhb/protocol";
 
-import type { DashboardActiveRun, DashboardLoop, DashboardSnapshot, LoopLifecycle } from "./index.js";
+import type {
+  DashboardActiveRun,
+  DashboardBoundSnapshotRef,
+  DashboardLoop,
+  DashboardSnapshot,
+  LoopLifecycle,
+} from "./index.js";
 
 /** The one placeholder for "this value is not set" (plan §2 切片一). */
 export const NONE_TEXT = "暂无";
@@ -33,6 +47,47 @@ export const DASHBOARD_RUN_PATH = `${DASHBOARD_RUN_PREFIX}/:id/run`;
  *  percent-decodes `:id` on the way back in, so the round trip is lossless. */
 export function dashboardRunAction(loopId: string): string {
   return `${DASHBOARD_RUN_PREFIX}/${encodeURIComponent(loopId)}/run`;
+}
+
+// ---- slice 7 artifact page paths (ADR-010 决策 27) ----
+// Same encoding discipline as `dashboardRunAction`: ids are path segments,
+// query values are percent-encoded by the builder — the templates escape
+// whatever is interpolated, and these helpers make the href attribute and
+// the registered Hono pattern agree by construction.
+
+/** The loop artifact page. */
+export function dashboardArtifactsPath(loopId: string): string {
+  return `${DASHBOARD_RUN_PREFIX}/${encodeURIComponent(loopId)}/artifacts`;
+}
+
+/** The run-snapshot page (one bound Run's file table). */
+export function dashboardRunArtifactsPath(loopId: string, runId: string): string {
+  return `${dashboardArtifactsPath(loopId)}/runs/${encodeURIComponent(runId)}`;
+}
+
+/** The diff result page (GET form target). */
+export function dashboardArtifactDiffPath(loopId: string): string {
+  return `${dashboardArtifactsPath(loopId)}/diff`;
+}
+
+/** The config form's POST action. */
+export function dashboardArtifactConfigPath(loopId: string): string {
+  return `${dashboardArtifactsPath(loopId)}/config`;
+}
+
+/** The Hono patterns the artifact pages register — defined next to the link
+ *  builders so a drift between the rendered href and the mounted route is a
+ *  one-file diff (the `DASHBOARD_RUN_PATH` convention). */
+export const DASHBOARD_LOOP_ARTIFACTS_PATH = `${DASHBOARD_RUN_PREFIX}/:id/artifacts`;
+export const DASHBOARD_RUN_ARTIFACTS_PATH = `${DASHBOARD_RUN_PREFIX}/:id/artifacts/runs/:runId`;
+export const DASHBOARD_ARTIFACT_DIFF_PATH = `${DASHBOARD_RUN_PREFIX}/:id/artifacts/diff`;
+export const DASHBOARD_ARTIFACT_CONFIG_PATH = `${DASHBOARD_RUN_PREFIX}/:id/artifacts/config`;
+
+/** A download href: snapshotId + manifest path as QUERY values, both
+ *  percent-encoded — the lookup is the manifest entries table, never a disk
+ *  path (决策 27). */
+export function artifactDownloadLink(loopId: string, snapshotId: string, path: string): string {
+  return `/api/loops/${encodeURIComponent(loopId)}/artifacts/download?snapshotId=${encodeURIComponent(snapshotId)}&path=${encodeURIComponent(path)}`;
 }
 
 /** Kept in English on purpose: these are domain terms, not UI chrome. */
@@ -277,5 +332,245 @@ export function buildDashboardPageModel(snapshot: DashboardSnapshot): DashboardP
     truncationNotice: atCap ? "已达显示上限，可能还有更早更新的 Loop 未显示。" : null,
     emptyNotice: shown === 0 ? "暂无 Loop。通过管理 API 创建 Loop 后会显示在这里。" : null,
     loops: snapshot.loops.map(toLoopCard),
+  };
+}
+
+// ---- slice 7 artifact page models (ADR-010 决策 27) ----
+
+/** The config form's field name — the ONLY field besides the token that
+ *  `checkCsrfFormFields` admits for this form. */
+export const ARTIFACT_DIR_FIELD = "artifactDir";
+
+const ARTIFACT_UNCONFIGURED_TEXT = "未配置";
+const STALE_NOTICE_TEXT = "配置代际已变更：当前文件视图仍属于旧代际的同步结果，新的同步成功后自动替换。";
+const ARTIFACT_SYNC_ERROR_PREFIX = "同步失败";
+
+/** Labels for the `?config=` banner token. Unknown tokens render NO banner —
+ *  the set is fixed here so a hostile query value can only ever be inert
+ *  text (still escaped by the template). */
+export const CONFIG_BANNER_LABELS: Record<string, string> = {
+  updated: "Artifact 目录已更新。",
+  cleared: "Artifact 目录已清除。",
+  unchanged: "Artifact 目录无变化。",
+  artifact_config_conflict: "保存被拒绝：配置冲突或代际耗尽，请刷新后重试。",
+  artifact_validation_failed: "保存被拒绝：目录非法（需要绝对路径，或相对路径需 Loop 配置 workdir）。",
+  not_found: "保存被拒绝：Loop 不存在。",
+};
+
+/** The page's default diff baseline (the stop-boundary rule): the MOST RECENT
+ *  bound Run snapshot whose manifestRevision is SMALLER than the target's;
+ *  `null` = the empty-set baseline (the first-snapshot convention). Pure. */
+export function defaultDiffBaseline(
+  target: { manifestRevision: number },
+  bound: ReadonlyArray<{ manifestRevision: number; committedAt: string }>,
+): number | null {
+  const older = bound.filter((s) => s.manifestRevision < target.manifestRevision);
+  if (older.length === 0) return null;
+  older.sort((a, b) => b.manifestRevision - a.manifestRevision || (a.committedAt < b.committedAt ? 1 : -1));
+  return older[0]!.manifestRevision;
+}
+
+/** One option of the two diff dropdowns. `value` is the snapshot id, or ""
+ *  for the empty-set baseline. */
+export interface DiffSelectOption {
+  value: string;
+  label: string;
+  selected: boolean;
+}
+
+/** The shared diff form model (rendered on the artifact page and the diff
+ *  page). `selectedFrom`/`selectedTo` are the current selections ("" = empty
+ *  baseline for from). */
+export interface DiffFormModel {
+  action: string;
+  fromOptions: DiffSelectOption[];
+  toOptions: DiffSelectOption[];
+}
+
+function snapshotLabel(snapshot: { manifestRevision: number; committedAt: string }): string {
+  return `r${snapshot.manifestRevision}（${formatUtc(snapshot.committedAt)}）`;
+}
+
+function buildDiffFormModel(
+  loopId: string,
+  bound: ReadonlyArray<DashboardBoundSnapshotRef>,
+  selectedFrom: string,
+  selectedTo: string,
+): DiffFormModel {
+  const fromOptions: DiffSelectOption[] = [
+    { value: "", label: "（空集合）", selected: selectedFrom === "" },
+    ...bound.map((s) => ({ value: s.snapshotId, label: snapshotLabel(s), selected: selectedFrom === s.snapshotId })),
+  ];
+  const toOptions: DiffSelectOption[] = bound.map((s) => ({
+    value: s.snapshotId,
+    label: snapshotLabel(s),
+    selected: selectedTo === s.snapshotId,
+  }));
+  return { action: dashboardArtifactDiffPath(loopId), fromOptions, toOptions };
+}
+
+/** The artifact overview page: config form, sync state, the current view,
+ *  the bound-Run snapshot list and the diff form. */
+export interface LoopArtifactsPageModel {
+  loopId: string;
+  configAction: string;
+  configBanner: string | null;
+  artifactDirLabel: string;
+  /** The raw current dir for the form input ("" when unconfigured). */
+  artifactDirValue: string;
+  stale: boolean;
+  staleNotice: string | null;
+  manifestRevision: number;
+  committedAtLabel: string;
+  fileCountLabel: string;
+  totalBytesLabel: string;
+  sync: { attemptedAtLabel: string; succeededAtLabel: string; errorLabel: string | null };
+  /** One row per current-view file; `downloadLink` is present only when a
+   *  manifest is bound (unconfigured loops have no snapshot to address). */
+  files: Array<{ path: string; hash: string; size: number; downloadLink: string | null }>;
+  snapshots: Array<{ runId: string; snapshotId: string; manifestRevision: number; committedAtLabel: string; href: string }>;
+  diff: DiffFormModel;
+  /** The plan's page default: the newest bound snapshot is the pre-selected
+   *  diff target, its default baseline pre-selected in `diff`. */
+  hasSnapshots: boolean;
+}
+
+export function buildLoopArtifactsPageModel(input: {
+  loopId: string;
+  view: LoopArtifactsResponse;
+  bound: ReadonlyArray<DashboardBoundSnapshotRef>;
+  configToken: string | null;
+}): LoopArtifactsPageModel {
+  const { loopId, view, bound, configToken } = input;
+  const newest = bound[0] ?? null;
+  const defaultTo = newest?.snapshotId ?? "";
+  const defaultBaselineRevision = newest === null ? null : defaultDiffBaseline(newest, bound);
+  const defaultFrom =
+    defaultBaselineRevision === null
+      ? ""
+      : (bound.find((s) => s.manifestRevision === defaultBaselineRevision)?.snapshotId ?? "");
+
+  return {
+    loopId,
+    configAction: dashboardArtifactConfigPath(loopId),
+    configBanner:
+      configToken === null || !Object.hasOwn(CONFIG_BANNER_LABELS, configToken)
+        ? null
+        : CONFIG_BANNER_LABELS[configToken]!,
+    artifactDirLabel: view.artifactDir ?? ARTIFACT_UNCONFIGURED_TEXT,
+    artifactDirValue: view.artifactDir ?? "",
+    stale: view.stale,
+    staleNotice: view.stale ? STALE_NOTICE_TEXT : null,
+    manifestRevision: view.manifestRevision,
+    committedAtLabel: formatUtc(view.committedAt),
+    fileCountLabel: String(view.fileCount),
+    totalBytesLabel: String(view.totalBytes),
+    sync: {
+      attemptedAtLabel: formatUtc(view.sync.attemptedAt),
+      succeededAtLabel: formatUtc(view.sync.succeededAt),
+      errorLabel: view.sync.error === null ? null : `${ARTIFACT_SYNC_ERROR_PREFIX}：${view.sync.error}`,
+    },
+    files: view.files.map((f) => ({
+      path: f.path,
+      hash: f.hash,
+      size: f.size,
+      downloadLink: view.manifestId === null ? null : artifactDownloadLink(loopId, view.manifestId, f.path),
+    })),
+    snapshots: bound.map((s) => ({
+      runId: s.runId,
+      snapshotId: s.snapshotId,
+      manifestRevision: s.manifestRevision,
+      committedAtLabel: formatUtc(s.committedAt),
+      href: dashboardRunArtifactsPath(loopId, s.runId),
+    })),
+    diff: buildDiffFormModel(loopId, bound, defaultFrom, defaultTo),
+    hasSnapshots: bound.length > 0,
+  };
+}
+
+/** The run-snapshot page: the bound snapshot's file table with per-file
+ *  download links, or the explicit missing state. */
+export interface RunArtifactsPageModel {
+  loopId: string;
+  runId: string;
+  backPath: string;
+  state: "bound" | "missing";
+  snapshotId: string | null;
+  manifestRevisionLabel: string;
+  committedAtLabel: string;
+  fileCountLabel: string;
+  files: Array<{ path: string; hash: string; size: number; downloadLink: string | null }>;
+}
+
+export function buildRunArtifactsPageModel(input: {
+  response: RunArtifactsResponse;
+}): RunArtifactsPageModel {
+  const { response } = input;
+  const backPath = dashboardArtifactsPath(response.loopId);
+  if (response.state === "missing") {
+    return {
+      loopId: response.loopId,
+      runId: response.runId,
+      backPath,
+      state: "missing",
+      snapshotId: null,
+      manifestRevisionLabel: NONE_TEXT,
+      committedAtLabel: NONE_TEXT,
+      fileCountLabel: NONE_TEXT,
+      files: [],
+    };
+  }
+  return {
+    loopId: response.loopId,
+    runId: response.runId,
+    backPath,
+    state: "bound",
+    snapshotId: response.snapshotId,
+    manifestRevisionLabel: `r${response.manifestRevision}`,
+    committedAtLabel: formatUtc(response.committedAt),
+    fileCountLabel: String(response.fileCount),
+    files: response.files.map((f) => ({
+      path: f.path,
+      hash: f.hash,
+      size: f.size,
+      downloadLink: artifactDownloadLink(response.loopId, response.snapshotId, f.path),
+    })),
+  };
+}
+
+/** The diff result page: the three change classes, before/after hash+size
+ *  only — no content preview, no text diff (the stop boundary). */
+export interface ArtifactDiffPageModel {
+  loopId: string;
+  backPath: string;
+  fromLabel: string;
+  toLabel: string;
+  empty: boolean;
+  added: Array<{ path: string; hash: string; size: number }>;
+  modified: Array<{ path: string; beforeHash: string; beforeSize: number; afterHash: string; afterSize: number }>;
+  removed: Array<{ path: string; hash: string; size: number }>;
+  diff: DiffFormModel;
+}
+
+export function buildArtifactDiffPageModel(input: {
+  loopId: string;
+  response: ArtifactDiffResponse;
+  bound: ReadonlyArray<DashboardBoundSnapshotRef>;
+  selectedFrom: string;
+  selectedTo: string;
+}): ArtifactDiffPageModel {
+  const { loopId, response, bound, selectedFrom, selectedTo } = input;
+  const refLabel = (ref: { manifestRevision: number } | null): string =>
+    ref === null ? "（空集合）" : `r${ref.manifestRevision}`;
+  return {
+    loopId,
+    backPath: dashboardArtifactsPath(loopId),
+    fromLabel: refLabel(response.from),
+    toLabel: refLabel(response.to),
+    empty: response.added.length === 0 && response.modified.length === 0 && response.removed.length === 0,
+    added: response.added,
+    modified: response.modified,
+    removed: response.removed,
+    diff: buildDiffFormModel(loopId, bound, selectedFrom, selectedTo),
   };
 }

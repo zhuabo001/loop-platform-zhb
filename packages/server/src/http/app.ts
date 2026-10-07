@@ -41,25 +41,42 @@
 import { bodyLimit } from "hono/body-limit";
 import { Hono, type Context } from "hono";
 import type { DashboardRoutes } from "../dashboard/routes.js";
-import { DASHBOARD_RUN_PATH } from "../dashboard/routes.js";
+import {
+  DASHBOARD_ARTIFACT_CONFIG_PATH,
+  DASHBOARD_ARTIFACT_DIFF_PATH,
+  DASHBOARD_LOOP_ARTIFACTS_PATH,
+  DASHBOARD_RUN_ARTIFACTS_PATH,
+  DASHBOARD_RUN_PATH,
+} from "../dashboard/routes.js";
 
 import {
+  ARTIFACT_PREPARE_REQUEST_MAX_UTF8_BYTES,
+  ARTIFACT_SYNC_ID_HEADER,
+  artifactDiffQuerySchema,
+  artifactDownloadQuerySchema,
+  artifactSyncErrorReportRequestSchema,
   cancelRunRequestSchema,
   createLoopRequestSchema,
   LOOP_COMPLETED_CODE,
   LOOP_NOT_COMPLETED_CODE,
+  parseBoundedJsonText,
   pollRequestSchema,
+  prepareArtifactSyncRequestSchema,
   reopenLoopRequestSchema,
   reportRequestSchema,
   RUN_CAPABILITY_INVALID_CODE,
   triggerRunRequestSchema,
+  updateArtifactDirRequestSchema,
   updateGoalRequestSchema,
   updateScheduleRequestSchema,
   updateTaskFileRequestSchema,
 } from "@loopzhb/protocol";
 
-import { LoopValidationError } from "../admin/errors.js";
+import { ArtifactDirValidationError, LoopValidationError } from "../admin/errors.js";
 import { LOOP_PATH_CAP, type LoopAdmin } from "../admin/index.js";
+import type { ArtifactApi } from "../artifact/api.js";
+import { mapArtifactFailure, type ArtifactInternalFailure } from "../artifact/error-mapping.js";
+import type { BlobStreamChunk } from "../artifact/blob-store.js";
 import { InvalidMachineCredentialError, RunCapabilityInvalidError } from "../coordinator/errors.js";
 import type { RunCoordinator } from "../coordinator/index.js";
 import type { Loop } from "../db/schema.js";
@@ -94,6 +111,139 @@ async function parseJsonBody(c: Context): Promise<unknown> {
   }
 }
 
+/** The Content-Disposition value (RFC 6266): a quoted `filename` fallback
+ *  carrying printable ASCII only, plus `filename*=UTF-8''…` whenever the
+ *  basename has non-ASCII characters. `Headers` is ByteString — a raw CJK
+ *  basename throws at composition (review #110: a 500 AFTER a successful
+ *  open, handle-close path working, client still got no file). The basename
+ *  is the manifest path's LAST segment only (server-written policy-validated
+ *  relative paths — defense in depth); control chars stripped, `"` and `\`
+ *  backslash-escaped in the quoted fallback. Empty fallback ⇒ `artifact`. */
+function contentDispositionValue(manifestPath: string): string {
+  const base = (manifestPath.split("/").pop() ?? "").replace(/[\x00-\x1f\x7f]/g, "");
+  const fallback = base.replace(/[^\x20-\x7e]/g, "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const asciiName = fallback === "" ? "artifact" : fallback;
+  if (/^[\x20-\x7e]*$/.test(base)) return `attachment; filename="${asciiName}"`;
+  // RFC 5987 encoding: encodeURIComponent leaves `!'()*` unescaped, which
+  // attr-char does not allow.
+  const encoded = encodeURIComponent(base).replace(/[!'()*]/g, (ch) =>
+    `%${ch.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+  return `attachment; filename="${asciiName}"; filename*=UTF-8''${encoded}`;
+}
+
+/** The AV8 chunk forwarder. RELEASE IS NOT THIS GENERATOR'S JOB (#109, round
+ *  2): a lazy generator's body — its finally included — does not exist until
+ *  the first `next()`, so no cleanup registered here can cover a consumer
+ *  that cancels before the first pull. The response builder below owns the
+ *  one idempotent close() (eager abort hook + ReadableStream cancel). This
+ *  loop only forwards chunks, stops pulling on abort, and — for a terminal
+ *  mid-stream `storage_error` element (决策 14's two-phase channel — the
+ *  iterator never throws) — truncates the body: headers incl. status and
+ *  Content-Length are already sent, so the truncation is the only honest
+ *  ending (决策 27). */
+async function* pumpArtifactDownload(
+  bytes: AsyncIterable<BlobStreamChunk>,
+  signal: AbortSignal | undefined,
+): AsyncGenerator<Uint8Array> {
+  for await (const chunk of bytes) {
+    if (signal?.aborted) return; // client gone: stop pulling
+    if (chunk.ok) {
+      yield chunk.chunk;
+      continue;
+    }
+    console.error("[http] artifact download mid-stream storage error");
+    return;
+  }
+}
+
+/** Compose the download response. EVERY header is explicit on the bare
+ *  `Response`: Hono drops prepared headers on a returned Response
+ *  (dashboard/routes.ts's baked-in lesson). Range requests are deliberately
+ *  ignored (决策 27): always the full 200. */
+function artifactDownloadResponse(
+  c: Context,
+  opened: { bytes: AsyncIterable<BlobStreamChunk>; size: number; close(): Promise<void> },
+  entryPath: string,
+): Response {
+  const headers = new Headers({
+    "content-type": "application/octet-stream",
+    "content-disposition": contentDispositionValue(entryPath),
+    "content-length": String(opened.size),
+    "x-content-type-options": "nosniff",
+    "cache-control": "no-store",
+  });
+  const signal = c.req.raw.signal;
+  // #109 (HEAD): Hono answers HEAD by running the GET handler and discarding
+  // the body (hono-base #dispatch wraps the response in `new Response(null,
+  // …)`) — the stream is NEVER pulled and the signal never aborts, so the
+  // opened handle would leak. Answer with the headers (incl. Content-Length,
+  // which is what HEAD is for) and no body; release immediately.
+  if (c.req.method === "HEAD") {
+    void opened.close().catch(() => {});
+    return new Response(null, { status: 200, headers });
+  }
+  // #109 (round 2): the release responsibility is established HERE, at
+  // response-build time — a lazy generator's finally can never cover the
+  // not-yet-started cases.
+  //  1. The signal may ALREADY be aborted (the client left during the async
+  //     open, or before the request reached us): addEventListener on an
+  //     aborted signal never fires, so release immediately and answer the
+  //     headers with no body — the client is gone.
+  if (signal?.aborted) {
+    void opened.close().catch(() => {});
+    return new Response(null, { status: 200, headers });
+  }
+  //  2. The EAGER hook covers every abort from here on — even while the
+  //     source's first read hangs, since close() is not gated on a pull
+  //     resolving.
+  //  3. The body is a ReadableStream whose cancel() the consumer reaches
+  //     WITHOUT any pull: a direct `body.cancel()` before the first read
+  //     releases, where a generator's finally never ran.
+  // `settled` collapses abort / cancel / EOF / mid-stream truncation onto the
+  // one idempotent close() and drops the listener exactly once.
+  let settled = false;
+  const release = (): void => {
+    if (settled) return;
+    settled = true;
+    signal?.removeEventListener("abort", onAbort);
+    void opened.close().catch(() => {});
+  };
+  const onAbort = (): void => release();
+  signal?.addEventListener("abort", onAbort, { once: true });
+  const iterator = pumpArtifactDownload(opened.bytes, signal)[Symbol.asyncIterator]();
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (settled) {
+        // Released while idle (aborted between pulls): answer EOF, never
+        // start or resume the source.
+        controller.close();
+        return;
+      }
+      let next: IteratorResult<Uint8Array>;
+      try {
+        next = await iterator.next();
+      } catch {
+        // 决策 14's channel never throws; a defensive release + EOF if it did.
+        release();
+        controller.close();
+        return;
+      }
+      if (settled) return; // cancelled while this pull was in flight — touch nothing
+      if (next.done) {
+        release(); // natural EOF or the mid-stream truncation
+        controller.close();
+        return;
+      }
+      controller.enqueue(next.value);
+    },
+    cancel() {
+      release();
+    },
+  });
+  return new Response(body, { status: 200, headers });
+}
+
 /** The manual trigger takes NO business params: an EMPTY body normalizes to
  *  `{}` at this edge (goal §3); malformed JSON still marks `undefined`. */
 async function parseJsonBodyOrEmpty(c: Context): Promise<unknown> {
@@ -121,6 +271,14 @@ export function createServerApp(
    * has always been, which is why the 11 existing call sites are unchanged.
    */
   dashboard?: DashboardRoutes,
+  /**
+   * The artifact facade (Batch 2 slice 2) — the narrow interface wired by
+   * `bootstrapServer`. ABSENT means the six artifact routes are NOT mounted
+   * (every artifact path stays indistinguishable from an unknown route), so
+   * every pre-existing call site is unchanged and the dormancy guard keeps a
+   * clean control.
+   */
+  artifacts?: ArtifactApi,
 ): Hono {
   const app = new Hono();
 
@@ -257,6 +415,13 @@ export function createServerApp(
         // Fixed classification only — the message embeds user input.
         console.warn("[http] create-loop schedule rejected", err.field);
         return jsonError(c, 400, "invalid request");
+      }
+      if (err instanceof ArtifactDirValidationError) {
+        // The SAME coded 400 the PATCH route emits for the same value
+        // (ADR-010 决策 8): one planner, one classification.
+        console.warn("[http] create-loop artifact dir rejected", err.reason);
+        const mapping = mapArtifactFailure(err.reason);
+        return jsonError(c, mapping.status, mapping.message, mapping.code);
       }
       throw err;
     }
@@ -430,12 +595,265 @@ export function createServerApp(
     return c.json({ loop: loopSummary }, 200);
   });
 
+  // ---- Phase 5 artifact routes (Batch 2 slice 2, ADR-010 决策 22) ----
+  // Mounted ONLY when the production facade is wired. Management config needs
+  // no credential (loopback boundary); machine routes verify an EXISTING
+  // machine (never registering) and every domain failure rides the frozen
+  // `ARTIFACT_FAILURE_HTTP` table verbatim.
+  if (artifacts !== undefined) {
+    /** The table entry as a JSON error — the ONE failure shaper. */
+    const artifactError = (c: Context, failure: ArtifactInternalFailure): Response => {
+      const mapping = mapArtifactFailure(failure);
+      return jsonError(c, mapping.status, mapping.message, mapping.code);
+    };
+    /** The unified machine credential gate (the poll precedent). */
+    const credentialOr401 = (c: Context): string | Response => {
+      const token = bearerToken(c);
+      if (token === undefined) return jsonError(c, 401, "invalid machine credential");
+      return token;
+    };
+    /** Drain an unread request body on an early refusal: a stream the handler
+     *  never pulls would otherwise keep the client uploading (PUT). */
+    const discardBody = (c: Context): void => {
+      void c.req.raw.body?.cancel().catch(() => {});
+    };
+    const artifactCap = bodyLimit({
+      maxSize: ARTIFACT_PREPARE_REQUEST_MAX_UTF8_BYTES,
+      onError: (c) => jsonError(c, 413, "request body too large"),
+    });
+
+    app.patch("/api/loops/:id/artifact-dir", cap, async (c) => {
+      const raw = await parseJsonBody(c);
+      if (raw === undefined) return jsonError(c, 400, "invalid request");
+      const parsed = updateArtifactDirRequestSchema.safeParse(raw);
+      if (!parsed.success) {
+        console.warn("[http] update-artifact-dir DTO rejected", parsed.error.issues);
+        return jsonError(c, 400, "invalid request");
+      }
+      const result = await artifacts.updateConfig(c.req.param("id"), parsed.data);
+      if (!result.ok) return artifactError(c, result.failure);
+      const loopSummary = await admin.getLoopSummary(result.loop.id);
+      if (!loopSummary) return jsonError(c, 404, "not found");
+      return c.json({ loop: loopSummary }, 200);
+    });
+
+    // ---- slice 7 read routes (ADR-010 决策 27) ----
+    // The query-string precedent: raw values, EMPTY STRING normalized to
+    // undefined (an HTML form's empty option submits `key=`), then the FROZEN
+    // query schema. Malformed ⇒ the code-less 400. The normalization covers
+    // the diff `from`/`to` (review #112) AND the download `snapshotId`/`path`
+    // (#112 round 2): a required key submitted empty is the malformed 400,
+    // never a shape-valid empty string sailing into a downstream 404.
+    const parseDownloadQuery = (c: Context): { snapshotId: string; path: string } | undefined => {
+      const snapshotId = c.req.query("snapshotId");
+      const path = c.req.query("path");
+      const parsed = artifactDownloadQuerySchema.safeParse({
+        snapshotId: snapshotId === "" ? undefined : snapshotId,
+        path: path === "" ? undefined : path,
+      });
+      return parsed.success ? parsed.data : undefined;
+    };
+    const parseDiffQuery = (c: Context): { from?: string; to: string } | undefined => {
+      const from = c.req.query("from");
+      const to = c.req.query("to");
+      const parsed = artifactDiffQuerySchema.safeParse({
+        from: from === undefined || from === "" ? undefined : from,
+        to: to === undefined || to === "" ? undefined : to,
+      });
+      return parsed.success ? parsed.data : undefined;
+    };
+
+    app.get("/api/loops/:id/artifacts", async (c) => {
+      const result = await artifacts.readLoop(c.req.param("id"));
+      if (!result.ok) return artifactError(c, result.failure);
+      return c.json(result.response);
+    });
+
+    app.get("/api/runs/:id/artifacts", async (c) => {
+      const result = await artifacts.readRun(c.req.param("id"));
+      if (!result.ok) return artifactError(c, result.failure);
+      return c.json(result.response);
+    });
+
+    app.get("/api/loops/:id/artifacts/diff", async (c) => {
+      const query = parseDiffQuery(c);
+      if (query === undefined) return jsonError(c, 400, "invalid request");
+      const result = await artifacts.diffSnapshots(c.req.param("id"), query);
+      if (!result.ok) return artifactError(c, result.failure);
+      return c.json(result.response);
+    });
+
+    app.get("/api/loops/:id/artifacts/download", async (c) => {
+      const query = parseDownloadQuery(c);
+      if (query === undefined) return jsonError(c, 400, "invalid request");
+      const result = await artifacts.openDownload(c.req.param("id"), query);
+      if (!result.ok) {
+        // R3 (决策 27): at THIS route only, a blob gone from disk under a live
+        // manifest entry means the path's bytes are missing — the code-less
+        // 404 family, never the generic table's 409. Every other failure
+        // rides the frozen table verbatim.
+        return artifactError(c, result.failure === "blob_missing" ? "path_not_found" : result.failure);
+      }
+      try {
+        return artifactDownloadResponse(c, result.stream, result.entry.path);
+      } catch (err) {
+        // Composition failed after the open: release the handle before the
+        // error escapes to app.onError.
+        await result.stream.close().catch(() => {});
+        throw err;
+      }
+    });
+
+    app.get("/api/machine/loops/:id/artifacts", async (c) => {
+      const token = credentialOr401(c);
+      if (typeof token !== "string") return token;
+      try {
+        const result = await artifacts.readMachineLoop(token, c.req.param("id"));
+        if (!result.ok) return artifactError(c, result.failure);
+        return c.json(result.response);
+      } catch (err) {
+        if (err instanceof InvalidMachineCredentialError) {
+          console.warn("[http] artifact credential rejected", err.message);
+          return jsonError(c, 401, "invalid machine credential");
+        }
+        throw err;
+      }
+    });
+
+    app.post("/api/machine/sync", artifactCap, async (c) => {
+      const token = credentialOr401(c);
+      if (typeof token !== "string") return token;
+      // The DUAL gate (ADR-010 决策 5): the transport cap above bounds the
+      // body; this re-checks the SAME raw-text ceiling BEFORE JSON.parse —
+      // unknown fields count toward it, and the tolerant strip rescues
+      // nothing. Invalid UTF-8 decodes with replacement chars, so the text
+      // gate is not redundant with the byte gate.
+      const bounded = parseBoundedJsonText(await c.req.text(), ARTIFACT_PREPARE_REQUEST_MAX_UTF8_BYTES);
+      if (!bounded.ok) {
+        if (bounded.failure === "too_large") return jsonError(c, 413, "request body too large");
+        console.warn("[http] sync prepare body rejected");
+        return jsonError(c, 400, "invalid request");
+      }
+      const parsed = prepareArtifactSyncRequestSchema.safeParse(bounded.value);
+      if (!parsed.success) {
+        console.warn("[http] sync prepare DTO rejected", parsed.error.issues);
+        // 决策 13 puts the schema domain on `artifact_validation_failed`
+        // (terminal) with the policy rejections — only MALFORMED JSON keeps
+        // the code-less 400 (#86).
+        return artifactError(c, "manifest_invalid");
+      }
+      try {
+        const result = await artifacts.prepare(token, parsed.data);
+        if (!result.ok) {
+          // Fixed classification + policy index only — manifest paths and
+          // hashes are user input and never reach the log.
+          if (result.failure === "manifest_invalid") {
+            console.warn("[http] sync prepare policy rejected", result.reason, result.index);
+          }
+          return artifactError(c, result.failure);
+        }
+        return c.json(result.response);
+      } catch (err) {
+        if (err instanceof InvalidMachineCredentialError) {
+          console.warn("[http] sync prepare credential rejected", err.message);
+          return jsonError(c, 401, "invalid machine credential");
+        }
+        throw err;
+      }
+    });
+
+    app.put("/api/machine/blob/:hash", async (c) => {
+      const token = credentialOr401(c);
+      if (typeof token !== "string") {
+        discardBody(c);
+        return token;
+      }
+      const syncId = c.req.header(ARTIFACT_SYNC_ID_HEADER)?.trim();
+      if (!syncId) {
+        discardBody(c);
+        return jsonError(c, 400, "invalid request");
+      }
+      try {
+        // STREAMING (no bodyLimit, no buffering): the raw request body goes
+        // straight to the BlobStore, which counts real bytes and hashes them
+        // against the negotiated entry — declared sizes are never trusted.
+        const result = await artifacts.put(token, {
+          syncId,
+          hash: c.req.param("hash"),
+          bytes: c.req.raw.body ?? (async function* empty() {})(),
+        });
+        if (!result.ok) {
+          discardBody(c);
+          return artifactError(c, result.failure);
+        }
+        return c.json({ ok: true as const, size: result.size, published: result.published });
+      } catch (err) {
+        discardBody(c);
+        if (err instanceof InvalidMachineCredentialError) {
+          console.warn("[http] blob put credential rejected", err.message);
+          return jsonError(c, 401, "invalid machine credential");
+        }
+        throw err;
+      }
+    });
+
+    app.post("/api/machine/sync/:id/commit", async (c) => {
+      const token = credentialOr401(c);
+      if (typeof token !== "string") {
+        discardBody(c);
+        return token;
+      }
+      try {
+        const result = await artifacts.commit(token, { syncId: c.req.param("id") });
+        if (!result.ok) return artifactError(c, result.failure);
+        return c.json(result.receipt);
+      } catch (err) {
+        if (err instanceof InvalidMachineCredentialError) {
+          console.warn("[http] sync commit credential rejected", err.message);
+          return jsonError(c, 401, "invalid machine credential");
+        }
+        throw err;
+      }
+    });
+
+    app.post("/api/machine/loops/:id/artifact-sync-error", cap, async (c) => {
+      const token = credentialOr401(c);
+      if (typeof token !== "string") return token;
+      const raw = await parseJsonBody(c);
+      if (raw === undefined) return jsonError(c, 400, "invalid request");
+      const parsed = artifactSyncErrorReportRequestSchema.safeParse(raw);
+      if (!parsed.success) {
+        console.warn("[http] artifact sync-error DTO rejected", parsed.error.issues);
+        return jsonError(c, 400, "invalid request");
+      }
+      try {
+        const result = await artifacts.reportSyncError(token, c.req.param("id"), parsed.data);
+        if (!result.ok) return artifactError(c, result.failure);
+        return c.json({ ok: true as const, recorded: result.recorded });
+      } catch (err) {
+        if (err instanceof InvalidMachineCredentialError) {
+          console.warn("[http] artifact sync-error credential rejected", err.message);
+          return jsonError(c, 401, "invalid machine credential");
+        }
+        throw err;
+      }
+    });
+  }
+
   // The Dashboard's two HTML routes. Registered last, but their gate is the
   // global middleware above — registering the gate here would leave `/` and
   // the POST reachable with a hostile Host, and would not protect the API.
+  // Slice 7 adds the four artifact page routes, present only when the
+  // dashboard was built WITH the artifact seam (decision 27).
   if (dashboard !== undefined) {
     app.get("/", dashboard.index);
     app.post(DASHBOARD_RUN_PATH, dashboard.formContentType, dashboard.bodyCap, dashboard.run);
+    if (dashboard.loopArtifacts !== undefined) {
+      app.get(DASHBOARD_LOOP_ARTIFACTS_PATH, dashboard.loopArtifacts);
+      app.get(DASHBOARD_RUN_ARTIFACTS_PATH, dashboard.runArtifacts!);
+      app.get(DASHBOARD_ARTIFACT_DIFF_PATH, dashboard.artifactDiff!);
+      app.post(DASHBOARD_ARTIFACT_CONFIG_PATH, dashboard.formContentType, dashboard.bodyCap, dashboard.artifactConfig!);
+    }
   }
 
   return app;

@@ -156,11 +156,8 @@ function segmentMatches(rule: string, segment: string): boolean {
   return segment.length >= head.length + tail.length && segment.startsWith(head) && segment.endsWith(tail);
 }
 
-/** True when `path` (already validated as a canonical relative path) hits a
- *  never-sync rule: a directory rule matching any contiguous segment window,
- *  or a file rule matching the basename. ASCII case-insensitive. */
-export function isNeverSyncPath(path: string): boolean {
-  const segments = path.split("/").map(asciiLower);
+/** One never-sync DIRECTORY rule window against already-folded segments. */
+function matchesNeverSyncDirectoryWindow(segments: readonly string[]): boolean {
   for (const rule of NEVER_SYNC_DIRECTORY_RULES) {
     const ruleSegments = asciiLower(rule).split("/");
     window: for (let start = 0; start + ruleSegments.length <= segments.length; start++) {
@@ -170,11 +167,33 @@ export function isNeverSyncPath(path: string): boolean {
       return true;
     }
   }
+  return false;
+}
+
+/** True when `path` (already validated as a canonical relative path) hits a
+ *  never-sync rule: a directory rule matching any contiguous segment window,
+ *  or a file rule matching the basename. ASCII case-insensitive. */
+export function isNeverSyncPath(path: string): boolean {
+  const segments = path.split("/").map(asciiLower);
+  if (matchesNeverSyncDirectoryWindow(segments)) return true;
   const basename = segments[segments.length - 1]!;
   for (const rule of NEVER_SYNC_FILE_RULES) {
     if (segmentMatches(asciiLower(rule), basename)) return true;
   }
   return false;
+}
+
+/** True when `path` — a DIRECTORY path, relative or absolute — hits a
+ *  never-sync DIRECTORY rule: any contiguous segment window of the path
+ *  (so an ancestor or a realpath'd symlink landing point is covered too).
+ *  FILE rules deliberately do NOT apply: a directory that merely shares a
+ *  credential file's basename (e.g. a project folder literally named
+ *  `credentials`) is not a secret. ASCII case-insensitive; a leading empty
+ *  segment from an absolute path never participates in a rule window. This is
+ *  the single-source predicate for the slice-5 artifact-root guard
+ *  (ADR-010 决策 25, #91) — never re-implement the window matching locally. */
+export function isNeverSyncDirectoryPath(path: string): boolean {
+  return matchesNeverSyncDirectoryWindow(path.split("/").map(asciiLower));
 }
 
 // ---- path validation (ADR-010 决策 2) ----

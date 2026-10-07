@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Loop-platform-zhb machine daemon: short-poll claim → sandboxed Claude Code runner → report, with in-process retry of unconfirmed reports. The production runner is the real Claude Code adapter (fail-closed OS sandbox, probe-pinned binary — ADR-006); the Fake Runner survives only as a test fixture. Production dependency surface is @loopzhb/protocol only; HTTP is Node 22 native fetch.",
+  "description": "Loop-platform-zhb machine daemon: short-poll claim → sandboxed Claude Code runner → report, with in-process retry of unconfirmed reports. The production runner is the real Claude Code adapter (fail-closed OS sandbox, probe-pinned binary — ADR-006); the Fake Runner survives only as a test fixture. Production dependencies are @loopzhb/protocol plus chokidar (the slice-5 artifact watcher, pinned 4.0.3 and imported only by src/artifact-watcher.ts); HTTP is Node 22 native fetch.",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -23,7 +23,8 @@
     "test": "pnpm build && vitest run"
   },
   "dependencies": {
-    "@loopzhb/protocol": "workspace:*"
+    "@loopzhb/protocol": "workspace:*",
+    "chokidar": "4.0.3"
   },
   "devDependencies": {
     "@types/node": "^25.9.3",

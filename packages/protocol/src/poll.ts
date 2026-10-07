@@ -55,6 +55,18 @@ export const pollRequestSchema = z.object({
 });
 export type PollRequest = z.infer<typeof pollRequestSchema>;
 
+/** Phase 5 artifact sync (ADR-010 决策 20): the loop's artifact configuration
+ *  as a claim needs it. Present ONLY when the loop has a configured artifact
+ *  directory at claim time; the values come from the authoritative claimed
+ *  Loop row. The daemon's final sync fixes THIS generation — a directory set
+ *  during the run never re-binds it. */
+export const deliveryArtifactConfigSchema = z.object({
+  dir: z.string(),
+  /** The config generation observed at claim time. */
+  configRevision: z.number().int().nonnegative(),
+});
+export type DeliveryArtifactConfig = z.infer<typeof deliveryArtifactConfigSchema>;
+
 /** The loop's machine-side config, as a run needs to execute it. */
 export const deliveryLoopSchema = z.object({
   id: z.string(),
@@ -72,6 +84,9 @@ export const deliveryLoopSchema = z.object({
   /** Phase 4: the loop's normalized goal (null = Open Loop). Only servers
    *  minting v1 terminal leases send it; old daemons strip it (ADR-009). */
   goal: z.string().nullable().optional(),
+  /** Phase 5 artifact sync: absent ⇒ no artifact sync for this run
+   *  (unconfigured loop, or an old server). */
+  artifact: deliveryArtifactConfigSchema.optional(),
 });
 export type DeliveryLoop = z.infer<typeof deliveryLoopSchema>;
 

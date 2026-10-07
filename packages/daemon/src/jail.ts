@@ -17,6 +17,8 @@
  */
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
+import type { Stats } from "node:fs";
+import { constants as osConstants } from "node:os";
 import path from "node:path";
 
 export class JailError extends Error {
@@ -63,25 +65,61 @@ export interface WorkdirJail {
   dispose(): Promise<void>;
 }
 
-/** Canonicalize a root set: every root must be an absolute, `..`-free path to
+/** TEST-ONLY seam (the bounded-read `openImpl` precedent): lets a test make
+ *  the post-realpath stat fail without racing the real filesystem. */
+export interface CanonicalizeRootsIo {
+  stat?: (absolutePath: string) => Promise<Stats>;
+}
+
+/** Only OS errno codes describe an unusable filesystem root. Node's
+ *  ERR_* argument errors and unknown exceptions remain programming failures
+ *  and must retain their original identity for the caller (#89). */
+function isFilesystemError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const code = (error as NodeJS.ErrnoException).code;
+  return typeof code === "string" && Object.hasOwn(osConstants.errno, code);
+}
+
+/** Canonicalize a root set: every root must be an absolute, NUL/`..`-free path to
  *  an existing directory; realpath collapses symlink aliases, exact
  *  duplicates drop out (first-seen order). Used for the daemon roots ONCE at
  *  construction (fail-fast startup) AND for server roots on EVERY resolve —
- *  the server is never trusted to have normalized. Any rejection is a
- *  JailError (fail-closed). */
-async function canonicalizeRoots(roots: string[], label: string): Promise<string[]> {
+ *  the server is never trusted to have normalized. A rejected shape or a
+ *  recognized filesystem fault in realpath/stat is a JailError (fail-closed);
+ *  unknown and programming exceptions propagate unchanged. A recognized errno
+ *  escaping this helper would give the same unusable root two control flows depending on
+ *  which syscall noticed it (review #89). Exported for the slice-3 artifact
+ *  root resolver, which applies the same discipline to the server roots on
+ *  every scan. */
+export async function canonicalizeRoots(roots: string[], label: string, io?: CanonicalizeRootsIo): Promise<string[]> {
+  const stat = io?.stat ?? fs.stat;
   const canonical: string[] = [];
   for (const root of roots) {
+    // NUL is a rejected configuration shape, not an injected program error:
+    // Node reports it as ERR_INVALID_ARG_VALUE, so reject before realpath.
+    if (root.includes("\0")) {
+      throw new JailError(`${label} contains a NUL byte: ${JSON.stringify(root)}`);
+    }
     if (!path.isAbsolute(root) || root.split(path.sep).includes("..")) {
       throw new JailError(`${label} must be an absolute path without .. segments: ${JSON.stringify(root)}`);
     }
     let real: string;
     try {
       real = await fs.realpath(root);
-    } catch {
+    } catch (error) {
+      if (!isFilesystemError(error)) throw error;
       throw new JailError(`${label} does not exist: ${JSON.stringify(root)}`);
     }
-    if (!(await fs.stat(real)).isDirectory()) {
+    let observation: Stats;
+    try {
+      observation = await stat(real);
+    } catch (error) {
+      if (!isFilesystemError(error)) throw error;
+      // The root vanished, or its permissions changed, between the realpath
+      // and the stat — the same unusable root as a failed realpath.
+      throw new JailError(`${label} could not be inspected: ${JSON.stringify(root)}`);
+    }
+    if (!observation.isDirectory()) {
       throw new JailError(`${label} is not a directory: ${JSON.stringify(root)}`);
     }
     if (!canonical.includes(real)) canonical.push(real);
@@ -103,8 +141,11 @@ export function isWithinOrEqual(parent: string, child: string): boolean {
  *  the NARROWER one survives. Exact duplicates and children already covered
  *  by a parent in the result set are dropped. Empty ⇒ the caller rejects —
  *  the server may only ever NARROW the daemon's roots, and a disjoint
- *  delivery gets no workdir at all. */
-function intersectRoots(daemonRoots: readonly string[], serverRoots: string[]): string[] {
+ *  delivery gets no workdir at all. Exported for the slice-3 artifact root
+ *  resolver: an artifact tree obeys the SAME intersection (it is not a
+ *  scratch-minting workdir resolution). PRECONDITION (both callers): every
+ *  input root is already canonical — the containment test is lexical. */
+export function intersectRoots(daemonRoots: readonly string[], serverRoots: string[]): string[] {
   const pairs: string[] = [];
   for (const d of daemonRoots) {
     for (const s of serverRoots) {

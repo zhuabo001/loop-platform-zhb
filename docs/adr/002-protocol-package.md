@@ -99,3 +99,10 @@ server 与 daemon 是两个独立部署的进程，唯一耦合点是 HTTP wire 
      watch/prepare/commit/`artifactDir`/Run 快照字段在 Batch 1 预声明形状，
      但没有任何生产路由消费（ADR-010 决策 16 的休眠边界）；开放顺序由
      Batch 2 计划固定。
+- 2026-10-07（Phase 5 Batch 2 收口登记）：上一条第 2 项的「没有任何生产路由
+  消费」是对 Batch 1 休眠态的描述；Batch 2 已全部消费——prepare/PUT/commit
+  与 machine 读取（片 2）、watch/watchDigest（片 5）、Report 的
+  `artifactSnapshotId`/`artifactSyncError`（片 6）、管理读路由与 Dashboard
+  （片 7）。该句作为现状陈述自此过时，保留为历史记录。additive/tolerant-reader
+  纪律不变：Batch 2 对 wire 形状的全部改动均为片 1/2 的加法并登记
+  tolerant-reader 清单，已冻结形状零修改。

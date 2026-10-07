@@ -358,3 +358,147 @@ describe("renderDashboardPage", () => {
     expect(page).toContain('class="wrap"');
   });
 });
+
+// ---- Batch 2 slice 7: the artifact page models (ADR-010 决策 27) ----
+
+import type { LoopArtifactsResponse } from "@loopzhb/protocol";
+
+import { renderArtifactDiffPage, renderLoopArtifactsPage, renderRunArtifactsPage } from "./page.js";
+import {
+  buildArtifactDiffPageModel,
+  buildLoopArtifactsPageModel,
+  buildRunArtifactsPageModel,
+  defaultDiffBaseline,
+} from "./view.js";
+
+const ARTIFACT_VIEW: LoopArtifactsResponse = {
+  loopId: "loop-1",
+  artifactDir: "/data/out",
+  configRevision: 1,
+  manifestRevision: 2,
+  manifestId: "amf-2",
+  committedAt: "2026-10-06T00:01:00.000Z",
+  stale: false,
+  fileCount: 1,
+  totalBytes: 3,
+  sync: { attemptedAt: null, succeededAt: null, error: null },
+  files: [{ path: "dir/a.txt", hash: "a".repeat(64), size: 3 }],
+};
+
+const BOUND = [
+  { runId: "run-2", snapshotId: "amf-2", manifestRevision: 2, committedAt: "2026-10-06T00:01:00.000Z" },
+  { runId: "run-1", snapshotId: "amf-1", manifestRevision: 1, committedAt: "2026-10-06T00:00:00.000Z" },
+];
+
+describe("defaultDiffBaseline (the page-default rule)", () => {
+  it("picks the most recent snapshot SMALLER than the target; null for the first", () => {
+    expect(defaultDiffBaseline({ manifestRevision: 2 }, BOUND)).toBe(1);
+    expect(defaultDiffBaseline({ manifestRevision: 1 }, BOUND)).toBeNull();
+  });
+
+  it("ignores newer-or-equal revisions entirely", () => {
+    expect(
+      defaultDiffBaseline({ manifestRevision: 1 }, [
+        { manifestRevision: 3, committedAt: "2026-10-06T00:03:00.000Z" },
+        { manifestRevision: 1, committedAt: "2026-10-06T00:01:00.000Z" },
+      ]),
+    ).toBeNull();
+  });
+});
+
+describe("slice 7 page models (AV3)", () => {
+  it("hostile loop id / dir / file path are escaped in text and attribute position; zero script", () => {
+    const hostile = 'loop-<script>alert(1)"\'';
+    const view: LoopArtifactsResponse = {
+      ...ARTIFACT_VIEW,
+      loopId: hostile,
+      artifactDir: hostile,
+      manifestId: "amf-2",
+      files: [{ path: 'x/<img src=y>.txt', hash: "a".repeat(64), size: 3 }],
+    };
+    const model = buildLoopArtifactsPageModel({
+      loopId: hostile,
+      view,
+      bound: BOUND,
+      configToken: null,
+    });
+    const html = renderLoopArtifactsPage(model, { csrfToken: "tok" });
+    expect(html).not.toContain("<script");
+    expect(html).not.toContain("<img");
+    expect(html).toContain("loop-&lt;script&gt;");
+    // The download href's query values are percent-encoded, then the & is
+    // entity-escaped by the template — hostile path text can never break out.
+    expect(html).toContain(encodeURIComponent("x/<img src=y>.txt").replace(/%/g, "%"));
+    expect(html).not.toContain('src=y">');
+    // The config form carries the raw (escaped) current dir.
+    expect(html).toContain('value="loop-&lt;script&gt;alert(1)&quot;');
+  });
+
+  it("the run page and the diff page render synchronously with zero script", () => {
+    const runHtml = renderRunArtifactsPage(
+      buildRunArtifactsPageModel({
+        response: {
+          runId: "run-2",
+          loopId: "loop-1",
+          state: "bound",
+          snapshotId: "amf-2",
+          manifestRevision: 2,
+          configRevision: 1,
+          committedAt: "2026-10-06T00:01:00.000Z",
+          fileCount: 1,
+          totalBytes: 3,
+          files: [{ path: "a.txt", hash: "b".repeat(64), size: 3 }],
+        },
+      }),
+    );
+    expect(runHtml).not.toContain("<script");
+    expect(runHtml).toContain("a.txt");
+
+    const diffHtml = renderArtifactDiffPage(
+      buildArtifactDiffPageModel({
+        loopId: "loop-1",
+        response: {
+          loopId: "loop-1",
+          from: null,
+          to: { snapshotId: "amf-2", manifestRevision: 2 },
+          added: [{ path: "n.txt", hash: "c".repeat(64), size: 1 }],
+          modified: [],
+          removed: [],
+        },
+        bound: BOUND,
+        selectedFrom: "",
+        selectedTo: "amf-2",
+      }),
+    );
+    expect(diffHtml).not.toContain("<script");
+    expect(diffHtml).toContain("（空集合）");
+    expect(diffHtml).toContain("n.txt");
+  });
+
+  it("the stale notice and the sync-error line ride the model as fixed copy", () => {
+    const model = buildLoopArtifactsPageModel({
+      loopId: "loop-1",
+      view: {
+        ...ARTIFACT_VIEW,
+        stale: true,
+        sync: { attemptedAt: "2026-10-06T00:00:00.000Z", succeededAt: null, error: "timeout" },
+      },
+      bound: [],
+      configToken: "updated",
+    });
+    const html = renderLoopArtifactsPage(model, { csrfToken: "tok" });
+    expect(html).toContain("配置代际已变更");
+    expect(html).toContain("同步失败：timeout");
+    expect(html).toContain("Artifact 目录已更新。");
+  });
+
+  it("P3: the banner lookup is own-key — prototype property names are not labels", () => {
+    for (const token of ["__proto__", "constructor", "toString", "hasOwnProperty"]) {
+      const model = buildLoopArtifactsPageModel({ loopId: "loop-1", view: ARTIFACT_VIEW, bound: [], configToken: token });
+      expect(model.configBanner).toBeNull();
+      const html = renderLoopArtifactsPage(model, { csrfToken: "tok" });
+      expect(html).not.toContain("[object Object]");
+      expect(html).not.toContain("function");
+    }
+  });
+});
