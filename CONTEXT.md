@@ -212,3 +212,16 @@ _Avoid_: Auto-claim, migration
 The configured public base URL of the server; the OAuth callback URL derives from it alone,
 never from request headers.
 _Avoid_: Host header, request URL
+
+**Pending OAuth Transaction**:
+The server-memory record of an in-flight GitHub login — state and PKCE verifier held
+server-side, bound to a short-lived HttpOnly cookie carrying only the random transaction id;
+consumed atomically exactly once by the callback, dead after ten minutes or any restart.
+_Avoid_: OAuth session, login state (both collide with Login Session)
+
+**Session CSRF Token**:
+The per-Login-Session form token DERIVED from the session credential
+(`sha256(credential + ":csrf")`), never stored; submitted as the `csrf` form field of logout
+(and later dashboard forms). Distinct from the dashboard's boot-level token, which is one
+process-wide value until slice 6 re-wires the forms.
+_Avoid_: CSRF token unqualified, double-submit cookie

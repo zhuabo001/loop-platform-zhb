@@ -49,3 +49,27 @@ origin 校验规则：显式值经 `new URL()` 解析；拒绝解析失败、协
 - 片 3/4 的 namespace 切换不需要变更 BlobStore 或 wire；team id 的 CHECK 保证切换产物永远是合法存储键。
 - 全部现存 `bootstrapServer` 测试调用点必须携带 `auth` 配置（testkit 提供 `makeTestAuthConfig`）；遗漏由 typecheck 结构性列出。
 - 旧部署升级到 Batch 3 后，全部旧机器对管理面不可见、不可执行，直到离线认领（片 4）；这是批次完成定义的一部分，不是缺陷。
+
+## 修订 2026-10-07（片 2 落实增补）
+
+片 2（GitHub 登录与持久 Session）实施时增补并冻结以下条目；编号接续原决策。
+
+### 8. Cookie 名称与属性矩阵落实
+
+Session Cookie 名 `loopzhb_session`，属性 `HttpOnly; SameSite=Lax; Path=/; Max-Age=604800`，https origin 时附 `Secure`，永不设 Domain。`Max-Age=604800` 显式镜像 7 天绝对有效期（用户确认 2026-10-07）：浏览器重启后登录态保留到服务端上限，语义单一来源仍是 `auth_sessions` 行。OAuth 待完成事务 Cookie 名 `loopzhb_oauth_tx`，`Path=/auth/github`（前缀覆盖回调路径）、`Max-Age=600`（镜像 10 分钟事务 TTL），其余属性相同。`Secure` 判定在模块构造时由配置的 origin 推导一次，永不读请求。
+
+### 9. OAuth 待完成事务：内存存储、浏览器绑定、原子一次性消费
+
+待完成事务保存在服务端内存 `Map`（重启即失效，符合批次规则），cookie 只携带随机事务 id，state 与 PKCE verifier 不出服务端。回调原子消费（get+delete 一次完成），每条分支（含全部失败）都消费——重放只得到 `state_unknown`。TTL 10 分钟，在消费时以注入 Clock 惰性判定；另设有界增长护栏（超过 1024 条先驱逐过期项再逐最旧），防 `/auth/github` 刷量内存膨胀。
+
+### 10. OAuth 失败固定八值分类
+
+`access_denied` / `state_missing` / `state_unknown` / `state_mismatch` / `code_missing` / `exchange_failed` / `network_error` / `response_invalid`。回调失败一律 303 `/login?error=<分类>`；登录页把分类映射为固定文案，未知值落通用文案，原始参数永不回显。上游响应正文、授权码、access token、client secret 永不进入响应、URL 或日志；日志只含固定串与 HTTP 状态码数字。GitHub access token 密闭在 adapter 的 `resolveIdentity` 单一操作内（类型层面不可获得），只用于本次身份查询。
+
+### 11. Session 级 CSRF token：凭据派生，不落库
+
+Session 级表单 CSRF token 从 Session 凭据派生：`sha256(credential + ":csrf")`（用户确认 2026-10-07）。这修正了片 1 验收记录中「0007 加列存哈希」的预留——随机铸造 + 哈希落库与「/api/session 交付明文」不可兼得，且凭据哈希纪律不允许存明文。派生式下：服务端在 resolve 时从浏览器 cookie 呈送的明文凭据重算 token;DB 泄漏（只有凭据哈希）无法推出 token;CSRF 攻击者骑浏览器自动带 cookie 但读不到 HttpOnly 值，也算不出 token。token 强度恰好等于它所保护的凭据，重启天然持久，auth_sessions 无需加列（0007 撤销，journal 保持 7 条）。退出及片 6 Dashboard 表单沿用 `csrf` 字段名，校验复用 dashboard/csrf.ts 提取出的 `extractSoleCsrfToken`（冻结的良构/重复判定不漂移），比较走 `timingSafeEqual`。
+
+### 12. 路由失败面与 /api/session DTO
+
+`POST /auth/logout` 失败面为 JSON 错误信封（401 未认证 / 400 表单畸形 / 403 token 判定；用户确认 2026-10-07），CSRF 失败不撤销任何 Session。`GET /api/session` 200 响应 DTO（`sessionInfoResponseSchema`，含 `csrfToken` 字段）单源在 `@loopzhb/protocol`（wire 惯例；决策 6 的例外不适用于 wire 面），响应恒 `Cache-Control: no-store`，401 为 `{error:"not authenticated"}`。过期边界钉死：`now >= expiresAt` 即过期（恰在到期时刻失效，前一毫秒有效）。Session 凭据形态 `sk_` + 32 字节随机 base64url。AU 编组编号：AU10 = 账号改名、AU11 = 身份稳定性、AU12 = 回调地址固定（用户确认 2026-10-07）。

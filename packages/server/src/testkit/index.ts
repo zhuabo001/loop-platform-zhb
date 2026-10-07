@@ -304,3 +304,35 @@ export async function seedClaimedMachine(
 ): Promise<string> {
   return seedMachineForToken(db, token, { teamId, ...overrides });
 }
+
+// ---- Slice 2: Set-Cookie assertion helper ----
+
+export interface ParsedSetCookie {
+  name: string;
+  value: string;
+  /** Attribute keys lowercased; flag attributes (HttpOnly, Secure) are true. */
+  attrs: Record<string, string | true>;
+}
+
+/** Parse ALL Set-Cookie headers of a response (a 303 can carry both a session
+ *  cookie and a tx-cookie clear). Uses `headers.getSetCookie()` — never
+ *  `get()`, which would smash the values together. */
+export function parseSetCookies(res: Response): ParsedSetCookie[] {
+  return res.headers.getSetCookie().map((line) => {
+    const [nameValue, ...attrParts] = line.split(";");
+    const eq = nameValue!.indexOf("=");
+    const attrs: Record<string, string | true> = {};
+    for (const part of attrParts) {
+      const trimmed = part.trim();
+      const i = trimmed.indexOf("=");
+      if (i === -1) attrs[trimmed.toLowerCase()] = true;
+      else attrs[trimmed.slice(0, i).trim().toLowerCase()] = trimmed.slice(i + 1).trim();
+    }
+    return { name: nameValue!.slice(0, eq), value: nameValue!.slice(eq + 1), attrs };
+  });
+}
+
+/** The value of one named Set-Cookie, or undefined when absent. */
+export function setCookieValue(res: Response, name: string): string | undefined {
+  return parseSetCookies(res).find((c) => c.name === name)?.value;
+}

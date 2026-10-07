@@ -42,6 +42,7 @@ import { loops, machines } from "../db/schema.js";
 import { createOwnerControl, type OwnerControl } from "../owner/index.js";
 import {
   FakeClock,
+  makeTestAuthConfig,
   seedLease,
   seedLoop,
   seedMachine,
@@ -54,6 +55,7 @@ import {
 } from "../testkit/index.js";
 import { createArtifactApi, type ArtifactApi } from "../artifact/api.js";
 import { createMemoryBlobStore } from "../artifact/blob-store-memory.js";
+import { createAuthModule } from "../auth/index.js";
 import { createRunCoordinator, type RunCoordinator } from "../coordinator/index.js";
 import { createServerApp } from "./app.js";
 
@@ -1213,5 +1215,61 @@ describe("AD2(a): create persists artifactDir atomically through the shared plan
       error: "invalid request",
     });
     expect(await snapshotLoops(db)).toHaveLength(1);
+  });
+});
+
+describe("Batch 3 slice 2: the auth surface mount", () => {
+  const AUTH_PATHS: [string, string][] = [
+    ["GET", "/login"],
+    ["GET", "/auth/github"],
+    ["GET", "/auth/github/callback"],
+    ["POST", "/auth/logout"],
+    ["GET", "/api/session"],
+  ];
+
+  it("auth ABSENT: all five paths stay indistinguishable from unknown routes", async () => {
+    await fresh();
+    for (const [method, path] of AUTH_PATHS) {
+      const res = await app.request(path, { method });
+      expect([method, path, res.status]).toEqual([method, path, 404]);
+      expect(await res.json()).toEqual({ error: "not found" });
+    }
+  });
+
+  it("auth PRESENT: the five routes are mounted with their handlers and middleware", async () => {
+    await fresh();
+    const auth = createAuthModule({
+      authConfig: makeTestAuthConfig(),
+      db,
+      clock,
+      // Never reached by these probes (the callback probe fails before the
+      // adapter); a throwing stub proves it.
+      fetchImpl: (() => {
+        throw new Error("unexpected GitHub call");
+      }) as typeof fetch,
+    });
+    const withAuth = createServerApp(
+      coordinator,
+      admin,
+      createLifecycleAdmin({ db, clock }),
+      createScheduleAdmin({ db, clock }),
+      ownerControl,
+      undefined,
+      undefined,
+      undefined,
+      auth,
+    );
+
+    expect((await withAuth.request("/login")).status).toBe(200);
+    const start = await withAuth.request("/auth/github");
+    expect(start.status).toBe(303);
+    expect(start.headers.get("location")).toMatch(/^https:\/\/github\.com\/login\/oauth\/authorize\?/);
+    // The callback's first verdict needs no adapter call.
+    const callback = await withAuth.request("/auth/github/callback");
+    expect(callback.status).toBe(303);
+    expect(callback.headers.get("location")).toBe("/login?error=state_missing");
+    // Logout middleware chain: 415 before any session/CSRF logic.
+    expect((await withAuth.request("/auth/logout", { method: "POST" })).status).toBe(415);
+    expect((await withAuth.request("/api/session")).status).toBe(401);
   });
 });

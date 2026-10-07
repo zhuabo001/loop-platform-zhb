@@ -586,3 +586,23 @@ describe("AD4 artifact wiring (Batch 2 slice 2 — the dormancy guard, rewritten
     expect(res.status).toBe(401);
   });
 });
+
+describe("Batch 3 slice 2: bootstrapServer wires the auth module from config.auth", () => {
+  it("the five routes are live on a booted server; the loopback hostGate still guards them", async () => {
+    const dir = await tmpDataDir();
+    const b = await boot(dir);
+
+    expect((await b.app.request("/login")).status).toBe(200);
+    expect((await b.app.request("/api/session")).status).toBe(401);
+    const start = await b.app.request("/auth/github");
+    expect(start.status).toBe(303);
+    expect(start.headers.get("location")).toMatch(/^https:\/\/github\.com\/login\/oauth\/authorize\?/);
+
+    // The dashboard's GLOBAL loopback-Host gate precedes the auth routes on a
+    // loopback bind: a hostile Host gets the byte-identical 404, a loopback
+    // Host passes.
+    const hostile = await b.app.request("/login", { headers: { host: "evil.example.com" } });
+    expect(hostile.status).toBe(404);
+    expect(await hostile.json()).toEqual({ error: "not found" });
+  });
+});

@@ -40,6 +40,7 @@
  */
 import { bodyLimit } from "hono/body-limit";
 import { Hono, type Context } from "hono";
+import type { AuthRoutes } from "../auth/index.js";
 import type { DashboardRoutes } from "../dashboard/routes.js";
 import {
   DASHBOARD_ARTIFACT_CONFIG_PATH,
@@ -279,6 +280,15 @@ export function createServerApp(
    * clean control.
    */
   artifacts?: ArtifactApi,
+  /**
+   * The auth surface (Batch 3 slice 2): the five login/session routes.
+   * OPTIONAL trailing param so the existing call sites are unchanged; absent
+   * ⇒ `/login`, `/auth/*` and `/api/session` stay indistinguishable from
+   * unknown routes. `bootstrapServer` always builds it (config.auth is
+   * REQUIRED) — the absence is a test-assembly choice, never a production
+   * state. Slice 2 does NOT gate the management routes (that is slice 5).
+   */
+  auth?: AuthRoutes,
 ): Hono {
   const app = new Hono();
 
@@ -838,6 +848,18 @@ export function createServerApp(
         throw err;
       }
     });
+  }
+
+  // The auth surface (Batch 3 slice 2). Registered before the dashboard
+  // block; ordering vs the global hostGate is irrelevant (the gate is
+  // middleware, applied to every request regardless of route). These routes
+  // never read Host — the callback URL is config-frozen (ADR-011 决策 5).
+  if (auth !== undefined) {
+    app.get("/login", auth.loginPage);
+    app.get("/auth/github", auth.githubStart);
+    app.get("/auth/github/callback", auth.githubCallback);
+    app.post("/auth/logout", auth.formContentType, auth.bodyCap, auth.logout);
+    app.get("/api/session", auth.sessionApi);
   }
 
   // The Dashboard's two HTML routes. Registered last, but their gate is the

@@ -21,6 +21,7 @@ import { createLoopAdmin, newUuidLoopId } from "./admin/index.js";
 import { createArtifactApi, type ArtifactApi } from "./artifact/api.js";
 import { createMachineAttributionResolver } from "./artifact/attribution-machine.js";
 import { createProductionArtifactHome } from "./artifact/production.js";
+import { createAuthModule } from "./auth/index.js";
 import { createRunCoordinator, mintRunCredential, newUuidRunId, type CoordinatorHooks, type RunCoordinator } from "./coordinator/index.js";
 import { isLoopbackHost, loadServerConfig, unauthenticatedExposureWarning, type ServerConfig } from "./config.js";
 import { mintCsrfToken } from "./dashboard/csrf.js";
@@ -78,6 +79,12 @@ export interface BootstrapOverrides {
    *  or whitespace override is IGNORED rather than honoured, so no test seam
    *  can silently disable CSRF. */
   csrfToken?: string;
+  /** TEST-ONLY GitHub transport for the auth module (Batch 3 slice 2): a
+   *  scripted in-process fetch, so an E2E login never touches a real socket.
+   *  Production passes neither field. */
+  githubFetch?: typeof fetch;
+  /** TEST-ONLY GitHub request timeout override (ms). */
+  githubTimeoutMs?: number;
 }
 
 /**
@@ -155,6 +162,17 @@ export async function bootstrapServer(
           csrfToken: overrides.csrfToken?.trim() ? overrides.csrfToken : mintCsrfToken(),
         })
       : undefined;
+    // Batch 3 slice 2: the auth surface. config.auth is REQUIRED (ADR-011
+    // 决策 5 — loadServerConfig has already failed the boot on a missing or
+    // malformed OAuth config), so production ALWAYS mounts the five routes;
+    // the GitHub transport seams are test-only overrides.
+    const auth = createAuthModule({
+      authConfig: config.auth,
+      db: handle.db,
+      clock,
+      fetchImpl: overrides.githubFetch,
+      timeoutMs: overrides.githubTimeoutMs,
+    });
 
     return {
       app: createServerApp(
@@ -166,6 +184,7 @@ export async function bootstrapServer(
         (loop) => scheduler.reconcile(loop),
         dashboard,
         artifacts,
+        auth,
       ),
       coordinator,
       sweep,
