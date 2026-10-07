@@ -84,16 +84,45 @@ interface RunningServer extends BootedServer {
 
 const runningServers = new Set<RunningServer>();
 const dirs: string[] = [];
+/** A watcher tracked at the seam. `closing` marks that close() was CALLED;
+ *  `closed` flips ONLY after the inner close has PHYSICALLY completed — a
+ *  rejected or never-finished close leaves the pair `true/false`, which the
+ *  afterEach invariant turns red (#114: never claim a close before it landed). */
+interface TrackedWatcher {
+  root: string;
+  closing: boolean;
+  closed: boolean;
+}
+/** Event-order log: a swap must close-complete the old watcher BEFORE the
+ *  successor subscribes (AS7's fixed order — the manager's admission awaits
+ *  the retained predecessor close before it calls the factory). */
+type WatchEvent = { kind: "subscribed" | "close-completed"; root: string };
 /** Every watcher ever created by any stack; afterEach asserts all closed
  *  (the handle-leak invariant, asserted at the seam — never OS fd counts). */
-const allTrackedWatchers: Array<{ root: string; closed: boolean }> = [];
-const drainables: Array<{ drained: boolean; drain(ms: number): Promise<unknown> }> = [];
+const allTrackedWatchers: TrackedWatcher[] = [];
+const drainables: Array<{ drained: boolean; drain(ms: number): Promise<{ settled: boolean }> }> = [];
 
 afterEach(async () => {
-  await Promise.all(drainables.splice(0).map((d) => d.drain(2_000).catch(() => {})));
-  await Promise.all([...runningServers].map((rs) => shutdown(rs).catch(() => {})));
+  // Cleanup must never mask verification: drain/shutdown errors and un-settled
+  // drains are COLLECTED and asserted — not swallowed — and the leak invariant
+  // still runs on the tracked entries afterwards.
+  const errors: unknown[] = [];
+  const drainResults = await Promise.all(
+    drainables.splice(0).map(async (d) => {
+      try {
+        return await d.drain(2_000);
+      } catch (err) {
+        errors.push(err);
+        return { settled: false };
+      }
+    }),
+  );
+  await Promise.all([...runningServers].map((rs) => shutdown(rs).catch((err: unknown) => errors.push(err))));
   await Promise.all(dirs.splice(0).map((d) => rm(d, { recursive: true, force: true }).catch(() => {})));
-  expect(allTrackedWatchers.splice(0).every((w) => w.closed)).toBe(true);
+  const watchers = allTrackedWatchers.splice(0);
+  expect(errors).toEqual([]);
+  expect(drainResults.every((r) => r.settled)).toBe(true);
+  expect(watchers.every((w) => w.closing && w.closed)).toBe(true);
 });
 
 // ---------------------------------------------------------------------------
@@ -258,31 +287,38 @@ function makeDial(baseUrl: string): Dial {
 interface DaemonStack {
   runtime: ReturnType<typeof createDaemonRuntime>;
   watch: ReturnType<typeof createArtifactWatchManager>;
-  tracked: Array<{ root: string; closed: boolean }>;
+  tracked: TrackedWatcher[];
+  events: WatchEvent[];
   runnerCalls: () => number;
 }
 
 function makeDaemonStack(dial: Dial, daemonRoots: readonly string[]): DaemonStack {
   const tracked: DaemonStack["tracked"] = [];
+  const events: DaemonStack["events"] = [];
   const client = createMachineClient({ baseUrl: "http://slice8.daemon", machineCredential: TOKEN, fetchImpl: dial.fetchImpl });
   const sync = createArtifactSyncClient({
     transport: createArtifactTransport({ baseUrl: "http://slice8.daemon", machineCredential: TOKEN, fetchImpl: dial.fetchImpl }),
     cache: createArtifactHashCache(),
   });
   // The tracking factory wraps the PRODUCTION chokidar factory so a swap's
-  // close is observable (the slice-5 integration precedent).
+  // close is observable (the slice-5 integration precedent). The entry flips
+  // `closed` ONLY after the inner close physically completed; a rejection
+  // propagates and leaves the leak-invariant pair `closing:true/closed:false`.
   const factory: ArtifactWatcherFactory = (root) => {
     const inner = createChokidarWatcher(root);
-    const entry = { root, closed: false };
+    const entry: TrackedWatcher = { root, closing: false, closed: false };
     tracked.push(entry);
     allTrackedWatchers.push(entry);
+    events.push({ kind: "subscribed", root });
     return {
       ready: () => inner.ready(),
       onEvent: (listener) => inner.onEvent(listener),
       onError: (listener) => inner.onError(listener),
       close: async () => {
-        entry.closed = true;
+        entry.closing = true;
         await inner.close();
+        entry.closed = true;
+        events.push({ kind: "close-completed", root });
       },
     };
   };
@@ -307,14 +343,14 @@ function makeDaemonStack(dial: Dial, daemonRoots: readonly string[]): DaemonStac
   });
   const drainable = {
     drained: false,
-    drain: async (ms: number) => {
+    drain: async (ms: number): Promise<{ settled: boolean }> => {
       if (drainable.drained) return { settled: true };
       drainable.drained = true;
       return watch.drain(ms);
     },
   };
   drainables.push(drainable);
-  return { runtime, watch, tracked, runnerCalls: () => runnerCalls };
+  return { runtime, watch, tracked, events, runnerCalls: () => runnerCalls };
 }
 
 // ---------------------------------------------------------------------------
@@ -573,8 +609,17 @@ describe("slice 8 fault-integration E2E (real HTTP + file PGlite + local BlobSto
     await stack.runtime.pollOnce();
     await until(async () => (await loopRow(rs.handle.db, loopId)).artifactManifestRevision === 2, "root B's scan to commit at generation 2");
     expect(stack.tracked).toHaveLength(2);
+    expect(stack.tracked[0]!.closing).toBe(true);
     expect(stack.tracked[0]!.closed).toBe(true);
     expect(stack.tracked[1]!.root).toBe(rootB);
+    // AS7's fixed order with PHYSICAL evidence (#114): the old watcher's close
+    // COMPLETED before the successor subscribed. The log records the actual
+    // close completion (not a flag flip), so a manager that subscribes early
+    // fails here even while every generation converges.
+    const closedA = stack.events.findIndex((e) => e.kind === "close-completed" && e.root === rootA);
+    const subscribedB = stack.events.findIndex((e) => e.kind === "subscribed" && e.root === rootB);
+    expect(closedA).toBeGreaterThanOrEqual(0);
+    expect(subscribedB).toBeGreaterThan(closedA);
     expect(await manifestPaths(rs.handle.db, loopId)).toEqual(["b.txt"]);
     const loop2 = await loopRow(rs.handle.db, loopId);
     const manifest2 = await manifestRow(rs.handle.db, loop2.artifactManifestId!);
@@ -610,6 +655,7 @@ describe("slice 8 fault-integration E2E (real HTTP + file PGlite + local BlobSto
     const loopId = await createLoop(rs, "ai4-loop", root);
     await stack.runtime.pollOnce();
     await until(async () => (await loopRow(rs.handle.db, loopId)).artifactManifestRevision === 1, "the startup scan to commit");
+    await stack.watch.settled(); // the startup round — responses included — must land BEFORE the fault window opens (#116)
 
     // Outage BEFORE the edit: the event-driven sync's first attempt fails for
     // real (observed via the dial, never wall-clock), then connectivity is
@@ -619,7 +665,12 @@ describe("slice 8 fault-integration E2E (real HTTP + file PGlite + local BlobSto
     await until(() => dial.thrownAttempts().length >= 1, "the first failed sync attempt");
     dial.offline = false;
 
+    // The revision moves when the SERVER applies — possibly BEFORE the commit
+    // response reached the client and the dial recorded its status. Join the
+    // sync round first (the AI5 converge pattern), THEN count (#116).
     await until(async () => (await loopRow(rs.handle.db, loopId)).artifactManifestRevision === 2, "the recovery to commit exactly one revision");
+    await stack.watch.settled();
+    expect((await loopRow(rs.handle.db, loopId)).artifactManifestRevision).toBe(2);
     expect(await manifestPaths(rs.handle.db, loopId)).toEqual(["a.txt", "b.txt"]);
     // Exactly ONE prepare+commit round carried the recovery (the thrown
     // attempts never reached the server); zero local-failure reports (AS1).
@@ -761,8 +812,9 @@ describe("slice 8 fault-integration E2E (real HTTP + file PGlite + local BlobSto
 
     // (a) DAEMON restart: production exit (drain) then a whole fresh stack —
     // the hash cache is memory and is gone (AS6's model at integration level).
-    await drainables[drainables.length - 1]!.drain(2_000);
-    expect(stack.tracked.every((w) => w.closed)).toBe(true);
+    const drainResult = await drainables[drainables.length - 1]!.drain(2_000);
+    expect(drainResult.settled).toBe(true);
+    expect(stack.tracked.every((w) => w.closing && w.closed)).toBe(true);
     stack = makeDaemonStack(dial, [root]);
     await stack.runtime.pollOnce(); // no digest echoed ⇒ the full watch set is re-delivered
     // The fresh client cannot prove equivalence (its baseline read carries no
@@ -834,6 +886,18 @@ describe("slice 8 fault-integration E2E (real HTTP + file PGlite + local BlobSto
     expect(run.outcome).toBe("exec");
     expect(run.artifactSnapshotId).toBeNull();
     expect(run.artifactSyncError).toBeNull();
+
+    // The WIRE-level guard (#115): DB null is only the server's cleanup — a
+    // Report CARRYING an empty artifactSyncError would still be cleaned to
+    // null. Assert on the actual Report body recorded by the dial for THIS
+    // run: neither artifact key is an own property at all.
+    const reports = dial.calls
+      .filter((c) => c.method === "POST" && c.path === "/api/machine/report")
+      .map((c) => JSON.parse(c.requestBody!) as Record<string, unknown>)
+      .filter((body) => body.runId === runId);
+    expect(reports).toHaveLength(1);
+    expect(reports[0]).not.toHaveProperty("artifactSnapshotId");
+    expect(reports[0]).not.toHaveProperty("artifactSyncError");
 
     // The guard: zero artifact traffic of ANY kind — no baseline reads, no
     // prepare, no PUT, no commit, no error reports.
