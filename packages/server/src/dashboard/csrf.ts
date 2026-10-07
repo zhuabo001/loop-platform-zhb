@@ -83,10 +83,11 @@ export function checkCsrfFormFields(
 /**
  * Extract the submitted token from a body that carries ONLY the CSRF field —
  * the token-only form's extraction half, WITHOUT the comparison, so the
- * session-level CSRF check (slice 2: compares HASHES, not plaintext) can
- * share the frozen well-formedness/duplicate rules instead of re-deriving
- * them. Verdict order is the frozen contract: `bad_form` (a stray field means
- * this is not the form we rendered) is judged before ANY token verdict.
+ * session-level CSRF check (slice 2: constant-time compare of the submitted
+ * token against the token DERIVED from the session credential) can share the
+ * frozen well-formedness/duplicate rules instead of re-deriving them. Verdict
+ * order is the frozen contract: `bad_form` (a stray field means this is not
+ * the form we rendered) is judged before ANY token verdict.
  *
  * `checkCsrfForm` is exactly this extraction plus the constant-time compare;
  * `checkCsrfFormFields` keeps its own whitelist two-pass (its pass-1 stray

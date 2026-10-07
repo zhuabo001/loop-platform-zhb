@@ -9,8 +9,12 @@
  * state ever touches the database.
  *
  * Browser binding: the cookie carries ONLY the random `txId`; `state` and the
- * PKCE `codeVerifier` never leave the server. A callback without the cookie —
- * or with a foreign txId — cannot reach the transaction at all.
+ * PKCE `codeVerifier` live in this server-side map, never in anything the
+ * browser holds onto. (Per the protocol, the state rides the authorize
+ * redirect to GitHub and back, and the verifier is sent exactly once — to
+ * GitHub's token endpoint; neither is ever delivered to the browser as a
+ * value it could reuse.) A callback without the cookie — or with a foreign
+ * txId — cannot reach the transaction at all.
  *
  * TTL is LAZY: checked on `consume()` against the injected Clock (no sweeper,
  * no timers). The one addition beyond lazy semantics is a bounded-growth
@@ -23,8 +27,10 @@ import { createHash, randomBytes } from "node:crypto";
 import type { Clock } from "../time.js";
 
 /** PKCE S256 challenge derivation (RFC 7636): base64url of the RAW sha256
- *  digest bytes — not of the hex text. The verifier never leaves the server;
- *  only this challenge rides the authorize redirect. */
+ *  digest bytes — not of the hex text. Only this challenge rides the
+ *  authorize redirect; the verifier itself leaves the server exactly once —
+ *  to GitHub's token endpoint in the exchange body — and never reaches the
+ *  browser. */
 export function pkceS256Challenge(verifier: string): string {
   return createHash("sha256").update(verifier).digest("base64url");
 }

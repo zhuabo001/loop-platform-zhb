@@ -68,11 +68,20 @@ export function createGitHubOAuthAdapter(deps: GitHubOAuthAdapterDeps): GitHubOA
     }
   }
 
-  async function parseJson(res: Response): Promise<{ ok: true; body: unknown } | { ok: false }> {
+  /** Read a response body as JSON, preserving the frozen taxonomy boundary:
+   *  a SyntaxError means the body fully ARRIVED but is not JSON
+   *  (`response_invalid`); ANY other rejection — the per-request signal
+   *  aborting the body read (timeout) or a transport reset mid-body — is a
+   *  `network_error`, exactly as a fetch-level throw is. Headers arriving
+   *  first does not turn a body-read transport failure into a parse
+   *  failure. */
+  async function parseJson(
+    res: Response,
+  ): Promise<{ ok: true; body: unknown } | { ok: false; classification: "network_error" | "response_invalid" }> {
     try {
       return { ok: true, body: await res.json() };
-    } catch {
-      return { ok: false };
+    } catch (err) {
+      return { ok: false, classification: err instanceof SyntaxError ? "response_invalid" : "network_error" };
     }
   }
 
@@ -107,7 +116,15 @@ export function createGitHubOAuthAdapter(deps: GitHubOAuthAdapterDeps): GitHubOA
         return { ok: false, classification: "exchange_failed" };
       }
       const tokenBody = await parseJson(exchange.res);
-      if (!tokenBody.ok || typeof tokenBody.body !== "object" || tokenBody.body === null) {
+      if (!tokenBody.ok) {
+        console.warn(
+          tokenBody.classification === "network_error"
+            ? "[auth] oauth network error"
+            : "[auth] oauth exchange response invalid",
+        );
+        return tokenBody;
+      }
+      if (typeof tokenBody.body !== "object" || tokenBody.body === null) {
         console.warn("[auth] oauth exchange response invalid");
         return { ok: false, classification: "response_invalid" };
       }
@@ -138,7 +155,15 @@ export function createGitHubOAuthAdapter(deps: GitHubOAuthAdapterDeps): GitHubOA
         return { ok: false, classification: "exchange_failed" };
       }
       const userBody = await parseJson(user.res);
-      if (!userBody.ok || typeof userBody.body !== "object" || userBody.body === null) {
+      if (!userBody.ok) {
+        console.warn(
+          userBody.classification === "network_error"
+            ? "[auth] oauth network error"
+            : "[auth] oauth identity response invalid",
+        );
+        return userBody;
+      }
+      if (typeof userBody.body !== "object" || userBody.body === null) {
         console.warn("[auth] oauth identity response invalid");
         return { ok: false, classification: "response_invalid" };
       }

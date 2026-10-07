@@ -166,6 +166,23 @@ describe("resolveIdentity — fixed failure taxonomy (AU8)", () => {
     });
   });
 
+  it("exchange body read fails after 2xx headers (timeout/reset mid-body) → network_error", async () => {
+    // Headers arrive, THEN the body stream dies — a transport failure under
+    // the frozen taxonomy, not a malformed body. A real Response over an
+    // erroring stream, so res.json() rejects the way undici does.
+    const bodyBreaks = () =>
+      new Response(
+        new ReadableStream({
+          start(c) {
+            c.error(new DOMException("The operation timed out.", "TimeoutError"));
+          },
+        }),
+        { status: 200 },
+      );
+    expect(await classify([bodyBreaks])).toEqual({ ok: false, classification: "network_error" });
+    expect(warnings).toEqual(["[auth] oauth network error"]);
+  });
+
   it("identity query non-2xx → exchange_failed; transport throw → network_error", async () => {
     const ok = () => jsonResponse(200, { access_token: TOKEN });
     expect(await classify([ok, () => jsonResponse(401, { message: "bad credentials SENTINEL" })])).toEqual({
@@ -197,6 +214,21 @@ describe("resolveIdentity — fixed failure taxonomy (AU8)", () => {
       ok: false,
       classification: "response_invalid",
     });
+  });
+
+  it("identity body read fails after 2xx headers → network_error", async () => {
+    const ok = () => jsonResponse(200, { access_token: TOKEN });
+    const bodyBreaks = () =>
+      new Response(
+        new ReadableStream({
+          start(c) {
+            c.error(new Error("reset mid-body"));
+          },
+        }),
+        { status: 200 },
+      );
+    expect(await classify([ok, bodyBreaks])).toEqual({ ok: false, classification: "network_error" });
+    expect(warnings).toEqual(["[auth] oauth network error"]);
   });
 });
 

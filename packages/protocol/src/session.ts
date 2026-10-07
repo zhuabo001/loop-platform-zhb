@@ -4,7 +4,9 @@
  * Session's absolute expiry, and the session-level form CSRF token.
  *
  * The `csrfToken` plaintext rides ONLY this response (on `Cache-Control:
- * no-store`); the server stores just its sha256 (migration 0007). It is part
+ * no-store`). The token is DERIVED from the session credential
+ * (`sha256(credential + ":csrf")`, ADR-011 决策 11) and is NEVER persisted —
+ * the retracted migration-0007 hash column does not exist. The field is part
  * of the frozen DTO now so the slice-6 dashboard wiring never touches this
  * schema.
  *
@@ -31,7 +33,8 @@ export const sessionInfoResponseSchema = z.object({
     /** Absolute expiry (ISO), writer-stamped at login; never slides. */
     expiresAt: isoTimestampSchema,
   }),
-  /** The session-level form CSRF token (plaintext; hash-only at rest). */
+  /** The session-level form CSRF token (plaintext; derived from the session
+   *  credential, never stored). */
   csrfToken: z.string(),
 });
 export type SessionInfo = z.infer<typeof sessionInfoResponseSchema>;
