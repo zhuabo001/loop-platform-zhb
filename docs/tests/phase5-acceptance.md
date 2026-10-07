@@ -292,3 +292,47 @@ server 较 `1cc201e` 恰 +7：config.test.ts +6（#118 哨兵非泄漏六分支�
 ### 结论（片 1）
 
 本片验收确认：身份模型及唯一约束有效，旧库升级与重复迁移保持历史数据，LM2 能检测身份归属、有效期及快照引用的变化；非法 origin 和缺失 OAuth 配置在资源打开前拒绝启动，origin 拒绝消息与实际启动日志不回显敏感输入。
+
+## 片 2 — GitHub 登录与持久 Session
+
+### 测试编组与结果（片 2）
+
+| 编组 | 主要证据（文件） | 覆盖 |
+|---|---|---|
+| AU1/AU3/AU6（存储层） | `server/src/auth/pending-tx.test.ts`（7 项） | 原子一次性消费（二次消费 null）；10 分钟 TTL 边界（恰 10 分钟过期，前 1ms 有效，FakeClock）；未知 txId；过期项由消费删除；有界增长护栏（超 1024 先逐过期再逐最旧） |
+| AU5/AU8/AU12（adapter 层） | `server/src/auth/github.test.ts`（10 项） | authorize URL pin（S256 challenge、配置冻结的 redirect_uri、无 scope）；PKCE RFC 7636 Appendix B 测试向量；交换非 2xx 与 2xx+error → exchange_failed；抛错/超时 → network_error；畸形 JSON/缺 access_token/非数字 id/缺 login → response_invalid；**哨兵泄漏断言**：code/token/secret/上游正文不出现在任何返回值与 console.warn 日志 |
+| AU9–AU11 | `server/src/auth/identity.test.ts`（5 项） | 首登单事务恰建一行 User/Team/Membership（FakeClock 盖章）；二登刷新 username/updatedAt、team id 不变；Promise.all 并发登录收敛单身份（PGlite 单写者下证明可观测结果，ON CONFLICT+重读为真 Postgres 保险，见下「诚实声明」）；预置非派生 id 个人团队被收养而非重复 |
+| AU1–AU8/AU12（路由层） | `server/src/auth/routes.test.ts`（26 项） | 回调失败九分支矩阵（无 cookie/未知 txId/过期/拒绝授权/缺 state/state 不符/缺 code/交换失败/网络失败）逐分支零写入证明（四表行数不变、无 session Set-Cookie、tx cookie 清除）；AU6 重放 → state_unknown 且行数保持；AU12 敌对 Host 不影响 redirect_uri；登录页分类→固定文案、未知值通用文案、原始参数不回显 |
+| SE1/SE2/SE3/SE6（服务层） | `server/src/auth/session.test.ts`（7 项） | mint 只存哈希（明文凭据不在库）；未知/空/缺失凭据 → null；到期边界 expiresAt±1ms；revoke 只删当前行且幂等；身份链断裂（无 FK 约定下的直接改库）按未登录处理 |
+| SE4 | `server/src/auth/cookies.test.ts`（11 项）+ routes.test.ts | Set-Cookie 串精确 pin（session/tx/clear 三种；Secure 恰好只在 https origin；永不带 Domain）；parseCookieHeader 回环与畸形边界（首个 `=` 切分、重复名先现优先） |
+| SE7/SE8 | `server/src/auth/session-csrf.test.ts`（8 项）+ routes.test.ts | verdict 矩阵（ok/不符/缺失/重复/畸形/坏转义/空期望值）；跨 Session token 403 且目标 Session 完好；logout 415/413/400/403 矩阵且失败不撤销任何 Session |
+| SE5 + 两条不变量 | `server/src/phase5-batch3-slice2-e2e.test.ts`（3 项） | 真实 `bootstrapServer` + 文件型 PGlite + 脚本化 githubFetch：登录 → 关库重启同 dataDir → /api/session 200（重启持久）；重启前未完成事务 → 重启后回调 state_unknown（内存语义）；失败登录四表零行（不变量 1）；首登后预置未认领机器 teamId 仍 null、新团队无机器（不变量 2） |
+| 挂载与接线 | `server/src/http/app.test.ts`（+2 项）、`server/src/start.test.ts`（+1 项） | auth 缺席时五路径与未知路由不可区分（404）；在场时五路由挂载含中间件链；bootstrapServer 从 config.auth 装配 auth 模块；回环 hostGate 先于 auth 路由 404 敌对 Host |
+| DTO | `protocol/src/session.test.ts`（4 项） | sessionInfoResponseSchema 必填字段、expiresAt 真 ISO datetime、宽容读者（未知键剥离不拒绝） |
+
+### 显式边界核对（片 2）
+
+- **停止边界**：管理路由 Session 门禁未做（片 5）；Dashboard 登录态与表单未接线、进程级 dashboard CSRF token 未动（片 6）；本片不作为可部署的管理面认证版本（片 7 生产演练）。
+- **设计修正（用户确认 2026-10-07，ADR-011 修订决策 11）**：片 1 验收记录预留的「0007 加列存 Session CSRF 哈希」撤销——随机铸造 + 哈希落库与 `/api/session` 明文交付不可兼得；改为凭据派生 `sha256(credential + ":csrf")`，不落库，journal 保持 7 条，phase4-M5/phase5-AM1/AM5/LM1/LM2 pin 不变。
+- **诚实声明**：AU9 并发登录在 PGlite 单写者下事务串行，测试钉住可观测契约（单身份、双成功），真实交错仲裁由 ON CONFLICT + 重读路径承担；pending-tx 的有界增长护栏（超惰性语义的逐最旧驱逐）为实现补充，已在此声明。
+- **protocol 增量**：仅 `sessionInfoResponseSchema`（wire 惯例）；server 内部枚举例外不受影响。
+- **新接缝**：`BootstrapOverrides.githubFetch/githubTimeoutMs` 为 INTERNAL-ONLY 测试接缝，生产不传。
+
+### 完整质量门（片 2，`78e51b7`）
+
+```text
+$ pnpm test          # EXIT=0
+  packages/protocol: 16 files / 292 tests
+  packages/daemon:   34 passed + 2 skipped files / 790 passed + 7 skipped tests
+  packages/server:   86 passed + 3 skipped files / 1139 passed + 3 skipped tests
+$ pnpm typecheck     # EXIT=0
+$ pnpm build         # EXIT=0
+$ pnpm --filter @loopzhb/server db:check   # EXIT=0；schema.ts 与 drizzle/ 零漂移（0007 已撤销，无新增迁移）
+$ git diff --check   # EXIT=0
+```
+
+server 较片 1 复审基线（`1fc3300`，1058+3skip）+81：八个新测试文件（cookies 11、pending-tx 7、session-csrf 8、github 10、identity 5、session 7、routes 26、slice2-e2e 3），app.test.ts +2、start.test.ts +1；protocol 288→292（session DTO 4 项）。
+
+### 结论（片 2）
+
+本片验收确认：GitHub 授权码流程（一次性 state、浏览器绑定、PKCE S256、10 分钟内存事务、原子消费）与持久 Session（哈希即主键、7 天绝对有效期、凭据派生 CSRF、退出删行）按冻结规则实现；失败路径逐分支零写入且无敏感信息泄漏；Session 重启持久、未完成登录重启失效；首次登录不取得旧机器。管理面门禁、Dashboard 接线与生产演练分别留待片 5/6/7。
