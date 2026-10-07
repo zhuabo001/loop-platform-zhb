@@ -146,13 +146,15 @@ Round 1 零阻断，唯一 P3 证据措辞项经定点复核核销关闭；生�
 
 1. **AI1（idle 编辑与删除）**：poll 投递 watch 集合 ⇒ 订阅 ⇒ 启动全扫提交 revision 1（无 Run）；创建/修改/删除逐次收敛为 revision 2/3/4 且路径精确；静默窗口零 prepare/commit；**同内容改写**（mtime 变、内容同）触发事件但零请求（客户端抑制——M6 变异证明该腿非 vacuous）；已提交 manifest 的 blob 全部落盘（无部分 manifest）。
 2. **AI2（两次 Run 与快照冻结）**：两次 Run 经**真实 socket** 完成 claim → 最终同步 → Report 绑定（片 6 同链走 app.request）；snap1 ≠ snap2；Run 1 行与 snap1 manifest 行级冻结；snap1 下载字节与编辑前内容逐字节一致；diff 恰为 added/modified/removed 三类。
-3. **AI3（配置变化）**：PATCH 新根在 daemon 知情前视图确定性地 `stale:true`（代际 2）；下一次 poll 换代——旧 watcher 关闭、新根订阅并以 `configRevision:2` 提交；PATCH null 后 poll 携带空集合、watcher 关闭、两个旧根再编辑零流量零 revision 移动、视图 `artifactDir:null`。
-4. **AI4（断网）**：断网先于编辑开启；dial 观测到真实失败尝试后在客户端 1 s/2 s 退避窗口内恢复；恰一次 prepare/commit 收敛 revision +1；零本地失败上报；后续编辑照常。
+3. **AI3（配置变化）**：PATCH 新根在 daemon 知情前视图确定性地 `stale:true`（代际 2）；下一次 poll 换代——旧 watcher 关闭、新根订阅并以 `configRevision:2` 提交；换代顺序有**物理证据**：事件日志按真实关闭完成排序，断言 `close-completed(rootA)` 先于 `subscribed(rootB)`（AS7 固定序，Round1 #114 加固）；PATCH null 后 poll 携带空集合、watcher 关闭、两个旧根再编辑零流量零 revision 移动、视图 `artifactDir:null`。
+4. **AI4（断网）**：断网先于编辑开启（开启前先 join 启动轮 `watch.settled()`）；dial 观测到真实失败尝试后在客户端 1 s/2 s 退避窗口内恢复；恰一次 prepare/commit 收敛 revision +1——revision 由服务端应用先于响应落定，统计前先 join `watch.settled()`（AI5 converge 同型，Round1 #116 加固）；零本地失败上报；后续编辑照常。
 5. **AI5（响应丢失三腿 + 会话过期；假服务端语义平价核心）**：对**真实服务端**——(a) prepare 响应在应用后丢失 ⇒ 同 requestId 重试得**同一 syncId**；(b) PUT 响应在发布后丢失 ⇒ 重 PUT 得 `published:false`（blob 去重）；(c) commit 响应在回执冻结后丢失 ⇒ 重 commit 取回**逐值相等的同一冻结回执**、revision 恰进一；(d) 服务端时钟拨快 2 小时 ⇒ commit 得 409 `artifact_session_expired` ⇒ 客户端同载荷重 prepare（**原地续期、同 syncId**、重算 `needHashes:[]`、零重复上传）⇒ commit 成功。
 6. **AI6（进程重启）**：(a) daemon 重启（生产 drain 后整栈重建，哈希缓存随进程消失）——基线读自服务端，**零 PUT**、恰一轮 prepare/commit、revision 恰 +1（AS6 记录的 U2 残余「等价内容重启首轮铸一次 revision」在集成面复现并钉死）、新 manifest 条目与重启前逐值一致、随后静默；(b) server 重启（生产序关闭、同 `dataDir` 重 boot、dial 重绑）——snap1 manifest 行与下载字节逐值/逐字节不变，新编辑经**新监听**同步，blob 根零 `.tmp-*` 残留，全部 manifest 的 configRevision 与 Loop 当前代际一致（无旧代际提交）。
-7. **AI7（生产启用 + 旧 Loop 不上传守卫）**：生产形态 daemon（capability 齐全、artifact 依赖全接线）对**未配置** Loop——零 artifact 流量（无基线读/prepare/PUT/commit/错误上报）、Report 无 artifact 字段、Run 正常 done/exec、不进 watch 集合、blob 根未创建。此例取代 Batch 1 休眠守卫套件（AD1–AD4 已逐片翻转为激活断言）；旧 Loop 不上传单元钉（runtime/delivery/poll/final-sync 四处）全部保留零改动。
+7. **AI7（生产启用 + 旧 Loop 不上传守卫）**：生产形态 daemon（capability 齐全、artifact 依赖全接线）对**未配置** Loop——零 artifact 流量（无基线读/prepare/PUT/commit/错误上报）、Report 无 artifact 字段（**wire 级**：按 runId 筛选 dial 记录的真实 Report 请求体，断言 `artifactSnapshotId`/`artifactSyncError` 均非 own property——DB null 只是服务端清洗，不能区分 wire 多带空串，Round1 #115 加固）、Run 正常 done/exec、不进 watch 集合、blob 根未创建。此例取代 Batch 1 休眠守卫套件（AD1–AD4 已逐片翻转为激活断言）；旧 Loop 不上传单元钉（runtime/delivery/poll/final-sync 四处）全部保留零改动。
 
 **变异验证**（验收提交 `f8b3ba1`；`cp` 备份 → 变异 → 定向红 → `cp` 恢复 → 复绿）：M1 删 poll 路径 watch apply ⇒ AI1–AI6 红；M2 事件不开窗 ⇒ AI1 红；M3 管线跳过最终同步 ⇒ AI2 红；M4 配置换代不增代际 ⇒ AI3 红；M5 重放铸新回执 ⇒ AI5 红（首次变异落在事务内重放点未转红——本流程的重试在 precheck 重放点即返回，事务内点不可达；更正变异点后转红，如实记录）；M6 删无变化抑制 ⇒ AI1 红；M7 复合变异（runtime 无配置条件 + final-sync 快路径**双拆**——单层各自被另一层拦下，防御纵深如实记录）⇒ AI7 红。7/7 全部被对应场景抓住。
+
+**Round1 复审修复变异验证**（加固提交 `1886409`；同法，变异落 daemon dist 后 `cp` 恢复复绿）：M8 watcher close 在释放前拒绝 ⇒ afterEach 泄漏不变式红（6/7 例，AI7 本就不建 watcher）；M9 复合（300 ms 慢关闭 + 删除 successor 对 predecessor close 的 `await`）⇒ AI3 红（revision 2 提交时旧 watcher 物理未关闭——`closed` 标志先抓住，序断言同为红靶）；单删 `await` 一项在本机未转红（chokidar 关闭快于本地 admission，序上偶然串行——任何事件序断言对纯竞态都不保证检出，故采审查同款慢关闭法定为确定性红）；慢关闭控制（`await` 完整 + 300 ms 关闭）⇒ AI3 绿（不误报）；M10 旧 Loop fallback 携带 `artifactSyncError:""` ⇒ AI7 wire 断言红；M11 控制（commit 响应延迟 300 ms）⇒ AI4 绿（settled join 吸收延迟，不误报；红侧「无 join 则同延迟必红」已由 Round1 审查证明）。
 
 ## 假服务端语义平价表
 
@@ -163,7 +165,7 @@ Round 1 零阻断，唯一 P3 证据措辞项经定点复核核销关闭；生�
 | `failNext(step, throw_after_apply)`（prepare/PUT/commit） | AI5(a)/(b)/(c)：真实应用后丢响应，同 requestId/syncId、`published:false`、冻结回执逐值相等 |
 | `offline` | AI4：dial 级断网（请求不出 daemon），退避窗口内恢复收敛 |
 | `expireSession` | AI5(d)：真实服务端时钟驱动的到期 + 原地续期 |
-| `dropSessions`（服务端重启丢 session） | 部分平价：真实服务端 session 是 PGlite 持久的，重启不丢（AI6(b) 证明）；fake 建模的是更弱服务端，真实对应物是过期（AI5(d)） |
+| `dropSessions`（服务端重启丢 session） | 部分平价：fake 建模的是更弱服务端，真实对应物是过期（AI5(d)）。session 行的 PGlite 持久化只是 schema 层事实——AI6(b) 只证明 manifest 行与下载字节跨重启稳定，未重放同一 session 的跨重启 commit，故不作「重启不丢 session」的证据（片 8 Round1 复审指针：second boot 实际清空 session 行而 AI6 仍绿；这不声称产品丢 session，仅纠正证据归因） |
 | `seedBlob`/`needHashes` 协商去重 | AH5/AH6（片 2 真实 HTTP e2e）+ AI5(d) `needHashes:[]` + AI6(a) 零 PUT |
 | `holdPuts`、`before{Prepare,Put,Report}` hooks、`commitSession` | 单元级保留（`artifact-sync.test.ts`、server AC 系套件） |
 | `calls`/`stepCalls`/`maxConcurrentPuts` 日志 | dial.calls 日志（AI1–AI7 的流量断言） |
@@ -183,6 +185,8 @@ $ git diff --check   # EXIT=0
 
 日志：`/tmp/slice8-gates.log`（逐条记录真实退出码）。server 较片 7 基线（994+3）恰 +7：`phase5-batch2-slice8-e2e.test.ts` 的 AI1–AI7。
 
+Round1 复审修复提交 `1886409` 复跑五门全绿（protocol 288 / daemon 790+7skip / server 1001+3skip——断言硬化未新增用例，计数不变 / typecheck / build / `db:check` 无 drift / `git diff --check`）。
+
 ## 显式边界核对
 
 - **变更面**（`c2b1692..f8b3ba1` 代码部分）：仅新增 `phase5-batch2-slice8-e2e.test.ts` 与 `protocol/src/artifact.test.ts` 两行 describe 文案（断言零改动——「Batch 1 不消费」字样已过时）；daemon/server 产品代码、drizzle、lockfile、package.json 零改动：
@@ -194,13 +198,14 @@ $ git diff --check   # EXIT=0
   ```
 
 - **守卫处置**：AD1–AD4 已逐片翻转为激活断言（片 2/5/6/7）；`runtime.test.ts` 的「无 finalSync 依赖 ⇒ 零 artifact 字段」是合法可选依赖组合钉，保留；`store/report.ts`/`coordinator/index.ts` 的缺席 `artifactBinding` 路径保持 comment-only（生产自片 6 永远接线，钉一个生产不运行的配置无意义）；AI7 为旧 Loop 不上传的 e2e 级继任守卫。
-- **protocol 文案例外**：两行 describe 标签改文案不改断言，为本批唯一 protocol 包内改动，在此如实声明。
+- **protocol 文案例外**：两行 describe 标签改文案不改断言，为**片 8** 唯一的 protocol 包内改动（Batch 2 全批的 protocol 改动见各片验收段），在此如实声明。
 - **已知限制与残余**：U2（等价内容重启首轮铸一次 revision）在真实 HTTP 面复现并钉为恰 +1；中流截断在 HTTP 层不可检（决策 27）；下载忽略 Range（决策 27）；`artifact_dir_unconfigured` 读取域无路由返回（决策 27）；**PGlite 单连接证据不替代 #11/#72 的真实多物理连接 Postgres 并发验证**。
 
 ## 复审与 Issue 收口
 
 - 片 1–7 三轨复核的 Issue（#83、#85–#90、#92–#99、#105–#106、#109–#113）全部核销关闭；片 8 的三轨复核在本记录提交后进行，发现项走 Issue Tracker 流程（修复不自行关闭，独立复审核销）。
-- 开放 Issue 恰为右移项 #11/#56/#61/#72；**#72 保持 OPEN**（真实多连接验收归 Phase 6，本批不触碰）。
+- 片 8 Round1 三轨复核（2026-10-07，基线 `c2b1692..0945029`）：三轨各 2P2+1P3，主审去重 3 项 P2——**#114**（watcher 关闭完成/顺序验收假绿）、**#115**（AI7 未验证 Report wire 键缺席）、**#116**（AI4 在 commit 响应落定前统计）；2 项 P3（session 持久化证据归因、「本批」措辞）不建 Issue，已直接修正本记录。修复提交 `1886409`（测试 oracle 加固 + 本记录修订），变异验证 M8–M11 见上节；三项 P2 的核销待独立复审，本记录不自行标记关闭。
+- 开放 Issue 为右移项 #11/#56/#61/#72 与片 8 Round1 待核销项 #114/#115/#116；**#72 保持 OPEN**（真实多连接验收归 Phase 6，本批不触碰）。
 
 ## 结论（Batch 2）
 
