@@ -8,13 +8,14 @@
  * login (the user simply restarts the flow), and nothing about the pending
  * state ever touches the database.
  *
- * Browser binding: the cookie carries ONLY the random `txId`; `state` and the
- * PKCE `codeVerifier` live in this server-side map, never in anything the
- * browser holds onto. (Per the protocol, the state rides the authorize
- * redirect to GitHub and back, and the verifier is sent exactly once — to
- * GitHub's token endpoint; neither is ever delivered to the browser as a
- * value it could reuse.) A callback without the cookie — or with a foreign
- * txId — cannot reach the transaction at all.
+ * Browser binding: the cookie carries ONLY the random `txId`; this
+ * server-side map stores the expected `state` and PKCE `codeVerifier`.
+ * The browser sees and carries `state` in the authorization URL and callback
+ * query. The verifier never reaches the browser; the server sends it to
+ * GitHub's token endpoint in the exchange body. Binding relies on the txId
+ * cookie, one-time consumption of its server-side transaction, and comparison
+ * of the callback state with the stored state. It does not rely on keeping
+ * state secret from the browser.
  *
  * TTL is LAZY: checked on `consume()` against the injected Clock (no sweeper,
  * no timers). The one addition beyond lazy semantics is a bounded-growth
