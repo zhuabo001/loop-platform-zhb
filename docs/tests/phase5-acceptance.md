@@ -251,6 +251,21 @@ GitHub 用户登录后获得个人团队；管理 API 和 Dashboard 只显示该
 - **存量测试改造**：12 个测试文件 19 处 `bootstrapServer` 调用点统一携带 `auth: makeTestAuthConfig()`；`ServerConfig.auth` 为必选字段，遗漏由 typecheck 结构性列全。
 - **已知边界**（ADR-011）：users.id 与 GitHub 耦合（多身份提供商需未来迁移）；Session 级 CSRF 列不进 0006（片 2 落地时 0007 加列）；`unauthenticatedExposureWarning` 文案本片不动（启动提示更新是片 7 条目）。
 
+### 完整质量门（片 1，`1cc201e`）
+
+```text
+$ pnpm test          # EXIT=0
+  packages/protocol: 15 files / 288 tests
+  packages/daemon:   34 passed + 2 skipped files / 790 passed + 7 skipped tests
+  packages/server:   78 passed + 3 skipped files / 1051 passed + 3 skipped tests
+$ pnpm typecheck     # EXIT=0
+$ pnpm build         # EXIT=0
+$ pnpm --filter @loopzhb/server db:check   # EXIT=0；schema.ts 与 drizzle/ 零漂移（迁移 0006 已提交）
+$ git diff --check   # EXIT=0
+```
+
+server 较 Batch 2 基线（1001+3skip）恰 +50：`phase5-batch3-schema.test.ts` 20 项、`phase5-batch3-migration.test.ts` 3 项、config.test.ts 净 +25（42 项替换原 17 项）、start.test.ts +2 项 fail-fast。备注：一次并行负载下的全量 `pnpm test` 曾出现 daemon 单文件瞬态失败，同一代码随后两次独立复跑（daemon 单跑与全量重跑）均全绿，未复现。
+
 ### 复审与 Issue 收口（片 1）
 
 （片级三轨复核在切片完成后进行，发现项走 Issue Tracker 流程。）
