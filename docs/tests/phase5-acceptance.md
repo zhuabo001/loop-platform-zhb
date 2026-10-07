@@ -237,7 +237,7 @@ GitHub 用户登录后获得个人团队；管理 API 和 Dashboard 只显示该
 |---|---|---|
 | LM1 | `server/src/db/phase5-batch3-migration.test.ts` | Batch 2（0005）旧库无损升级：7 张旧表全部旧列 item-equal；旧 machines 行 `team_id`/`revoked_at` 落 null（不自动认领）；4 张身份新表存在且为空；artifact 引用链（snapshotId、manifest entries、已提交 session receipt）逐项保持；journal 精确 7 条 |
 | LM1-freeze | 同上 | `test-fixtures/phase5-migrations/` 与 committed 0000–0005 字节相等、journal idx [0..5] |
-| LM2 | 同上 | 身份四表与 machines（已认领+旧机器）**全行快照、每一列**经两轮 close/reopen + 重复迁移 item-equal；六张旧表全部旧列 item-equal（machines 旧列由全行快照覆盖）；journal 保持 7；表/索引不重复。oracle 覆盖全字段为 #117 修复后的形态，变异探针验证见复审节 |
+| LM2 | 同上 | 身份四表与 machines（已认领+旧机器）**全行快照、每一列**经两轮 close/reopen + 重复迁移 item-equal；六张旧表全部旧列 item-equal（machines 旧列由全行快照覆盖）；journal 保持 7；表/索引不重复。全字段比较的检测能力见下方变异验证（#117） |
 | SC-RT/UQ/CK/ENUM | `server/src/db/phase5-batch3-schema.test.ts`（20 项） | 四表 round-trip；machines 三形态（unclaimed/claimed/revoked）；users PK / teams 部分唯一 / memberships 复合 PK / auth_sessions hash PK 各自仲裁范围；id 格式 CHECK 负例；`TEAM_KINDS`/`MEMBERSHIP_ROLES` server 内部枚举 pin（ADR-011 决策 6 例外） |
 | DB-IDX | `server/src/db/index.test.ts` | 新库建表精确 11 张；索引 14 个名称+定义 pin（含 `teams_personal_owner_idx` 的 `WHERE kind='personal'` 谓词）；重复迁移幂等 |
 | CF-* | `server/src/config.test.ts`（48 项） | origin 规则全集（https 任意 host、http 仅 loopback、拒绝凭据/path/query/fragment、尾斜杠规范化、loopback 缺省派生、非 loopback 无显式 origin 拒绝）；OAuth 双密钥缺失/全空白合并点名报错；callback URL = origin + 固定路径；**拒绝消息不回显原始输入**——哨兵密码注入六个拒绝分支（不可解析/协议/凭据/path+query/fragment/非 loopback http），消息均不含哨兵（#118） |
@@ -281,12 +281,14 @@ $ git diff --check   # EXIT=0
 
 server 较 `1cc201e` 恰 +7：config.test.ts +6（#118 哨兵非泄漏六分支矩阵）、start.test.ts +1（#118 boot 日志边界非泄漏）；LM2 断言加固不改测试计数。另以真实 `dist/start.js` 携带嵌入哨兵密码的 origin 复验 #118：拒绝启动、退出 1、stderr 不含哨兵、dataDir 未创建。
 
-### 复审与 Issue 收口（片 1）
+### 变异验证与独立验收（片 1）
 
-- Round 1 三轨复核（2026-10-07，基线 `4ff517a..a3bbbd2`，handoff：`docs/handoff/codex-handoff-phase5-batch3-slice1-code-review.md`）：Standards 0；Specs 1 P2（**#117** LM2 只断言字段子集，Session user_id/expires_at 与历史 Run artifact_snapshot_id 变异仍通过）；Adversarial 1 P2（**#118** 非法 origin 错误回显原始输入，嵌入密码进入启动 stderr）。
-- 修复（2026-10-07，提交 `1fc3300`）：#117 — LM2 改为身份四表+machines **全行快照**（每一列）与六张旧表全部旧列的 item-equal 比对；复现审查变异探针（Session user_id→999999、expires_at→2099、Run artifact_snapshot_id→NULL）注入后 LM2 如预期转红，移除探针后复绿。#118 — `parseOrigin` 五个拒绝分支消息只保留变量名与失败原因，不再携带输入；config.test.ts 增六分支哨兵非泄漏矩阵、start.test.ts 增 boot 日志边界非泄漏用例；真实 `dist/start.js` 以 `https://ops:SENTINEL_PASSWORD@…` 启动复验：退出 1、stderr 不含哨兵、dataDir 未创建。
-- 两项 Issue 保持 OPEN，修复提交见下节质量门记录；按 Issue Tracker 约定，核销由下一轮独立复审决定，修复方不自行关闭。
+验证日期：2026-10-07；代码与验收记录基线：`0f26505`，行为修复提交：`1fc3300`。
+
+- **LM2 检测能力**（[#117](https://github.com/zhuabo001/loop-platform-zhb/issues/117)）：在独立临时测试副本中，分别将 Session 的 `user_id` 改为 `999999`、`expires_at` 改为 2099 年，以及将历史 Run 的 `artifact_snapshot_id` 设为 NULL。每次仅注入一种变异，LM2 均在对应的全字段比较断言失败（exit 1，1 failed / 2 skipped）；恢复原始代码后通过（exit 0，1 passed / 2 skipped）。
+- **实际启动日志边界**（[#118](https://github.com/zhuabo001/loop-platform-zhb/issues/118)）：通过真实 `dist/start.js` 执行 12 个拒绝探针，覆盖用户名/密码、query、path、fragment、协议、非 loopback HTTP、不可解析 URL、非法端口/IPv6、百分号编码及控制字符。全部退出 1，stdout/stderr 不含敏感哨兵值，dataDir 未创建。该证据验证实际进程日志出口，独立于 `main()` rejection 消息断言。
+- **定向回归**：`config.test.ts`、`start.test.ts`、`phase5-batch3-migration.test.ts` 共 3 个文件、69 项通过；`pnpm typecheck` 和 `git diff --check` 通过。完整 test/build/db:check 的执行结果见前述 `1fc3300` 质量门，本次独立验证未重复执行这些完整质量门。
 
 ### 结论（片 1）
 
-待片级复核核销 #117/#118 后收口。
+本片验收确认：身份模型及唯一约束有效，旧库升级与重复迁移保持历史数据，LM2 能检测身份归属、有效期及快照引用的变化；非法 origin 和缺失 OAuth 配置在资源打开前拒绝启动，origin 拒绝消息与实际启动日志不回显敏感输入。
