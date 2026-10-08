@@ -51,7 +51,7 @@ import { createOwnerControl } from "./owner/index.js";
 import { createScheduleAdmin } from "./schedule/index.js";
 import { RECLAIM_RUN_ERROR } from "./store/runs.js";
 import { createInactivitySweep, type InactivitySweep } from "./sweep/index.js";
-import { FakeClock, makeTestFactories } from "./testkit/index.js";
+import { FakeClock, makeTestFactories, seedClaimedMachineIfAbsent } from "./testkit/index.js";
 
 const TOKEN = "dk_fault_machine";
 const handles: DbHandle[] = [];
@@ -82,6 +82,10 @@ async function bootFake(dataDir?: string): Promise<FakeBoot> {
   const sweepLogs: string[] = [];
   const sweep = createInactivitySweep({ db: handle.db, clock, log: (line) => sweepLogs.push(line) });
   const ownerControl = createOwnerControl({ db: handle.db, clock });
+  // Phase 5 Batch 3 slice 3: poll no longer self-registers — state the claimed
+  // machine the daemon's token polls as (idempotent: re-boots of the same
+  // dataDir re-read the persisted row).
+  await seedClaimedMachineIfAbsent(handle.db, TOKEN);
   return {
     app: createServerApp(
       coordinator,

@@ -173,3 +173,55 @@ _Avoid_: Final upload, run commit
 The server-side derivation of the trusted Storage Namespace from the authenticated Machine; the
 wire can never name one.
 _Avoid_: Tenant lookup, namespace parameter
+
+**User**:
+A GitHub.com account known to the server, keyed by its immutable numeric user ID stored as a
+decimal string; the username is mutable display information only.
+_Avoid_: Account, username as identity
+
+**Team**:
+The unit of resource ownership; a Personal Team is the single team created atomically with a
+User's first login.
+_Avoid_: Organization, workspace
+
+**Membership**:
+The (user, team) grant recording a User's role in a Team; Batch 3 has exactly the owner
+Membership.
+_Avoid_: Invitation, member record
+
+**Login Session**:
+A server-issued browser credential that authenticates one User on the management surface for an
+absolute seven-day lifetime; only its SHA-256 hash is persisted, and logout deletes the row.
+_Avoid_: Session unqualified (agent session, artifact sync session), token
+
+**Unclaimed Machine**:
+A Machine whose `teamId` is null — pre-Batch-3 machines land here and stay invisible to every
+team until an offline Claim.
+_Avoid_: Orphan, legacy machine
+
+**Revoked Machine**:
+A Machine with a non-null `revokedAt`; its credential is dead regardless of team.
+_Avoid_: Disabled, deleted
+
+**Claim**:
+The offline, operator-driven assignment of an Unclaimed Machine and its Artifact history to an
+existing Personal Team.
+_Avoid_: Auto-claim, migration
+
+**Origin**:
+The configured public base URL of the server; the OAuth callback URL derives from it alone,
+never from request headers.
+_Avoid_: Host header, request URL
+
+**Pending OAuth Transaction**:
+The server-memory record of an in-flight GitHub login — state and PKCE verifier held
+server-side, bound to a short-lived HttpOnly cookie carrying only the random transaction id;
+consumed atomically exactly once by the callback, dead after ten minutes or any restart.
+_Avoid_: OAuth session, login state (both collide with Login Session)
+
+**Session CSRF Token**:
+The per-Login-Session form token DERIVED from the session credential
+(`sha256(credential + ":csrf")`), never stored; submitted as the `csrf` form field of logout
+(and later dashboard forms). Distinct from the dashboard's boot-level token, which is one
+process-wide value until slice 6 re-wires the forms.
+_Avoid_: CSRF token unqualified, double-submit cookie

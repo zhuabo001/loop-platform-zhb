@@ -16,7 +16,7 @@ import path from "node:path";
 
 import type { Db } from "../db/index.js";
 import { systemClock, type Clock } from "../time.js";
-import { createMachineAttributionResolver } from "./attribution-machine.js";
+import { createTeamAttributionResolver } from "./attribution-team.js";
 import { createLocalBlobStore } from "./blob-store-local.js";
 import type { ArtifactHomeDeps } from "./sync.js";
 
@@ -50,6 +50,11 @@ export function createProductionArtifactHome(options: ArtifactHomeProductionOpti
     clock: options.clock ?? systemClock,
     ids: { syncId: newArtifactSyncId, manifestId: newArtifactManifestId },
     blobStore: createLocalBlobStore({ rootDir: artifactBlobRoot(dataDir) }),
-    attribution: createMachineAttributionResolver({ db }),
+    // Phase 5 Batch 3 slice 3 (ADR-011): production attribution is the TEAM
+    // namespace derived from the machine's trusted ownership — `teamId` —
+    // not the machine's own id. `createMachineAttributionResolver` is
+    // retained for the slice-4 offline claim CLI, which must locate the
+    // legacy per-machine namespace it is migrating FROM.
+    attribution: createTeamAttributionResolver({ db }),
   };
 }

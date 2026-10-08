@@ -4,7 +4,7 @@
  * real booted server (file-backed PGlite via bootstrapServer, Hono
  * app.request adapted into the daemon's injectable fetch — no TCP port):
  *
- *   daemon poll (self-registers the machine) → GET /api/machines →
+ *   daemon poll (against the pre-seeded CLAIMED machine) → GET /api/machines →
  *   POST /api/loops → POST /api/loops/:id/run → daemon pollOnce (claim →
  *   Fake Runner → report) → GET observation APIs show done/exec + message.
  *
@@ -31,6 +31,7 @@ import { machineIdFromToken } from "@loopzhb/protocol/node";
 import { closeDb, type DbHandle } from "./db/index.js";
 import { runLeases } from "./db/schema.js";
 import { bootstrapServer, type BootedServer } from "./start.js";
+import { makeTestAuthConfig, seedClaimedMachineForToken } from "./testkit/index.js";
 
 const TOKEN = "dk_e2e_machine";
 const handles: DbHandle[] = [];
@@ -41,8 +42,11 @@ afterEach(async () => {
 
 async function boot(): Promise<BootedServer> {
   const dataDir = await mkdtemp(path.join(tmpdir(), `loopzhb-e2e-${process.pid}-`));
-  const b = await bootstrapServer({ host: "127.0.0.1", port: 3000, dataDir });
+  const b = await bootstrapServer({ auth: makeTestAuthConfig(), host: "127.0.0.1", port: 3000, dataDir });
   handles.push(b.handle);
+  // Phase 5 Batch 3 slice 3: poll no longer self-registers — state the claimed
+  // machine this daemon's token polls as.
+  await seedClaimedMachineForToken(b.handle.db, TOKEN);
   return b;
 }
 

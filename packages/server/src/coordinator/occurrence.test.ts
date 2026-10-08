@@ -19,7 +19,7 @@ import { eq } from "drizzle-orm";
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
 import { loops, runs } from "../db/schema.js";
 import { updateSchedule } from "../schedule/index.js";
-import { FakeClock, seedMachine, seedLoop, snapshotRuns } from "../testkit/index.js";
+import { FakeClock, seedClaimedMachineById, seedLoop, snapshotRuns } from "../testkit/index.js";
 import { createRunCoordinator, type RunCoordinatorDependencies } from "./index.js";
 
 const handles: DbHandle[] = [];
@@ -43,7 +43,9 @@ describe("O-group: scheduled trigger and atomic occurrence", () => {
     machineId = "m-test123456789a";
     runIdSeq = 0;
 
-    await seedMachine(db, machineId);
+    // Phase 5 Batch 3 slice 3: the enqueue boundary refuses a loop whose
+    // machine is orphan/unclaimed/revoked — this file's loop must be claimed.
+    await seedClaimedMachineById(db, machineId);
 
     const deps: RunCoordinatorDependencies = {
       db,

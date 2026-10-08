@@ -19,10 +19,20 @@ import { eq } from "drizzle-orm";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
-import { runs } from "../db/schema.js";
-import { SUPERSEDED_MESSAGE } from "../store/runs.js";
+import { machines, runs } from "../db/schema.js";
+import { enqueueExecRunTx, SUPERSEDED_MESSAGE } from "../store/runs.js";
 import { updateSchedule } from "../schedule/state-machine.js";
-import { FakeClock, seedLoop, seedMachine, seedRun, snapshotLoops, snapshotRuns, testDeps } from "../testkit/index.js";
+import {
+  FakeClock,
+  seedClaimedMachineById,
+  seedLoop,
+  seedMachine,
+  seedRun,
+  snapshotLoops,
+  snapshotRuns,
+  testDeps,
+  TEST_TEAM_ID,
+} from "../testkit/index.js";
 import { createRunCoordinator, type RunCoordinator } from "./index.js";
 
 const handles: DbHandle[] = [];
@@ -39,7 +49,9 @@ async function seeded(depsOverrides: Parameters<typeof testDeps>[2] = {}): Promi
   handles.push(h);
   db = h.db;
   clock = new FakeClock();
-  await seedMachine(db, "m-test");
+  // Phase 5 Batch 3 slice 3: enqueue refuses a loop whose machine is not
+  // execution-eligible — the T7 fixtures all ride this CLAIMED machine.
+  await seedClaimedMachineById(db, "m-test");
   await seedLoop(db, { id: "loop-1" });
   coordinator = createRunCoordinator(testDeps(db, clock, depsOverrides));
 }
@@ -313,5 +325,136 @@ describe("enqueueExecRun pendingPolicy (Q-group)", () => {
     expect(result).toEqual({ enqueued: true, runId: "run-1", supersededRunIds: [] });
     expect(hookCalls).toBe(2);
     expect((await snapshotRuns(db))[0]).toMatchObject({ id: "run-1", phase: "pending" });
+  });
+});
+
+/**
+ * E-group (Phase 5 Batch 3 slice 3, ADR-011; review issue #122): the
+ * EXECUTION-ELIGIBILITY gate at the enqueue boundary.
+ *
+ * `enqueueExecRunTx` is the ONE write path that creates Runs — the manual
+ * trigger, the Dashboard's Run Now, the cron tick and the restart catch-up all
+ * funnel through it — so an orphan (no machines row), unclaimed (`teamId`
+ * NULL) or revoked machine's loop must be refused THERE, before the
+ * transaction opens. Zero writes: no new Run, no supersede of the run already
+ * queued, no `loops.revision` bump and no schedule-watermark advance.
+ *
+ * Every negative case compares ALL THREE tables byte-for-byte: "no new Run" is
+ * not enough when the plan also forbids touching the queued pending
+ * (Batch plan §1: 保留现有 pending、历史 Run、配置和 schedule 游标).
+ */
+describe("enqueueExecRun execution-eligibility gate (E-group)", () => {
+  const OCCURRENCE = "2026-08-27T10:00:00.000Z";
+
+  /** A loop with a QUEUED pending run, whose machine is not eligible. */
+  async function seededIneligible(kind: "unclaimed" | "revoked" | "orphan", scheduled = false): Promise<string> {
+    const h = await openMigratedDb();
+    handles.push(h);
+    db = h.db;
+    clock = new FakeClock(new Date("2026-08-27T10:00:00Z"));
+
+    let machineId = "m-orphan00000000"; // no machines row at all
+    if (kind === "unclaimed") {
+      machineId = "m-unclaimed000000";
+      await seedMachine(db, machineId); // teamId NULL
+    } else if (kind === "revoked") {
+      machineId = "m-revoked0000000";
+      await seedMachine(db, machineId, { teamId: TEST_TEAM_ID, revokedAt: "2026-08-27T09:00:00.000Z" });
+    }
+
+    await seedLoop(db, {
+      id: "loop-1",
+      machineId,
+      ...(scheduled
+        ? {
+            cron: "0 10 * * *",
+            timezone: "UTC",
+            enabled: true,
+            scheduleRevision: 0,
+            scheduleActivatedAt: "2026-08-27T09:00:00.000Z",
+            lastScheduledAt: null,
+          }
+        : {}),
+    });
+    await seedRun(db, { id: "old-pending", loopId: "loop-1", machineId, ts: "2026-07-01T00:00:01.000Z" });
+    coordinator = createRunCoordinator(testDeps(db, clock));
+    return machineId;
+  }
+
+  for (const kind of ["unclaimed", "revoked", "orphan"] as const) {
+    it(`E1-${kind}: refuses the manual trigger with zero writes and keeps the queued pending`, async () => {
+      await seededIneligible(kind);
+      const runsBefore = await snapshotRuns(db);
+      const loopsBefore = await snapshotLoops(db);
+      const machinesBefore = await db.select().from(machines);
+
+      const result = await coordinator.enqueueExecRun("loop-1");
+
+      expect(result).toEqual({ enqueued: false, reason: "machine_ineligible" });
+      // The whole business state is byte-identical — including the pending
+      // that a superseding enqueue would have canceled.
+      expect(await snapshotRuns(db)).toEqual(runsBefore);
+      expect(await snapshotLoops(db)).toEqual(loopsBefore);
+      expect(await db.select().from(machines)).toEqual(machinesBefore);
+      expect(runsBefore).toHaveLength(1);
+      expect(runsBefore[0]).toMatchObject({
+        id: "old-pending",
+        phase: "pending",
+        outcome: null,
+        message: null,
+        ts: "2026-07-01T00:00:01.000Z",
+      });
+    });
+  }
+
+  it("E2: the refusal is the STORE's own boundary (enqueueExecRunTx), not a coordinator courtesy", async () => {
+    await seededIneligible("unclaimed");
+    const [loop] = await snapshotLoops(db);
+
+    const result = await enqueueExecRunTx(testDeps(db, clock), loop!);
+
+    expect(result).toEqual({ enqueued: false, reason: "machine_ineligible" });
+    expect(await snapshotRuns(db)).toHaveLength(1);
+    expect((await snapshotRuns(db))[0]).toMatchObject({ id: "old-pending", phase: "pending" });
+  });
+
+  it("E3: a SCHEDULED trigger for an ineligible machine refuses without advancing the watermark", async () => {
+    await seededIneligible("unclaimed", true);
+    const loopsBefore = await snapshotLoops(db);
+
+    const result = await coordinator.enqueueExecRun("loop-1", {
+      kind: "scheduled",
+      scheduledFor: OCCURRENCE,
+      scheduleRevision: 0,
+    });
+
+    expect(result).toEqual({ enqueued: false, reason: "machine_ineligible" });
+    // The catch-up / stale-callback path must not move the cursor either: an
+    // ineligible loop re-scans the SAME occurrence after a restart.
+    expect(await snapshotLoops(db)).toEqual(loopsBefore);
+    expect(loopsBefore[0]!.lastScheduledAt).toBeNull();
+    expect(await snapshotRuns(db)).toHaveLength(1);
+  });
+
+  it("E4: the control — the same loop enqueues normally once its machine is CLAIMED", async () => {
+    const machineId = await seededIneligible("unclaimed");
+    expect(await coordinator.enqueueExecRun("loop-1")).toEqual({
+      enqueued: false,
+      reason: "machine_ineligible",
+    });
+
+    // The claim (slice 4's offline CLI) is the only thing that changes here.
+    await db.update(machines).set({ teamId: TEST_TEAM_ID }).where(eq(machines.id, machineId));
+
+    expect(await coordinator.enqueueExecRun("loop-1")).toEqual({
+      enqueued: true,
+      runId: "run-1",
+      supersededRunIds: ["old-pending"],
+    });
+    const rows = await snapshotRuns(db);
+    expect(rows.map((r) => [r.id, r.phase])).toEqual([
+      ["old-pending", "canceled"],
+      ["run-1", "pending"],
+    ]);
   });
 });

@@ -40,6 +40,7 @@
  */
 import { bodyLimit } from "hono/body-limit";
 import { Hono, type Context } from "hono";
+import type { AuthRoutes } from "../auth/index.js";
 import type { DashboardRoutes } from "../dashboard/routes.js";
 import {
   DASHBOARD_ARTIFACT_CONFIG_PATH,
@@ -279,6 +280,15 @@ export function createServerApp(
    * clean control.
    */
   artifacts?: ArtifactApi,
+  /**
+   * The auth surface (Batch 3 slice 2): the five login/session routes.
+   * OPTIONAL trailing param so the existing call sites are unchanged; absent
+   * ⇒ `/login`, `/auth/*` and `/api/session` stay indistinguishable from
+   * unknown routes. `bootstrapServer` always builds it (config.auth is
+   * REQUIRED) — the absence is a test-assembly choice, never a production
+   * state. Slice 2 does NOT gate the management routes (that is slice 5).
+   */
+  auth?: AuthRoutes,
 ): Hono {
   const app = new Hono();
 
@@ -441,6 +451,13 @@ export function createServerApp(
       return c.json({ enqueued: true, runId: result.runId, supersededRunIds: result.supersededRunIds }, 202);
     }
     if (result.reason === "loop_not_found") return jsonError(c, 404, "not found");
+    // Phase 5 Batch 3 slice 3 (ADR-011 + Batch plan §1): a loop whose machine
+    // is orphan, unclaimed or revoked adds no run and supersedes nothing. The
+    // refusal is a flat 404 like an unknown loop — the same "not a resource
+    // you can act on" classification the slice-5 management scope will use for
+    // unclaimed machines, and deliberately NOT the `running_exists` fallback
+    // below (that would mislabel a refusal as a benign queue state).
+    if (result.reason === "machine_ineligible") return jsonError(c, 404, "not found");
     if (result.reason === "loop_completed") {
       // Phase 4 (ADR-009 决策 10): Run Now on a Completed loop is a flat 409
       // with the additive code — the success union's reason literals stay
@@ -838,6 +855,18 @@ export function createServerApp(
         throw err;
       }
     });
+  }
+
+  // The auth surface (Batch 3 slice 2). Registered before the dashboard
+  // block; ordering vs the global hostGate is irrelevant (the gate is
+  // middleware, applied to every request regardless of route). These routes
+  // never read Host — the callback URL is config-frozen (ADR-011 决策 5).
+  if (auth !== undefined) {
+    app.get("/login", auth.loginPage);
+    app.get("/auth/github", auth.githubStart);
+    app.get("/auth/github/callback", auth.githubCallback);
+    app.post("/auth/logout", auth.formContentType, auth.bodyCap, auth.logout);
+    app.get("/api/session", auth.sessionApi);
   }
 
   // The Dashboard's two HTML routes. Registered last, but their gate is the

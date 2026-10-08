@@ -4,10 +4,9 @@
  * artifact domain: the adapter never imports Db/BlobStore/store functions
  * (its own module doc forbids it), and this module never shapes HTTP.
  *
- * Every machine method authenticates through `verifyMachineCredential`
- * (existing machines only, NEVER registering — ADR-010 决策 7) and passes the
- * store-resolved identity into the state machine, which re-resolves the
- * storage namespace per operation. Credential failure throws the coordinator's
+ * Every machine method authenticates through `verifyEligibleMachineCredential`
+ * (existing AND claimed AND non-revoked machines only, NEVER registering —
+ * ADR-010 决策 7, ADR-011 slice 3). Credential failure throws the coordinator's
  * `InvalidMachineCredentialError` — the ONE 401 source the edge already maps
  * for poll. `updateConfig` is the management path: it carries NO credential
  * (loopback/trusted-network boundary, like every other /api/loops route).
@@ -36,7 +35,7 @@ import type {
 
 import { InvalidMachineCredentialError } from "../coordinator/errors.js";
 import { loops } from "../db/schema.js";
-import { verifyMachineCredential } from "../store/machines.js";
+import { verifyEligibleMachineCredential } from "../store/machines.js";
 import type { TrustedMachineIdentity } from "./attribution.js";
 import {
   diffLoopSnapshots,
@@ -110,7 +109,7 @@ export function createArtifactApi(home: ArtifactHomeDeps): ArtifactApi {
   const reads: ArtifactReadHome = { db, attribution, blobStore };
 
   async function authenticate(token: string): Promise<TrustedMachineIdentity> {
-    const machine = await verifyMachineCredential(db, token);
+    const machine = await verifyEligibleMachineCredential(db, token);
     if (!machine) throw new InvalidMachineCredentialError();
     return { machineId: machine.id };
   }

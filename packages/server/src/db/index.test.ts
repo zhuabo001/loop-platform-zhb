@@ -27,10 +27,14 @@ describe("runMigrations", () => {
       "artifact_blobs",
       "artifact_manifests",
       "artifact_sync_sessions",
+      "auth_sessions",
       "loops",
       "machines",
+      "memberships",
       "run_leases",
       "runs",
+      "teams",
+      "users",
     ]);
   });
 
@@ -51,14 +55,18 @@ describe("runMigrations", () => {
     const expected: Record<string, string> = {
       artifact_manifests_loop_revision_idx: "USING btree (loop_id, manifest_revision)",
       artifact_sync_sessions_request_idx: "USING btree (namespace_id, machine_id, request_id)",
+      auth_sessions_user_idx: "USING btree (user_id)",
       loops_active_schedule_idx: "USING btree (id)",
       loops_machine_idx: "USING btree (machine_id)",
+      machines_team_idx: "USING btree (team_id)",
+      memberships_team_idx: "USING btree (team_id)",
       run_leases_loop_idx: "USING btree (loop_id)",
       run_leases_run_idx: "USING btree (run_id)",
       runs_loop_idx: "USING btree (loop_id)",
       runs_loop_ts_idx: "USING btree (loop_id, ts)",
       runs_pending_idx: "USING btree (machine_id)",
       runs_phase_idx: "USING btree (phase)",
+      teams_personal_owner_idx: "USING btree (owner_user_id)",
     };
     expect([...byName.keys()].sort()).toEqual(Object.keys(expected).sort());
     for (const [name, def] of Object.entries(expected)) {
@@ -71,6 +79,9 @@ describe("runMigrations", () => {
     // The Scheduler's active-schedule scan carries its partial predicate:
     // enabled=true AND cron IS NOT NULL (Phase 3 Batch 1).
     expect(byName.get("loops_active_schedule_idx")).toContain("WHERE ((enabled = true) AND (cron IS NOT NULL))");
+    // One personal team per user (ADR-011 决策 3): the partial predicate pins
+    // the arbitration to kind='personal' rows only.
+    expect(byName.get("teams_personal_owner_idx")).toContain("WHERE (kind = 'personal'::text)");
   });
 
   it("persists across close/reopen in the file-backed tier", async () => {

@@ -67,7 +67,7 @@ import { closeDb } from "./db/index.js";
 import { loops, runLeases, runs } from "./db/schema.js";
 import { AcceptedReportCostObserver, DaemonControlObserver, DaemonLogObserver, DetachedProcessSupervisor } from "./real-claude-e2e-harness.js";
 import { bootstrapServer, waitForListening, type BootedServer } from "./start.js";
-import { FakeClock, FakeCronFactory } from "./testkit/index.js";
+import { FakeClock, FakeCronFactory, makeTestAuthConfig, seedClaimedMachineIfAbsent } from "./testkit/index.js";
 import { assertBatch3StateSource, buildBatch3AcceptanceTask } from "./phase4-batch3-acceptance-task.js";
 
 const ENABLED = process.env.LOOPZHB_REAL_CLAUDE_E2E === "1";
@@ -182,10 +182,14 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 3 real Claude E2E (opt-in)", () => {
       const reportCosts = new AcceptedReportCostObserver();
       const bootOne = async (): Promise<{ booted: BootedServer; url: string }> => {
         const booted = await bootstrapServer(
-          { host: "127.0.0.1", port: 0, dataDir },
+          { auth: makeTestAuthConfig(), host: "127.0.0.1", port: 0, dataDir },
           { clock, cronFactory: new FakeCronFactory() },
         );
         bootedServers.push(booted);
+        // Phase 5 Batch 3 slice 3: poll no longer self-registers — state the
+        // claimed machine this daemon's token polls as (idempotent across the
+        // restart phases, which boot repeatedly on the same dataDir).
+        await seedClaimedMachineIfAbsent(booted.handle.db, TOKEN);
         const listener = serve({ fetch: (req: Request) => reportCosts.fetch(req, (r) => booted.app.fetch(r)), port: 0, hostname: "127.0.0.1" });
         servers.push(listener);
         await waitForListening(listener);
@@ -279,13 +283,15 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 3 real Claude E2E (opt-in)", () => {
         console.log(`[b3-real] Claude version: ${provenance.version}`);
         console.log(`[b3-real] Claude sha256: ${provenance.sha256}`);
 
-        // 5. Machine registration.
+        // 5. Daemon readiness: the machine ROW exists from the start (Phase 5
+        //    Batch 3 slice 3 removed self-registration), so wait for `lastSeen`
+        //    — written only by the daemon's own poll contact.
         const machineId = machineIdFromToken(TOKEN);
         await waitFor(async () => {
-          const res = await fetch(`${baseUrl}/api/machines`);
+          const res = await fetch(`/api/machines`);
           if (!res.ok) return false;
-          const body = (await res.json()) as { machines?: Array<{ id: string }> };
-          return body.machines?.some((m) => m.id === machineId) ?? false;
+          const body = (await res.json()) as { machines?: Array<{ id: string; lastSeen: string | null }> };
+          return body.machines?.some((m) => m.id === machineId && m.lastSeen !== null) ?? false;
         }, REGISTER_TIMEOUT_MS);
 
         // 6. The Closed Loop with an ENABLED schedule, so the finish has to

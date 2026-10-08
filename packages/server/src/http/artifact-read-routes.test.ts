@@ -28,7 +28,7 @@ import { artifactManifests } from "../db/schema.js";
 import { createLifecycleAdmin } from "../loop-lifecycle/admin.js";
 import { createOwnerControl } from "../owner/index.js";
 import { createScheduleAdmin } from "../schedule/index.js";
-import { FakeClock, seedLoop, seedMachineForToken, seedRun, staticAttribution, testDeps } from "../testkit/index.js";
+import { FakeClock, seedLoop, seedClaimedMachineForToken, seedRun, staticAttribution, testDeps } from "../testkit/index.js";
 import { createServerApp } from "./app.js";
 
 const CONTENT_A = "artifact bytes A";
@@ -82,7 +82,7 @@ async function fresh(options: { unmappedAttribution?: boolean } = {}): Promise<v
   handles.push(handle);
   db = handle.db;
   const clock = new FakeClock();
-  machineId = await seedMachineForToken(db, "dk_read_routes_machine");
+  machineId = await seedClaimedMachineForToken(db, "dk_read_routes_machine");
   storeLog = { opens: 0, releases: 0 };
   store = countingStore(createMemoryBlobStore());
   app = createServerApp(

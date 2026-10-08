@@ -42,10 +42,12 @@ import { loops, machines } from "../db/schema.js";
 import { createOwnerControl, type OwnerControl } from "../owner/index.js";
 import {
   FakeClock,
+  makeTestAuthConfig,
   seedLease,
   seedLoop,
   seedMachine,
-  seedMachineForToken,
+  seedClaimedMachineById,
+  seedClaimedMachineForToken,
   seedRun,
   snapshotLoops,
   snapshotRuns,
@@ -54,6 +56,7 @@ import {
 } from "../testkit/index.js";
 import { createArtifactApi, type ArtifactApi } from "../artifact/api.js";
 import { createMemoryBlobStore } from "../artifact/blob-store-memory.js";
+import { createAuthModule } from "../auth/index.js";
 import { createRunCoordinator, type RunCoordinator } from "../coordinator/index.js";
 import { createServerApp } from "./app.js";
 
@@ -152,19 +155,19 @@ describe("createServerApp: seam properties", () => {
 });
 
 describe("POST /api/machine/poll", () => {
-  it("self-registers and returns a schema-valid empty delivery list", async () => {
+  it("rejects an unknown (well-shaped) device token — auto-registration is removed (PG3)", async () => {
     await fresh();
+    // No machine row exists for this token — since Phase 5 Batch 3 slice 3 the
+    // server no longer self-registers; the unified 401 fires immediately.
     const res = await pollReq({ host: "mbp.local" });
-    expect(res.status).toBe(200);
-    expect(res.headers.get("content-type")).toMatch(/application\/json/);
-    const json = await res.json();
-    expect(json).toEqual({ deliveries: [] });
-    expect(pollResponseSchema.parse(json)).toBeTruthy();
+    expect(res.status).toBe(401);
+    // Zero writes: the machines table remains empty.
+    expect(await db.select().from(machines)).toEqual([]);
   });
 
   it("delivers a schema-valid Delivery end-to-end over HTTP", async () => {
     await fresh();
-    const machineId = await seedMachineForToken(db, TOKEN);
+    const machineId = await seedClaimedMachineForToken(db, TOKEN);
     await seedLoop(db, { id: "loop-1", taskFile: "/srv/loop/README.md" });
     await seedRun(db, { id: "run-1", machineId });
 
@@ -202,7 +205,7 @@ describe("POST /api/machine/poll", () => {
     await fresh();
     await expectJsonError(await pollReq({}, "rk_not_a_device_token"), 401, { error: "invalid machine credential" });
     // Mismatched full hash at the derived id (enrolled under another token).
-    const id = await seedMachineForToken(db, "dk_enrolled_elsewhere", {});
+    const id = await seedClaimedMachineForToken(db, "dk_enrolled_elsewhere");
     await db.update(machines).set({ tokenHash: sha256("dk_somebody_else") }).where(eq(machines.id, id));
     await expectJsonError(await pollReq({}, "dk_enrolled_elsewhere"), 401, { error: "invalid machine credential" });
   });
@@ -217,7 +220,7 @@ describe("POST /api/machine/poll", () => {
 describe("POST /api/machine/report", () => {
   it("finalizes over HTTP and returns a schema-valid {ok:true}; repeat → 401 with code", async () => {
     await fresh();
-    const machineId = await seedMachineForToken(db, TOKEN);
+    const machineId = await seedClaimedMachineForToken(db, TOKEN);
     await seedLoop(db, { id: "loop-1" });
     await seedRun(db, { id: "run-1", machineId });
     const pollJson = pollResponseSchema.parse(
@@ -263,7 +266,7 @@ describe("POST /api/machine/report", () => {
 
   it("a forged body.runId cannot steer the finalize (lease is authoritative)", async () => {
     await fresh();
-    const machineId = await seedMachineForToken(db, TOKEN);
+    const machineId = await seedClaimedMachineForToken(db, TOKEN);
     await seedLoop(db, { id: "loop-1" });
     await seedRun(db, { id: "run-1", machineId, phase: "running" });
     await seedLease(db, { tokenHash: sha256("rk_real"), runId: "run-1", machineId });
@@ -451,7 +454,9 @@ describe("POST /api/loops", () => {
 describe("POST /api/loops/:id/run", () => {
   it("202 enqueues exactly one pending exec run (empty body normalizes to {})", async () => {
     await fresh();
-    await seedMachine(db, "m-test");
+    // Phase 5 Batch 3 slice 3: the enqueue boundary requires an execution-
+    // eligible machine — the manually triggered loop's machine is CLAIMED.
+    await seedClaimedMachineById(db, "m-test");
     await seedLoop(db, { id: "loop-1" });
     const res = await triggerReq("loop-1"); // NO body at all
     expect(res.status).toBe(202);
@@ -465,7 +470,7 @@ describe("POST /api/loops/:id/run", () => {
 
   it("inherits T7 over HTTP: re-trigger atomically supersedes the stale pending run", async () => {
     await fresh();
-    await seedMachine(db, "m-test");
+    await seedClaimedMachineById(db, "m-test");
     await seedLoop(db, { id: "loop-1" });
     await triggerReq("loop-1", {});
     // Unknown keys strip away; the second trigger supersedes the first.
@@ -479,7 +484,7 @@ describe("POST /api/loops/:id/run", () => {
 
   it("200 no-op with zero writes while a run is running", async () => {
     await fresh();
-    await seedMachine(db, "m-test");
+    await seedClaimedMachineById(db, "m-test");
     await seedLoop(db, { id: "loop-1" });
     await seedRun(db, { id: "run-live", phase: "running" });
     const before = await snapshotRuns(db);
@@ -497,6 +502,27 @@ describe("POST /api/loops/:id/run", () => {
     expect(await snapshotRuns(db)).toEqual([]);
   });
 
+  it("404 + zero writes when the loop's machine is not execution-eligible (unclaimed) — the queued pending survives", async () => {
+    await fresh();
+    // The ORDINARY pre-claim world: the machine row exists but no team owns it
+    // (Phase 5 Batch 3 slice 3 — before slice 4's offline claim).
+    await seedMachine(db, "m-test");
+    await seedLoop(db, { id: "loop-1" });
+    await seedRun(db, { id: "old-pending", ts: "2026-07-01T00:00:01.000Z" });
+    const runsBefore = await snapshotRuns(db);
+    const loopsBefore = await snapshotLoops(db);
+
+    // A flat 404 — the same classification as an unknown loop (Batch plan §1:
+    // 未认领、其他团队和不存在的资源，对管理入口统一返回 404). It must NOT
+    // fall through to the 200 `running_exists` shape, which would mislabel a
+    // refusal as a benign queue state.
+    await expectJsonError(await triggerReq("loop-1", {}), 404, { error: "not found" });
+
+    expect(await snapshotRuns(db)).toEqual(runsBefore);
+    expect(await snapshotLoops(db)).toEqual(loopsBefore);
+    expect(runsBefore[0]).toMatchObject({ id: "old-pending", phase: "pending", outcome: null });
+  });
+
   it("400 for malformed or non-object JSON, zero writes", async () => {
     await fresh();
     await seedMachine(db, "m-test");
@@ -511,7 +537,7 @@ describe("POST /api/loops/:id/run", () => {
 describe("POST /api/runs/:id/cancel", () => {
   it("200 {canceled:true} on a running run — the capability is revoked in the same transaction (T6's HTTP face)", async () => {
     await fresh();
-    const machineId = await seedMachineForToken(db, TOKEN);
+    const machineId = await seedClaimedMachineForToken(db, TOKEN);
     await seedLoop(db, { id: "loop-1" });
     await seedRun(db, { id: "run-1", machineId });
     const runToken = pollResponseSchema.parse(
@@ -1213,5 +1239,61 @@ describe("AD2(a): create persists artifactDir atomically through the shared plan
       error: "invalid request",
     });
     expect(await snapshotLoops(db)).toHaveLength(1);
+  });
+});
+
+describe("Batch 3 slice 2: the auth surface mount", () => {
+  const AUTH_PATHS: [string, string][] = [
+    ["GET", "/login"],
+    ["GET", "/auth/github"],
+    ["GET", "/auth/github/callback"],
+    ["POST", "/auth/logout"],
+    ["GET", "/api/session"],
+  ];
+
+  it("auth ABSENT: all five paths stay indistinguishable from unknown routes", async () => {
+    await fresh();
+    for (const [method, path] of AUTH_PATHS) {
+      const res = await app.request(path, { method });
+      expect([method, path, res.status]).toEqual([method, path, 404]);
+      expect(await res.json()).toEqual({ error: "not found" });
+    }
+  });
+
+  it("auth PRESENT: the five routes are mounted with their handlers and middleware", async () => {
+    await fresh();
+    const auth = createAuthModule({
+      authConfig: makeTestAuthConfig(),
+      db,
+      clock,
+      // Never reached by these probes (the callback probe fails before the
+      // adapter); a throwing stub proves it.
+      fetchImpl: (() => {
+        throw new Error("unexpected GitHub call");
+      }) as typeof fetch,
+    });
+    const withAuth = createServerApp(
+      coordinator,
+      admin,
+      createLifecycleAdmin({ db, clock }),
+      createScheduleAdmin({ db, clock }),
+      ownerControl,
+      undefined,
+      undefined,
+      undefined,
+      auth,
+    );
+
+    expect((await withAuth.request("/login")).status).toBe(200);
+    const start = await withAuth.request("/auth/github");
+    expect(start.status).toBe(303);
+    expect(start.headers.get("location")).toMatch(/^https:\/\/github\.com\/login\/oauth\/authorize\?/);
+    // The callback's first verdict needs no adapter call.
+    const callback = await withAuth.request("/auth/github/callback");
+    expect(callback.status).toBe(303);
+    expect(callback.headers.get("location")).toBe("/login?error=state_missing");
+    // Logout middleware chain: 415 before any session/CSRF logic.
+    expect((await withAuth.request("/auth/logout", { method: "POST" })).status).toBe(415);
+    expect((await withAuth.request("/api/session")).status).toBe(401);
   });
 });

@@ -60,6 +60,7 @@ import { closeDb, type DbHandle } from "./db/index.js";
 import { loops, runLeases } from "./db/schema.js";
 import { DaemonControlObserver, DaemonLogObserver, DetachedProcessSupervisor } from "./real-claude-e2e-harness.js";
 import { bootstrapServer, waitForListening } from "./start.js";
+import { makeTestAuthConfig, seedClaimedMachineIfAbsent } from "./testkit/index.js";
 
 const ENABLED = process.env.LOOPZHB_REAL_CLAUDE_E2E === "1";
 const TOKEN = "dk_e2e_batch2_real_claude";
@@ -143,8 +144,11 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 2 real Claude E2E (opt-in)", () => {
       // 2. Production server: file PGlite + real HTTP listener.
       const dataDir = await mkdtemp(path.join(tmpdir(), `loopzhb-b2real-data-${process.pid}-`));
       tempDirs.push(dataDir);
-      const booted = await bootstrapServer({ host: "127.0.0.1", port: 0, dataDir });
+      const booted = await bootstrapServer({ auth: makeTestAuthConfig(), host: "127.0.0.1", port: 0, dataDir });
       handles.push(booted.handle);
+      // Phase 5 Batch 3 slice 3: poll no longer self-registers — state the
+      // claimed machine this daemon's token polls as.
+      await seedClaimedMachineIfAbsent(booted.handle.db, TOKEN);
       const server = serve({ fetch: booted.app.fetch, port: 0, hostname: "127.0.0.1" });
       servers.push(server);
       await waitForListening(server);
@@ -204,13 +208,15 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 2 real Claude E2E (opt-in)", () => {
         console.log(`[b2-real] Claude version: ${provenance.version}`);
         console.log(`[b2-real] Claude sha256: ${provenance.sha256}`);
 
-        // 5. Machine registration.
+        // 5. Daemon readiness: the machine ROW exists from the start (Phase 5
+        //    Batch 3 slice 3 removed self-registration), so wait for `lastSeen`
+        //    — written only by the daemon's own poll contact.
         const machineId = machineIdFromToken(TOKEN);
         await waitFor(async () => {
-          const res = await fetch(`${baseUrl}/api/machines`);
+          const res = await fetch(`/api/machines`);
           if (!res.ok) return false;
-          const body = (await res.json()) as { machines?: Array<{ id: string }> };
-          return body.machines?.some((m) => m.id === machineId) ?? false;
+          const body = (await res.json()) as { machines?: Array<{ id: string; lastSeen: string | null }> };
+          return body.machines?.some((m) => m.id === machineId && m.lastSeen !== null) ?? false;
         }, REGISTER_TIMEOUT_MS);
 
         // 6. The Closed Loop (goal + far-future cron to prove the finish

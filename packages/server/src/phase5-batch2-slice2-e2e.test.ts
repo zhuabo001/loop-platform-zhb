@@ -2,9 +2,10 @@
  * AH5/AH6 — the slice-2 acceptance the plan words as "真实 HTTP 完成
  * prepare → PUT → commit": the FULL production assembly (bootstrapServer →
  * file-backed PGlite + the real local BlobStore under `<dataDir>/blobs`), a
- * REAL listener, and fetch. No internal shortcut: the machine enrolls itself
- * through poll, the loop is created through POST /api/loops with its
- * artifactDir, and every sync step rides the mounted routes.
+ * REAL listener, and fetch. No internal shortcut: the machine is seeded as
+ * CLAIMED (Phase 5 Batch 3 slice 3 removed poll self-registration) and makes
+ * its first contact through poll, the loop is created through POST /api/loops
+ * with its artifactDir, and every sync step rides the mounted routes.
  *
  * Also covered here: the CHUNKED prepare cap (a streamed oversize body is
  * rejected at the transport gate — the app.request-level suite can only
@@ -35,7 +36,7 @@ import { machineIdFromToken } from "@loopzhb/protocol/node";
 
 import { closeDb, type DbHandle } from "./db/index.js";
 import { artifactManifests, loops } from "./db/schema.js";
-import { FakeClock } from "./testkit/index.js";
+import { FakeClock, makeTestAuthConfig, seedClaimedMachineForToken, TEST_TEAM_ID } from "./testkit/index.js";
 import { bootstrapServer, waitForListening } from "./start.js";
 
 const TOKEN = "dk_e2e_batch2_slice2_token";
@@ -56,7 +57,7 @@ interface Harness {
 async function bootRealServer(): Promise<Harness> {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "loopzhb-slice2-e2e-"));
   const booted = await bootstrapServer(
-    { host: "127.0.0.1", port: 0, dataDir },
+    { auth: makeTestAuthConfig(), host: "127.0.0.1", port: 0, dataDir },
     { clock: new FakeClock() },
   );
   const server: ServerType = serve({ fetch: booted.app.fetch, port: 0, hostname: "127.0.0.1" });
@@ -68,6 +69,9 @@ async function bootRealServer(): Promise<Harness> {
     await fs.rm(dataDir, { recursive: true, force: true });
   };
   cleanups.push(close);
+  // Phase 5 Batch 3 slice 3: poll no longer self-registers — state the claimed
+  // machine this daemon's token polls as, before the first contact.
+  await seedClaimedMachineForToken(booted.handle.db, TOKEN);
   return { base: `http://127.0.0.1:${port}`, dataDir, handle: booted.handle, close };
 }
 
@@ -76,7 +80,10 @@ const machineHeaders = (extra: Record<string, string> = {}) => ({
   ...extra,
 });
 
-async function enrollMachine(base: string): Promise<void> {
+/** First contact by the pre-seeded claimed machine — a VERIFYING poll since
+ *  Phase 5 Batch 3 slice 3 removed self-registration (the machine is seeded
+ *  as claimed in bootRealServer). */
+async function firstPoll(base: string): Promise<void> {
   const res = await fetch(`${base}/api/machine/poll`, {
     method: "POST",
     headers: { "content-type": "application/json", ...machineHeaders() },
@@ -104,7 +111,7 @@ async function createConfiguredLoop(base: string, artifactDir: string): Promise<
 describe("AH5: the real-HTTP prepare → chunked PUT → commit chain", () => {
   it("syncs a file end to end and lands the bytes under <dataDir>/blobs", async () => {
     const harness = await bootRealServer();
-    await enrollMachine(harness.base);
+    await firstPoll(harness.base);
     const loopId = await createConfiguredLoop(harness.base, "/home/dev/project/dist");
 
     const bytes = new TextEncoder().encode(CONTENT);
@@ -156,8 +163,9 @@ describe("AH5: the real-HTTP prepare → chunked PUT → commit chain", () => {
     const receipt = commitArtifactSyncResponseSchema.parse(await commit.json());
     expect(receipt.manifestRevision).toBe(1);
 
-    // The bytes are on disk at the production path, byte-for-byte.
-    const blobPath = path.join(harness.dataDir, "blobs", machineIdFromToken(TOKEN), hash);
+    // The bytes are on disk at the production path, byte-for-byte. Phase 5
+    // Batch 3 slice 3: the namespace is the OWNING TEAM, not the machine id.
+    const blobPath = path.join(harness.dataDir, "blobs", TEST_TEAM_ID, hash);
     expect(await fs.readFile(blobPath)).toEqual(Buffer.from(bytes));
 
     // The loop's pointer advanced to the receipt's snapshot.
@@ -191,7 +199,7 @@ describe("AH5: the real-HTTP prepare → chunked PUT → commit chain", () => {
 
   it("rejects a CHUNKED body over the 8 MiB prepare cap at the transport gate", async () => {
     const harness = await bootRealServer();
-    await enrollMachine(harness.base);
+    await firstPoll(harness.base);
     const oversize = new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(new Uint8Array(ARTIFACT_PREPARE_REQUEST_MAX_UTF8_BYTES));

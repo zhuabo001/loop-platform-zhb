@@ -20,7 +20,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { closeDb, type DbHandle } from "../db/index.js";
 import { bootstrapServer, type BootedServer } from "../start.js";
-import { seedLoop, seedMachine, seedRun, snapshotRuns } from "../testkit/index.js";
+import { makeTestAuthConfig, seedClaimedMachineById, seedLoop, seedRun, snapshotRuns } from "../testkit/index.js";
 
 const handles: DbHandle[] = [];
 const dirs: string[] = [];
@@ -38,7 +38,7 @@ async function tmpDataDir(): Promise<string> {
 }
 
 async function boot(host: string, dataDir: string): Promise<BootedServer> {
-  const booted = await bootstrapServer({ host, port: 0, dataDir });
+  const booted = await bootstrapServer({ auth: makeTestAuthConfig(), host, port: 0, dataDir });
   handles.push(booted.handle);
   return booted;
 }
@@ -126,6 +126,9 @@ describe("H-group (Batch 3 Dashboard mount): assembly through bootstrapServer", 
 
   it("H9: a second Run Now leaves the queued run alone — the skip policy is really assembled", async () => {
     const booted = await boot("127.0.0.1", await tmpDataDir());
+    // The loop's machine must be execution-eligible (Phase 5 Batch 3 slice 3:
+    // the enqueue boundary refuses orphan/unclaimed/revoked machines).
+    await seedClaimedMachineById(booted.handle.db, "m-test");
     await seedLoop(booted.handle.db, { id: "loop-1" });
     const token = csrfFrom(await (await booted.app.request("/", { headers: { host: "127.0.0.1" } })).text());
 
@@ -148,8 +151,9 @@ describe("slice 7 (决策 27): the artifact pages through the REAL composition r
   it("the loop artifact page serves, the config form round-trips, and the run page shows the missing state", async () => {
     const booted = await boot("127.0.0.1", await tmpDataDir());
     // The production attribution resolver reads the machines row — the loop's
-    // machine must exist or every read is the 403.
-    await seedMachine(booted.handle.db, "m-test");
+    // machine must exist AND be claimed (Phase 5 Batch 3 slice 3: the
+    // namespace is the owning Team) or every read is the 403.
+    await seedClaimedMachineById(booted.handle.db, "m-test");
     await seedLoop(booted.handle.db, { id: "loop-1", machineId: "m-test", artifactDir: "/data/out" });
     await seedRun(booted.handle.db, { id: "run-1", loopId: "loop-1", machineId: "m-test", artifactSnapshotId: null });
 

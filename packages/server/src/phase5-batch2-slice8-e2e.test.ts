@@ -64,7 +64,7 @@ import { createChokidarWatcher, type ArtifactWatcherFactory } from "../../daemon
 import { closeDb } from "./db/index.js";
 import { artifactManifests, loops, runs } from "./db/schema.js";
 import { bootstrapServer, waitForListening, type BootedServer } from "./start.js";
-import { FakeClock, FakeCronFactory } from "./testkit/index.js";
+import { FakeClock, FakeCronFactory, makeTestAuthConfig, seedClaimedMachineIfAbsent, TEST_TEAM_ID } from "./testkit/index.js";
 
 const TOKEN = "dk_slice8_e2e_machine";
 const MACHINE_ID = machineIdFromToken(TOKEN);
@@ -152,7 +152,7 @@ async function shutdown(rs: RunningServer): Promise<void> {
  *  override seam so nothing fires autonomously. */
 async function bootServer(dataDir: string, clock: FakeClock): Promise<RunningServer> {
   const cronFactory = new FakeCronFactory();
-  const booted = await bootstrapServer({ host: "127.0.0.1", port: 0, dataDir }, { clock, cronFactory });
+  const booted = await bootstrapServer({ auth: makeTestAuthConfig(), host: "127.0.0.1", port: 0, dataDir }, { clock, cronFactory });
   const server = serve({ fetch: booted.app.fetch, port: 0, hostname: "127.0.0.1" });
   try {
     await waitForListening(server);
@@ -166,6 +166,10 @@ async function bootServer(dataDir: string, clock: FakeClock): Promise<RunningSer
   const port = typeof address === "object" && address !== null ? address.port : 0;
   const rs: RunningServer = { ...booted, server, baseUrl: `http://127.0.0.1:${port}` };
   runningServers.add(rs);
+  // Phase 5 Batch 3 slice 3: poll no longer self-registers — state the claimed
+  // machine this daemon's token polls as (idempotent across boots of the same
+  // dataDir, which re-reads the persisted row instead of re-inserting).
+  await seedClaimedMachineIfAbsent(rs.handle.db, TOKEN);
   try {
     await rs.scheduler.start();
     return rs;
@@ -393,7 +397,7 @@ async function manifestPaths(db: Db, loopId: string): Promise<string[]> {
 /** Every blob the manifest names must exist on disk (no partial manifest). */
 async function expectBlobsOnDisk(dataDir: string, manifest: { entries: ReadonlyArray<{ hash: string }> }): Promise<void> {
   for (const entry of manifest.entries) {
-    await readFile(path.join(dataDir, "blobs", MACHINE_ID, entry.hash));
+    await readFile(path.join(dataDir, "blobs", TEST_TEAM_ID, entry.hash));
   }
 }
 
@@ -855,7 +859,7 @@ describe("slice 8 fault-integration E2E (real HTTP + file PGlite + local BlobSto
       expect(manifest.configRevision).toBe(finalLoop.artifactConfigRevision);
       await expectBlobsOnDisk(dataDir, manifest);
     }
-    const blobNames = await readdir(path.join(dataDir, "blobs", MACHINE_ID));
+    const blobNames = await readdir(path.join(dataDir, "blobs", TEST_TEAM_ID));
     expect(blobNames.length).toBeGreaterThan(0);
     expect(blobNames.every((name) => /^[0-9a-f]{64}$/.test(name))).toBe(true);
   }, 90_000);
@@ -903,7 +907,7 @@ describe("slice 8 fault-integration E2E (real HTTP + file PGlite + local BlobSto
     // prepare, no PUT, no commit, no error reports.
     expect(dial.artifactCalls()).toEqual([]);
     expect(stack.tracked).toEqual([]);
-    // And the blob root was never even created for this machine.
-    await expect(readdir(path.join(dataDir, "blobs", MACHINE_ID))).rejects.toThrow();
+    // And the blob root was never even created for this team's namespace.
+    await expect(readdir(path.join(dataDir, "blobs", TEST_TEAM_ID))).rejects.toThrow();
   }, 90_000);
 });

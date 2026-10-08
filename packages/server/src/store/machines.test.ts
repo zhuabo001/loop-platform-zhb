@@ -11,12 +11,13 @@ import { machineIdFromToken } from "@loopzhb/protocol/node";
 
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
 import { machines } from "../db/schema.js";
-import { seedMachineForToken } from "../testkit/index.js";
+import { seedMachineForToken, TEST_TEAM_ID } from "../testkit/index.js";
 import {
   classifyHeartbeatWatermark,
   heartbeatAgeMs,
   HEARTBEAT_SKEW_SLACK_MS,
   isHeartbeatWatermarkAnomalous,
+  verifyEligibleMachineCredential,
   verifyMachineCredential,
 } from "./machines.js";
 
@@ -113,6 +114,78 @@ describe("verifyMachineCredential — existing machines only, never registering"
     await seedMachineForToken(db, TOKEN);
     for (const token of ["", "dk", "dk_x", "bearer x", `dk_${"a".repeat(121)}`]) {
       expect(await verifyMachineCredential(db, token), token).toBeUndefined();
+    }
+  });
+});
+
+// ---- verifyEligibleMachineCredential (PG3–PG5b) ----
+//
+// Five-step gate: shape → derived-id → full-hash → teamId (claimed) →
+// revokedAt (active). All failure reasons collapse to undefined — no signal
+// leakage. Tests at the pure store layer; the HTTP 401 mapping is end-to-end.
+
+describe("verifyEligibleMachineCredential — machine gate (PG3–PG5b)", () => {
+  const TOKEN = "dk_test_elig_alpha";
+  const TEAM_ID = TEST_TEAM_ID;
+
+  let handle: DbHandle;
+  let db: Db;
+
+  afterEach(async () => {
+    if (handle !== undefined) await closeDb(handle);
+    handle = undefined as unknown as DbHandle;
+  });
+
+  async function fresh(): Promise<void> {
+    handle = await openMigratedDb();
+    db = handle.db;
+  }
+
+  it("PG3: unknown token (no row) → undefined, zero writes", async () => {
+    await fresh();
+    const before = await db.select().from(machines);
+    expect(await verifyEligibleMachineCredential(db, TOKEN)).toBeUndefined();
+    expect(await db.select().from(machines)).toEqual(before);
+  });
+
+  it("PG4: full-hash mismatch → undefined (collision defence)", async () => {
+    await fresh();
+    await db.insert(machines).values({
+      id: machineIdFromToken(TOKEN),
+      name: "",
+      tokenHash: "not-the-real-hash",
+      teamId: TEAM_ID,
+      createdAt: "2026-07-01T00:00:00.000Z",
+    });
+    expect(await verifyEligibleMachineCredential(db, TOKEN)).toBeUndefined();
+  });
+
+  it("PG5: valid hash but teamId IS NULL (unclaimed) → undefined", async () => {
+    await fresh();
+    await seedMachineForToken(db, TOKEN); // no teamId override → null
+    expect(await verifyEligibleMachineCredential(db, TOKEN)).toBeUndefined();
+  });
+
+  it("PG5b: valid hash, teamId set, but revokedAt IS NOT NULL → undefined", async () => {
+    await fresh();
+    await seedMachineForToken(db, TOKEN, { teamId: TEAM_ID, revokedAt: "2026-07-01T00:00:00.000Z" });
+    expect(await verifyEligibleMachineCredential(db, TOKEN)).toBeUndefined();
+  });
+
+  it("PG6: valid hash + teamId + revokedAt null → returns the row", async () => {
+    await fresh();
+    await seedMachineForToken(db, TOKEN, { teamId: TEAM_ID });
+    const result = await verifyEligibleMachineCredential(db, TOKEN);
+    expect(result).not.toBeUndefined();
+    expect(result!.teamId).toBe(TEAM_ID);
+    expect(result!.revokedAt).toBeNull();
+  });
+
+  it("PG2: ill-shaped tokens never reach the DB", async () => {
+    await fresh();
+    await seedMachineForToken(db, TOKEN, { teamId: TEAM_ID });
+    for (const bad of ["", "dk", "dk_x", "bearer x", `dk_${"a".repeat(121)}`]) {
+      expect(await verifyEligibleMachineCredential(db, bad), bad).toBeUndefined();
     }
   });
 });

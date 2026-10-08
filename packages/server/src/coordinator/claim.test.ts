@@ -29,6 +29,7 @@ import {
   FakeClock,
   makeTestFactories,
   seedLoop,
+  seedClaimedMachineForToken,
   seedMachineForToken,
   seedRun,
   snapshotRuns,
@@ -55,7 +56,7 @@ async function fresh(): Promise<void> {
   handles.push(h);
   db = h.db;
   clock = new FakeClock();
-  machineId = await seedMachineForToken(db, TOKEN);
+  machineId = await seedClaimedMachineForToken(db, TOKEN);
   await seedLoop(db, { id: "loop-1", name: "react-doctor", taskFile: "/home/dev/loops/react-doctor/README.md" });
   const base = makeTestFactories();
   mintCount = 0;
@@ -366,7 +367,7 @@ describe("poll claim: availableSlots capacity gating (Phase 2)", () => {
     expect(mintCount).toBe(0);
     // Idle old daemon (a machine with NO pending work): the hint is never
     // sent on an idle poll (ADR-009 决策 7).
-    await seedMachineForToken(db, OTHER_TOKEN);
+    await seedClaimedMachineForToken(db, OTHER_TOKEN);
     const idle = await coordinator.poll(OTHER_TOKEN, {});
     expect(idle.deliveries).toEqual([]);
     expect(idle).not.toHaveProperty("requiredCapabilities");
