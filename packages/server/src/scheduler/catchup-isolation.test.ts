@@ -15,7 +15,7 @@ import { eq } from "drizzle-orm";
 
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
 import { loops } from "../db/schema.js";
-import { FakeClock, FakeCronFactory, seedMachine, seedLoop, snapshotRuns, testDeps } from "../testkit/index.js";
+import { FakeClock, FakeCronFactory, seedClaimedMachineById, seedLoop, snapshotRuns, testDeps } from "../testkit/index.js";
 import { createRunCoordinator, type RunCoordinator } from "../coordinator/index.js";
 import { createScheduler, type CronFactory, type Scheduler } from "./index.js";
 
@@ -43,7 +43,7 @@ describe("X-group: catch-up fault isolation and log discipline", () => {
     clock = new FakeClock(new Date("2026-08-27T12:30:00.000Z"));
     logs = [];
     runSeq = 0;
-    await seedMachine(db, MACHINE_ID);
+    await seedClaimedMachineById(db, MACHINE_ID);
     cronFactory = new FakeCronFactory();
     coordinator = createRunCoordinator(testDeps(db, clock, { newRunId: () => `run-${++runSeq}` }));
     scheduler = createScheduler({ db, coordinator, clock, cronFactory, log: (line) => logs.push(line) });

@@ -33,7 +33,7 @@ import { loops, machines, runLeases, runs } from "../db/schema.js";
 import { createLifecycleAdmin } from "../loop-lifecycle/admin.js";
 import { createOwnerControl, type OwnerControl } from "../owner/index.js";
 import { createScheduleAdmin } from "../schedule/index.js";
-import { FakeClock, seedLoop, seedMachineForToken, seedRun, snapshotLoops, testDeps } from "../testkit/index.js";
+import { FakeClock, seedLoop, seedClaimedMachineForToken, seedRun, snapshotLoops, testDeps } from "../testkit/index.js";
 import { createRunCoordinator, type RunCoordinator } from "../coordinator/index.js";
 import { createServerApp } from "./app.js";
 
@@ -60,7 +60,7 @@ async function fresh(): Promise<string> {
   const admin: LoopAdmin = createLoopAdmin({ db, clock, newLoopId: () => `loop-${++loopN}` });
   const ownerControl: OwnerControl = createOwnerControl({ db, clock });
   app = createServerApp(coordinator, admin, createLifecycleAdmin({ db, clock }), createScheduleAdmin({ db, clock }), ownerControl);
-  return seedMachineForToken(db, TOKEN);
+  return seedClaimedMachineForToken(db, TOKEN);
 }
 
 async function pollReq(body: unknown): Promise<Response> {

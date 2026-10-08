@@ -26,12 +26,21 @@ import { createMachineAttributionResolver } from "../artifact/attribution-machin
 import { createMemoryBlobStore } from "../artifact/blob-store-memory.js";
 import { createRunCoordinator } from "../coordinator/index.js";
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
-import { artifactSyncSessions, loops } from "../db/schema.js";
+import { artifactBlobs, artifactManifests, artifactSyncSessions, loops, machines } from "../db/schema.js";
 import { createLifecycleAdmin } from "../loop-lifecycle/admin.js";
 import { createOwnerControl } from "../owner/index.js";
 import { createScheduleAdmin } from "../schedule/index.js";
 import { REVISION_INT32_MAX } from "../schedule/transition.js";
-import { FakeClock, seedLoop, seedMachineForToken, staticAttribution, testDeps } from "../testkit/index.js";
+import {
+  FakeClock,
+  seedClaimedMachineForToken,
+  seedLease,
+  seedLoop,
+  seedRun,
+  snapshotBusinessState,
+  staticAttribution,
+  testDeps,
+} from "../testkit/index.js";
 import { createServerApp } from "./app.js";
 
 const TOKEN = "dk_routes_machine_alpha";
@@ -81,8 +90,8 @@ async function fresh(options: { artifactFault?: { at: number; cause: unknown } }
   clock = new FakeClock();
   syncSeq = 0;
   manifestSeq = 0;
-  machineId = await seedMachineForToken(db, TOKEN);
-  const otherMachineId = await seedMachineForToken(db, OTHER_TOKEN);
+  machineId = await seedClaimedMachineForToken(db, TOKEN);
+  const otherMachineId = await seedClaimedMachineForToken(db, OTHER_TOKEN);
   const artifactDb = options.artifactFault ? faultingSelect(db, options.artifactFault.at, options.artifactFault.cause) : db;
   app = createServerApp(
     createRunCoordinator(testDeps(db, clock)),
@@ -272,6 +281,108 @@ describe("AH9: GET /api/machine/loops/:id/artifacts", () => {
     await expectJson(await app.request("/api/machine/loops/loop-1/artifacts"), 401, {
       error: "invalid machine credential",
     });
+  });
+
+  /**
+   * This machine's OWN history — a queued run with its lease, a committed sync
+   * session, its manifest and the verified blob metadata — so the refusals
+   * below are compared against a POPULATED database rather than empty tables
+   * (review issue #123: "empty stayed empty" proves almost nothing).
+   */
+  async function seedMachineHistory(): Promise<void> {
+    await seedRun(db, { id: "run-queued", loopId: "loop-1", machineId });
+    await seedLease(db, { tokenHash: sha256("rk_routes_lease"), runId: "run-queued", loopId: "loop-1", machineId });
+    const entry = { path: "dist/a.js", hash: HASH_A, size: CONTENT_A.length };
+    await db.insert(artifactSyncSessions).values({
+      id: "sync-committed",
+      namespaceId: "ns-1",
+      machineId,
+      loopId: "loop-1",
+      requestId: "req-committed",
+      configRevision: 1,
+      baseManifestRevision: 0,
+      normalizedManifest: [entry],
+      payloadFingerprint: "f".repeat(64),
+      negotiatedHashes: [HASH_A],
+      createdAt: clock.iso(),
+      expiresAt: new Date(clock.now().getTime() + ARTIFACT_SYNC_SESSION_TTL_MILLIS).toISOString(),
+      receipt: { artifactSnapshotId: "amf-history", manifestRevision: 1 },
+    });
+    await db.insert(artifactManifests).values({
+      id: "amf-history",
+      namespaceId: "ns-1",
+      machineId,
+      loopId: "loop-1",
+      configRevision: 1,
+      manifestRevision: 1,
+      entries: [entry],
+      fileCount: 1,
+      totalBytes: CONTENT_A.length,
+      committedAt: clock.iso(),
+    });
+    await db.insert(artifactBlobs).values({
+      namespaceId: "ns-1",
+      hash: HASH_A,
+      size: CONTENT_A.length,
+      verifiedAt: clock.iso(),
+    });
+  }
+
+  // Phase 5 Batch 3 slice 3 (ADR-011): the Artifact path shares poll's
+  // execution-eligibility gate — an UNCLAIMED or REVOKED machine's valid
+  // credential is the same unified 401, never a namespace-less read. Each
+  // refusal is proved by comparing the ENTIRE business state (machines, loops,
+  // runs, leases and all three Artifact tables) before and after.
+  it("PG5: an UNCLAIMED machine's valid credential → 401 (no machine-namespace fallback)", async () => {
+    await fresh();
+    await configuredLoop();
+    await seedMachineHistory();
+    await db.update(machines).set({ teamId: null }).where(eq(machines.id, machineId));
+    const before = await snapshotBusinessState(db);
+    // The fixture is non-empty by construction — the comparison has teeth.
+    expect(before.runs).toHaveLength(1);
+    expect(before.runLeases).toHaveLength(1);
+    expect(before.artifactManifests).toHaveLength(1);
+
+    await expectJson(await machineReq("/api/machine/loops/loop-1/artifacts"), 401, {
+      error: "invalid machine credential",
+    });
+
+    expect(await snapshotBusinessState(db)).toEqual(before);
+  });
+
+  it("PG5b: a REVOKED machine's valid credential → 401, its own history untouched", async () => {
+    await fresh();
+    await configuredLoop();
+    await seedMachineHistory();
+    await db.update(machines).set({ revokedAt: clock.iso() }).where(eq(machines.id, machineId));
+    const before = await snapshotBusinessState(db);
+
+    await expectJson(await machineReq("/api/machine/loops/loop-1/artifacts"), 401, {
+      error: "invalid machine credential",
+    });
+    // A revoked machine's committed snapshots stay READABLE to its team (the
+    // resolver deliberately ignores revocation) — but this credential reaches
+    // neither the rows nor the blob store.
+    expect(await snapshotBusinessState(db)).toEqual(before);
+
+    // The write half too: prepare is the same gate.
+    await expectJson(
+      await machineReq("/api/machine/sync", {
+        method: "POST",
+        headers: jsonHeaders,
+        body: JSON.stringify({
+          requestId: "req-revoked",
+          loopId: "loop-1",
+          configRevision: 1,
+          baseManifestRevision: 0,
+          entries: [{ path: "dist/b.js", hash: HASH_A, size: CONTENT_A.length }],
+        }),
+      }),
+      401,
+      { error: "invalid machine credential" },
+    );
+    expect(await snapshotBusinessState(db)).toEqual(before);
   });
 });
 

@@ -6,7 +6,7 @@
  * factories with predictable sequences, and tiny row-seeding helpers so each
  * test states its fixture in one line.
  */
-import { asc } from "drizzle-orm";
+import { asc, eq } from "drizzle-orm";
 
 import { machineIdFromToken, sha256 } from "@loopzhb/protocol/node";
 
@@ -14,6 +14,9 @@ import type { RunCoordinatorDependencies } from "../coordinator/index.js";
 import type { AuthConfig } from "../config.js";
 import type { Db } from "../db/index.js";
 import {
+  artifactBlobs,
+  artifactManifests,
+  artifactSyncSessions,
   authSessions,
   loops,
   machines,
@@ -124,12 +127,24 @@ export function testDeps(
   return { db, clock, ...makeTestFactories(), ...overrides };
 }
 
-export async function seedMachine(db: Db, id: string, tokenHash = `hash-${id}`): Promise<void> {
-  await db.insert(machines).values({ id, name: "", tokenHash, createdAt: "2026-07-01T00:00:00.000Z" });
+/** Seed a machine by ID. `overrides` carries anything the fixture needs to
+ *  state explicitly — `teamId` for a claimed machine, `revokedAt` for a
+ *  revoked one; the omitted fields stay at their neutral values (teamId null =
+ *  UNCLAIMED). */
+export async function seedMachine(db: Db, id: string, overrides: Partial<NewMachine> = {}): Promise<void> {
+  await db.insert(machines).values({
+    id,
+    name: "",
+    tokenHash: `hash-${id}`,
+    createdAt: "2026-07-01T00:00:00.000Z",
+    ...overrides,
+  });
 }
 
-/** Seed the machine a given device token would self-register as (derived id +
- *  full hash — exactly what a first poll would have created). Returns the id. */
+/** Seed a machine row at the id a device token derives to — the row's id and
+ *  full token hash are exactly what the credential gate compares against.
+ *  `teamId` defaults to NULL: the row is UNCLAIMED, which the poll gate
+ *  rejects (PG5). Use `seedClaimedMachineForToken` for an eligible machine. */
 export async function seedMachineForToken(
   db: Db,
   token: string,
@@ -143,6 +158,47 @@ export async function seedMachineForToken(
     createdAt: "2026-07-01T00:00:00.000Z",
     ...overrides,
   });
+  return id;
+}
+
+/** The standard Team fixture id — same `t-<hex16>` shape ADR-011 决策 2 mints,
+ *  and legal under the BlobStore's NAMESPACE_ID_RE. */
+export const TEST_TEAM_ID = "t-0123456789abcdef";
+
+/** Seed a machine row BY ID as claimed by the standard test team and not
+ *  revoked — the execution-eligible fixture for tests that know only a
+ *  machine id (loops, artifact reads, the scheduler). Token-based callers use
+ *  `seedClaimedMachine` instead. */
+export async function seedClaimedMachineById(db: Db, id: string): Promise<void> {
+  await seedMachine(db, id, { teamId: TEST_TEAM_ID });
+}
+
+/**
+ * Seed a machine for a device token as CLAIMED and NOT REVOKED — the
+ * execution-eligible fixture (Phase 5 Batch 3 slice 3, ADR-011).
+ *
+ * Slice 3 removed production self-registration, so every test that polls must
+ * state its machine explicitly. `seedMachineForToken` alone produces an
+ * UNCLAIMED row (teamId NULL), which the poll gate now rejects with the
+ * unified 401 — that is the PG5 fixture. This helper is the PG6 one.
+ */
+export async function seedClaimedMachineForToken(
+  db: Db,
+  token: string,
+  overrides: Partial<NewMachine> = {},
+): Promise<string> {
+  return seedMachineForToken(db, token, { teamId: TEST_TEAM_ID, ...overrides });
+}
+
+/**
+ * Idempotent variant for REBOOT scenarios: a second boot of the same dataDir
+ * re-reads the persisted row instead of inserting a duplicate. Returns the
+ * machine id either way.
+ */
+export async function seedClaimedMachineIfAbsent(db: Db, token: string): Promise<string> {
+  const id = machineIdFromToken(token);
+  const existing = await db.select({ id: machines.id }).from(machines).where(eq(machines.id, id));
+  if (existing.length === 0) await seedClaimedMachineForToken(db, token);
   return id;
 }
 
@@ -196,6 +252,30 @@ export async function snapshotLoops(db: Db): Promise<Loop[]> {
 
 export async function snapshotLeases(db: Db): Promise<RunLeaseRow[]> {
   return db.select().from(runLeases).orderBy(asc(runLeases.tokenHash));
+}
+
+/**
+ * EVERY business table, deterministically ordered — the zero-write oracle for
+ * the Phase 5 Batch 3 slice 3 refusal paths (Batch plan §1 验收: 对比拒绝前后
+ * Machine、Run、Lease 和 Artifact 状态，证明零业务写入).
+ *
+ * Pair it with a POPULATED fixture: an empty table trivially "stays equal",
+ * so a refusal test that seeds nothing proves almost nothing (review issue
+ * #123 — a mutation inserting a real Run row left the old oracle green).
+ */
+export async function snapshotBusinessState(db: Db) {
+  return {
+    machines: await db.select().from(machines).orderBy(asc(machines.id)),
+    loops: await db.select().from(loops).orderBy(asc(loops.id)),
+    runs: await db.select().from(runs).orderBy(asc(runs.id)),
+    runLeases: await snapshotLeases(db),
+    artifactSyncSessions: await db.select().from(artifactSyncSessions).orderBy(asc(artifactSyncSessions.id)),
+    artifactManifests: await db.select().from(artifactManifests).orderBy(asc(artifactManifests.id)),
+    artifactBlobs: await db
+      .select()
+      .from(artifactBlobs)
+      .orderBy(asc(artifactBlobs.namespaceId), asc(artifactBlobs.hash)),
+  };
 }
 
 export { staticAttribution } from "./artifact-attribution.js";

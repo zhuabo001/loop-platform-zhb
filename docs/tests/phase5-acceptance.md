@@ -336,3 +336,62 @@ server 较片 1 复审基线（`1fc3300`，1058+3skip）+81：八个新测试文
 ### 结论（片 2）
 
 本片验收确认：GitHub 授权码流程（一次性 state、浏览器绑定、PKCE S256、10 分钟内存事务、原子消费）与持久 Session（哈希即主键、7 天绝对有效期、凭据派生 CSRF、退出删行）按冻结规则实现；失败路径逐分支零写入且无敏感信息泄漏；Session 重启持久、未完成登录重启失效；首次登录不取得旧机器。管理面门禁、Dashboard 接线与生产演练分别留待片 5/6/7。
+
+## 片 3 — 关闭自注册与未认领机器执行隔离
+
+### 测试编组与结果（片 3）
+
+| 编组 | 主要证据（文件） | 覆盖 |
+|---|---|---|
+| PG2–PG6（存储层） | `server/src/store/machines.test.ts`（15 项，+6） | `verifyEligibleMachineCredential` 五步门：PG3 未知 token → undefined 且零写入；PG4 全量 hash 不符（截断碰撞防御）；PG5 `teamId` 为空（未认领）；PG5b `revokedAt` 非空（已撤销）；PG6 已认领未撤销 → 返回行；PG2 形状非法 token 不触库。未知/未认领/已撤销三类拒绝**返回同一 undefined**，调用方无法区分（无信号泄漏）；只读谓词 `isMachineExecutionEligible` 供 scheduler 复验 |
+| PG1–PG6（poll 路径） | `server/src/coordinator/poll.test.ts`（32 项，含新 PG 门控编组） | PG1 缺 Bearer；PG2 形状非法；PG3 未知 token **不再建行**（自注册已删除）；PG4 hash 不符；PG5 未认领；PG5b 已撤销——每条拒绝分支以 `snapshotBusinessState`（machines/loops/runs/run_leases 与三张 artifact 表，全字段、确定性排序）**整体前后相等**证明零业务写入，且比对发生在**非空世界**上（预设 pending Run + progress、lease、已提交 sync session/manifest/blob；PG4 为整行比较而非部分字段），空表之间的相等不作为证据；PG6 已认领机器 poll 成功，且断言**心跳是该次 poll 的唯一写入**（其余六张表逐表相等）。**顺序回归**：畸形、well-shaped 未知、未认领、已撤销四类凭据携带非法 capability 声明一律 401（凭据门整体先于资源策略 400，ADR-011 决策 17），同一声明来自已验证机器才是 400 且同样零写入。原 `poll: self-registration` 编组（4 项）已删除；其身份快照断言由 PG6 与 A-13 编组以显式预置机器承接，字段清洗/封顶（NUL 剥离 → trim → 64 字符上限）覆盖在同一 contact 路径上补回 |
+| PG 矩阵（Artifact 路径） | `server/src/http/artifact-routes.test.ts`（27 项，+2） | 未认领机器（`teamId` 置空）与已撤销机器（`revokedAt` 置值）持有效凭据访问 machine Artifact 端点 → 统一 401 `invalid machine credential`，**不存在按机器 namespace 的降级读取**；两者在同一 `snapshotBusinessState` oracle 上比对**非空**自身历史（queued Run + lease + 已提交 session/manifest/blob）前后整体相等；已撤销机器另加 prepare 写入路径的 401 与同一比对 |
+| AT9（Team attribution） | `server/src/artifact/attribution-team.test.ts`（7 项） | namespace 取自 `machines.teamId`，跨调用/跨实例稳定；teamId 通过 `NAMESPACE_ID_RE`；机器行缺失、`teamId` 为空、`teamId` 非法三种拒绝均折叠为 `attribution_missing`；`machineId` 与 `namespaceId` 分离；resolve 零写入 |
+| AT10（生产装配） | `server/src/artifact/production.test.ts`（5 项） | 生产 ArtifactHome 全链路 prepare → PUT → commit 落在 `<dataDir>/blobs/<teamId>/<hash>`；构造零文件系统副作用；id 前缀与时钟注入不变。AT8（`attribution-machine.test.ts`）保持全绿——旧 resolver 退为片 4 源侧读取 |
+| PE1–PE5（Scheduler 资格边界） | `server/src/scheduler/scheduler.test.ts`（28 项，含新资格编组） | PE1 未认领机器 loop：无 job、无 catch-up、无 Run；PE2 已撤销机器同上；PE3 已认领未撤销机器为对照（注册 + 恢复 downtime 的 10:00 occurrence）；PE4 机器行缺失的孤儿 loop 被排除；PE5 注册后转撤销：tick 被 `scheduler: machine_ineligible` 拒绝，**不新增 Run 且 `lastScheduledAt` 游标不推进** |
+| PD1–PD2（停机排空，\#121） | 同上文件（+2） | PD1 在 tick 挂起于资格查询时调用 `stopAndDrain`：drain **不提前返回**（放行前断言未 settle），放行后 tick 不发起任何 enqueue——`runs` 仍为 1（时钟已推进到下一次 occurrence，泄漏的 enqueue 会真建 Run）、游标与 revision 不变、零日志；PD2 资格查询抛错：异常不被排空集合吞掉（经 Croner `catch` 收口为固定 `croner_error`），`stopAndDrain` 正常结束且无写入 |
+| E1–E4（enqueue 边界资格门，\#122） | `server/src/coordinator/enqueue.test.ts`（19 项，+6） | E1×3 未认领/已撤销/孤儿机器的手动触发 → `machine_ineligible`，且 machines/loops/runs **三表整体相等**（既有 pending 的 `phase/outcome/message/ts` 逐字段不变，即未 supersede、未 bump revision）；E2 直接调用 store 的 `enqueueExecRunTx` 同样拒绝（门在 store 边界，不是 coordinator 的礼节）；E3 scheduled 触发（catch-up/陈旧回调路径）拒绝且 `lastScheduledAt` 不推进；E4 对照：同一 loop 在其机器被认领后正常入队并 supersede 旧 pending |
+| 手动触发的 HTTP 映射 | `server/src/http/app.test.ts`（50 项，+1） | 未认领机器 loop 的 `POST /api/loops/:id/run` → **平 404 `not found`**（与未知 loop 同分类，不落入 `running_exists` 200 兜底），runs/loops 前后整体相等、既有 pending 原样保留 |
+| Report 独立语义回归 | `server/src/coordinator/report.test.ts`、`lifecycle.test.ts`、`poll-progress.test.ts`（全绿） | 本片未触碰 RunLease 验证与终态语义；既有 lease 的合法 Report 与迟到 reconcile 行为不变 |
+| 存量装配改造（自注册假设清理） | coordinator/restart-e2e/daemon-e2e/phase4-*/phase5-batch2-* /integration/start/roundrobin/fault-injection 等 20 余文件 | 所有 poll/claim 类测试改为显式预置**已认领**机器（`seedClaimedMachineForToken` / `seedClaimedMachineIfAbsent` / `seedClaimedMachineById`）；原先以「机器出现在 `/api/machines`」作 daemon 就绪信号的 6 处（phase4-batch2、phase4-batch3、slice4-secret 及三个 opt-in real-Claude E2E）改判 `lastSeen` 非空——机器行现在预先存在，行存在不再证明 daemon 已启动。三个 opt-in real-Claude 文件同步补齐预置与就绪判据，避免人工演练时因 401 卡死 |
+
+### 显式边界核对（片 3）
+
+- **停止边界**：不提供新机器接入（ConnectKey = Batch 4）、不提供在线撤销入口、不通过测试开关恢复自注册。本片删除自注册**连实现一并删除**（`registerMachineOnPoll` 与仅服务于它的 `machineNameFallback` 已移除）。
+- **资格复验边界**：启动扫描（SQL JOIN 过滤）+ cron tick（提交前复验）+ **enqueue 边界**（`enqueueExecRunTx` 在事务前以 `isMachineExecutionEligible` 复验，零写入拒绝）三处落地——手动触发、Dashboard、cron 与 catch-up 全部经该唯一写入口，故四条入队路径同受一闸。claim 边界不另加检查：poll 在任何 claim 之前已用同一凭据门验证机器，候选集合 `pendingExecRunsForMachine` 亦由该机器 id 限定，且本片无在线认领/撤销入口（撤销仅经片 4 停服 CLI），不存在并发归属变化窗口（ADR-011 决策 16）。管理面 Session 门禁与创建 Loop 时的机器归属校验仍由片 5 承担。
+- **命名空间切换**：生产 Artifact namespace 由机器 id 改为所属 Team id（ADR-011 决策 2 的落实，决策 14 记录）。存储键规则、wire 形状、manifest/session 契约均不变；片 4 认领在复制 Blob 后以单事务切换元数据。
+- **protocol 增量**：无。本片不改 wire DTO、不新增迁移（journal 保持 7 条）。
+- **测试接缝**：testkit 新增 `TEST_TEAM_ID` 常量与三个已认领机器 fixture（`seedClaimedMachineForToken` 按 token、`seedClaimedMachineIfAbsent` 幂等重启版、`seedClaimedMachineById` 按 id）；`seedMachine` 的三参签名由 `(db, id, tokenHash)` 改为 `(db, id, overrides)`，与 `seedMachineForToken` 统一为 overrides 形式，`teamId`/`revokedAt` 等显式字段由调用点声明。TEST-ONLY，不进构建产物。
+
+### 变异验证（片 3）
+
+每次变异注入后运行定向套件，随后以备份文件 `cp` 恢复并逐字节 diff 确认复原。
+
+| 变异 | 落点 | 结果 |
+|---|---|---|
+| M1 排空集合不登记 tick | `scheduler/index.ts` 回调去掉 `trackInFlight` | PD1 红（`stopAndDrain` 提前返回：`drained=true`） |
+| M2 资格查询后不复检 `stopped` | 同上，删去第二个守卫 | PD1 红（停机后真建 Run：`runs` 长度 2） |
+| M3 拒绝前泄漏 Run 写入 | `verifyEligibleMachineCredential` 两个拒绝分支各插入一条真实 runs 行 | poll 编组 6 项全红（同一变异在原 machines 单表 oracle 下曾 4/4 全绿） |
+| M4 拒绝前泄漏 Lease 写入 | 同上，插入 run_leases 行 | poll 编组 3 项红（PG1 ordering、PG5、PG5b） |
+| M5 Artifact 拒绝前泄漏 session 写入 | `artifact/api.ts` 的 401 前插入 artifact_sync_sessions 行 | artifact 路由 PG5/PG5b 双红 |
+
+M3–M5 覆盖 Run/Lease/Artifact 三类副作用，证明 oracle 对每一类都能检出；M1/M2 证明停机排空的确定性交错测试能检出对应回归。
+
+### 完整质量门（片 3）
+
+```text
+$ pnpm test          # EXIT=0
+  packages/protocol: 16 files / 292 tests
+  packages/daemon:   34 passed + 2 skipped files / 790 passed + 7 skipped tests
+  packages/server:   87 passed + 3 skipped files / 1175 passed + 3 skipped tests
+$ pnpm typecheck     # EXIT=0
+$ pnpm build         # EXIT=0
+$ pnpm --filter @loopzhb/server db:check   # EXIT=0；schema.ts 与 drizzle/ 零漂移（本片无新增迁移）
+$ git diff --check   # EXIT=0
+```
+
+server 较片 2 基线（`78e51b7`，1139+3skip）**+36**，全部为资格门控与归因切换的新证据，无删除后未补偿的覆盖：`store/machines.test.ts` +6（PG2–PG5b、PG6）、`coordinator/poll.test.ts` 净 +7（PG 门控编组 9 项替换自注册编组 4 项、判定顺序回归 1、identity 清洗/封顶补回 1；四类凭据的顺序断言与全表 oracle 不增减项数）、`http/artifact-routes.test.ts` +2（PG5/PG5b）、`artifact/attribution-team.test.ts` +7（新文件 AT9）、`scheduler/scheduler.test.ts` +7（PE1–PE5 + PD1/PD2）、`coordinator/enqueue.test.ts` +6（E1–E4）、`http/app.test.ts` +1（手动入口 machine_ineligible）。protocol 与 daemon 包零改动（292 / 790+7skip 与片 2 一致）。
+
+### 结论（片 3）
+
+本片验收确认：生产自注册已彻底移除——未知、未认领、已撤销三类机器凭据在 poll 与 Artifact 两条路径上统一 401，且凭据门整体先于 capability 资源策略与任何心跳/快照/claim 写入；未认领、已撤销与孤儿机器的 loop 不注册调度、不 catch-up、不在 enqueue 边界新增 Run、不 supersede 既有 pending、游标不推进；生产 Artifact namespace 已切换为所属 Team；拒绝路径的零写入由覆盖全部业务表的非空 oracle 与三类副作用变异证明。机器接入（ConnectKey）、离线认领与在线撤销分别留待 Batch 4 与片 4。

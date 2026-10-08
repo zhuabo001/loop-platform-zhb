@@ -33,14 +33,13 @@ import { randomBytes, randomUUID } from "node:crypto";
 import {
   hasArtifactSyncV1,
   hasTerminalJournalV1,
-  isDeviceTokenShape,
   TERMINAL_JOURNAL_V1_CAPABILITY,
   type Delivery,
   type PollRequest,
   type PollResponse,
   type ReportRequest,
 } from "@loopzhb/protocol";
-import { machineIdFromToken, sha256 } from "@loopzhb/protocol/node";
+import { sha256 } from "@loopzhb/protocol/node";
 
 import { planArtifactWatchResponse, readMachineWatchItems } from "../artifact/watch.js";
 import { buildDelivery } from "../gateway/delivery.js";
@@ -48,8 +47,7 @@ import { resolveLiveLease } from "../store/leases.js";
 import {
   applyMachinePollContact,
   capabilitySnapshotFromPoll,
-  getMachine,
-  registerMachineOnPoll,
+  verifyEligibleMachineCredential,
 } from "../store/machines.js";
 import { executeReportTx, type ReportStoreDeps, type ReportTxResult } from "../store/report.js";
 import {
@@ -184,11 +182,13 @@ export function createRunCoordinator(deps: RunCoordinatorDependencies) {
     /**
      * The daemon's heartbeat + run claim (plan §2).
      *
-     * Order matters: cheap shape filter → capability resource policy (Phase 4:
+     * Order matters: the credential gate FIRST (shape + derived-id + full-hash
+     * + team-ownership + revocation — Phase 5 Batch 3 slice 3, ADR-011, a
+     * five-step eligibility check that rejects unknown, unclaimed and revoked
+     * machines with the unified 401) → capability resource policy (Phase 4:
      * an illegal declaration rejects the WHOLE poll with a 400 BEFORE any
-     * heartbeat/snapshot/claim write — ADR-009 修订 2026-09-01 决策 1) →
-     * derived-id + full-hash verification (self-registering on first contact)
-     * → heartbeat/identity/capability-snapshot write (OUTSIDE any claim
+     * heartbeat/snapshot/claim write — ADR-009 修订 2026-09-01 决策 1 fixes
+     * 401-before-400) → heartbeat/identity/capability-snapshot write (OUTSIDE any claim
      * transaction — confirmed contact survives a lost claim race) → progress
      * heartbeats → capability gate → capacity gate → the per-candidate atomic
      * claims.
@@ -207,23 +207,27 @@ export function createRunCoordinator(deps: RunCoordinatorDependencies) {
      * adapter maps that to the unified 401.
      */
     async poll(deviceToken: string, body: PollRequest): Promise<PollResponse> {
-      if (!isDeviceTokenShape(deviceToken)) throw new InvalidMachineCredentialError();
-      // Resource policy FIRST (after the cheap shape filter, before ANY
-      // write): an illegal declaration is a 400 for the whole poll.
-      const capabilities = capabilitySnapshotFromPoll(body.capabilities);
-      const machineId = machineIdFromToken(deviceToken);
-      const tokenHash = sha256(deviceToken);
+      // The credential gate runs FIRST — the full five-step check (Phase 5
+      // Batch 3 slice 3, ADR-011): shape → derived-id → full-hash → teamId
+      // (claimed) → revokedAt (active). All five steps collapse to the same
+      // 401 — no signal leakage, and auto-registration is REMOVED: unknown
+      // tokens are never enrolled here.
+      //
+      // ADR-009 修订 2026-09-01 决策 1 fixes this ORDER: a credential failure
+      // (401) precedes the capability resource policy (400), so an
+      // unauthenticated caller never receives a policy verdict — an unknown,
+      // unclaimed or revoked credential answers 401 even when it ships an
+      // illegal capability declaration (review probe: the declaration used to
+      // win the race for well-shaped ineligible tokens).
+      const verifiedMachine = await verifyEligibleMachineCredential(deps.db, deviceToken);
+      if (!verifiedMachine) throw new InvalidMachineCredentialError();
+      const machineId = verifiedMachine.id;
 
-      let machine = await getMachine(deps.db, machineId);
-      if (machine) {
-        // Full-hash verification on top of the derived id — a 64-bit
-        // truncation collision must not hand one machine's authority to a
-        // different token (reference audit H-01).
-        if (machine.tokenHash !== tokenHash) throw new InvalidMachineCredentialError();
-        machine = await applyMachinePollContact(deps, machine, body, capabilities);
-      } else {
-        machine = await registerMachineOnPoll(deps, { machineId, tokenHash, identity: body, capabilities });
-      }
+      // Resource policy next, on an AUTHENTICATED request, still before ANY
+      // write: an illegal declaration rejects the whole poll with a 400.
+      const capabilities = capabilitySnapshotFromPoll(body.capabilities);
+
+      const machine = await applyMachinePollContact(deps, verifiedMachine, body, capabilities);
 
       if (body.progress !== undefined && body.progress.length > 0) {
         await applyRunProgress(deps, { machineId, entries: body.progress });

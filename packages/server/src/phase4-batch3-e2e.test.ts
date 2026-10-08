@@ -64,7 +64,7 @@ import { closeDb } from "./db/index.js";
 import { loops, runLeases, runs, type Loop } from "./db/schema.js";
 import { AcceptedReportCostObserver, DaemonLogObserver, DetachedProcessSupervisor } from "./real-claude-e2e-harness.js";
 import { bootstrapServer, waitForListening, type BootedServer } from "./start.js";
-import { FakeClock, FakeCronFactory, makeTestAuthConfig } from "./testkit/index.js";
+import { FakeClock, FakeCronFactory, makeTestAuthConfig, seedClaimedMachineIfAbsent } from "./testkit/index.js";
 
 const TOKEN = "dk_e2e_batch3_dashboard";
 const GOAL = "Record the step-1 marker into state, then finish from the updated Timeline";
@@ -130,6 +130,10 @@ async function bootLifetime(dataDir: string, clock: FakeClock): Promise<Lifetime
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("failed to get server address");
     lifetime.baseUrl = `http://127.0.0.1:${address.port}`;
+    // Phase 5 Batch 3 slice 3: poll no longer self-registers — state the
+    // claimed machine this daemon's token polls as (idempotent: this helper
+    // boots repeatedly on the SAME dataDir across the restart phases).
+    await seedClaimedMachineIfAbsent(booted.handle.db, TOKEN);
     // start.ts main()'s fixed order: the listener is bound BEFORE the
     // scheduler's startup scan, so nothing schedules behind an unbound port.
     await booted.scheduler.start();
@@ -272,13 +276,15 @@ describe("Phase 4 Batch 3 deterministic E2E (E1–E2): Dashboard → state → f
       daemon.stderr?.on("data", (chunk: Buffer) => logs.append("stderr", chunk));
 
       try {
-        // 4. Machine registration (the daemon self-registers on first poll).
+        // 4. Daemon readiness. Phase 5 Batch 3 slice 3 removed self-
+        //    registration: the machine ROW exists from the start, so wait for
+        //    `lastSeen` — written only by the daemon's own poll contact.
         const machineId = machineIdFromToken(TOKEN);
         await waitFor(async () => {
           const res = await fetch(`${first.baseUrl}/api/machines`);
           if (!res.ok) return false;
-          const body = (await res.json()) as { machines?: Array<{ id: string }> };
-          return body.machines?.some((m) => m.id === machineId) ?? false;
+          const body = (await res.json()) as { machines?: Array<{ id: string; lastSeen: string | null }> };
+          return body.machines?.some((m) => m.id === machineId && m.lastSeen !== null) ?? false;
         }, REGISTER_TIMEOUT_MS);
 
         // 5. The Closed Loop (goal + minutely cron, far from firing under a

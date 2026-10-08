@@ -22,7 +22,7 @@ import { isRunTokenShape, pollResponseSchema } from "@loopzhb/protocol";
 import { machineIdFromToken } from "@loopzhb/protocol/node";
 
 import { mintRunCredential } from "./coordinator/index.js";
-import { FakeClock, makeTestAuthConfig } from "./testkit/index.js";
+import { FakeClock, makeTestAuthConfig, seedClaimedMachineForToken } from "./testkit/index.js";
 import type { CronFactory, CronJob } from "./scheduler/index.js";
 import { closeDb, openMigratedDb, type DbHandle } from "./db/index.js";
 import { loops, machines, runs } from "./db/schema.js";
@@ -101,6 +101,9 @@ describe("bootstrapServer", () => {
     const { app, handle } = await boot(dir);
 
     expect(handle.dataDir).toBe(dir); // file-backed, not the memory fixture
+    // Pre-seed a claimed machine so the poll gate passes (Phase 5 Batch 3 slice 3:
+    // auto-registration removed; unknown tokens → 401).
+    await seedClaimedMachineForToken(handle.db, "dk_boot_machine");
     const res = await poll(app, "dk_boot_machine", { host: "boot-host" });
     expect(res.status).toBe(200);
     expect(pollResponseSchema.parse(await res.json())).toEqual({ deliveries: [] });
@@ -440,8 +443,10 @@ describe("bootstrapServer", () => {
 
   it("restart durability: machine, run and ACTIVE LEASE survive close/reopen — a pre-restart claim still reports (T4)", async () => {
     const dir = await tmpDataDir();
-    // Boot 1: enroll, seed a loop, enqueue + claim a run.
+    // Boot 1: pre-seed a claimed machine, seed a loop, enqueue + claim a run.
     const first = await boot(dir);
+    // Pre-seed so the poll gate passes (Phase 5 Batch 3 slice 3: no auto-register).
+    await seedClaimedMachineForToken(first.handle.db, "dk_boot_machine");
     await poll(first.app, "dk_boot_machine");
     await first.handle.db.insert(loops).values({
       id: "loop-1",
@@ -492,7 +497,10 @@ describe("bootstrapServer", () => {
     );
     handles.push(b.handle);
 
-    // Machine registration stamps lastSeen from the coordinator clock.
+    // Pre-seed a claimed machine so the poll gate passes (Phase 5 Batch 3 slice 3:
+    // auto-registration removed; unknown tokens → 401).
+    await seedClaimedMachineForToken(b.handle.db, "dk_boot_clock");
+    // Machine contact stamps lastSeen from the coordinator clock.
     await poll(b.app, "dk_boot_clock");
     const machineId = machineIdFromToken("dk_boot_clock");
     const machine = (await b.handle.db.select().from(machines))[0]!;

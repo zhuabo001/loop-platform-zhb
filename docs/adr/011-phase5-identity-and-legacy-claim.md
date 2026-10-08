@@ -73,3 +73,43 @@ Session 级表单 CSRF token 从 Session 凭据派生：`sha256(credential + ":c
 ### 12. 路由失败面与 /api/session DTO
 
 `POST /auth/logout` 失败面为 JSON 错误信封（401 未认证 / 400 表单畸形 / 403 token 判定；用户确认 2026-10-07），CSRF 失败不撤销任何 Session。`GET /api/session` 200 响应 DTO（`sessionInfoResponseSchema`，含 `csrfToken` 字段）单源在 `@loopzhb/protocol`（wire 惯例；决策 6 的例外不适用于 wire 面），响应恒 `Cache-Control: no-store`，401 为 `{error:"not authenticated"}`。过期边界钉死：`now >= expiresAt` 即过期（恰在到期时刻失效，前一毫秒有效）。Session 凭据形态 `sk_` + 32 字节随机 base64url。AU 编组编号：AU10 = 账号改名、AU11 = 身份稳定性、AU12 = 回调地址固定（用户确认 2026-10-07）。
+
+## 修订 2026-10-08（片 3 落实增补）
+
+### 13. 机器执行资格：五步门与统一 401（删除生产自注册）
+
+Poll 与全部 Artifact machine 端点的凭据校验合并为**一个实现** `verifyEligibleMachineCredential`（`store/machines.ts`），固定五步顺序：token 形状 → 派生 id 行查找 → 全量 tokenHash 比对（H-01 截断碰撞防御）→ `teamId` 非空（已认领）→ `revokedAt` 为空（未撤销）。**五种拒绝原因全部折叠为同一 undefined → 统一 401**，不区分、不泄漏信号；调用方只记固定分类日志。
+
+生产自注册（`registerMachineOnPoll`）与 poll 的「首接触建档」分支**连实现一并删除**：这里没有测试开关可以恢复，新机器接入属于 Batch 4 的 ConnectKey 流程。未认领与已撤销机器在任何心跳、identity、capability 快照与 claim 写入**之前**被拒绝，故拒绝路径零业务写入。
+
+### 14. 生产 Artifact Attribution 切换落实（决策 2 的落地）
+
+`createProductionArtifactHome` 与 report 事务的 artifact 绑定改用 `createTeamAttributionResolver`：存储 namespace 取自被可信解析的 `machines.teamId`（`namespaceId = teamId`），不再取机器自身 id。存储键 `(namespaceId, hash)` 规则与 wire 形状不变（ADR-010 决策 7 不变量保持）。
+
+`createMachineAttributionResolver`（Machine namespace）**保留但退出生产路径**：片 4 离线认领 CLI 需要它以**源侧**身份读取认领前位于机器 namespace 下的 Blob，并在复制进 Team namespace 前完成校验。
+
+### 15. Scheduler 的执行资格边界
+
+启动扫描以 `loops LEFT JOIN machines` 并按 `teamId IS NOT NULL AND revokedAt IS NULL` 过滤：未认领、已撤销机器（以及机器行缺失的孤儿 loop）**不注册 job、不 catch-up、不新增 Run、不推进 schedule 游标**。cron tick 回调在 enqueue 之前**再次**复验资格（`isMachineExecutionEligible`，只读谓词），因此即便 job 因运行期配置变更被注册，tick 也被固定分类 `scheduler: machine_ineligible` 拒绝，游标不推进。
+
+**资格复验范围**：机器执行资格还在唯一入队写入口复验（决策 16），使手动触发、Dashboard、cron tick 与 catch-up 均受同一规则约束，符合 Batch 计划第 133 行的 enqueue 边界要求。管理面 Session 门禁与创建 Loop 时的机器归属校验仍属片 5；本片不提供在线撤销入口，撤销仅经片 4 的停服 CLI 发生，故不存在并发撤销窗口。
+
+## 修订 2026-10-08（二）（机器执行资格与零写入验证）
+
+### 16. 执行资格下沉到 enqueue 边界（#122）
+
+`enqueueExecRunTx`（创建 Run 的唯一写入口；手动触发、Dashboard、cron tick、重启 catch-up 全部经它）在打开事务**之前**以 `isMachineExecutionEligible` 复验 loop 的机器：机器行缺失（孤儿）、`teamId` 为空（未认领）或 `revokedAt` 非空（已撤销）一律返回新结果 `{ enqueued: false, reason: "machine_ineligible" }`，**零写入**——不新增 Run、不 supersede 既有 pending、不 bump `loops.revision`、不推进 schedule 游标。读在事务外：本批没有在线认领与在线撤销（片 4 的 CLI 要求停服），快照即权威，fail-closed 拒绝不需要重试。
+
+HTTP 映射：`POST /api/loops/:id/run` 对 `machine_ineligible` 返回**平 404 `not found`**（与未知 loop 同分类，同 Batch 计划第 44 行「未认领、其他团队和不存在的资源统一 404」），**不落入** `running_exists` 的 200 兜底——那会把拒绝误标为普通队列状态。claim 边界不需要新检查：poll 在任何 claim 之前已用同一凭据门验证机器，且 `claimRunWithLeaseTx` 的候选只能来自该已验机器的 `pendingExecRunsForMachine`（本批无并发归属变化窗口）。catch-up 边界由本决策与决策 15 的扫描过滤双重覆盖。
+
+### 17. Poll 拒绝顺序：凭据 401 先于资源策略 400
+
+Poll 流水线的固定顺序改为「凭据门 → capability 资源策略」：ADR-009 修订 2026-09-01 决策 1 要求 credential 失败（401）先于 capability 拒绝（400），而实现曾把资源策略置于完整机器门之前，使 well-shaped 的未知/未认领/已撤销凭据携带非法声明时得到 400。整改后：形状、派生 id、全量 hash、归属、撤销**五步整体**先于资源策略；只有通过门的请求才可能得到 400，且 400 仍先于任何心跳/快照/claim 写入。已撤销凭据携带合法声明同样只得到 401。
+
+### 18. Scheduler tick 全生命周期进入排空集合（#121）
+
+`reconcile` 注册的 cron 回调改为**同步**登记整条 tick（含资格查询 await）到 drain 集合：`stopAndDrain()` 不再可能在 tick 仍挂起于资格查询时提前返回（ADR-008 第 6 节：先排空 callbacks 再关库）。资格查询返回后**再次**检查 `stopped`，停机后的 tick 不再 enqueue（该 occurrence 由下次启动的 catch-up 覆盖，不丢）。固定分类与逐 loop 错误隔离不变；资格查询异常仍经 Croner 的 `catch` 收口为 `scheduler: croner_error` 并正常结束排空。
+
+### 19. 零写入 oracle 覆盖全部业务表（#123）
+
+拒绝路径的零写入证据从「machines 表快照」升级为 `snapshotBusinessState`（machines、loops、runs、run_leases 与三张 artifact 表，全字段、确定性排序）**前后整体相等**，且必须配合**非空世界**（预设 pending Run 及其 progress、lease、已提交 sync session/manifest/blob）——空表之间的相等不构成证据。PG4 由部分字段匹配改为整行比较。poll 与 Artifact 两条拒绝路径共用同一 oracle。

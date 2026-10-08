@@ -19,7 +19,7 @@ import { serve, type ServerType } from "@hono/node-server";
 
 import { createLoopAdmin, newUuidLoopId } from "./admin/index.js";
 import { createArtifactApi, type ArtifactApi } from "./artifact/api.js";
-import { createMachineAttributionResolver } from "./artifact/attribution-machine.js";
+import { createTeamAttributionResolver } from "./artifact/attribution-team.js";
 import { createProductionArtifactHome } from "./artifact/production.js";
 import { createAuthModule } from "./auth/index.js";
 import { createRunCoordinator, mintRunCredential, newUuidRunId, type CoordinatorHooks, type RunCoordinator } from "./coordinator/index.js";
@@ -119,7 +119,7 @@ export async function bootstrapServer(
       // per call on the caller-supplied (transaction) handle — never cached,
       // never wire input.
       artifactBinding: {
-        resolveAttribution: (machineId, db) => createMachineAttributionResolver({ db }).resolve({ machineId }),
+        resolveAttribution: (machineId, db) => createTeamAttributionResolver({ db }).resolve({ machineId }),
       },
     });
     const admin = createLoopAdmin({ db: handle.db, clock, newLoopId: newUuidLoopId });

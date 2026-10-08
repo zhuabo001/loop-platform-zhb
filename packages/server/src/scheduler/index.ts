@@ -9,7 +9,10 @@
  *  - Register/unregister Croner jobs for active loops
  *  - Invoke RunCoordinator on each occurrence
  *  - Isolate per-loop errors (one bad config doesn't block others)
- *  - Graceful shutdown with drain (wait for in-flight callbacks)
+ *  - Graceful shutdown with drain: stopAndDrain() returns only after every
+ *    tick that had STARTED has settled — including one parked on its
+ *    eligibility read, and including the enqueue the tick may still owe
+ *    (ADR-008 §6: drain callbacks BEFORE the DB closes)
  *
  * Dependencies:
  *  - db: for scanning active loops on start
@@ -26,12 +29,13 @@
  */
 
 import type { Db } from "../db/index.js";
-import { loops, type Loop } from "../db/schema.js";
-import { and, eq, isNotNull } from "drizzle-orm";
+import { loops, machines, type Loop } from "../db/schema.js";
+import { and, eq, isNotNull, isNull } from "drizzle-orm";
 import type { RunCoordinator } from "../coordinator/index.js";
 import type { EnqueueExecRunResult } from "../store/runs.js";
 import type { Clock } from "../time.js";
 import { isValidPersistedScheduleState, latestOccurrence } from "../schedule/time-semantics.js";
+import { isMachineExecutionEligible } from "../store/machines.js";
 
 /**
  * Croner job interface — abstracts the real Croner for testing.
@@ -64,6 +68,12 @@ export interface SchedulerDeps {
   clock: Clock;
   cronFactory: CronFactory;
   log?: (line: string) => void;
+  /** TEST-ONLY interleaving seam for the execution-eligibility read (never set
+   *  by production boot — production always uses the store predicate below).
+   *  Tests hold it open to pin the drain contract: a tick parked on this read
+   *  must still be drained by stopAndDrain(), and must not enqueue once the
+   *  scheduler has stopped. It must never be used to weaken the gate. */
+  isMachineEligible?(machineId: string): Promise<boolean>;
 }
 
 /**
@@ -80,7 +90,14 @@ interface JobEntry {
  * Creates a Scheduler instance.
  */
 export function createScheduler(deps: SchedulerDeps) {
-  const { db, coordinator, clock, cronFactory, log = console.warn } = deps;
+  const {
+    db,
+    coordinator,
+    clock,
+    cronFactory,
+    log = console.warn,
+    isMachineEligible = (machineId: string) => isMachineExecutionEligible(db, machineId),
+  } = deps;
 
   // Registry: loopId → JobEntry
   const registry = new Map<string, JobEntry>();
@@ -96,33 +113,120 @@ export function createScheduler(deps: SchedulerDeps) {
   let stopped = false;
 
   /**
+   * The ONE drain-tracking primitive: register a promise in the shutdown
+   * drain set SYNCHRONOUSLY (no await in between) and hand it back unchanged.
+   * stopAndDrain() awaits every registered promise, so any work that has
+   * STARTED is drained before it returns — ADR-008 §6: callbacks are drained
+   * BEFORE the DB closes (issue #121: the eligibility read used to sit
+   * outside this set, so a stop could return while a tick was still parked on
+   * it and the tick then wrote into a closing database).
+   *
+   * Settlement handlers only remove the entry; they never swallow the
+   * rejection for the caller — the returned promise still settles the way the
+   * original did (Croner's `catch` sees it, `Promise.allSettled` absorbs it
+   * on drain).
+   */
+  function trackInFlight<T>(promise: Promise<T>): Promise<T> {
+    inFlightCallbacks.add(promise);
+    const forget = () => {
+      inFlightCallbacks.delete(promise);
+    };
+    // then(onFulfilled, onRejected) — a bare .finally() would float a second
+    // rejecting promise (unhandled rejection) whenever the work throws.
+    void promise.then(forget, forget);
+    return promise;
+  }
+
+  /**
    * Shared in-flight enqueue lifecycle — the ONE shape used by both the
    * online callback and the restart catch-up (review P3: the two paths used
-   * to duplicate it). The promise is added to the SHARED drain set
-   * SYNCHRONOUSLY, before any await, so stopAndDrain() covers both paths
-   * alike; a thrown enqueue always earns the fixed `enqueue_failed`
-   * classification. A resolved non-enqueue is a benign race outcome: only the
-   * online callback observes it (`enqueue_skipped` with the reason); the
-   * catch-up passes no observer and stays silent (§2.3).
+   * to duplicate it). The promise is tracked SYNCHRONOUSLY, before any await,
+   * so stopAndDrain() covers both paths alike; a thrown enqueue always earns
+   * the fixed `enqueue_failed` classification. A resolved non-enqueue is a
+   * benign race outcome: only the online callback observes it
+   * (`enqueue_skipped` with the reason); the catch-up passes no observer and
+   * stays silent (§2.3).
    */
   async function drainTrackedEnqueue(
     loopId: string,
     result: Promise<EnqueueExecRunResult>,
     onSkip?: (reason: Extract<EnqueueExecRunResult, { enqueued: false }>["reason"]) => void,
   ): Promise<void> {
-    const promise = result
-      .then((r) => {
-        if (!r.enqueued) onSkip?.(r.reason);
-      })
-      .catch(() => {
-        log(`scheduler: enqueue_failed loop=${loopId}`);
-      });
-    inFlightCallbacks.add(promise);
-    try {
-      await promise;
-    } finally {
-      inFlightCallbacks.delete(promise);
+    await trackInFlight(
+      result
+        .then((r) => {
+          if (!r.enqueued) onSkip?.(r.reason);
+        })
+        .catch(() => {
+          log(`scheduler: enqueue_failed loop=${loopId}`);
+        }),
+    );
+  }
+
+  /**
+   * ONE scheduled tick — the entire Croner callback body. It is a named
+   * function so `reconcile` can register the WHOLE lifecycle in the drain set
+   * synchronously (see `trackInFlight`); the awaits inside it — the
+   * eligibility read above all — are therefore covered by stopAndDrain().
+   */
+  async function runScheduledTick(loop: Loop): Promise<void> {
+    // A stopped scheduler must never touch the (possibly already closed)
+    // database — a timer that outlived stop() fires into this guard.
+    if (stopped) return;
+
+    // Execution-eligibility re-verification at the SCHEDULING boundary
+    // (Phase 5 Batch 3 slice 3, ADR-011): a job registered while the machine
+    // was eligible must not enqueue once the machine is unclaimed or revoked.
+    // Read-only; the loop's own `machineId` is the only input. An ineligible
+    // machine produces NO run and the watermark is not advanced (the enqueue
+    // never happens).
+    if (!(await isMachineEligible(loop.machineId))) {
+      log(`scheduler: machine_ineligible loop=${loop.id}`);
+      return;
     }
+
+    // Re-check AFTER the eligibility await: stopAndDrain() may have been
+    // requested while that read was in flight (it drains this tick, so it
+    // waits for us — but the tick itself must still not write into a
+    // scheduler that has stopped). The occurrence is recovered by the next
+    // start's catch-up, so bailing out here loses nothing.
+    if (stopped) return;
+
+    // Callback captures loop state at registration time
+    const capturedRevision = loop.scheduleRevision;
+    const capturedCron = loop.cron!;
+    const capturedTimezone = loop.timezone;
+
+    // Calculate canonical occurrence using latestOccurrence
+    let scheduledFor: Date | null = null;
+    try {
+      const now = clock.now();
+      scheduledFor = latestOccurrence(
+        { cron: capturedCron, timezone: capturedTimezone },
+        now,
+      );
+    } catch {
+      log(`scheduler: occurrence_rebuild_failed loop=${loop.id}`);
+      return;
+    }
+
+    if (scheduledFor === null) {
+      log(`scheduler: occurrence_rebuild_failed loop=${loop.id}`);
+      return;
+    }
+
+    // The enqueue is awaited INSIDE the callback so the promise Croner sees
+    // stays pending until the write settles — that is what makes the protect
+    // (overrun) handler able to skip a re-entrant tick.
+    await drainTrackedEnqueue(
+      loop.id,
+      coordinator.enqueueExecRun(loop.id, {
+        kind: "scheduled",
+        scheduledFor: scheduledFor.toISOString(),
+        scheduleRevision: capturedRevision,
+      }),
+      (reason) => log(`scheduler: enqueue_skipped loop=${loop.id} reason=${reason}`),
+    );
   }
 
   /**
@@ -188,47 +292,12 @@ export function createScheduler(deps: SchedulerDeps) {
             log(`scheduler: croner_error loop=${loop.id}`);
           },
         },
-        async () => {
-          // A stopped scheduler must never touch the (possibly already closed)
-          // database — a timer that outlived stop() fires into this guard.
-          if (stopped) return;
-
-          // Callback captures loop state at registration time
-          const capturedRevision = loop.scheduleRevision;
-          const capturedCron = loop.cron!;
-          const capturedTimezone = loop.timezone;
-
-          // Calculate canonical occurrence using latestOccurrence
-          let scheduledFor: Date | null = null;
-          try {
-            const now = clock.now();
-            scheduledFor = latestOccurrence(
-              { cron: capturedCron, timezone: capturedTimezone },
-              now,
-            );
-          } catch {
-            log(`scheduler: occurrence_rebuild_failed loop=${loop.id}`);
-            return;
-          }
-
-          if (scheduledFor === null) {
-            log(`scheduler: occurrence_rebuild_failed loop=${loop.id}`);
-            return;
-          }
-
-          // The enqueue is awaited INSIDE the callback so the promise Croner
-          // sees stays pending until the write settles — that is what makes
-          // the protect (overrun) handler able to skip a re-entrant tick.
-          await drainTrackedEnqueue(
-            loop.id,
-            coordinator.enqueueExecRun(loop.id, {
-              kind: "scheduled",
-              scheduledFor: scheduledFor.toISOString(),
-              scheduleRevision: capturedRevision,
-            }),
-            (reason) => log(`scheduler: enqueue_skipped loop=${loop.id} reason=${reason}`),
-          );
-        },
+        // The WHOLE tick joins the drain set SYNCHRONOUSLY — before its first
+        // await — so stopAndDrain() can never return while this callback is
+        // still in flight (ADR-008 §6; issue #121). Exactly ONE entry per
+        // tick: the awaits inside the tick (eligibility read, occurrence
+        // rebuild, enqueue) are all covered by it.
+        () => trackInFlight(runScheduledTick(loop)),
       );
 
       registry.set(loop.id, {
@@ -272,12 +341,27 @@ export function createScheduler(deps: SchedulerDeps) {
     async start(): Promise<void> {
       if (stopped) throw new Error("Scheduler already stopped");
 
-      // Scan active loops (enabled=true AND cron IS NOT NULL) — the SQL
-      // predicate matches the loops_active_schedule_idx partial index.
-      const scheduledLoops = await db
-        .select()
+      // Scan active loops whose machine is execution-eligible (Phase 5 Batch 3
+      // slice 3, ADR-011): JOIN machines, require teamId IS NOT NULL (claimed)
+      // and revokedAt IS NULL (not revoked). Unclaimed and revoked machines are
+      // excluded at the startup scan — they get no job and no catch-up.
+      //
+      // leftJoin so a loop whose machineId has no machines row is also excluded
+      // (surfaced as machines.teamId = null via the isNotNull filter) — no FK
+      // exists but the predicate handles orphan rows without a crash.
+      const rawRows = await db
+        .select({ loop: loops })
         .from(loops)
-        .where(and(eq(loops.enabled, true), isNotNull(loops.cron)));
+        .leftJoin(machines, eq(loops.machineId, machines.id))
+        .where(
+          and(
+            eq(loops.enabled, true),
+            isNotNull(loops.cron),
+            isNotNull(machines.teamId),
+            isNull(machines.revokedAt),
+          ),
+        );
+      const scheduledLoops: Loop[] = rawRows.map((r) => r.loop);
 
       console.log(`[scheduler] starting: found ${scheduledLoops.length} active scheduled loops`);
 

@@ -52,7 +52,7 @@ import { closeDb, type DbHandle } from "./db/index.js";
 import { loops, runLeases } from "./db/schema.js";
 import { DaemonControlObserver, DaemonLogObserver, DetachedProcessSupervisor } from "./real-claude-e2e-harness.js";
 import { bootstrapServer, waitForListening } from "./start.js";
-import { makeTestAuthConfig } from "./testkit/index.js";
+import { makeTestAuthConfig, seedClaimedMachineForToken } from "./testkit/index.js";
 
 const TOKEN = "dk_e2e_batch2_machine";
 /** Planted provider secret: the agent env legitimately carries it, so it must
@@ -132,6 +132,9 @@ describe("Phase 4 Batch 2 deterministic E2E: production daemon + fake Claude, tw
       tempDirs.push(dataDir);
       const booted = await bootstrapServer({ auth: makeTestAuthConfig(), host: "127.0.0.1", port: 0, dataDir });
       handles.push(booted.handle);
+      // Phase 5 Batch 3 slice 3: poll no longer self-registers — state the
+      // claimed machine this daemon's token polls as.
+      await seedClaimedMachineForToken(booted.handle.db, TOKEN);
       const server = serve({ fetch: booted.app.fetch, port: 0, hostname: "127.0.0.1" });
       servers.push(server);
       await waitForListening(server);
@@ -204,13 +207,16 @@ describe("Phase 4 Batch 2 deterministic E2E: production daemon + fake Claude, tw
       daemon.stderr?.on("data", (chunk: Buffer) => logs.append("stderr", chunk));
 
       try {
-        // 4. Machine registration (the daemon self-registers on first poll).
+        // 4. Daemon readiness. Phase 5 Batch 3 slice 3 removed self-
+        //    registration, so the machine ROW exists from the start — its mere
+        //    presence no longer proves the daemon has started. Wait for
+        //    `lastSeen`: only the daemon's own poll contact writes it.
         const machineId = machineIdFromToken(TOKEN);
         await waitFor(async () => {
           const res = await fetch(`${baseUrl}/api/machines`);
           if (!res.ok) return false;
-          const body = (await res.json()) as { machines?: Array<{ id: string }> };
-          return body.machines?.some((m) => m.id === machineId) ?? false;
+          const body = (await res.json()) as { machines?: Array<{ id: string; lastSeen: string | null }> };
+          return body.machines?.some((m) => m.id === machineId && m.lastSeen !== null) ?? false;
         }, REGISTER_TIMEOUT_MS);
 
         // 5. Control-root audit: exactly one NEW root, 0700, with the static

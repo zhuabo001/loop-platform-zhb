@@ -1,6 +1,13 @@
 /**
- * Store-internal machine primitives: first-contact self-registration and the
- * per-poll heartbeat/identity write (A-13).
+ * Store-internal machine primitives: credential verification (including the
+ * execution-eligibility gate) and the per-poll heartbeat/identity write (A-13).
+ *
+ * Phase 5 Batch 3 slice 3 (ADR-011) REMOVED first-contact self-registration:
+ * `verifyEligibleMachineCredential` is the single credential door for poll and
+ * every Artifact machine operation, and unknown, unclaimed or revoked
+ * credentials all collapse to the same undefined → unified 401. New machines
+ * arrive through Batch 4's ConnectKey flow; nothing in this module inserts a
+ * machine row.
  *
  * `lastSeen` is a PERSISTED HEARTBEAT WATERMARK, not a per-poll audit stamp:
  * it refreshes only when null, unparsable, or at least LAST_SEEN_REFRESH_MS
@@ -26,7 +33,6 @@ import { and, eq, sql } from "drizzle-orm";
 import { isDeviceTokenShape, normalizeCapabilities } from "@loopzhb/protocol";
 import { machineIdFromToken, sha256 } from "@loopzhb/protocol/node";
 
-import { InvalidMachineCredentialError } from "../coordinator/errors.js";
 import type { Db } from "../db/index.js";
 import { machines, type Machine, type NewMachine } from "../db/schema.js";
 import type { Clock } from "../time.js";
@@ -135,25 +141,20 @@ function cleanIdentityField(value: string | undefined, cap: number): string | un
   return cleaned.slice(0, cap);
 }
 
-/** Stable display-name fallback derived from the machine id. */
-export function machineNameFallback(machineId: string): string {
-  return `machine-${machineId.slice(2, 8)}`;
-}
-
 export async function getMachine(db: Db, id: string): Promise<Machine | undefined> {
   return (await db.select().from(machines).where(eq(machines.id, id)))[0];
 }
 
 /**
- * Verify an EXISTING machine credential — the artifact routes' auth read path
- * (Batch 2 slice 2, ADR-010 决策 7/13). Fixed order: shape filter → derived id
- * → row lookup → FULL tokenHash compare (a 64-bit truncation collision must
- * not hand one machine's authority to a different token, the reference audit
- * H-01 rule poll applies too).
+ * Verify an EXISTING machine credential — shape filter → derived id → row
+ * lookup → FULL tokenHash compare (H-01 collision defence). Returns the row or
+ * undefined; NEVER registers. Callers map undefined → unified 401.
  *
- * NEVER registers: `undefined` means "no such verified machine" and the
- * caller maps it to the unified 401. Poll remains the ONLY enrollment
- * surface; self-registration is untouched by this path.
+ * This is the INNER verification step: it answers "does this token belong to a
+ * known machine?" and deliberately says nothing about whether that machine may
+ * execute. Team ownership and revocation are the eligibility half, applied by
+ * `verifyEligibleMachineCredential` below. Exported because the store's own
+ * tests pin the two halves separately.
  */
 export async function verifyMachineCredential(db: Db, token: string): Promise<Machine | undefined> {
   if (!isDeviceTokenShape(token)) return undefined;
@@ -163,46 +164,43 @@ export async function verifyMachineCredential(db: Db, token: string): Promise<Ma
 }
 
 /**
- * First-contact self-registration (Phase 1: poll is the ONLY enrollment
- * surface, enrollment is ungated until Phase 5 adds the connect-key check in
- * front of this branch). INSERTs the derived id, the FULL token hash, the
- * cleaned identity snapshot and the clock-stamped watermark in one row.
+ * Verify an EXISTING, EXECUTION-ELIGIBLE machine credential (Phase 5 Batch 3
+ * slice 3, ADR-011). Five ordered checks:
+ *   1. Token shape filter
+ *   2. Derived-id row lookup
+ *   3. Full tokenHash compare (H-01 collision defence)
+ *   4. teamId IS NOT NULL  (machine has been claimed by a team)
+ *   5. revokedAt IS NULL   (machine has not been revoked)
  *
- * A concurrent first poll for the SAME token loses the PK race: catch, re-read,
- * and converge to the row the winner inserted (idempotent — never a 500). A
- * row at the derived id under a DIFFERENT hash is a truncated-id collision:
- * reject the credential.
+ * Returns the row or undefined. All rejection reasons collapse to undefined
+ * — the unified 401 surface. The caller MUST NOT distinguish between them
+ * (no signal leakage). Used by the poll pipeline and all Artifact machine
+ * endpoints so both paths share EXACTLY one implementation.
+ *
+ * Log discipline: the caller emits a fixed classification line; this function
+ * never logs.
  */
-export async function registerMachineOnPoll(
-  deps: MachineStoreDeps,
-  input: { machineId: string; tokenHash: string; identity: PollIdentity; capabilities: string[] | null },
-): Promise<Machine> {
-  const nowIso = deps.clock.now().toISOString();
-  const hostname = cleanIdentityField(input.identity.host, CAP_HOSTNAME);
-  const values: NewMachine = {
-    id: input.machineId,
-    name: hostname ?? machineNameFallback(input.machineId),
-    hostname: hostname ?? null,
-    platform: cleanIdentityField(input.identity.platform, CAP_PLATFORM) ?? null,
-    arch: cleanIdentityField(input.identity.arch, CAP_ARCH) ?? null,
-    daemonVersion: cleanIdentityField(input.identity.version, CAP_VERSION) ?? null,
-    tokenHash: input.tokenHash,
-    roots: null,
-    lastSeen: nowIso,
-    capabilities: input.capabilities,
-    createdAt: nowIso,
-  };
-  try {
-    await deps.db.insert(machines).values(values);
-  } catch (err) {
-    const existing = await getMachine(deps.db, input.machineId);
-    if (existing) {
-      if (existing.tokenHash === input.tokenHash) return existing;
-      throw new InvalidMachineCredentialError();
-    }
-    throw err; // a real DB failure, not a race — surface it (500 at the edge)
-  }
-  return (await getMachine(deps.db, input.machineId))!;
+export async function verifyEligibleMachineCredential(db: Db, token: string): Promise<Machine | undefined> {
+  const machine = await verifyMachineCredential(db, token);
+  if (!machine) return undefined;
+  if (machine.teamId === null || machine.revokedAt !== null) return undefined;
+  return machine;
+}
+
+/**
+ * The execution-eligibility PREDICATE by machine id (Phase 5 Batch 3 slice 3,
+ * ADR-011): the machine row exists, is claimed by a team and is not revoked.
+ * Read-only — the scheduler re-verifies through here at its scheduling
+ * boundaries, where the credential is not in hand (only the loop's
+ * `machineId` is).
+ *
+ * Deliberately a predicate, not a credential check: it answers "may this
+ * machine's loops execute?", which is exactly what the scheduler needs and is
+ * NOT an authentication surface.
+ */
+export async function isMachineExecutionEligible(db: Db, machineId: string): Promise<boolean> {
+  const machine = await getMachine(db, machineId);
+  return machine !== undefined && machine.teamId !== null && machine.revokedAt === null;
 }
 
 /** The contact could not safely settle within the bounded CAS budget.

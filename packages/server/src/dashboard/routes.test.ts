@@ -31,7 +31,7 @@ import { createLifecycleAdmin } from "../loop-lifecycle/admin.js";
 import { createOwnerControl } from "../owner/index.js";
 import { createScheduleAdmin } from "../schedule/index.js";
 import { waitForListening } from "../start.js";
-import { FakeClock, seedLoop, seedRun } from "../testkit/index.js";
+import { FakeClock, seedClaimedMachineById, seedLoop, seedRun } from "../testkit/index.js";
 import { createServerApp } from "../http/app.js";
 import { createDashboardRead, type DashboardArtifactRead, type DashboardRead } from "./index.js";
 import { dashboardCsp } from "./routes.js";
@@ -120,6 +120,10 @@ async function fresh(options: FreshOptions = {}): Promise<void> {
   });
   read = createDashboardRead({ admin, db, clock });
   enqueueCalls = [];
+  // Every loop fixture here rides the default `m-test` machine, and the real
+  // coordinator behind the Run Now seam refuses an enqueue for a machine that
+  // is not execution-eligible (Phase 5 Batch 3 slice 3) — so it is CLAIMED.
+  await seedClaimedMachineById(db, "m-test");
   app = buildApp({ ...options, csrfToken: options.csrfToken ?? TOKEN_A });
 }
 

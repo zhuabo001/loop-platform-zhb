@@ -34,7 +34,7 @@ import { createLifecycleAdmin } from "./loop-lifecycle/admin.js";
 import { createOwnerControl } from "./owner/index.js";
 import { createScheduleAdmin } from "./schedule/index.js";
 import { createInactivitySweep } from "./sweep/index.js";
-import { FakeClock, seedLease, seedLoop, seedRun, snapshotRuns } from "./testkit/index.js";
+import { FakeClock, seedLease, seedLoop, seedClaimedMachineForToken, seedRun, snapshotRuns } from "./testkit/index.js";
 
 const TOKEN = "dk_liveness_machine";
 const RUN_COUNT = 25;
@@ -67,6 +67,9 @@ async function bootLiveness() {
     ownerControl,
   );
   const sweep = createInactivitySweep({ db: handle.db, clock, log: () => {} });
+  // Pre-seed the daemon's machine as CLAIMED so poll gate passes (Phase 5
+  // Batch 3 slice 3: auto-registration removed; unknown tokens → 401).
+  await seedClaimedMachineForToken(handle.db, TOKEN);
   return { app, sweep, handle, clock };
 }
 

@@ -254,6 +254,11 @@ describe("AM: Phase 5 migration 0005 and dormancy", () => {
     await seedPhase4Data(handle);
     const upgraded = await upgradeInPlace(handle);
 
+    // After migration 0006, the machine row has teamId=NULL (unclaimed).
+    // Set it to a valid team id so the poll gate passes (Phase 5 Batch 3
+    // slice 3: auto-registration removed; unclaimed machines → 401).
+    await upgraded.client.query(`UPDATE machines SET team_id = 't-0123456789abcdef' WHERE id = '${MACHINE_ID}'`);
+
     const coordinator = createRunCoordinator(testDeps(upgraded.db, new FakeClock()));
 
     // (i) The upgraded v0 lease finalizes through the REAL coordinator report

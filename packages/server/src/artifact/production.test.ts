@@ -6,9 +6,9 @@
  *  blob root:         pinned at `<dataDir>/blobs`.
  *  ids:               `sync-`/`amf-` prefixed and unique.
  *  clock:             defaults to systemClock, honors an injected clock.
- *  end to end:        the assembled deps resolve the machine namespace and run
- *                     prepare → PUT → commit, landing the verified bytes at
- *                     `<dataDir>/blobs/<machineId>/<hash>`.
+ *  end to end:        the assembled deps resolve the TEAM namespace (Phase 5
+ *                     Batch 3 slice 3) and run prepare → PUT → commit, landing
+ *                     the verified bytes at `<dataDir>/blobs/<teamId>/<hash>`.
  */
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
@@ -18,7 +18,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
-import { FakeClock, seedLoop, seedMachine } from "../testkit/index.js";
+import { FakeClock, seedClaimedMachineById, seedLoop, TEST_TEAM_ID } from "../testkit/index.js";
 import { systemClock } from "../time.js";
 import { updateArtifactConfig } from "./config.js";
 import {
@@ -87,20 +87,22 @@ describe("AT10: createProductionArtifactHome", () => {
     expect(createProductionArtifactHome({ db, dataDir, clock }).clock).toBe(clock);
   });
 
-  it("runs prepare → PUT → commit and lands the verified bytes under <dataDir>/blobs/<machineId>/<hash>", async () => {
+  it("runs prepare → PUT → commit and lands the verified bytes under <dataDir>/blobs/<teamId>/<hash>", async () => {
     const db = await freshDb();
     const dataDir = await tempDataDir();
     const clock = new FakeClock();
     const deps = createProductionArtifactHome({ db, dataDir, clock });
 
-    await seedMachine(db, MACHINE_ID);
+    await seedClaimedMachineById(db, MACHINE_ID);
     await seedLoop(db, { id: "loop-1", machineId: MACHINE_ID });
     const cfg = await updateArtifactConfig({ db, clock }, "loop-1", { artifactDir: "/data/out" });
     expect(cfg.ok && cfg.outcome).toBe("changed");
 
+    // Phase 5 Batch 3 slice 3: the namespace is the OWNING TEAM, not the
+    // machine's own id.
     expect(await deps.attribution.resolve({ machineId: MACHINE_ID })).toEqual({
       ok: true,
-      namespaceId: MACHINE_ID,
+      namespaceId: TEST_TEAM_ID,
       machineId: MACHINE_ID,
     });
 
@@ -132,7 +134,7 @@ describe("AT10: createProductionArtifactHome", () => {
       },
     );
     expect(put).toEqual({ ok: true, size: CONTENT.length, published: true });
-    expect(await fs.readFile(path.join(dataDir, ARTIFACT_BLOB_ROOT_DIRNAME, MACHINE_ID, HASH), "utf8")).toBe(CONTENT);
+    expect(await fs.readFile(path.join(dataDir, ARTIFACT_BLOB_ROOT_DIRNAME, TEST_TEAM_ID, HASH), "utf8")).toBe(CONTENT);
 
     const commit = await commitArtifactSync(deps, { machineId: MACHINE_ID }, { syncId: prepare.response.syncId });
     expect(commit.ok).toBe(true);

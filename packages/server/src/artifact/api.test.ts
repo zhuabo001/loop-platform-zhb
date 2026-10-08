@@ -11,7 +11,7 @@ import { machines } from "../db/schema.js";
 import {
   FakeClock,
   seedLoop,
-  seedMachineForToken,
+  seedClaimedMachineForToken,
   snapshotLoops,
   staticAttribution,
 } from "../testkit/index.js";
@@ -61,7 +61,7 @@ describe("artifact API facade", () => {
     const handle = await openMigratedDb();
     handles.push(handle);
     db = handle.db;
-    machineId = await seedMachineForToken(db, TOKEN);
+    machineId = await seedClaimedMachineForToken(db, TOKEN);
     const deps: ArtifactHomeDeps = {
       db,
       clock: new FakeClock(),

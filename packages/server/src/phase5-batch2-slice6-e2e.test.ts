@@ -40,7 +40,7 @@ import { createArtifactTransport } from "../../daemon/dist/artifact-client.js";
 import { closeDb, type Db, type DbHandle } from "./db/index.js";
 import { artifactManifests, loops, runs } from "./db/schema.js";
 import { bootstrapServer, type BootedServer } from "./start.js";
-import { makeTestAuthConfig } from "./testkit/index.js";
+import { makeTestAuthConfig, seedClaimedMachineForToken, TEST_TEAM_ID } from "./testkit/index.js";
 
 const TOKEN = "dk_slice6_e2e_machine";
 const handles: DbHandle[] = [];
@@ -53,6 +53,9 @@ async function boot(): Promise<BootedServer> {
   const dataDir = await mkdtemp(path.join(tmpdir(), `loopzhb-slice6-e2e-${process.pid}-`));
   const b = await bootstrapServer({ auth: makeTestAuthConfig(), host: "127.0.0.1", port: 3000, dataDir });
   handles.push(b.handle);
+  // Phase 5 Batch 3 slice 3: poll no longer self-registers — state the claimed
+  // machine this daemon's token polls as.
+  await seedClaimedMachineForToken(b.handle.db, TOKEN);
   return b;
 }
 
@@ -140,7 +143,8 @@ describe("slice 6 E2E: run-final sync binds the snapshot inside the report trans
     // the file's actual hash.
     const manifest1 = (await b.handle.db.select().from(artifactManifests).where(eq(artifactManifests.id, snapshotId1!)))[0]!;
     expect(manifest1).toMatchObject({
-      namespaceId: machineId,
+      // Phase 5 Batch 3 slice 3: the namespace is the OWNING TEAM.
+      namespaceId: TEST_TEAM_ID,
       machineId,
       loopId: loop.id,
       configRevision: 1,

@@ -451,6 +451,13 @@ export function createServerApp(
       return c.json({ enqueued: true, runId: result.runId, supersededRunIds: result.supersededRunIds }, 202);
     }
     if (result.reason === "loop_not_found") return jsonError(c, 404, "not found");
+    // Phase 5 Batch 3 slice 3 (ADR-011 + Batch plan §1): a loop whose machine
+    // is orphan, unclaimed or revoked adds no run and supersedes nothing. The
+    // refusal is a flat 404 like an unknown loop — the same "not a resource
+    // you can act on" classification the slice-5 management scope will use for
+    // unclaimed machines, and deliberately NOT the `running_exists` fallback
+    // below (that would mislabel a refusal as a benign queue state).
+    if (result.reason === "machine_ineligible") return jsonError(c, 404, "not found");
     if (result.reason === "loop_completed") {
       // Phase 4 (ADR-009 决策 10): Run Now on a Completed loop is a flat 409
       // with the additive code — the success union's reason literals stay

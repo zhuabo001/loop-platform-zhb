@@ -29,7 +29,7 @@ import { machineIdFromToken } from "@loopzhb/protocol/node";
 import { closeDb, type DbHandle } from "./db/index.js";
 import { loops, runLeases, runs } from "./db/schema.js";
 import { bootstrapServer, waitForListening, type BootedServer } from "./start.js";
-import { FakeClock, FakeCronFactory, makeTestAuthConfig } from "./testkit/index.js";
+import { FakeClock, FakeCronFactory, makeTestAuthConfig, seedClaimedMachineIfAbsent } from "./testkit/index.js";
 import type { Clock } from "./time.js";
 
 const TOKEN = "dk_restart_e2e";
@@ -80,6 +80,10 @@ async function attachListener(
 async function boot(dataDir: string, clock: FakeClock): Promise<RunningServer> {
   const cronFactory = new FakeCronFactory();
   const booted = await bootstrapServer({ auth: makeTestAuthConfig(), host: "127.0.0.1", port: 0, dataDir }, { clock, cronFactory });
+  // Pre-seed the daemon's machine as CLAIMED so the poll gate passes after
+  // Phase 5 Batch 3 slice 3 removed auto-registration (idempotent: a second
+  // boot of the same dataDir re-reads the persisted row).
+  await seedClaimedMachineIfAbsent(booted.handle.db, TOKEN);
   const rs = await attachListener(booted, clock, cronFactory);
   try {
     await rs.scheduler.start();
