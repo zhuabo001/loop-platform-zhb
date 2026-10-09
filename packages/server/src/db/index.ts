@@ -19,6 +19,8 @@ import { fileURLToPath } from "node:url";
 import { PGlite } from "@electric-sql/pglite";
 import { drizzle, type PgliteDatabase } from "drizzle-orm/pglite";
 
+import type { DataDirLock } from "../data-dir-lock.js";
+
 import { businessSchema } from "./schema.js";
 
 export type Db = PgliteDatabase<typeof businessSchema>;
@@ -29,14 +31,20 @@ export interface DbHandle {
   client: PGlite;
   /** The data dir backing this handle, or null for an in-memory database. */
   dataDir: string | null;
+  /** The dataDir exclusive lock this handle owns (ADR-011 决策 20). Absent for
+   *  in-memory handles and for callers that did not pass one. `closeDb` releases
+   *  it AFTER the client closes, so the next process cannot open the database
+   *  while this one is still shutting down. */
+  dataDirLock?: DataDirLock;
 }
 
-/** Open (or create) the database. No `dataDir` ⇒ in-memory (tests). */
-export async function createDb(options: { dataDir?: string } = {}): Promise<DbHandle> {
+/** Open (or create) the database. No `dataDir` ⇒ in-memory (tests). The caller
+ *  owns `dataDirLock` acquisition; this function only carries it. */
+export async function createDb(options: { dataDir?: string; dataDirLock?: DataDirLock } = {}): Promise<DbHandle> {
   const dataDir = options.dataDir ?? null;
   const client = new PGlite(dataDir == null ? undefined : path.join(dataDir, "pgdata"));
   const db = drizzle(client, { schema: businessSchema });
-  return { db, client, dataDir };
+  return { db, client, dataDir, ...(options.dataDirLock ? { dataDirLock: options.dataDirLock } : {}) };
 }
 
 /** `packages/server/drizzle`, resolved from EITHER src/ (vitest) or dist/
@@ -56,7 +64,7 @@ export async function runMigrations(handle: DbHandle): Promise<void> {
 }
 
 /** Convenience for tests and boot: open + migrate in one call. */
-export async function openMigratedDb(options: { dataDir?: string } = {}): Promise<DbHandle> {
+export async function openMigratedDb(options: { dataDir?: string; dataDirLock?: DataDirLock } = {}): Promise<DbHandle> {
   const handle = await createDb(options);
   await runMigrations(handle);
   return handle;
@@ -64,4 +72,7 @@ export async function openMigratedDb(options: { dataDir?: string } = {}): Promis
 
 export async function closeDb(handle: DbHandle): Promise<void> {
   await handle.client.close();
+  // Release AFTER the client closes: the next process must not be able to open
+  // this data directory while we are still tearing ours down.
+  await handle.dataDirLock?.release();
 }

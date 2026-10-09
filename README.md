@@ -99,6 +99,26 @@ pnpm --filter @loopzhb/server start
 
 启动后：`GET /` 是 Dashboard（仅回环绑定才有），`/api/machine/*` 供 daemon 接入，`/api/loops*` 与 `/api/runs*` 是管理接口。
 
+## 旧机器认领（离线）
+
+Batch 3 关闭了 poll 自注册：旧机器在被显式认领前对管理面不可见、不可执行。认领必须**停服**执行。
+
+```bash
+pnpm --filter @loopzhb/server build
+pnpm --filter @loopzhb/server claim:legacy -- --data-dir <数据目录> --github-user-id <数字ID> --machine-id <机器ID> [--machine-id <机器ID> ...] [--dry-run]
+```
+
+- **先停 Server 与 Daemon**，再执行。Server 与本命令共用数据目录独占锁（`<数据目录>/data-dir.lock`），在打开数据库之前获取。
+- 先跑 `--dry-run` 核对目标账号、团队、机器与需复制字节数；移除 `--dry-run` 才真正执行。
+- `--machine-id` 可重复；不提供「认领全部」。目标账号必须**已经通过 GitHub 登录**并拥有个人团队，本命令不创建账号。
+- 选中机器存在 **running** Run 时拒绝（先 drain）；pending Run 只在报告里提示，认领后随机器恢复执行。
+- 复制失败或事务失败不会留下半认领机器；已复制的目标 Blob 保留并由重试复用。源 Blob 与源元数据一律保留，不执行 GC。
+- 退出码：`0` 成功/幂等 no-op、`1` 拒绝或失败、`2` 用法错误、`3` 数据目录被锁。
+- **锁绝不自动抢占**。若持有者已崩溃，确认没有进程在使用该数据目录后手工删除锁文件：`rm <数据目录>/data-dir.lock`。
+- **回滚须知**：认领会改写 Artifact namespace，只回退应用二进制不够——必须恢复升级前的完整数据目录备份。
+
+完整参数与退出码以 `--help` 为准。
+
 ## Dashboard（本机）
 
 仅当 server 绑定**回环地址**时存在，入口是 `GET /`（例如 `http://127.0.0.1:3000/`）；绑定非回环地址时完全不挂载——`GET /` 与写路由都落回普通 404，与任意未知路径不可区分。

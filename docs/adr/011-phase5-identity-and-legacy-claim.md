@@ -113,3 +113,37 @@ Poll 流水线的固定顺序改为「凭据门 → capability 资源策略」�
 ### 19. 零写入 oracle 覆盖全部业务表（#123）
 
 拒绝路径的零写入证据从「machines 表快照」升级为 `snapshotBusinessState`（machines、loops、runs、run_leases 与三张 artifact 表，全字段、确定性排序）**前后整体相等**，且必须配合**非空世界**（预设 pending Run 及其 progress、lease、已提交 sync session/manifest/blob）——空表之间的相等不构成证据。PG4 由部分字段匹配改为整行比较。poll 与 Artifact 两条拒绝路径共用同一 oracle。
+
+## 修订 2026-10-10（片 4 落实增补）
+
+### 20. dataDir 独占锁（Server 与 CLI 共用）
+
+锁文件 `<dataDir>/data-dir.lock`，以 `open(path, "wx", 0o600)` 原子获取；`EEXIST` 即拒绝。内容为一行 JSON 持有者记录 `{pid, hostname, role, startedAt, version}`；该记录**只供操作者阅读**，任何代码路径都不据它做判定（PID 存活探测在 PID 复用下不可靠，故不用）。释放幂等，且仅在 `fstat(handle)` 与 `lstat(path)` 的 `dev`+`ino` 相同才 `unlink`——恢复方式就是手工 `rm`，这个竞态是真实存在的。**绝不自动抢占**；SIGKILL 留下陈旧锁导致下次启动被拒，是已文档化的契约而非缺陷，恢复命令写进 `--help` 与 README 运维段。
+
+**接线范围（相对计划第 227 行的偏差点，如实登记）**：片 7 的收口条目把「dataDir 锁接入实际生产组合根」列为批次收口项；本片**提前到片 4 同时接入 `bootstrapServer`**，因为 `@electric-sql/pglite@0.5.4` 只提供进程内 async mutex，**没有任何跨进程文件锁**（在 `dist/index.cjs` 中核实：仅 `mutex already locked` 一类的进程内错误，唯一的 `O_EXCL` 命中是 Emscripten 的 NODEFS 标志表）。只有 CLI 持锁而 Server 不持锁，等于没有锁：两个进程仍会同时写同一个 `<dataDir>/pgdata`，且认领会与在线写入竞争。片 7 保留的部分是：真实 HTTP 升级演练（BI1–BI6）、跨进程锁断言的进程级证据、README 运维说明之外的生产收口。
+
+获取顺序固定：CLI 为「解析参数 → stat dataDir（绝不创建）→ 取锁 → stat pgdata → 开库」；Server 为「mkdir → 取锁 → 开库」。`closeDb` 先关客户端**再**释放锁，故下一个进程不会在本次仍在收尾时打开数据库。开库失败时锁由获取方显式释放（此时 handle 尚不存在，既有的失败清理覆盖不到）。
+
+### 21. 离线认领契约（拷贝后单事务）
+
+**先拷贝、后事务**：全部选中机器的全部 Blob 在**任何数据库写入之前**复制并验证完毕，之后才在单个事务中切换归属与元数据。事务只写四列——`machines.team_id`、`artifact_manifests.namespace_id`、`artifact_sync_sessions.namespace_id`，以及目标 namespace 下新增的 `artifact_blobs` 行；manifest id/entries/revision/committedAt、session receipt/normalizedManifest、`runs.artifact_snapshot_id`、`loops.*`、`machines.id`/`token_hash` 逐字节不动。
+
+**ADR-010 决策 11/12「manifest 不可变」的精确豁免**：不可变指 id、entries、manifestRevision、committedAt、configRevision；`namespace_id` 是**恰好迁移一次**的列——只在认领事务中改写，此后再不改动。两条 UPDATE 都以原 namespace 为前置条件并断言影响行数，失配即整事务回滚（`claim_guard_lost`）。
+
+**`published:false` 不是验证**：本地 BlobStore 只校验传入流，从不回读既存目标文件，故批次契约「若目标 Blob 已存在，也必须验证」必须由 CLI 自己回读并重算 SHA-256 兑现。目标既存但损坏一律**硬拒绝、绝不覆盖**——认领的全部意义就是历史不变。源流的中断以抛错方式进入共享验证管线，归类为 `storage_error` 而非 `content_mismatch`，避免把流中断误报成源数据损坏。
+
+**拷贝集 = 源 namespace 的全部 `artifact_blobs` 行**（manifest entries 是其子集，由链检查保证）。这不只是保守：一个仍处于 pending 的 session 在认领后重放 commit 时，其完整性检查要在**新** namespace 看到 blob 行与文件，漏掉未上表但已协商的 hash 会让该 session 永久无法提交。
+
+**源侧全部保留**：源 Blob 文件与源 `(machineId, hash)` 元数据行都不删。保留与 `createMachineAttributionResolver` 的存续语义一致，可复查、可逆，且与批次的无 GC 姿态一致；下一次目标是同一对的认领是幂等 no-op，不会把它们当作待迁移行。
+
+**活跃 Run 判定（用户裁定）**：`phase = 'running'` **拒绝**，`phase = 'pending'` **只警告**。running Run 持活跃 lease，其 Report 由 Run 凭据授权（不经机器资格门），可在认领后落地并对着刚改写过的行重新派生归属——这正是「先 drain」的对象。pending Run 在认领前惰性（未认领机器无法 claim 工作），认领后随机器恢复而可执行；若连它一起拒绝会死锁：取消 Run 要开管理 API，开 Server 又被锁禁止。dry-run 与执行报告都列出其数量供操作者判断。
+
+**幂等与重试**：同一目标重复认领为 no-op（已认领机器改按**目标** namespace 做完整链检查，半迁移的世界判 `chain_inconsistent` 而非二次迁移）；跨团队、机器缺失、链不一致拒绝**整组**，没有「能认领多少算多少」。崩溃或回滚后的重跑是普通重跑：数据库未变，已发布的目标 Blob 由 `has` + 回读验证发现并计为 reused。事务失败后未引用的目标 Blob 保留，由重试复用——契约明确允许。
+
+**链检查**（不通过一律拒绝）：manifest/session 的 `namespaceId` 必须等于期望源 namespace；其 `loopId` 必须属于该机器；`fileCount === entries.length`、`totalBytes === Σsize`；每个 entry 的 hash 满足 `ARTIFACT_HASH_RE` 且 size 落在合法域；每个 entry hash 有同尺寸的 blob 行；`runs.artifactSnapshotId` 与 `loops.artifactManifestId` 必须落在该机器的 manifest 集合内；同 hash 跨机器尺寸冲突；每个 blob 行的文件必须存在（`source_blob_missing`）。
+
+**dry-run 深度（用户裁定）**：只做元数据行 + 存在性（lstat），不读字节、不算哈希；损坏的源 Blob 在执行阶段才暴露。dry-run 严格只读且快。
+
+### 22. `claim:legacy` 命令表面
+
+`pnpm --filter @loopzhb/server claim:legacy -- --data-dir <目录> --github-user-id <数字ID> --machine-id <机器ID> [--machine-id …] [--dry-run]`。`--data-dir` 必填且无环境变量回退；`--github-user-id` 必须是十进制 GitHub 数字 ID（复用 `schema.ts` 的 `GITHUB_USER_ID_REGEX` 同源规则）；`--machine-id` 可重复，重复**值**判用法错误（复制粘贴失误，静默去重会掩盖它），至少一个——不提供「认领全部」。退出码：0 成功/幂等 no-op，1 拒绝或失败，2 用法错误，3 数据目录被锁。CLI **不读任何环境变量**，也不 import `loadServerConfig`（运维 shell 没有 OAuth 三件套）。`--data-dir` 不存在或缺少 `pgdata` 时在开库前拒绝——避免在笔误路径上静默建库再报「目标用户不存在」。CLI 与 Server 共用 `openMigratedDb` 开库路径，故 CLI 可能顺带应用迁移；升级顺序保证 Server 先启动过，这是已披露的行为。

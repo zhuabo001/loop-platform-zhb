@@ -26,6 +26,12 @@ _Avoid_: Sweep, cancel
 The time of a Run's most recent lifecycle transition.
 _Avoid_: Run creation time
 
+**Data-dir Lock**:
+The exclusive lock over one server data directory, shared by the Server and the offline claim command;
+it is the only cross-process mutex over the embedded database, since PGlite provides none. It is never
+taken over automatically.
+_Avoid_: Database lock, PID lockfile
+
 **Machine Heartbeat Watermark**:
 Durable recent proof that an authenticated Machine has contacted the server; Machine presence is
 derived from this watermark rather than stored as a separate fact.

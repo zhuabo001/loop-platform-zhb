@@ -395,3 +395,75 @@ server 较片 2 基线（`78e51b7`，1139+3skip）**+36**，全部为资格门�
 ### 结论（片 3）
 
 本片验收确认：生产自注册已彻底移除——未知、未认领、已撤销三类机器凭据在 poll 与 Artifact 两条路径上统一 401，且凭据门整体先于 capability 资源策略与任何心跳/快照/claim 写入；未认领、已撤销与孤儿机器的 loop 不注册调度、不 catch-up、不在 enqueue 边界新增 Run、不 supersede 既有 pending、游标不推进；生产 Artifact namespace 已切换为所属 Team；拒绝路径的零写入由覆盖全部业务表的非空 oracle 与三类副作用变异证明。机器接入（ConnectKey）、离线认领与在线撤销分别留待 Batch 4 与片 4。
+
+## 片 4 — 离线认领与 Artifact namespace 迁移
+
+> 权威计划：`docs/plan/codex-phase5-batch3-slices-plan.md` 第 50–70 行与 Slice 4 节；长期裁决：`docs/adr/011-phase5-identity-and-legacy-claim.md` 决策 20–22。
+
+### 测试编组与结果（片 4）
+
+**LM3–LM10 映射**：计划原文列出 9 个短语但只给 8 个编号，按列表序把「重复/跨团队认领」并入 LM5；映射如实记录于此。
+
+| 编号 | 场景 | 文件 |
+|---|---|---|
+| LM3 | 未知目标（用户缺失 / 无个人团队 / 团队缺 owner membership） | `claim/args.test.ts`、`claim/slice4-refusal-e2e.test.ts` |
+| LM4 | 错误机器（机器缺失 / 已撤销） | `claim/slice4-refusal-e2e.test.ts` |
+| LM5 | 重复认领幂等 no-op + 跨团队整组拒绝 + 重复 `--machine-id` 用法错 | `claim/slice4-e2e.test.ts`、`claim/slice4-refusal-e2e.test.ts` |
+| LM6 | 停服要求（真实 Server 持锁 ⇒ 退出 3 且数据库未被打开；停服后同一命令成功） | 同上 + `data-dir-lock.test.ts` |
+| LM7 | 活跃 Run 拒绝（`running` 拒绝 / `done` 放行 / `pending` 只警告） | `claim/slice4-refusal-e2e.test.ts` |
+| LM8 | 复制失败（源缺失 / 源损坏 / 目标既存但损坏且不被覆盖 / 注入 storage_error 且第五个之后失败） | 同上 |
+| LM9 | 事务回滚 + 规划后被抢注的守卫 | 同上 |
+| LM10 | 断点重试、同 hash 复用、历史完整性与原凭据恢复 | `claim/slice4-e2e.test.ts` |
+
+**编组明细**：
+
+- **参数层**（`claim/args.test.ts`，14 项，纯单测无 I/O）：文档化调用形态、`--data-dir` 相对路径按 cwd 解析、`--machine-id` 可重复且保序、单个前导 `--` 容忍、`--dry-run` 默认假、帮助探针在 flag 槽生效而**值槽不生效**（`--data-dir --help` 是畸形值而非探针）、未知 flag/位置参数/`--dry-run=true`/重复单值 flag/重复 `--machine-id` 值/缺值/`--` 形状值/空值/非十进制 uid/零个 `--machine-id` 全部拒绝；USAGE 文本钉住锁路径、`rm` 恢复行与四个退出码。
+- **锁**（`data-dir-lock.test.ts`，8 项，真实临时目录无接缝）：持有者记录（pid/role/startedAt/主机名）与 0600 权限、释放后文件消失且二次释放幂等、第二次获取被拒并报出持有者、手写陈旧锁被拒且拒绝文本含 `rm <路径>`（损坏记录**仍是锁**）、**释放的 inode 守卫**（锁文件被换掉后释放不动新文件）、Server 启动以 `role: server` 记录、被锁时 `bootstrapServer` 拒绝**且未创建 pgdata**、`closeDb` 释放锁后同一 dataDir 可再次启动、取锁后开库失败也归还锁。
+- **dry-run**：报告目标账号/团队/机器/计数/需复制字节数，`<root>/<teamId>` 不产生目录，11 表 oracle 前后相等，源字节仍在。
+- **认领全链路**（`claim/slice4-e2e.test.ts`，6 项）：manifest `namespaceId` 迁移且 `id`/`entries`/`manifestRevision`/`committedAt` 逐字不变；两 session（含已提交）迁移且 receipt 逐字不变；机器 `id`/`tokenHash` 不变、仅 `team_id` 变化；团队 namespace 与源 namespace 各 3 个文件**并存**；源元数据行 3 行**保留**；二次运行是 no-op（11 表 + 目录列表不变）；两机器同 hash 单次运行只发布一次（计数装饰器断言恰好 1 次）、分两次运行第二次报 `0 copied / 3 reused` 且零发布；原凭据 `verifyEligibleMachineCredential` 返回同一行、`isMachineExecutionEligible` 为真、认领后新一轮 prepare→PUT→commit 落在 `<dataDir>/blobs/<teamId>/<hash>`。
+- **拒绝矩阵**（`claim/slice4-refusal-e2e.test.ts`，17 项）：LM3 三变体、LM4 两变体、LM5 整组拒绝、LM6 真实 Server 持锁（退出 3，且经 Server 自己的 handle 断言其机器行未被触碰）、LM7 的运行中 Run（拒绝并在终态后放行、残留 pending 计入警告）、LM8 四变体（源文件缺失、源同长度异内容、**目标既存损坏且逐字节未被覆盖**、注入 storage_error 在第 6 次写时失败——前 5 个已落盘而**没有任何机器被认领**）、LM9 两项（注入回滚；规划后机器被另一团队抢注 → `claim_guard_lost` 且另一台机器同样未被认领）、LM10 三项链不一致（manifest namespace 漂移、manifest entry 无 blob 行、loop 快照游标悬空）。
+
+**零写入 oracle**：拒绝路径一律在**非空世界**（预置已认领前置状态、loop、Run、真实落盘的 blob 与行、manifest、已提交与 pending session）上比对 `snapshotBusinessState`（7 张业务表）**加**新增的 `snapshotIdentityState`（users/teams/memberships/auth_sessions，共 11 张表，全字段、确定性排序）。
+
+### 显式边界核对（片 4）
+
+- **停止边界**：不在线认领、不迁移已归属机器、不删除源 Blob（文件与元数据行均保留）、不预建 GitHub 身份、不实现 ConnectKey（Batch 4）。管理面 Session 门禁与团队过滤 = 片 5；Dashboard 登录态 = 片 6；真实 HTTP 升级演练与跨进程锁断言 = 片 7。
+- **偏差点（如实登记）**：计划第 227 行把「dataDir 锁接入实际生产组合根」列为片 7 收口项，本片**提前接入 `bootstrapServer`**（ADR-011 决策 20 记录理由：PGlite 0.5.4 无跨进程文件锁，只有 CLI 持锁等于没有锁）。片 7 保留真实 HTTP 演练、进程级跨进程断言与 README 之外的运维收口。
+- **未覆盖的分支（如实声明）**：`target_team_namespace_invalid` 在 `teams_id_namespace_ck` 下**构造性不可达**，作为防御性拒绝保留但**没有测试**（本记录不声称有覆盖）。dry-run **不做内容校验**（用户裁定：只做元数据行 + 存在性 lstat），损坏的源 Blob 只在执行阶段暴露。CLI 与 Server 共用 `openMigratedDb`，故 **CLI 可能顺带应用迁移**——升级顺序保证 Server 先启动过，这是已披露行为而非缺陷。
+- **仅证到模块/HTTP 层**：LM10 的「原 Daemon 可恢复同步和执行」在本片以凭据门、执行资格谓词与真实 prepare→PUT→commit 落盘证明；**进程级**的「Daemon 子进程重启后继续同步与执行」属片 7（BI1–BI6），本片不声称。
+- **无新迁移**：所需列全部来自 0005/0006，journal 保持 7 条，`db:check` 零漂移，三处 `count = 7` 的钉桩测试无需改动。
+- **protocol/daemon 零改动**：本片只动 `packages/server`。
+- **测试接缝**：testkit 新增 `artifact-history.ts`（真实 `writeVerified` 落盘、真实 sha256、可注入撒谎行与原始写文件）与 `claim-fixtures.ts`（世界夹具、CLI 调用器、11 表 oracle、注入失败/计数装饰器）；两者经 `tsconfig.build.json` 排除，不进 dist。`claim-fixtures` **刻意不由 testkit 桶文件再导出**（它 import 桶文件，再导出会形成模块环），两个 e2e 文件直接 import。
+
+### 变异验证（片 4）
+
+八项变异，全部被对应用例抓住（每项恢复后逐字节复核）：
+
+| 变异 | 目标用例 |
+|---|---|
+| M1 锁获取由 `"wx"` 改为 `"w"`（不再互斥） | LM6（真实 Server 持锁时 CLI 仍应退出 3） |
+| M2 事务提到拷贝之前 | LM8「第六次写失败时全部机器未认领」 |
+| M3 复用路径信任目标、不回读验证 | LM8「目标既存损坏」 |
+| M4 session 的 `namespace_id` 不迁移 | 全链路「receipt 逐字不变」 |
+| M5 删除跨团队拒绝 | LM5「整组拒绝」 |
+| M6 删除 `machines.team_id IS NULL` 守卫 | LM9「规划后被抢注」（本项**首轮未被抓住**，为此补 `beforeClaimTx` 接缝与该用例后才转红——缺口由变异验证自身发现，如实记录） |
+| M7 接受无 blob 行的 manifest entry | LM10「manifest entry 无 blob 行」 |
+| M8 `closeDb` 不释放锁 | 锁「关库释放后同一 dataDir 可再次启动」 |
+
+### 完整质量门（片 4）
+
+```bash
+pnpm test                                   # protocol 292 / daemon 790 + 7 skipped / server 1220 + 3 skipped，EXIT=0
+pnpm typecheck                              # EXIT=0
+pnpm build                                  # EXIT=0（产出 dist/claim/main.js）
+pnpm --filter @loopzhb/server db:check      # 零漂移（本片无新增迁移），EXIT=0
+git diff --check                            # EXIT=0
+```
+
+server 较片 3 基线（1175 + 3 skipped）**+45**，恰为新增的四个套件：参数 14 + 锁 8 + 认领全链路 6 + 拒绝矩阵 17。protocol 与 daemon 计数不变（本片零改动这两个包）。
+
+**构建产物烟测（真实进程，非单元层）**：以真实 `dist/start.js` 启动 Server（临时 dataDir、真实 HTTP 端口），在另一个进程执行 `dist/claim/main.js`——退出码 **3**，stderr 为固定的锁拒绝文本（含持有者 pid/role/时间与 `rm` 恢复行）；SIGTERM 停止 Server 后锁文件消失，同一命令再次执行进入业务判定并以 `target_user_missing` 退出 **1**。该烟测另抓出「锁拒绝文本缺尾换行导致 shell 提示符粘连」并已修复（拒绝矩阵中以 `endsWith("\n")` 钉住）。
+
+### 结论（片 4）
+
+片 4 交付离线认领命令与 dataDir 独占锁。LM3–LM10 全覆盖，五道质量门全绿，八项变异全部被对应用例抓住。三条如实登记：**dataDir 锁从片 7 提前接入 `bootstrapServer`**（ADR-011 决策 20 记录理由与偏差）、**`target_team_namespace_invalid` 构造性不可达因而无测试**、**LM10 的「原 Daemon 恢复」只证到模块/HTTP 层**（进程级证据属片 7）。本片未关闭任何既有 Issue，也无需新建：实施过程中的两处真实缺口（M6 守卫无覆盖、拒绝文本缺尾换行）由变异验证与真实进程烟测自身发现并当轮补齐。

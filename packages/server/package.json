@@ -21,6 +21,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "start": "node --enable-source-maps dist/start.js",
+    "claim:legacy": "node --enable-source-maps dist/claim/main.js",
     "typecheck": "pnpm --filter @loopzhb/protocol build && pnpm --filter @loopzhb/daemon build && tsc --noEmit",
     "test": "pnpm --filter @loopzhb/protocol build && pnpm --filter @loopzhb/daemon build && vitest run",
     "db:generate": "drizzle-kit generate",

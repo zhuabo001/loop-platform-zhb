@@ -278,7 +278,36 @@ export async function snapshotBusinessState(db: Db) {
   };
 }
 
+/**
+ * The IDENTITY half of the zero-write oracle (Phase 5 Batch 3 slice 4): users,
+ * teams, memberships and auth_sessions. Compose it with
+ * `snapshotBusinessState` when a refusal must prove it touched NEITHER the
+ * business tables nor the identity tables — the offline claim reads both.
+ *
+ * Same rule as `snapshotBusinessState`: pair it with a POPULATED fixture.
+ */
+export async function snapshotIdentityState(db: Db) {
+  return {
+    users: await db.select().from(users).orderBy(asc(users.id)),
+    teams: await db.select().from(teams).orderBy(asc(teams.id)),
+    memberships: await db.select().from(memberships).orderBy(asc(memberships.userId), asc(memberships.teamId)),
+    authSessions: await db.select().from(authSessions).orderBy(asc(authSessions.credentialHash)),
+  };
+}
+
 export { staticAttribution } from "./artifact-attribution.js";
+// NOTE: `./claim-fixtures.js` is deliberately NOT re-exported here. It imports
+// this barrel, so re-exporting it would close a module cycle; the claim tests
+// import it directly instead.
+export {
+  artifactBlobPath,
+  makeArtifactBlob,
+  plantRawBlobFile,
+  seedArtifactBlob,
+  seedArtifactManifest,
+  seedArtifactSyncSession,
+  unlinkArtifactBlobFile,
+} from "./artifact-history.js";
 
 // ---- Phase 5 Batch 3 identity fixtures (ADR-011) ----
 //

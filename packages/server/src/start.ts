@@ -27,6 +27,7 @@ import { isLoopbackHost, loadServerConfig, unauthenticatedExposureWarning, type 
 import { mintCsrfToken } from "./dashboard/csrf.js";
 import { createDashboardArtifactRead, createDashboardRead } from "./dashboard/index.js";
 import { createDashboardRoutes } from "./dashboard/routes.js";
+import { acquireDataDirLock, DataDirLockError, formatAcquireFailureMessage } from "./data-dir-lock.js";
 import { closeDb, openMigratedDb, type DbHandle } from "./db/index.js";
 import { createServerApp } from "./http/app.js";
 import { createLifecycleAdmin, type LifecycleOpsHooks } from "./loop-lifecycle/admin.js";
@@ -89,10 +90,11 @@ export interface BootstrapOverrides {
 
 /**
  * Everything except the listener — the testable core of boot. Creates the
- * data dir, opens+migrates the file-backed DB at `<dataDir>/pgdata`, and
- * wires the production coordinator (systemClock, UUID run ids, `rk_` mint)
- * and the production sweep (default 20min timeout). Throws if the data dir
- * cannot be created — boot fails fast, before listen.
+ * data dir, takes the dataDir exclusive lock (ADR-011 决策 20), opens+migrates
+ * the file-backed DB at `<dataDir>/pgdata`, and wires the production
+ * coordinator (systemClock, UUID run ids, `rk_` mint) and the production sweep
+ * (default 20min timeout). Throws if the data dir cannot be created or is
+ * locked by another process — boot fails fast, before listen.
  *
  * DB-handle ownership: a failure INSIDE bootstrap closes the handle here; once
  * the BootedServer is returned, the caller owns the handle exactly once.
@@ -106,7 +108,22 @@ export async function bootstrapServer(
   const clock = overrides.clock ?? systemClock;
   const cronFactory = overrides.cronFactory ?? productionCronFactory;
   await fs.promises.mkdir(config.dataDir, { recursive: true });
-  const handle = await openMigratedDb({ dataDir: config.dataDir });
+  // Boot gate (ADR-011 决策 20): take the dataDir lock BEFORE the database is
+  // opened. PGlite takes no cross-process lock of its own, so this is the only
+  // thing keeping two processes off one `<dataDir>/pgdata` — and the only thing
+  // that can refuse an offline claim against a RUNNING server.
+  const lockResult = await acquireDataDirLock(config.dataDir, { role: "server", clock });
+  if (!lockResult.ok) {
+    throw new DataDirLockError(formatAcquireFailureMessage(lockResult));
+  }
+  let handle: DbHandle;
+  try {
+    handle = await openMigratedDb({ dataDir: config.dataDir, dataDirLock: lockResult.lock });
+  } catch (err) {
+    // The handle never existed, so the catch below cannot release this lock.
+    await lockResult.lock.release().catch(() => {});
+    throw err;
+  }
   try {
     const coordinator = createRunCoordinator({
       db: handle.db,
