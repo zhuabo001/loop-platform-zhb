@@ -32,14 +32,18 @@ import { createOwnerControl } from "../owner/index.js";
 import { createScheduleAdmin } from "../schedule/index.js";
 import { REVISION_INT32_MAX } from "../schedule/transition.js";
 import {
+  createTestManagementAccess,
   FakeClock,
+  seedClaimedMachineById,
   seedClaimedMachineForToken,
+  seedManagementSession,
   seedLease,
   seedLoop,
   seedRun,
   snapshotBusinessState,
   staticAttribution,
   testDeps,
+  withManagementSession,
 } from "../testkit/index.js";
 import { createServerApp } from "./app.js";
 
@@ -93,25 +97,28 @@ async function fresh(options: { artifactFault?: { at: number; cause: unknown } }
   machineId = await seedClaimedMachineForToken(db, TOKEN);
   const otherMachineId = await seedClaimedMachineForToken(db, OTHER_TOKEN);
   const artifactDb = options.artifactFault ? faultingSelect(db, options.artifactFault.at, options.artifactFault.cause) : db;
-  app = createServerApp(
-    createRunCoordinator(testDeps(db, clock)),
-    createLoopAdmin({ db, clock, newLoopId: () => "loop-x" }),
-    createLifecycleAdmin({ db, clock }),
-    createScheduleAdmin({ db, clock }),
-    createOwnerControl({ db, clock }),
-    undefined,
-    undefined,
-    createArtifactApi({
-      db: artifactDb,
-      clock,
-      ids: { syncId: () => `sync-${++syncSeq}`, manifestId: () => `amf-${++manifestSeq}` },
-      blobStore: createMemoryBlobStore(),
-      // Stage-2 fault injection needs a REAL attribution read: the production
-      // resolver queries the machines row, staticAttribution never reads.
-      attribution: options.artifactFault
-        ? createMachineAttributionResolver({ db: artifactDb })
-        : staticAttribution({ [machineId]: "ns-1", [otherMachineId]: "ns-2" }),
+  const { credential } = await seedManagementSession(db, { clock });
+  app = withManagementSession(
+    createServerApp({
+      coordinator: createRunCoordinator(testDeps(db, clock)),
+      admin: createLoopAdmin({ db, clock, newLoopId: () => "loop-x" }),
+      lifecycle: createLifecycleAdmin({ db, clock }),
+      schedule: createScheduleAdmin({ db, clock }),
+      ownerControl: createOwnerControl({ db, clock }),
+      management: createTestManagementAccess(db, clock),
+      artifacts: createArtifactApi({
+        db: artifactDb,
+        clock,
+        ids: { syncId: () => `sync-${++syncSeq}`, manifestId: () => `amf-${++manifestSeq}` },
+        blobStore: createMemoryBlobStore(),
+        // Stage-2 fault injection needs a REAL attribution read: the production
+        // resolver queries the machines row, staticAttribution never reads.
+        attribution: options.artifactFault
+          ? createMachineAttributionResolver({ db: artifactDb })
+          : staticAttribution({ [machineId]: "ns-1", [otherMachineId]: "ns-2" }),
+      }),
     }),
+    credential,
   );
 }
 
@@ -210,6 +217,10 @@ describe("AH2: PATCH /api/loops/:id/artifact-dir", () => {
       404,
       { error: "not found" },
     );
+    // Slice 5: the ownership gate answers before the DTO is parsed, so the
+    // malformed-body probe needs an OWNED loop to reach the route.
+    await seedClaimedMachineById(db, "m-test");
+    await seedLoop(db, { id: "loop-1" });
     await expectJson(
       await app.request("/api/loops/loop-1/artifact-dir", {
         method: "PATCH",

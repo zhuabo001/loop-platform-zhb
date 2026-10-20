@@ -64,7 +64,13 @@ import { closeDb } from "./db/index.js";
 import { loops, runLeases, runs, type Loop } from "./db/schema.js";
 import { AcceptedReportCostObserver, DaemonLogObserver, DetachedProcessSupervisor } from "./real-claude-e2e-harness.js";
 import { bootstrapServer, waitForListening, type BootedServer } from "./start.js";
-import { FakeClock, FakeCronFactory, makeTestAuthConfig, seedClaimedMachineIfAbsent } from "./testkit/index.js";
+import {
+  FakeClock,
+  FakeCronFactory,
+  makeTestAuthConfig,
+  seedClaimedMachineIfAbsent,
+  seedManagementSession,
+} from "./testkit/index.js";
 
 const TOKEN = "dk_e2e_batch3_dashboard";
 const GOAL = "Record the step-1 marker into state, then finish from the updated Timeline";
@@ -118,6 +124,15 @@ async function waitFor(check: () => Promise<boolean>, timeoutMs: number, interva
   throw new Error(`waitFor timeout after ${timeoutMs}ms`);
 }
 
+let sessionCredential = "";
+
+/** Every management request carries the Login Session (slice 5). */
+function sessionHeaders(extra: ConstructorParameters<typeof Headers>[0] = {}): Headers {
+  const headers = new Headers(extra);
+  if (!headers.has("cookie")) headers.set("cookie", `loopzhb_session=${sessionCredential}`);
+  return headers;
+}
+
 const reportCosts = new AcceptedReportCostObserver();
 
 async function bootLifetime(dataDir: string, clock: FakeClock): Promise<Lifetime> {
@@ -134,6 +149,8 @@ async function bootLifetime(dataDir: string, clock: FakeClock): Promise<Lifetime
     // claimed machine this daemon's token polls as (idempotent: this helper
     // boots repeatedly on the SAME dataDir across the restart phases).
     await seedClaimedMachineIfAbsent(booted.handle.db, TOKEN);
+    // Idempotent across the restart phases of ONE dataDir.
+    sessionCredential = (await seedManagementSession(booted.handle.db, { clock })).credential;
     // start.ts main()'s fixed order: the listener is bound BEFORE the
     // scheduler's startup scan, so nothing schedules behind an unbound port.
     await booted.scheduler.start();
@@ -176,7 +193,7 @@ async function getPage(baseUrl: string): Promise<string> {
 }
 
 async function runsOf(baseUrl: string, loopId: string) {
-  const res = await fetch(`${baseUrl}/api/loops/${loopId}/runs`);
+  const res = await fetch(`${baseUrl}/api/loops/${loopId}/runs`, { headers: sessionHeaders() });
   expect(res.status).toBe(200);
   return runListResponseSchema.parse(await res.json()).runs;
 }
@@ -191,7 +208,7 @@ async function createLoop(
 ): Promise<{ id: string }> {
   const res = await fetch(`${baseUrl}/api/loops`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: sessionHeaders({ "content-type": "application/json" }),
     body: JSON.stringify(body),
   });
   expect(res.status).toBe(201);
@@ -281,7 +298,7 @@ describe("Phase 4 Batch 3 deterministic E2E (E1–E2): Dashboard → state → f
         //    `lastSeen` — written only by the daemon's own poll contact.
         const machineId = machineIdFromToken(TOKEN);
         await waitFor(async () => {
-          const res = await fetch(`${first.baseUrl}/api/machines`);
+          const res = await fetch(`${first.baseUrl}/api/machines`, { headers: sessionHeaders() });
           if (!res.ok) return false;
           const body = (await res.json()) as { machines?: Array<{ id: string; lastSeen: string | null }> };
           return body.machines?.some((m) => m.id === machineId && m.lastSeen !== null) ?? false;
@@ -415,7 +432,7 @@ describe("Phase 4 Batch 3 deterministic E2E (E1–E2): Dashboard → state → f
           [`/api/loops/${loopId}/schedule`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: true }) }],
           [`/api/loops/${loopId}/goal`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ goal: "too late" }) }],
         ] as Array<[string, RequestInit]>) {
-          const res = await fetch(`${first.baseUrl}${route}`, init);
+          const res = await fetch(`${first.baseUrl}${route}`, { ...init, headers: sessionHeaders(init.headers) });
           const text = await res.text();
           apiBodies.push(text);
           expect(res.status).toBe(409);

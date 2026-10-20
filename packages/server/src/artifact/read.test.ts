@@ -26,10 +26,15 @@ import {
   readLoopArtifactsView,
   readRunArtifactsView,
   type ArtifactReadHome,
+  type ReadScope,
 } from "./read.js";
 import { seedLoop, seedMachine, seedRun, staticAttribution } from "../testkit/index.js";
 
 const NOW = "2026-10-06T00:00:00.000Z";
+
+/** These tests pin the READ SEMANTICS, not ownership; the team-scoped arm is
+ *  covered by the slice-5 gate/scope suites. */
+const UNSCOPED: ReadScope = { kind: "unscoped" };
 
 function hashOf(content: string): string {
   return createHash("sha256").update(content).digest("hex");
@@ -147,7 +152,7 @@ describe("read facade over real PGlite (frozen evaluation order, AV1/AV2/AV7)", 
   describe("readLoopArtifactsView", () => {
     it("unconfigured loop is NOT an error: the nullable view shape is served (AV7)", async () => {
       await seedLoop(db, { id: "loop-1", machineId: "m-1" });
-      const result = await readLoopArtifactsView(home, "loop-1");
+      const result = await readLoopArtifactsView(home, "loop-1", UNSCOPED);
       expect(result).toEqual({
         ok: true,
         response: {
@@ -171,7 +176,7 @@ describe("read facade over real PGlite (frozen evaluation order, AV1/AV2/AV7)", 
         artifactSyncAttemptedAt: NOW,
         artifactSyncError: "directory_missing",
       });
-      const result = await readLoopArtifactsView(home, "loop-1");
+      const result = await readLoopArtifactsView(home, "loop-1", UNSCOPED);
       if (!result.ok) throw new Error(`fixture must succeed: ${JSON.stringify(result)}`);
       expect(result.response).toMatchObject({
         artifactDir: "/data/out",
@@ -189,7 +194,7 @@ describe("read facade over real PGlite (frozen evaluation order, AV1/AV2/AV7)", 
 
     it("config generation moved on ⇒ stale:true, the old view still served (决策 8, AV7)", async () => {
       await seedBoundLoop({ artifactConfigRevision: 2 });
-      const result = await readLoopArtifactsView(home, "loop-1");
+      const result = await readLoopArtifactsView(home, "loop-1", UNSCOPED);
       if (!result.ok) throw new Error(`fixture must succeed: ${JSON.stringify(result)}`);
       expect(result.response.stale).toBe(true);
       expect(result.response.files).toHaveLength(2);
@@ -197,17 +202,18 @@ describe("read facade over real PGlite (frozen evaluation order, AV1/AV2/AV7)", 
 
     it("dangling pointer ⇒ manifest null, stale:false, empty files (out-of-band damage only)", async () => {
       await seedBoundLoop({ artifactManifestId: "amf-ghost" });
-      const result = await readLoopArtifactsView(home, "loop-1");
+      const result = await readLoopArtifactsView(home, "loop-1", UNSCOPED);
       if (!result.ok) throw new Error(`fixture must succeed: ${JSON.stringify(result)}`);
       expect(result.response).toMatchObject({ manifestId: "amf-ghost", manifestRevision: 1, stale: false, files: [] });
     });
 
     it("unknown loop ⇒ loop_not_found; unmapped machine ⇒ attribution_missing (AV2)", async () => {
       await seedLoop(db, { id: "loop-1", machineId: "m-1" });
-      expect(await readLoopArtifactsView(home, "loop-nope")).toEqual({ ok: false, failure: "loop_not_found" });
+      expect(await readLoopArtifactsView(home, "loop-nope", UNSCOPED)).toEqual({ ok: false, failure: "loop_not_found" });
       const refused = await readLoopArtifactsView(
         { ...home, attribution: staticAttribution({}) },
         "loop-1",
+        UNSCOPED,
       );
       expect(refused).toEqual({ ok: false, failure: "attribution_missing" });
     });
@@ -217,7 +223,7 @@ describe("read facade over real PGlite (frozen evaluation order, AV1/AV2/AV7)", 
     it("unbound run ⇒ the EXPLICIT missing state, exactly the frozen shape (AV7)", async () => {
       await seedBoundLoop();
       await seedRun(db, { id: "run-1", loopId: "loop-1", machineId: "m-1", artifactSnapshotId: null });
-      const result = await readRunArtifactsView(home, "run-1");
+      const result = await readRunArtifactsView(home, "run-1", UNSCOPED);
       expect(result).toEqual({ ok: true, response: { runId: "run-1", loopId: "loop-1", state: "missing" } });
       if (result.ok) expect(result.response).not.toHaveProperty("files");
     });
@@ -225,7 +231,7 @@ describe("read facade over real PGlite (frozen evaluation order, AV1/AV2/AV7)", 
     it("bound run serves the snapshot's frozen bound shape", async () => {
       await seedBoundLoop();
       await seedRun(db, { id: "run-1", loopId: "loop-1", machineId: "m-1", artifactSnapshotId: "amf-1" });
-      const result = await readRunArtifactsView(home, "run-1");
+      const result = await readRunArtifactsView(home, "run-1", UNSCOPED);
       if (!result.ok) throw new Error(`fixture must succeed: ${JSON.stringify(result)}`);
       expect(result.response).toEqual({
         runId: "run-1",
@@ -246,17 +252,17 @@ describe("read facade over real PGlite (frozen evaluation order, AV1/AV2/AV7)", 
       await seedLoop(db, { id: "loop-2", machineId: "m-1" });
       await seedLoop(db, { id: "loop-1", machineId: "m-1" });
       await seedRun(db, { id: "run-1", loopId: "loop-1", machineId: "m-1", artifactSnapshotId: "amf-other" });
-      expect(await readRunArtifactsView(home, "run-1")).toEqual({ ok: false, failure: "snapshot_not_found" });
+      expect(await readRunArtifactsView(home, "run-1", UNSCOPED)).toEqual({ ok: false, failure: "snapshot_not_found" });
     });
 
     it("bound-but-row-gone ⇒ snapshot_not_found, NOT missing (V3: never rewrite history)", async () => {
       await seedLoop(db, { id: "loop-1", machineId: "m-1" });
       await seedRun(db, { id: "run-1", loopId: "loop-1", machineId: "m-1", artifactSnapshotId: "amf-ghost" });
-      expect(await readRunArtifactsView(home, "run-1")).toEqual({ ok: false, failure: "snapshot_not_found" });
+      expect(await readRunArtifactsView(home, "run-1", UNSCOPED)).toEqual({ ok: false, failure: "snapshot_not_found" });
     });
 
     it("unknown run ⇒ run_not_found", async () => {
-      expect(await readRunArtifactsView(home, "run-nope")).toEqual({ ok: false, failure: "run_not_found" });
+      expect(await readRunArtifactsView(home, "run-nope", UNSCOPED)).toEqual({ ok: false, failure: "run_not_found" });
     });
 
     it("#111: the nested page's expected parent folds a mismatch into run_not_found at the IDENTITY step", async () => {
@@ -264,21 +270,21 @@ describe("read facade over real PGlite (frozen evaluation order, AV1/AV2/AV7)", 
       await seedRun(db, { id: "run-1", loopId: "loop-1", machineId: "m-1", artifactSnapshotId: "amf-1" });
       // Wrong / nonexistent parent: indistinguishable from a run that never
       // existed — bound state and (below) missing state alike.
-      expect(await readRunArtifactsView(home, "run-1", "loop-OTHER")).toEqual({ ok: false, failure: "run_not_found" });
-      expect(await readRunArtifactsView(home, "run-1", "loop-nope")).toEqual({ ok: false, failure: "run_not_found" });
-      expect(await readRunArtifactsView(home, "run-nope", "loop-1")).toEqual({ ok: false, failure: "run_not_found" });
+      expect(await readRunArtifactsView(home, "run-1", UNSCOPED, "loop-OTHER")).toEqual({ ok: false, failure: "run_not_found" });
+      expect(await readRunArtifactsView(home, "run-1", UNSCOPED, "loop-nope")).toEqual({ ok: false, failure: "run_not_found" });
+      expect(await readRunArtifactsView(home, "run-nope", UNSCOPED, "loop-1")).toEqual({ ok: false, failure: "run_not_found" });
       // The matching parent keeps the domain result.
-      const bound = await readRunArtifactsView(home, "run-1", "loop-1");
+      const bound = await readRunArtifactsView(home, "run-1", UNSCOPED, "loop-1");
       if (!bound.ok) throw new Error(`fixture must succeed: ${JSON.stringify(bound)}`);
       expect(bound.response.state).toBe("bound");
       // No expected parent (the flat JSON route): the unscoped legacy read.
-      const legacy = await readRunArtifactsView(home, "run-1");
+      const legacy = await readRunArtifactsView(home, "run-1", UNSCOPED);
       if (!legacy.ok) throw new Error(`fixture must succeed: ${JSON.stringify(legacy)}`);
       expect(legacy.response.state).toBe("bound");
       // …and the missing state folds the same way.
       await seedRun(db, { id: "run-2", loopId: "loop-1", machineId: "m-1", artifactSnapshotId: null });
-      expect(await readRunArtifactsView(home, "run-2", "loop-OTHER")).toEqual({ ok: false, failure: "run_not_found" });
-      const missing = await readRunArtifactsView(home, "run-2", "loop-1");
+      expect(await readRunArtifactsView(home, "run-2", UNSCOPED, "loop-OTHER")).toEqual({ ok: false, failure: "run_not_found" });
+      const missing = await readRunArtifactsView(home, "run-2", UNSCOPED, "loop-1");
       if (!missing.ok) throw new Error(`fixture must succeed: ${JSON.stringify(missing)}`);
       expect(missing.response.state).toBe("missing");
     });
@@ -290,17 +296,17 @@ describe("read facade over real PGlite (frozen evaluation order, AV1/AV2/AV7)", 
       await seedRun(db, { id: "run-1", loopId: "loop-1", machineId: "m-1", artifactSnapshotId: null });
       const unmapped = { ...home, attribution: staticAttribution({}) };
       // Correct parent: attribution_missing is the preserved 403 control.
-      expect(await readRunArtifactsView(unmapped, "run-1", "loop-1")).toEqual({
+      expect(await readRunArtifactsView(unmapped, "run-1", UNSCOPED, "loop-1")).toEqual({
         ok: false,
         failure: "attribution_missing",
       });
       // Wrong / nonexistent parent: run_not_found — the domain failure must
       // not leak the run's existence under a foreign scope (决策 13/27).
-      expect(await readRunArtifactsView(unmapped, "run-1", "loop-OTHER")).toEqual({
+      expect(await readRunArtifactsView(unmapped, "run-1", UNSCOPED, "loop-OTHER")).toEqual({
         ok: false,
         failure: "run_not_found",
       });
-      expect(await readRunArtifactsView(unmapped, "run-1", "loop-nope")).toEqual({
+      expect(await readRunArtifactsView(unmapped, "run-1", UNSCOPED, "loop-nope")).toEqual({
         ok: false,
         failure: "run_not_found",
       });
@@ -321,7 +327,7 @@ describe("read facade over real PGlite (frozen evaluation order, AV1/AV2/AV7)", 
           yield new TextEncoder().encode("aaa");
         })(),
       });
-      const result = await openArtifactDownload(home, "loop-1", { snapshotId: "amf-1", path: "a.txt" });
+      const result = await openArtifactDownload(home, "loop-1", { snapshotId: "amf-1", path: "a.txt" }, UNSCOPED);
       if (!result.ok) throw new Error(`fixture must succeed: ${JSON.stringify(result)}`);
       expect(result.entry).toEqual(entry("a.txt", "aaa"));
       expect(result.manifest.id).toBe("amf-1");
@@ -335,7 +341,7 @@ describe("read facade over real PGlite (frozen evaluation order, AV1/AV2/AV7)", 
       // The lookup is the manifest ENTRIES table, never a disk path: a
       // traversal-shaped string is simply an unknown path.
       for (const path of ["absent.txt", "../escape.txt"]) {
-        expect(await openArtifactDownload(home, "loop-1", { snapshotId: "amf-1", path })).toEqual({
+        expect(await openArtifactDownload(home, "loop-1", { snapshotId: "amf-1", path }, UNSCOPED)).toEqual({
           ok: false,
           failure: "path_not_found",
         });
@@ -343,14 +349,14 @@ describe("read facade over real PGlite (frozen evaluation order, AV1/AV2/AV7)", 
       await seedManifest({ id: "amf-other", loopId: "loop-2" });
       await seedLoop(db, { id: "loop-2", machineId: "m-1" });
       expect(
-        await openArtifactDownload(home, "loop-1", { snapshotId: "amf-other", path: "a.txt" }),
+        await openArtifactDownload(home, "loop-1", { snapshotId: "amf-other", path: "a.txt" }, UNSCOPED),
       ).toEqual({ ok: false, failure: "snapshot_not_found" });
     });
 
     it("blob gone ⇒ RAW blob_missing (the ROUTE composes R3 → 404 path_not_found)", async () => {
       await seedManifest({ id: "amf-1" });
       await seedLoop(db, { id: "loop-1", machineId: "m-1" });
-      const result = await openArtifactDownload(home, "loop-1", { snapshotId: "amf-1", path: "a.txt" });
+      const result = await openArtifactDownload(home, "loop-1", { snapshotId: "amf-1", path: "a.txt" }, UNSCOPED);
       expect(result).toEqual({ ok: false, failure: "blob_missing" });
     });
 
@@ -363,7 +369,7 @@ describe("read facade over real PGlite (frozen evaluation order, AV1/AV2/AV7)", 
         ...home,
         blobStore: createMemoryBlobStore({ faults: { notRegularKeys: new Set([`m-1/${HASH_A}`]) } }),
       };
-      const result = await openArtifactDownload(anomalous, "loop-1", { snapshotId: "amf-1", path: "a.txt" });
+      const result = await openArtifactDownload(anomalous, "loop-1", { snapshotId: "amf-1", path: "a.txt" }, UNSCOPED);
       expect(result).toEqual({ ok: false, failure: "storage_error" });
     });
 
@@ -390,7 +396,7 @@ describe("read facade over real PGlite (frozen evaluation order, AV1/AV2/AV7)", 
         attribution: staticAttribution({}),
         blobStore: createMemoryBlobStore(),
       };
-      const result = await openArtifactDownload(poisoned, "loop-1", { snapshotId: "amf-1", path: "a.txt" });
+      const result = await openArtifactDownload(poisoned, "loop-1", { snapshotId: "amf-1", path: "a.txt" }, UNSCOPED);
       expect(result).toEqual({ ok: false, failure: "attribution_missing" });
     });
   });
@@ -418,7 +424,7 @@ describe("read facade over real PGlite (frozen evaluation order, AV1/AV2/AV7)", 
 
     it("from+to: the three classes with the frozen response shape (AV6)", async () => {
       await seedTwoSnapshots();
-      const result = await diffLoopSnapshots(home, "loop-1", { from: "amf-1", to: "amf-2" });
+      const result = await diffLoopSnapshots(home, "loop-1", { from: "amf-1", to: "amf-2" }, UNSCOPED);
       if (!result.ok) throw new Error(`fixture must succeed: ${JSON.stringify(result)}`);
       expect(result.response).toEqual({
         loopId: "loop-1",
@@ -432,7 +438,7 @@ describe("read facade over real PGlite (frozen evaluation order, AV1/AV2/AV7)", 
 
     it("omitted from = empty-set baseline: from is null in the response (AV6)", async () => {
       await seedTwoSnapshots();
-      const result = await diffLoopSnapshots(home, "loop-1", { to: "amf-2" });
+      const result = await diffLoopSnapshots(home, "loop-1", { to: "amf-2" }, UNSCOPED);
       if (!result.ok) throw new Error(`fixture must succeed: ${JSON.stringify(result)}`);
       expect(result.response.from).toBeNull();
       expect(result.response.added.map((e) => e.path).sort()).toEqual(["a.txt", "b.txt"]);
@@ -443,11 +449,11 @@ describe("read facade over real PGlite (frozen evaluation order, AV1/AV2/AV7)", 
       await seedTwoSnapshots();
       await seedManifest({ id: "amf-other", loopId: "loop-2", manifestRevision: 1 });
       await seedLoop(db, { id: "loop-2", machineId: "m-1" });
-      expect(await diffLoopSnapshots(home, "loop-1", { to: "amf-other" })).toEqual({
+      expect(await diffLoopSnapshots(home, "loop-1", { to: "amf-other" }, UNSCOPED)).toEqual({
         ok: false,
         failure: "snapshot_not_found",
       });
-      expect(await diffLoopSnapshots(home, "loop-1", { from: "amf-other", to: "amf-2" })).toEqual({
+      expect(await diffLoopSnapshots(home, "loop-1", { from: "amf-other", to: "amf-2" }, UNSCOPED)).toEqual({
         ok: false,
         failure: "snapshot_not_found",
       });
@@ -455,7 +461,7 @@ describe("read facade over real PGlite (frozen evaluation order, AV1/AV2/AV7)", 
 
     it("unknown loop ⇒ loop_not_found (evaluation order: scope before snapshots)", async () => {
       await seedTwoSnapshots();
-      expect(await diffLoopSnapshots(home, "loop-nope", { to: "amf-2" })).toEqual({
+      expect(await diffLoopSnapshots(home, "loop-nope", { to: "amf-2" }, UNSCOPED)).toEqual({
         ok: false,
         failure: "loop_not_found",
       });
@@ -470,10 +476,10 @@ describe("read facade over real PGlite (frozen evaluation order, AV1/AV2/AV7)", 
       const runsBefore = await db.select().from(runs);
       const manifestsBefore = await db.select().from(artifactManifests);
 
-      await readLoopArtifactsView({ ...home, attribution: staticAttribution({}) }, "loop-1");
-      await readRunArtifactsView(home, "run-nope");
-      await openArtifactDownload(home, "loop-1", { snapshotId: "amf-1", path: "nope.txt" });
-      await diffLoopSnapshots(home, "loop-1", { to: "amf-ghost" });
+      await readLoopArtifactsView({ ...home, attribution: staticAttribution({}) }, "loop-1", UNSCOPED);
+      await readRunArtifactsView(home, "run-nope", UNSCOPED);
+      await openArtifactDownload(home, "loop-1", { snapshotId: "amf-1", path: "nope.txt" }, UNSCOPED);
+      await diffLoopSnapshots(home, "loop-1", { to: "amf-ghost" }, UNSCOPED);
 
       expect(await db.select().from(loops)).toEqual(loopsBefore);
       expect(await db.select().from(runs)).toEqual(runsBefore);

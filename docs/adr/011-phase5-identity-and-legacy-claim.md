@@ -147,3 +147,41 @@ Poll 流水线的固定顺序改为「凭据门 → capability 资源策略」�
 ### 22. `claim:legacy` 命令表面
 
 `pnpm --filter @loopzhb/server claim:legacy -- --data-dir <目录> --github-user-id <数字ID> --machine-id <机器ID> [--machine-id …] [--dry-run]`。`--data-dir` 必填且无环境变量回退；`--github-user-id` 必须是十进制 GitHub 数字 ID（复用 `schema.ts` 的 `GITHUB_USER_ID_REGEX` 同源规则）；`--machine-id` 可重复，重复**值**判用法错误（复制粘贴失误，静默去重会掩盖它），至少一个——不提供「认领全部」。退出码：0 成功/幂等 no-op，1 拒绝或失败，2 用法错误，3 数据目录被锁。CLI **不读任何环境变量**，也不 import `loadServerConfig`（运维 shell 没有 OAuth 三件套）。`--data-dir` 不存在或缺少 `pgdata` 时在开库前拒绝——避免在笔误路径上静默建库再报「目标用户不存在」。CLI 与 Server 共用 `openMigratedDb` 开库路径，故 CLI 可能顺带应用迁移；升级顺序保证 Server 先启动过，这是已披露的行为。
+
+## 修订 2026-10-20（片 5 落实增补）
+
+### 23. 管理面默认拒绝门禁
+
+Session 门禁挂在 `/api/*` 上，**默认拒绝**，只精确豁免三个路径形态：`/api/session`（登录态探针，自身返回 401）、`/api/machine` 与 `/api/machine/*`（Bearer 机器凭据）。豁免谓词必须带斜杠——`startsWith("/api/machine")` 会把 `/api/machines`（机器列表）一并豁免，这是静默的跨团队数据泄漏；该边界由单测与变异 M3 同时钉住。未登录一律 `401 {"error":"not authenticated"}`，不新增 `code`，与 `/api/session`、`/auth/logout` 的既有约定一致。
+
+注册顺序固定：`hostGate`（若有 Dashboard）→ sessionGate → loopGate/runGate → 机器路由 → 管理路由 → auth/Dashboard。因此认证先于 `bodyLimit` 与 DTO 解析：匿名超大或畸形请求得到 401 而非 413/400。默认拒绝的已知后果是**未知 `/api/*` 路径的匿名响应由 404 变为 401**；非 `/api` 路径仍是扁平 404。
+
+`createServerApp` 由 9 个位置参数改为 options object，`management: ManagementAccess` 为**必填**字段：生产与测试装配都无法在类型层面省略门禁。
+
+### 24. Team Scope 只来自 Session；过滤先于排序与限量
+
+管理查询的 teamId 唯一来源是 `ResolvedSession.team.id`；请求参数、header 与 body 都不能覆盖。`listMachines`、`listLoops`、`getLoopSummary`、`listRuns` 与 `createLoop` 全部改为团队范围查询：loops/runs 经 `loops.machine_id → machines.team_id` 内连接推导（`runs.machine_id` 是冗余副本，不作归属依据），`machines_team_idx` 就此投入使用。谓词在 SQL 内、`ORDER BY` 与 `LIMIT` 之前执行——过滤后置会让其他团队的新行吃掉 100 行上限（MG4 的回归目标）。
+
+Dashboard 在片 6 之前仍未认证，其无 scope 读取被收敛为**具名出口** `listLoopsUnscoped()` 与 `ArtifactApi` 的四个 `*Unscoped` 方法；生产 HTTP 路由只能调用带 teamId 的 `listLoops(teamId)` 与 `*ForTeam`。`read.ts` 内部用判别联合 `ReadScope = { kind: "team"; teamId } | { kind: "unscoped" }`，不用可选 teamId，避免生产路由误传 `undefined` 退化为无 scope。片 6 删除这些出口时类型检查会列出唯一调用点。
+
+`revokedAt` 不参与管理过滤：本批没有在线撤销入口，撤销只影响执行资格（决策 15/16 不变）。
+
+### 25. 归属执法在路径中间件
+
+`/api/loops/:id`、`/api/loops/:id/*`、`/api/runs/:id`、`/api/runs/:id/*` 在处理器之前解析 `id`，按 **Run → Loop → Machine → Team** 链检查（`store/scope.ts` 的窄投影查询）。未找到、孤儿、未认领、跨团队一律 `404 {"error":"not found"}`，与 `app.notFound` 逐字节一致；中间件拿不到 Session team 时返回 401，绝不 `next()`。`POST /api/loops` 是唯一资源 id 来自 body 的管理写入口，其机器查找改为 `(id, teamId)` 双条件，失配沿用既有 `machine_not_found` → 扁平 404，零写入。
+
+该执法依赖本批不变量：**Server 运行期间归属不可变**（认领只能由片 4 的 CLI 在停服并持 dataDir 锁时发生，本批无在线撤销）。Batch 4 若引入在线归属变更，必须重新审视中间件读取与处理器写入之间的 TOCTOU 窗口。
+
+### 26. Artifact 管理读的归属前置
+
+`resolveLoopScope` 在读到 loop 行之后、`attribution.resolve` 之前比较团队；`readRunArtifactsView` 在 run → 父路径 → loop 之后、attribution 与 snapshot 之前比较。未认领与跨团队折叠为既有的 `loop_not_found` / `run_not_found`（无 code 404），**不落到 `attribution_missing`（403）**，也不得触及 snapshot 解析或 blob 打开。`ARTIFACT_FAILURE_HTTP` 与机器路径的 403 语义一行未改。
+
+`PATCH /api/loops/:id/artifact-dir` 不向 `updateArtifactConfig` 下沉 teamId：loopGate 已在处理器之前完成只读归属检查，零写入由门禁本身保证。写归属执法统一在 HTTP 边界，域层不重复。
+
+### 27. 凭据类型隔离
+
+管理门禁只读 `loopzhb_session` Cookie；机器路由只读 `Authorization: Bearer`。两条解析链没有共享入口，因此同一请求同时携带两种凭据也只会在各自表面使用各自凭据（MG10）。管理路由没有 Bearer 分支，机器路由没有 Session 分支——这是结构性的，不是逐路由的纪律。
+
+### 28. 片 5 提前接线生产组合根
+
+相对批次计划第 223 行把「认证接入实际生产组合根」列在片 7 的偏差点，本片**如实登记**：`createAuthModule` 改为返回 `{ routes, sessions }`，`bootstrapServer` 无条件构造 `ManagementAccess` 并注入 `createServerApp` 的必填字段。理由：片 3 已关闭生产 poll 自注册，若管理面继续匿名，分支上的生产形态将长期停在「机器侧已关、管理侧全开」的中间态；片 4 提前接锁已开此先例。片 7 保留的部分不变：真实 HTTP 升级演练（BI1–BI6）、生产认证不可旁路的完整验收、旧测试假设清理的最终核对。

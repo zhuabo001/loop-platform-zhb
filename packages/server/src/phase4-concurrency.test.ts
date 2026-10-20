@@ -68,7 +68,14 @@ import { createOwnerControl } from "./owner/index.js";
 import { createScheduleAdmin } from "./schedule/index.js";
 import { RECLAIM_RUN_ERROR } from "./store/runs.js";
 import { createInactivitySweep, type InactivitySweep } from "./sweep/index.js";
-import { FakeClock, makeTestFactories, seedClaimedMachineForToken } from "./testkit/index.js";
+import {
+  createTestManagementAccess,
+  FakeClock,
+  makeTestFactories,
+  seedClaimedMachineForToken,
+  seedManagementSession,
+  withManagementSession,
+} from "./testkit/index.js";
 
 const handles: DbHandle[] = [];
 
@@ -100,7 +107,19 @@ async function bootFake(options: { lifecycleHooks?: LifecycleOpsHooks } = {}): P
   const ownerControl = createOwnerControl({ db: handle.db, clock });
   const lifecycle = createLifecycleAdmin({ db: handle.db, clock, hooks: options.lifecycleHooks });
   const schedule = createScheduleAdmin({ db: handle.db, clock });
-  return { app: createServerApp(coordinator, admin, lifecycle, schedule, ownerControl), db: handle.db, handle, clock, sweep };
+  const { credential } = await seedManagementSession(handle.db, { clock });
+  const app = withManagementSession(
+    createServerApp({
+      coordinator,
+      admin,
+      lifecycle,
+      schedule,
+      ownerControl,
+      management: createTestManagementAccess(handle.db, clock),
+    }),
+    credential,
+  );
+  return { app, db: handle.db, handle, clock, sweep };
 }
 
 function appFetch(app: FakeBoot["app"]): typeof fetch {

@@ -22,7 +22,7 @@ import { isRunTokenShape, pollResponseSchema } from "@loopzhb/protocol";
 import { machineIdFromToken } from "@loopzhb/protocol/node";
 
 import { mintRunCredential } from "./coordinator/index.js";
-import { FakeClock, makeTestAuthConfig, seedClaimedMachineForToken } from "./testkit/index.js";
+import { FakeClock, makeTestAuthConfig, seedClaimedMachineForToken, seedManagementSession } from "./testkit/index.js";
 import type { CronFactory, CronJob } from "./scheduler/index.js";
 import { closeDb, openMigratedDb, type DbHandle } from "./db/index.js";
 import { loops, machines, runs } from "./db/schema.js";
@@ -487,6 +487,33 @@ describe("bootstrapServer", () => {
     });
     expect(again.status).toBe(401);
   });
+  it("slice 5: the production assembly gates the management surface behind a Login Session", async () => {
+    const dir = await tmpDataDir();
+    const clock = new FakeClock(new Date("2026-08-27T09:00:00.000Z"));
+    const b = await bootstrapServer(
+      { auth: makeTestAuthConfig(), host: "127.0.0.1", port: 3000, dataDir: dir },
+      { clock, cronFactory: new FakeCronFactory() },
+    );
+    handles.push(b.handle);
+
+    // Anonymous management requests are 401 — this is the PRODUCTION root,
+    // not a test assembly (ADR-011 决策 23/28).
+    for (const path of ["/api/machines", "/api/loops"]) {
+      const res = await b.app.request(path);
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual({ error: "not authenticated" });
+    }
+    // The exempt surfaces keep their own semantics.
+    expect((await b.app.request("/api/session")).status).toBe(401);
+    expect((await b.app.request("/api/machine/poll", { method: "POST" })).status).toBe(401);
+
+    // An authenticated caller gets the team-scoped list.
+    const { credential } = await seedManagementSession(b.handle.db, { clock });
+    const loops = await b.app.request("/api/loops", { headers: { cookie: `loopzhb_session=${credential}` } });
+    expect(loops.status).toBe(200);
+    expect(await loops.json()).toEqual({ loops: [] });
+  });
+
   it("bootstrap overrides: ONE injected Clock reaches coordinator, admin, scheduler and the HTTP app (Batch 3 §2.4)", async () => {
     const dir = await tmpDataDir();
     const clock = new FakeClock(new Date("2026-08-27T09:00:00.000Z"));
@@ -500,6 +527,8 @@ describe("bootstrapServer", () => {
     // Pre-seed a claimed machine so the poll gate passes (Phase 5 Batch 3 slice 3:
     // auto-registration removed; unknown tokens → 401).
     await seedClaimedMachineForToken(b.handle.db, "dk_boot_clock");
+    // Slice 5: management requests need a Login Session.
+    const { credential } = await seedManagementSession(b.handle.db, { clock });
     // Machine contact stamps lastSeen from the coordinator clock.
     await poll(b.app, "dk_boot_clock");
     const machineId = machineIdFromToken("dk_boot_clock");
@@ -510,7 +539,7 @@ describe("bootstrapServer", () => {
     // job with the INJECTED cron factory (not the production Croner).
     const createRes = await b.app.request("/api/loops", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", cookie: `loopzhb_session=${credential}` },
       body: JSON.stringify({ machineId, taskFile: "/srv/TASK.md", cron: "0 10 * * *", timezone: "UTC" }),
     });
     expect(createRes.status).toBe(201);

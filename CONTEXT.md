@@ -32,6 +32,21 @@ it is the only cross-process mutex over the embedded database, since PGlite prov
 taken over automatically.
 _Avoid_: Database lock, PID lockfile
 
+**Team Scope**:
+The team derived from a resolved Login Session; the only selector for which managed resources a
+request may see or change. It never comes from a request parameter, header or body.
+_Avoid_: Tenant, workspace, user-supplied team filter
+
+**Management Access**:
+The Session gate plus the ownership gates over the management JSON surface: deny by default on
+`/api/*`, exempting the login-status probe and the machine credential routes.
+_Avoid_: Admin login, API key, per-route permission
+
+**Ownership Chain**:
+The one derivation Run → Loop → Machine → Team used by the management gates and the Artifact reads;
+`runs.machineId` is a redundant copy and never decides ownership.
+_Avoid_: Resource owner, ACL
+
 **Machine Heartbeat Watermark**:
 Durable recent proof that an authenticated Machine has contacted the server; Machine presence is
 derived from this watermark rather than stored as a separate fact.

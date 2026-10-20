@@ -31,6 +31,7 @@ import { acquireDataDirLock, DataDirLockError, formatAcquireFailureMessage } fro
 import { closeDb, openMigratedDb, type DbHandle } from "./db/index.js";
 import { createServerApp } from "./http/app.js";
 import { createLifecycleAdmin, type LifecycleOpsHooks } from "./loop-lifecycle/admin.js";
+import { createManagementAccess } from "./management/access.js";
 import { createOwnerControl } from "./owner/index.js";
 import { createScheduleAdmin } from "./schedule/index.js";
 import { createScheduler, type CronFactory, type Scheduler } from "./scheduler/index.js";
@@ -190,19 +191,24 @@ export async function bootstrapServer(
       fetchImpl: overrides.githubFetch,
       timeoutMs: overrides.githubTimeoutMs,
     });
+    // Slice 5 (ADR-011 决策 23/28): the management gate shares the login
+    // module's SessionService. Production cannot omit it — `management` is a
+    // REQUIRED field of createServerApp's deps.
+    const management = createManagementAccess({ db: handle.db, sessions: auth.sessions });
 
     return {
-      app: createServerApp(
+      app: createServerApp({
         coordinator,
         admin,
         lifecycle,
         schedule,
         ownerControl,
-        (loop) => scheduler.reconcile(loop),
+        management,
+        onScheduleCommitted: (loop) => scheduler.reconcile(loop),
         dashboard,
         artifacts,
-        auth,
-      ),
+        auth: auth.routes,
+      }),
       coordinator,
       sweep,
       scheduler,

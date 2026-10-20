@@ -10,7 +10,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createLoopResponseSchema } from "@loopzhb/protocol";
 
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
-import { FakeClock, seedMachine, snapshotLoops, snapshotRuns } from "../testkit/index.js";
+import { FakeClock, seedClaimedMachineById, snapshotLoops, snapshotRuns, TEST_TEAM_ID } from "../testkit/index.js";
 import { LoopValidationError } from "./errors.js";
 import { createLoopAdmin, LOOP_NAME_CAP, LOOP_PATH_CAP, type LoopAdmin } from "./index.js";
 
@@ -22,6 +22,8 @@ afterEach(async () => {
 let db: Db;
 let clock: FakeClock;
 let admin: LoopAdmin;
+/** Every create is scoped to the standard test team (ADR-011 决策 24). */
+const createLoop = (input: Parameters<LoopAdmin["createLoop"]>[0]) => admin.createLoop(input, TEST_TEAM_ID);
 
 async function seeded(): Promise<void> {
   const h = await openMigratedDb();
@@ -30,13 +32,13 @@ async function seeded(): Promise<void> {
   clock = new FakeClock();
   let n = 0;
   admin = createLoopAdmin({ db, clock, newLoopId: () => `loop-${++n}` });
-  await seedMachine(db, "m-0123456789abcdef");
+  await seedClaimedMachineById(db, "m-0123456789abcdef");
 }
 
 describe("createLoop", () => {
   it("creates a loop with Phase-1 fixed defaults, injected id and clock stamps — and NO run", async () => {
     await seeded();
-    const result = await admin.createLoop({
+    const result = await createLoop({
       machineId: "m-0123456789abcdef",
       name: "react-doctor",
       workdir: "/home/dev/project",
@@ -94,7 +96,7 @@ describe("createLoop", () => {
 
   it("defaults omitted optional fields to null (goal omitted → Open Loop)", async () => {
     await seeded();
-    const result = await admin.createLoop({ machineId: "m-0123456789abcdef", taskFile: "/home/dev/TASK.md" });
+    const result = await createLoop({ machineId: "m-0123456789abcdef", taskFile: "/home/dev/TASK.md" });
     expect(result.created).toBe(true);
     if (!result.created) return;
     expect(result.loop).toMatchObject({ name: null, workdir: null, goal: null, lastRun: null });
@@ -102,7 +104,7 @@ describe("createLoop", () => {
 
   it("Phase 4: a missing taskFile is a 400-class rejection with zero writes (application-layer requirement)", async () => {
     await seeded();
-    await expect(admin.createLoop({ machineId: "m-0123456789abcdef" })).rejects.toMatchObject({
+    await expect(createLoop({ machineId: "m-0123456789abcdef" })).rejects.toMatchObject({
       name: "LoopValidationError",
       field: "taskFile",
     });
@@ -111,7 +113,7 @@ describe("createLoop", () => {
 
   it("Phase 4: the goal is normalized (trim) and validated; invalid goals reject with zero writes", async () => {
     await seeded();
-    const ok = await admin.createLoop({
+    const ok = await createLoop({
       machineId: "m-0123456789abcdef",
       taskFile: "/home/dev/TASK.md",
       goal: "  ship the migration  ",
@@ -124,7 +126,7 @@ describe("createLoop", () => {
 
     for (const goal of ["   ", "two\nlines", "g".repeat(2001)]) {
       await expect(
-        admin.createLoop({ machineId: "m-0123456789abcdef", taskFile: "/home/dev/TASK.md", goal }),
+        createLoop({ machineId: "m-0123456789abcdef", taskFile: "/home/dev/TASK.md", goal }),
       ).rejects.toMatchObject({ name: "LoopValidationError", field: "goal" });
     }
     expect(await snapshotLoops(db)).toHaveLength(1);
@@ -132,14 +134,14 @@ describe("createLoop", () => {
 
   it("returns machine_not_found with zero writes for an unregistered (well-shaped) machine", async () => {
     await seeded();
-    const result = await admin.createLoop({ machineId: "m-ffffffffffffffff", taskFile: "/home/dev/TASK.md" });
+    const result = await createLoop({ machineId: "m-ffffffffffffffff", taskFile: "/home/dev/TASK.md" });
     expect(result).toEqual({ created: false, reason: "machine_not_found" });
     expect(await snapshotLoops(db)).toEqual([]);
   });
 
   it("accepts fields exactly AT the caps and rejects one char beyond, zero writes on rejection", async () => {
     await seeded();
-    const atName = await admin.createLoop({
+    const atName = await createLoop({
       machineId: "m-0123456789abcdef",
       name: "n".repeat(LOOP_NAME_CAP),
       workdir: "/".repeat(LOOP_PATH_CAP),
@@ -150,7 +152,7 @@ describe("createLoop", () => {
     for (const field of ["name", "workdir", "taskFile"] as const) {
       const cap = field === "name" ? LOOP_NAME_CAP : LOOP_PATH_CAP;
       await expect(
-        admin.createLoop({
+        createLoop({
           machineId: "m-0123456789abcdef",
           taskFile: "/home/dev/TASK.md",
           [field]: "x".repeat(cap + 1),
@@ -164,7 +166,7 @@ describe("createLoop", () => {
   it("checks caps BEFORE the machine lookup — an invalid body is a 400 even for an unknown machine", async () => {
     await seeded();
     await expect(
-      admin.createLoop({
+      createLoop({
         machineId: "m-ffffffffffffffff",
         taskFile: "/home/dev/TASK.md",
         name: "n".repeat(LOOP_NAME_CAP + 1),

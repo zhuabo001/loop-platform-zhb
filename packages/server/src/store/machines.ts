@@ -145,6 +145,20 @@ export async function getMachine(db: Db, id: string): Promise<Machine | undefine
   return (await db.select().from(machines).where(eq(machines.id, id)))[0];
 }
 
+/** The TEAM-SCOPED machine lookup (Phase 5 Batch 3 slice 5, ADR-011 决策 24):
+ *  an unclaimed or another team's machine is indistinguishable from a missing
+ *  one. Used by loop creation, where the machine id arrives in the body and no
+ *  path gate can pre-check it. */
+export async function getTeamMachine(db: Db, id: string, teamId: string): Promise<Machine | undefined> {
+  return (
+    await db
+      .select()
+      .from(machines)
+      .where(and(eq(machines.id, id), eq(machines.teamId, teamId)))
+      .limit(1)
+  )[0];
+}
+
 /**
  * Verify an EXISTING machine credential — shape filter → derived id → row
  * lookup → FULL tokenHash compare (H-01 collision defence). Returns the row or

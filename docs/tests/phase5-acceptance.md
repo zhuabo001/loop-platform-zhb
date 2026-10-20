@@ -467,3 +467,78 @@ server 较片 3 基线（1175 + 3 skipped）**+45**，恰为新增的四个套�
 ### 结论（片 4）
 
 片 4 交付离线认领命令与 dataDir 独占锁。LM3–LM10 全覆盖，五道质量门全绿，八项变异全部被对应用例抓住。三条如实登记：**dataDir 锁从片 7 提前接入 `bootstrapServer`**（ADR-011 决策 20 记录理由与偏差）、**`target_team_namespace_invalid` 构造性不可达因而无测试**、**LM10 的「原 Daemon 恢复」只证到模块/HTTP 层**（进程级证据属片 7）。本片未关闭任何既有 Issue，也无需新建：实施过程中的两处真实缺口（M6 守卫无覆盖、拒绝文本缺尾换行）由变异验证与真实进程烟测自身发现并当轮补齐。
+
+## 片 5 — 管理 API Session 门禁与团队过滤
+
+> 权威计划：`docs/plan/codex-phase5-batch3-slices-plan.md` Slice 5 节（行 170–190）；长期裁决：`docs/adr/011-phase5-identity-and-legacy-claim.md` 决策 23–28。
+
+### 测试编组与结果（片 5）
+
+**MG1–MG10 映射**：
+
+| 编号 | 场景 | 文件 |
+|---|---|---|
+| MG1 | 匿名访问全部 15 条管理路由 + 未知 `/api/*` → 401；`/api/session`、`/api/machine/*` 豁免；认证先于 body 解析 | `http/management-routes.test.ts`、`management/access.test.ts`、`phase5-batch3-slice5-e2e.test.ts`、`start.test.ts`（生产组合根 pin） |
+| MG2 | 过期边界（恰在到期时刻 401、前一毫秒 200）、未知/空/畸形 cookie、身份链断裂 → 401 | `management/access.test.ts`、`testkit/management-session.test.ts`（fixture 的时钟推算） |
+| MG3 | A/B/未认领三世界的 machines、loops、runs 列表隔离；summary 同规则 | `admin/team-scope.test.ts`、`http/management-routes.test.ts` |
+| MG4 | 过滤先于排序与限量：B 团队 100+ 条更新更晚的 loop / 排序更靠前的 machine，A 团队的唯一条目仍返回 | `admin/team-scope.test.ts` |
+| MG5 | 创建 Loop：他团队、未认领、不存在机器 → 扁平 404，零写入 | `admin/team-scope.test.ts`、`http/management-routes.test.ts` |
+| MG6 | trigger、cancel、schedule、goal、task-file、reopen、artifact-dir 的全部跨团队/未认领/缺失组合 → 404 且与 `/nope` 逐字节相等；11 表快照不变 | `http/management-routes.test.ts`、`phase5-batch3-slice5-e2e.test.ts` |
+| MG7 | `/api/loops/:id/runs`、artifacts、diff、download 的跨团队读取 → 404 | 同上 |
+| MG8 | Artifact 归属检查先于 attribution / snapshot / blob：跨团队 download 的 store `read` 调用数不增加（对照 unscoped 路径证明 blob 真实存在） | `artifact/scope.test.ts`、`http/management-routes.test.ts` |
+| MG9 | 未认领机器的完整历史（pending Run + lease + 历史行）在全部拒绝路径后逐字节保留；它不出现在任何列表；trigger 不新增/不 supersede | `phase5-batch3-slice5-e2e.test.ts` |
+| MG10 | 机器 Bearer 打管理路由 401、Session cookie 打 `/api/machine/poll` 401、同时携带互不提升 | `management/access.test.ts` |
+
+**编组明细**：
+
+- **归属链查询**（`store/scope.test.ts`，7 项）：own/foreign/unclaimed/missing 四态；孤儿 loop 与孤儿 run 折叠为 `found:false`；**run 的归属经其 loop 推导而非 `runs.machine_id`**（刻意让冗余列指向他处的回归）；`teamMatches` 拒绝 null/空串。
+- **门禁**（`management/access.test.ts`，11 项）：豁免谓词逐路径（含 `/api/machines` 与 `/api/machine` 的斜杠边界）；13 条管理路由匿名 401；过期边界；四种坏凭据与身份链断裂；凭据混用三方向；**Hono 路径参数绑定证明**（自有 loop 的 `POST /api/loops/:id/run` 返回 200，陌生 loop 返回 404——绑定失效时自有 loop 也会 404）。
+- **testkit**（`testkit/management-session.test.ts`，3 项）：会话过期按调用方时钟推算（而非 FIXTURE_T0）；A/B 两会话同库并存；请求包装器只补 cookie、不覆盖调用方显式 cookie。
+- **团队查询**（`admin/team-scope.test.ts`，5 项）：MG3/MG4/MG5 的查询级证据；Dashboard 临时无 scope 出口仍可见全部 loop。
+- **Artifact 归属**（`artifact/scope.test.ts`，6 项）：他团队与未认领 loop/run 的 view/run/diff/download 全部折叠为既有 404 字面量；跨团队时 **attribution 解析次数为 0**；download 在拒绝路径上 **store `read` 次数不增加**；自有团队四条读取正常。
+- **HTTP 矩阵**（`http/management-routes.test.ts`，9 项）：15 条路由匿名 401；豁免面；认证先于畸形 body；写矩阵逐字节 404；非空世界（run + lease + manifest + 真实 blob）的 11 表零写入；创建 Loop 的三类拒绝 + 零写入；跨团队 download；列表隔离。
+- **生产根 E2E**（`phase5-batch3-slice5-e2e.test.ts`，5 项）：经 `bootstrapServer` + 文件型 PGlite；匿名 401；A/B/未认领矩阵；MG9 历史逐字节保留；A 团队 trigger 正常（旧 pending 被 supersede、新 run pending）；B 会话只见 B 且无法操作 A。
+
+**既有测试迁移（如实记录）**：`createServerApp` 改为 options object（20 个调用点由 typecheck 逐一列出），管理请求统一经 testkit 的 `withManagementSession` 注入会话；管理路径涉及的机器夹具改为已认领（`TEST_TEAM_ID`），而 PG5/PG6 等「未认领拒绝」负例**保留未认领机器**。迁移中钉住的两个时钟陷阱：`seedSession` 的默认过期是 FIXTURE_T0+7d，使用其他 FakeClock 的 bootstrap 测试必须按调用方时钟推算（`seedManagementSession` 已内建）；`bootstrapServer` 的生产默认时钟是 `systemClock`，Dashboard 挂载测试必须用同一时钟种会话。
+
+### 显式边界核对（片 5）
+
+- **停止边界**：Dashboard 登录态（片 6）、ConnectKey/在线接入（Batch 4）、在线撤销与团队迁移、Batch 4 的深模块/事务权限隔离均未实现；**#56 保持 OPEN 不核销**（同源意图校验、`Content-Type` 门禁、拒绝空体仍未做）。
+- **Dashboard 仍未认证（如实声明）**：`GET /`、Run Now 与 artifact config 表单在片 5 仍只有回环 Host 边界；未认领机器与旧 Artifact 仍可能出现在 Dashboard 页面，直到片 6。
+- **归属中间件的前提**：依赖「Server 运行期间归属不可变」——认领只能由片 4 的停服 CLI 发生，本批无在线撤销。Batch 4 引入在线归属变更时必须重审中间件读取与处理器写入之间的 TOCTOU。ADR-011 决策 25 已登记。
+- **行为变化（如实披露）**：未知 `/api/*` 的匿名响应由 404 变为 401（默认拒绝的后果）；匿名畸形/超大管理请求由 400/413 变为 401（认证先于解析）；`createServerApp` 的装配形状变化不构成 wire 变化。
+- **写归属只在 HTTP 边界**：`updateArtifactConfig` 等域函数不加 teamId；`PATCH /api/loops/:id/artifact-dir` 由 loopGate 在处理器前拦截。这是 D2 的直接后果，已记录。
+- **不在本片核验**：真实 HTTP 升级演练与生产认证不可旁路的完整验收属片 7（BI1–BI6）；真实 GitHub OAuth 与真实 Claude 未执行。MG 矩阵使用预置 Session 与测试时钟。
+- **无新迁移**：本片不新增迁移，journal 保持 7 条，`db:check` 零漂移。
+
+### 变异验证（片 5）
+
+八项变异，全部被对应用例抓住（每项恢复后复跑）：
+
+| 变异 | 击红的用例 |
+|---|---|
+| M1 删除 `app.use("/api/*", sessionGate)` | 匿名矩阵 11 项失败（MG1） |
+| M2/M3 豁免谓词改为 `startsWith("/api/machine")`（丢失斜杠边界） | `/api/machines` 匿名不再 401；豁免谓词单测与 MG3 列表同时变红 |
+| M4 删除 `listMachines` 的 team 过滤 | MG3 与列表隔离用例 |
+| M5 `listLoops(teamId)` 退化为无 scope 查询 | MG3 + **MG4「A 团队唯一条目仍返回」** |
+| M6 loopGate 永远放行 | MG6 写矩阵、零写入 oracle、MG9 历史保留、B 会话无法操作 A |
+| M7 `resolveLoopScope` 删除团队比较 | MG8 的 view/download/diff/镜像四面（management-routes 因 loopGate 先行仍绿，证明纵深是两道） |
+| M8 sessionGate 改读 `Authorization` 而非 Cookie | MG1 认证用例、MG2 过期边界、MG10 三方向、MG9 |
+
+### 完整质量门（片 5）
+
+```bash
+pnpm test                                   # protocol 292 / daemon 790 + 7 skipped / server 1267 + 3 skipped，全绿
+pnpm typecheck                              # EXIT=0
+pnpm build                                  # EXIT=0
+pnpm --filter @loopzhb/server db:check      # 零漂移（本片无新增迁移），EXIT=0
+git diff --check                            # EXIT=0
+```
+
+server 较片 4 基线（1220 + 3 skipped）**+47**，恰为新增的七个套件与一处生产 pin：归属链 7 + 门禁 11 + testkit 3 + 团队查询 5 + Artifact 归属 6 + HTTP 矩阵 9 + 生产根 E2E 5 + `start.test.ts` 的生产门禁 pin 1。protocol 与 daemon 计数不变（本片零改动这两个包）。
+
+**一次真实抖动（如实记录）**：首次全仓 `pnpm test` 中，daemon 的 `artifact-watcher.test.ts`「原子保存」用例以 5 秒超时失败；单独复跑该文件 6/6 通过，随后全仓复跑全绿。该用例依赖真实 chokidar 的文件系统事件，在并行负载下抖动；与本片改动无关（本片未触碰 daemon）。
+
+### 结论（片 5）
+
+片 5 结束了「机器自注册已关、管理面仍匿名」的中间态：管理 JSON API 默认拒绝、只认 Session；登录后只能看见与操作自己团队；未认领、跨团队与不存在的资源在管理入口统一扁平 404；归属检查先于 attribution、快照与 blob。MG1–MG10 全覆盖，五道质量门全绿，八项变异全部被抓住。如实登记四条：**生产组合根从片 7 提前接线**（ADR-011 决策 28）、**Dashboard 在片 6 前仍未认证**、**未知 `/api/*` 的匿名响应由 404 变 401**、**归属中间件依赖本批「无在线归属变更」的不变量**。本片不核销 #56。

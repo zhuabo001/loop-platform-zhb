@@ -117,12 +117,15 @@ describe("loopback policy", () => {
     }
   });
 
-  it("a non-loopback host produces the unauthenticated-exposure warning naming the host", () => {
+  it("a non-loopback host warns about the exposure — naming the login gate, closed enrollment and the missing Dashboard", () => {
     const warning = unauthenticatedExposureWarning("0.0.0.0");
     expect(warning).toContain("0.0.0.0");
-    expect(warning).toMatch(/NO authentication/);
-    // The Day 8–10 cancel route is part of the unauthenticated surface.
+    // Slice 5: the old "NO authentication" claim is now false.
+    expect(warning).not.toMatch(/NO authentication/);
+    expect(warning).toContain("login Session");
+    expect(warning).toContain("claimed offline");
     expect(warning).toContain("/api/runs*");
+    expect(warning).toContain("loopback");
     expect(unauthenticatedExposureWarning("192.168.1.10")).not.toBeNull();
   });
 });

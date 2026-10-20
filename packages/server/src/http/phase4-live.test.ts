@@ -33,7 +33,17 @@ import { loops, machines, runLeases, runs } from "../db/schema.js";
 import { createLifecycleAdmin } from "../loop-lifecycle/admin.js";
 import { createOwnerControl, type OwnerControl } from "../owner/index.js";
 import { createScheduleAdmin } from "../schedule/index.js";
-import { FakeClock, seedLoop, seedClaimedMachineForToken, seedRun, snapshotLoops, testDeps } from "../testkit/index.js";
+import {
+  createTestManagementAccess,
+  FakeClock,
+  seedClaimedMachineForToken,
+  seedLoop,
+  seedManagementSession,
+  seedRun,
+  snapshotLoops,
+  testDeps,
+  withManagementSession,
+} from "../testkit/index.js";
 import { createRunCoordinator, type RunCoordinator } from "../coordinator/index.js";
 import { createServerApp } from "./app.js";
 
@@ -59,8 +69,20 @@ async function fresh(): Promise<string> {
   let loopN = 0;
   const admin: LoopAdmin = createLoopAdmin({ db, clock, newLoopId: () => `loop-${++loopN}` });
   const ownerControl: OwnerControl = createOwnerControl({ db, clock });
-  app = createServerApp(coordinator, admin, createLifecycleAdmin({ db, clock }), createScheduleAdmin({ db, clock }), ownerControl);
-  return seedClaimedMachineForToken(db, TOKEN);
+  const machineId = await seedClaimedMachineForToken(db, TOKEN);
+  const { credential } = await seedManagementSession(db, { clock });
+  app = withManagementSession(
+    createServerApp({
+      coordinator,
+      admin,
+      lifecycle: createLifecycleAdmin({ db, clock }),
+      schedule: createScheduleAdmin({ db, clock }),
+      ownerControl,
+      management: createTestManagementAccess(db, clock),
+    }),
+    credential,
+  );
+  return machineId;
 }
 
 async function pollReq(body: unknown): Promise<Response> {

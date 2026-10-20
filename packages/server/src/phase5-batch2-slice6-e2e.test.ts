@@ -40,7 +40,8 @@ import { createArtifactTransport } from "../../daemon/dist/artifact-client.js";
 import { closeDb, type Db, type DbHandle } from "./db/index.js";
 import { artifactManifests, loops, runs } from "./db/schema.js";
 import { bootstrapServer, type BootedServer } from "./start.js";
-import { makeTestAuthConfig, seedClaimedMachineForToken, TEST_TEAM_ID } from "./testkit/index.js";
+import { makeTestAuthConfig, seedClaimedMachineForToken, TEST_TEAM_ID, seedManagementSession, withManagementSession } from "./testkit/index.js";
+import { systemClock } from "./time.js";
 
 const TOKEN = "dk_slice6_e2e_machine";
 const handles: DbHandle[] = [];
@@ -56,7 +57,9 @@ async function boot(): Promise<BootedServer> {
   // Phase 5 Batch 3 slice 3: poll no longer self-registers — state the claimed
   // machine this daemon's token polls as.
   await seedClaimedMachineForToken(b.handle.db, TOKEN);
-  return b;
+  // Slice 5: the management surface requires a Login Session.
+  const { credential } = await seedManagementSession(b.handle.db, { clock: systemClock });
+  return { ...b, app: withManagementSession(b.app, credential) };
 }
 
 /** Adapt the Hono app into the daemon's fetch (the daemon-e2e precedent). */

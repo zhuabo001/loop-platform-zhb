@@ -78,7 +78,7 @@ export interface DashboardSnapshot {
 export interface DashboardReadDeps {
   /** Narrow read seam to the existing observation surface — the Dashboard
    *  never reaches past `listLoops` into the admin module's writes. */
-  admin: Pick<LoopAdmin, "listLoops">;
+  admin: Pick<LoopAdmin, "listLoopsUnscoped">;
   db: Db;
   clock: Clock;
 }
@@ -111,7 +111,7 @@ export function createDashboardRead(deps: DashboardReadDeps): DashboardRead {
   return {
     async snapshot(): Promise<DashboardSnapshot> {
       const generatedAt = deps.clock.now().toISOString();
-      const loopSummaries = await deps.admin.listLoops();
+      const loopSummaries = await deps.admin.listLoopsUnscoped();
       if (loopSummaries.length === 0) {
         // Nothing to enrich: the two batched reads below are skipped rather
         // than issued with empty IN lists.
@@ -210,7 +210,7 @@ export interface DashboardArtifactRead {
  *  narrowing pattern as `DashboardReadDeps.admin`. */
 export type DashboardArtifactReadSource = Pick<
   ArtifactApi,
-  "readLoop" | "readRun" | "diffSnapshots" | "updateConfig"
+  "readLoopUnscoped" | "readRunUnscoped" | "diffSnapshotsUnscoped" | "updateConfig"
 >;
 
 export function createDashboardArtifactRead(deps: {
@@ -218,9 +218,9 @@ export function createDashboardArtifactRead(deps: {
   api: DashboardArtifactReadSource;
 }): DashboardArtifactRead {
   return {
-    loopArtifacts: (loopId) => deps.api.readLoop(loopId),
-    runArtifacts: (loopId, runId) => deps.api.readRun(runId, loopId),
-    diff: (loopId, query) => deps.api.diffSnapshots(loopId, query),
+    loopArtifacts: (loopId) => deps.api.readLoopUnscoped(loopId),
+    runArtifacts: (loopId, runId) => deps.api.readRunUnscoped(runId, loopId),
+    diff: (loopId, query) => deps.api.diffSnapshotsUnscoped(loopId, query),
     updateConfig: (loopId, command) => deps.api.updateConfig(loopId, command),
 
     async boundSnapshots(loopId): Promise<DashboardBoundSnapshotRef[]> {

@@ -28,7 +28,19 @@ import { artifactManifests } from "../db/schema.js";
 import { createLifecycleAdmin } from "../loop-lifecycle/admin.js";
 import { createOwnerControl } from "../owner/index.js";
 import { createScheduleAdmin } from "../schedule/index.js";
-import { FakeClock, seedLoop, seedClaimedMachineForToken, seedRun, staticAttribution, testDeps } from "../testkit/index.js";
+import {
+  createTestManagementAccess,
+  FakeClock,
+  permissiveManagementAccess,
+  seedClaimedMachineForToken,
+  seedLoop,
+  seedManagementSession,
+  seedRun,
+  staticAttribution,
+  testDeps,
+  TEST_TEAM_ID,
+  withManagementSession,
+} from "../testkit/index.js";
 import { createServerApp } from "./app.js";
 
 const CONTENT_A = "artifact bytes A";
@@ -77,6 +89,8 @@ function countingStore(inner: BlobStore): BlobStore {
   };
 }
 
+let sessionCredential: string;
+
 async function fresh(options: { unmappedAttribution?: boolean } = {}): Promise<void> {
   const handle = await openMigratedDb();
   handles.push(handle);
@@ -85,22 +99,24 @@ async function fresh(options: { unmappedAttribution?: boolean } = {}): Promise<v
   machineId = await seedClaimedMachineForToken(db, "dk_read_routes_machine");
   storeLog = { opens: 0, releases: 0 };
   store = countingStore(createMemoryBlobStore());
-  app = createServerApp(
-    createRunCoordinator(testDeps(db, clock)),
-    createLoopAdmin({ db, clock, newLoopId: () => "loop-x" }),
-    createLifecycleAdmin({ db, clock }),
-    createScheduleAdmin({ db, clock }),
-    createOwnerControl({ db, clock }),
-    undefined,
-    undefined,
-    createArtifactApi({
+  const rawApp = createServerApp({
+    coordinator: createRunCoordinator(testDeps(db, clock)),
+    admin: createLoopAdmin({ db, clock, newLoopId: () => "loop-x" }),
+    lifecycle: createLifecycleAdmin({ db, clock }),
+    schedule: createScheduleAdmin({ db, clock }),
+    ownerControl: createOwnerControl({ db, clock }),
+    management: createTestManagementAccess(db, clock),
+    artifacts: createArtifactApi({
       db,
       clock,
       ids: { syncId: () => "sync-1", manifestId: () => "amf-1" },
       blobStore: store,
       attribution: staticAttribution(options.unmappedAttribution ? {} : { [machineId]: "ns-1" }),
     }),
-  );
+  });
+  const { credential } = await seedManagementSession(db, { clock, teamId: TEST_TEAM_ID });
+  sessionCredential = credential;
+  app = withManagementSession(rawApp, credential);
 }
 
 async function seedManifest(
@@ -386,22 +402,21 @@ describe("GET /api/loops/:id/artifacts/download (AV4/AV5/AV8, R3)", () => {
       },
     };
     const clock = new FakeClock();
-    const gatedApp = createServerApp(
-      createRunCoordinator(testDeps(db, clock)),
-      createLoopAdmin({ db, clock, newLoopId: () => "loop-x" }),
-      createLifecycleAdmin({ db, clock }),
-      createScheduleAdmin({ db, clock }),
-      createOwnerControl({ db, clock }),
-      undefined,
-      undefined,
-      createArtifactApi({
+    const gatedApp = createServerApp({
+      coordinator: createRunCoordinator(testDeps(db, clock)),
+      admin: createLoopAdmin({ db, clock, newLoopId: () => "loop-x" }),
+      lifecycle: createLifecycleAdmin({ db, clock }),
+      schedule: createScheduleAdmin({ db, clock }),
+      ownerControl: createOwnerControl({ db, clock }),
+      management: permissiveManagementAccess(),
+      artifacts: createArtifactApi({
         db,
         clock,
         ids: { syncId: () => "sync-1", manifestId: () => "amf-1" },
         blobStore: gatedOpenStore,
         attribution: staticAttribution({ [machineId]: "ns-1" }),
       }),
-    );
+    });
     const ctl = new AbortController();
     const pending = gatedApp.request(downloadPath, { signal: ctl.signal });
     await new Promise((resolve) => setTimeout(resolve, 20)); // the handler is parked in the open
@@ -513,22 +528,21 @@ describe("GET /api/loops/:id/artifacts/download (AV4/AV5/AV8, R3)", () => {
       },
     };
     const clock = new FakeClock();
-    const gatedApp = createServerApp(
-      createRunCoordinator(testDeps(db, clock)),
-      createLoopAdmin({ db, clock, newLoopId: () => "loop-x" }),
-      createLifecycleAdmin({ db, clock }),
-      createScheduleAdmin({ db, clock }),
-      createOwnerControl({ db, clock }),
-      undefined,
-      undefined,
-      createArtifactApi({
+    const gatedApp = createServerApp({
+      coordinator: createRunCoordinator(testDeps(db, clock)),
+      admin: createLoopAdmin({ db, clock, newLoopId: () => "loop-x" }),
+      lifecycle: createLifecycleAdmin({ db, clock }),
+      schedule: createScheduleAdmin({ db, clock }),
+      ownerControl: createOwnerControl({ db, clock }),
+      management: permissiveManagementAccess(),
+      artifacts: createArtifactApi({
         db,
         clock,
         ids: { syncId: () => "sync-1", manifestId: () => "amf-1" },
         blobStore: gatedStore,
         attribution: staticAttribution({ [machineId]: "ns-1" }),
       }),
-    );
+    });
     const ctl = new AbortController();
     const res = await gatedApp.request(downloadPath, { signal: ctl.signal });
     expect(res.status).toBe(200);
@@ -580,22 +594,21 @@ describe("GET /api/loops/:id/artifacts/download (AV4/AV5/AV8, R3)", () => {
       },
     };
     const clock = new FakeClock();
-    const faultyApp = createServerApp(
-      createRunCoordinator(testDeps(db, clock)),
-      createLoopAdmin({ db, clock, newLoopId: () => "loop-x" }),
-      createLifecycleAdmin({ db, clock }),
-      createScheduleAdmin({ db, clock }),
-      createOwnerControl({ db, clock }),
-      undefined,
-      undefined,
-      createArtifactApi({
+    const faultyApp = createServerApp({
+      coordinator: createRunCoordinator(testDeps(db, clock)),
+      admin: createLoopAdmin({ db, clock, newLoopId: () => "loop-x" }),
+      lifecycle: createLifecycleAdmin({ db, clock }),
+      schedule: createScheduleAdmin({ db, clock }),
+      ownerControl: createOwnerControl({ db, clock }),
+      management: permissiveManagementAccess(),
+      artifacts: createArtifactApi({
         db,
         clock,
         ids: { syncId: () => "sync-1", manifestId: () => "amf-1" },
         blobStore: faultyStore,
         attribution: staticAttribution({ [machineId]: "ns-1" }),
       }),
-    );
+    });
     const res = await faultyApp.request(
       `/api/loops/loop-1/artifacts/download?snapshotId=amf-1&path=${encodeURIComponent("big.bin")}`,
     );

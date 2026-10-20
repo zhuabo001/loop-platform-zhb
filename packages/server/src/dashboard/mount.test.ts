@@ -20,7 +20,15 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { closeDb, type DbHandle } from "../db/index.js";
 import { bootstrapServer, type BootedServer } from "../start.js";
-import { makeTestAuthConfig, seedClaimedMachineById, seedLoop, seedRun, snapshotRuns } from "../testkit/index.js";
+import { systemClock } from "../time.js";
+import {
+  makeTestAuthConfig,
+  seedClaimedMachineById,
+  seedLoop,
+  seedManagementSession,
+  seedRun,
+  snapshotRuns,
+} from "../testkit/index.js";
 
 const handles: DbHandle[] = [];
 const dirs: string[] = [];
@@ -37,10 +45,14 @@ async function tmpDataDir(): Promise<string> {
   return dir;
 }
 
-async function boot(host: string, dataDir: string): Promise<BootedServer> {
+type Booted = BootedServer & { credential: string };
+
+async function boot(host: string, dataDir: string): Promise<Booted> {
   const booted = await bootstrapServer({ auth: makeTestAuthConfig(), host, port: 0, dataDir });
   handles.push(booted.handle);
-  return booted;
+  // The production boot uses the system clock, so the fixture must too.
+  const { credential } = await seedManagementSession(booted.handle.db, { clock: systemClock });
+  return { ...booted, credential };
 }
 
 const FORM = "application/x-www-form-urlencoded";
@@ -93,9 +105,13 @@ describe("H-group (Batch 3 Dashboard mount): assembly through bootstrapServer", 
       expect(res.headers.get("content-security-policy")).toBeNull();
     }
 
-    // The JSON API is untouched on both binds.
+    // The JSON API stays mounted on both binds and is now Session-gated.
     for (const booted of [loopback, exposed]) {
-      const loops = await booted.app.request("/api/loops", { headers: { host: "127.0.0.1" } });
+      const anonymous = await booted.app.request("/api/loops", { headers: { host: "127.0.0.1" } });
+      expect(anonymous.status).toBe(401);
+      const loops = await booted.app.request("/api/loops", {
+        headers: { host: "127.0.0.1", cookie: `loopzhb_session=${booted.credential}` },
+      });
       expect(loops.status).toBe(200);
     }
   });

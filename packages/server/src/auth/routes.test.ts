@@ -87,7 +87,7 @@ async function fresh(opts: { authConfig?: ReturnType<typeof makeTestAuthConfig>;
     db: h.db,
     clock,
     fetchImpl: opts.github ?? fakeGitHub(),
-  });
+  }).routes;
   const app = new Hono();
   app.get("/login", auth.loginPage);
   app.get("/auth/github", auth.githubStart);

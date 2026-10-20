@@ -64,7 +64,14 @@ import { createChokidarWatcher, type ArtifactWatcherFactory } from "../../daemon
 import { closeDb } from "./db/index.js";
 import { artifactManifests, loops, runs } from "./db/schema.js";
 import { bootstrapServer, waitForListening, type BootedServer } from "./start.js";
-import { FakeClock, FakeCronFactory, makeTestAuthConfig, seedClaimedMachineIfAbsent, TEST_TEAM_ID } from "./testkit/index.js";
+import {
+  FakeClock,
+  FakeCronFactory,
+  makeTestAuthConfig,
+  seedClaimedMachineIfAbsent,
+  seedManagementSession,
+  TEST_TEAM_ID,
+} from "./testkit/index.js";
 
 const TOKEN = "dk_slice8_e2e_machine";
 const MACHINE_ID = machineIdFromToken(TOKEN);
@@ -147,6 +154,15 @@ async function shutdown(rs: RunningServer): Promise<void> {
   }
 }
 
+let sessionCredential = "";
+
+/** Every management request carries the Login Session (slice 5). */
+function sessionHeaders(extra: ConstructorParameters<typeof Headers>[0] = {}): Headers {
+  const headers = new Headers(extra);
+  if (!headers.has("cookie")) headers.set("cookie", `loopzhb_session=${sessionCredential}`);
+  return headers;
+}
+
 /** One server lifetime — production boot order (listener bound BEFORE the
  *  scheduler starts), FakeClock + FakeCronFactory through the internal
  *  override seam so nothing fires autonomously. */
@@ -170,6 +186,8 @@ async function bootServer(dataDir: string, clock: FakeClock): Promise<RunningSer
   // machine this daemon's token polls as (idempotent across boots of the same
   // dataDir, which re-reads the persisted row instead of re-inserting).
   await seedClaimedMachineIfAbsent(rs.handle.db, TOKEN);
+  // Idempotent across boots of the same dataDir.
+  sessionCredential = (await seedManagementSession(rs.handle.db, { clock })).credential;
   try {
     await rs.scheduler.start();
     return rs;
@@ -420,7 +438,7 @@ async function createLoop(rs: RunningServer, name: string, artifactDir?: string)
   if (artifactDir !== undefined) body.artifactDir = artifactDir;
   const res = await fetch(`${rs.baseUrl}/api/loops`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: sessionHeaders({ "content-type": "application/json" }),
     body: JSON.stringify(body),
   });
   expect(res.status).toBe(201);
@@ -430,14 +448,14 @@ async function createLoop(rs: RunningServer, name: string, artifactDir?: string)
 async function patchArtifactDir(rs: RunningServer, loopId: string, artifactDir: string | null): Promise<void> {
   const res = await fetch(`${rs.baseUrl}/api/loops/${loopId}/artifact-dir`, {
     method: "PATCH",
-    headers: { "content-type": "application/json" },
+    headers: sessionHeaders({ "content-type": "application/json" }),
     body: JSON.stringify({ artifactDir }),
   });
   expect(res.status).toBe(200);
 }
 
 async function triggerRun(rs: RunningServer, loopId: string): Promise<string> {
-  const res = await fetch(`${rs.baseUrl}/api/loops/${loopId}/run`, { method: "POST" });
+  const res = await fetch(`${rs.baseUrl}/api/loops/${loopId}/run`, { method: "POST", headers: sessionHeaders() });
   expect(res.status).toBe(202);
   const body = triggerRunResponseSchema.parse(await res.json());
   if (!body.enqueued) throw new Error("expected the trigger to enqueue");
@@ -445,7 +463,7 @@ async function triggerRun(rs: RunningServer, loopId: string): Promise<string> {
 }
 
 async function currentView(rs: RunningServer, loopId: string) {
-  const res = await fetch(`${rs.baseUrl}/api/loops/${loopId}/artifacts`);
+  const res = await fetch(`${rs.baseUrl}/api/loops/${loopId}/artifacts`, { headers: sessionHeaders() });
   expect(res.status).toBe(200);
   return loopArtifactsResponseSchema.parse(await res.json());
 }
@@ -453,6 +471,7 @@ async function currentView(rs: RunningServer, loopId: string) {
 async function downloadBytes(rs: RunningServer, loopId: string, snapshotId: string, artifactPath: string): Promise<Buffer> {
   const res = await fetch(
     `${rs.baseUrl}/api/loops/${loopId}/artifacts/download?snapshotId=${snapshotId}&path=${encodeURIComponent(artifactPath)}`,
+    { headers: sessionHeaders() },
   );
   expect(res.status).toBe(200);
   return Buffer.from(await res.arrayBuffer());
@@ -566,7 +585,9 @@ describe("slice 8 fault-integration E2E (real HTTP + file PGlite + local BlobSto
     expect((await downloadBytes(rs, loopId, snapshot1, "app.js")).equals(snapshot1Bytes)).toBe(true);
 
     // The structural diff shows exactly the three change classes.
-    const diffRes = await fetch(`${rs.baseUrl}/api/loops/${loopId}/artifacts/diff?from=${snapshot1}&to=${snapshot2}`);
+    const diffRes = await fetch(`${rs.baseUrl}/api/loops/${loopId}/artifacts/diff?from=${snapshot1}&to=${snapshot2}`, {
+      headers: sessionHeaders(),
+    });
     expect(diffRes.status).toBe(200);
     const diff = artifactDiffResponseSchema.parse(await diffRes.json());
     expect(diff.added.map((e) => e.path)).toEqual(["notes.txt"]);

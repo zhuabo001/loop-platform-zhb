@@ -11,7 +11,7 @@ import { loopSummarySchema, machineSummarySchema, runSummarySchema } from "@loop
 
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
 import { machines, runs, type NewMachine } from "../db/schema.js";
-import { FakeClock, seedLoop, seedRun } from "../testkit/index.js";
+import { FakeClock, seedClaimedMachineById, seedLoop, seedRun, TEST_TEAM_ID } from "../testkit/index.js";
 import {
   createLoopAdmin,
   LOOP_LIST_CAP,
@@ -37,11 +37,14 @@ async function fresh(): Promise<void> {
   db = h.db;
   let n = 0;
   admin = createLoopAdmin({ db, clock: new FakeClock(), newLoopId: () => `loop-${++n}` });
+  // The default loop machine: every loop seeded without an explicit machineId
+  // belongs to it, so the scoped queries below see them (ADR-011 决策 24).
+  await seedClaimedMachineById(db, "m-test");
 }
 
 /** Machines with caller-chosen names (testkit's seedMachine fixes name=""). */
 async function seedMachineRow(id: string, name: string, extra: Partial<NewMachine> = {}): Promise<void> {
-  await db.insert(machines).values({ id, name, tokenHash: `hash-${id}`, createdAt: "2026-07-01T00:00:00.000Z", ...extra });
+  await db.insert(machines).values({ id, name, tokenHash: `hash-${id}`, createdAt: "2026-07-01T00:00:00.000Z", teamId: TEST_TEAM_ID, ...extra });
 }
 
 const iso = (seconds: number): string => new Date(Date.UTC(2026, 6, 1, 0, 0, 0) + seconds * 1000).toISOString();
@@ -49,11 +52,13 @@ const iso = (seconds: number): string => new Date(Date.UTC(2026, 6, 1, 0, 0, 0) 
 describe("listMachines", () => {
   it("sorts name ASC then id ASC and picks exactly the summary fields", async () => {
     await fresh();
+    // The shared fixture's default loop machine is not part of this assertion.
+    await db.delete(machines).where(eq(machines.id, "m-test"));
     await seedMachineRow("m-bbb", "alpha");
     await seedMachineRow("m-aaa", "alpha"); // same name ⇒ id ASC decides
     await seedMachineRow("m-ccc", "", { hostname: null, platform: null, arch: null, daemonVersion: null, lastSeen: null });
 
-    const list = await admin.listMachines();
+    const list = await admin.listMachines(TEST_TEAM_ID);
     expect(list.map((m) => m.id)).toEqual(["m-ccc", "m-aaa", "m-bbb"]); // "" < "alpha"
     expect(list[1]).toEqual({
       id: "m-aaa",
@@ -73,11 +78,12 @@ describe("listMachines", () => {
 
   it("caps at 100 AFTER sorting — the sort-last row is the one dropped", async () => {
     await fresh();
+    await db.delete(machines).where(eq(machines.id, "m-test"));
     await seedMachineRow("m-zzz", "zzz"); // inserted FIRST, sorts LAST
     for (let i = 0; i < MACHINE_LIST_CAP; i += 1) {
       await seedMachineRow(`m-${String(i).padStart(3, "0")}`, `a${String(i).padStart(3, "0")}`);
     }
-    const list = await admin.listMachines();
+    const list = await admin.listMachines(TEST_TEAM_ID);
     expect(list).toHaveLength(MACHINE_LIST_CAP);
     expect(list.some((m) => m.id === "m-zzz")).toBe(false);
     expect(list[0]!.id).toBe("m-000");
@@ -90,7 +96,7 @@ describe("listLoops", () => {
     await seedLoop(db, { id: "loop-b", updatedAt: iso(5) });
     await seedLoop(db, { id: "loop-a", updatedAt: iso(5) });
 
-    expect((await admin.listLoops()).map((loop) => loop.id)).toEqual(["loop-a", "loop-b"]);
+    expect((await admin.listLoops(TEST_TEAM_ID)).map((loop) => loop.id)).toEqual(["loop-a", "loop-b"]);
   });
 
   it("sorts updatedAt DESC then id ASC; lastRun is the latest EXEC run only", async () => {
@@ -109,7 +115,7 @@ describe("listLoops", () => {
     await seedRun(db, { id: "run-b", loopId: "loop-mid", ts: iso(40) });
     // loop-old: no runs at all.
 
-    const list = await admin.listLoops();
+    const list = await admin.listLoops(TEST_TEAM_ID);
     expect(list.map((l) => l.id)).toEqual(["loop-new", "loop-mid", "loop-old"]);
     expect(list[0]!.lastRun).toMatchObject({ id: "run-newer", role: "exec" });
     expect(list[1]!.lastRun).toMatchObject({ id: "run-b" });
@@ -119,9 +125,9 @@ describe("listLoops", () => {
   it("pins the full LoopSummary nullability on a freshly created loop", async () => {
     await fresh();
     await seedMachineRow("m-0123456789abcdef", "mbp");
-    const created = await admin.createLoop({ machineId: "m-0123456789abcdef", taskFile: "/home/dev/TASK.md" });
+    const created = await admin.createLoop({ machineId: "m-0123456789abcdef", taskFile: "/home/dev/TASK.md" }, TEST_TEAM_ID);
     expect(created.created).toBe(true);
-    const list = await admin.listLoops();
+    const list = await admin.listLoops(TEST_TEAM_ID);
     expect(list).toHaveLength(1);
     expect(list[0]).toEqual({
       id: "loop-1",
@@ -156,7 +162,7 @@ describe("listLoops", () => {
       await seedLoop(db, { id: `loop-${String(i).padStart(3, "0")}`, updatedAt: iso(i + 1) });
     }
     await seedLoop(db, { id: "loop-oldest", updatedAt: iso(0) }); // inserted LAST, sorts LAST
-    const list = await admin.listLoops();
+    const list = await admin.listLoops(TEST_TEAM_ID);
     expect(list).toHaveLength(LOOP_LIST_CAP);
     expect(list.some((l) => l.id === "loop-oldest")).toBe(false);
     expect(list[0]!.id).toBe(`loop-${String(LOOP_LIST_CAP - 1).padStart(3, "0")}`);
@@ -166,7 +172,7 @@ describe("listLoops", () => {
 describe("listRuns", () => {
   it("returns undefined for an unknown loop (the route's 404)", async () => {
     await fresh();
-    expect(await admin.listRuns("loop-nope")).toBeUndefined();
+    expect(await admin.listRuns("loop-nope", TEST_TEAM_ID)).toBeUndefined();
   });
 
   it("sorts ts DESC then id DESC and keeps superseded runs visible", async () => {
@@ -177,7 +183,7 @@ describe("listRuns", () => {
     await seedRun(db, { id: "run-tie-a", loopId: "loop-1", ts: iso(30) });
     await seedRun(db, { id: "run-tie-b", loopId: "loop-1", ts: iso(30) });
 
-    const list = await admin.listRuns("loop-1");
+    const list = await admin.listRuns("loop-1", TEST_TEAM_ID);
     expect(list!.map((r) => r.id)).toEqual(["run-tie-b", "run-tie-a", "run-new", "run-old"]);
     expect(list![3]).toMatchObject({ phase: "canceled", outcome: "skipped" });
   });
@@ -187,11 +193,11 @@ describe("listRuns", () => {
     await seedLoop(db, { id: "loop-1" });
     await seedRun(db, { id: "run-a", loopId: "loop-1", ts: iso(10) });
     await seedRun(db, { id: "run-b", loopId: "loop-1", ts: iso(20) });
-    expect((await admin.listRuns("loop-1"))![0]!.id).toBe("run-b");
+    expect((await admin.listRuns("loop-1", TEST_TEAM_ID))![0]!.id).toBe("run-b");
 
     // A lifecycle transition lands on run-a: its ts jumps to the newest.
     await db.update(runs).set({ ts: iso(30), phase: "done" }).where(eq(runs.id, "run-a"));
-    const list = await admin.listRuns("loop-1");
+    const list = await admin.listRuns("loop-1", TEST_TEAM_ID);
     expect(list!.map((r) => r.id)).toEqual(["run-a", "run-b"]);
     expect(list![0]).toMatchObject({ id: "run-a", phase: "done" });
   });
@@ -206,7 +212,7 @@ describe("listRuns", () => {
       ts: iso(20),
       progress: { step: 2, label: "testing", at: iso(20) },
     });
-    const list = await admin.listRuns("loop-1");
+    const list = await admin.listRuns("loop-1", TEST_TEAM_ID);
     expect(list![0]!.progress).toEqual({ step: 2, label: "testing", at: iso(20) });
     expect(list![1]!.progress).toEqual({ step: 1, label: "editing", at: null });
   });
@@ -218,7 +224,7 @@ describe("listRuns", () => {
       await seedRun(db, { id: `run-${String(i).padStart(3, "0")}`, loopId: "loop-1", ts: iso(i + 1) });
     }
     await seedRun(db, { id: "run-oldest", loopId: "loop-1", ts: iso(0) }); // sorts LAST
-    const list = await admin.listRuns("loop-1");
+    const list = await admin.listRuns("loop-1", TEST_TEAM_ID);
     expect(list).toHaveLength(RUN_LIST_CAP);
     expect(list!.some((r) => r.id === "run-oldest")).toBe(false);
     expect(list![0]!.id).toBe(`run-${String(RUN_LIST_CAP - 1).padStart(3, "0")}`);

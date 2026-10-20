@@ -29,7 +29,13 @@ import { machineIdFromToken } from "@loopzhb/protocol/node";
 import { closeDb, type DbHandle } from "./db/index.js";
 import { loops, runLeases, runs } from "./db/schema.js";
 import { bootstrapServer, waitForListening, type BootedServer } from "./start.js";
-import { FakeClock, FakeCronFactory, makeTestAuthConfig, seedClaimedMachineIfAbsent } from "./testkit/index.js";
+import {
+  FakeClock,
+  FakeCronFactory,
+  makeTestAuthConfig,
+  seedClaimedMachineIfAbsent,
+  seedManagementSession,
+} from "./testkit/index.js";
 import type { Clock } from "./time.js";
 
 const TOKEN = "dk_restart_e2e";
@@ -84,6 +90,10 @@ async function boot(dataDir: string, clock: FakeClock): Promise<RunningServer> {
   // Phase 5 Batch 3 slice 3 removed auto-registration (idempotent: a second
   // boot of the same dataDir re-reads the persisted row).
   await seedClaimedMachineIfAbsent(booted.handle.db, TOKEN);
+  // Slice 5: the management surface requires a Session. Idempotent, so a
+  // reboot of the same dataDir re-attaches to the persisted row — which is
+  // itself part of the restart contract.
+  sessionCredential = (await seedManagementSession(booted.handle.db, { clock })).credential;
   const rs = await attachListener(booted, clock, cronFactory);
   try {
     await rs.scheduler.start();
@@ -120,10 +130,16 @@ function makeDaemon(rs: RunningServer, runner?: AgentRunner) {
   });
 }
 
+let sessionCredential = "";
+const sessionHeaders = (extra: Record<string, string> = {}): Record<string, string> => ({
+  cookie: `loopzhb_session=${sessionCredential}`,
+  ...extra,
+});
+
 async function createScheduledLoop(rs: RunningServer, cron: string): Promise<string> {
   const res = await fetch(`${rs.baseUrl}/api/loops`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: sessionHeaders({ "content-type": "application/json" }),
     body: JSON.stringify({ machineId: MACHINE_ID, name: "e2e-loop", cron, timezone: "UTC", taskFile: "/srv/e2e/TASK.md" }),
   });
   expect(res.status).toBe(201);
@@ -132,7 +148,7 @@ async function createScheduledLoop(rs: RunningServer, cron: string): Promise<str
 }
 
 async function listRuns(rs: RunningServer, loopId: string) {
-  const res = await fetch(`${rs.baseUrl}/api/loops/${loopId}/runs`);
+  const res = await fetch(`${rs.baseUrl}/api/loops/${loopId}/runs`, { headers: sessionHeaders() });
   expect(res.status).toBe(200);
   return runListResponseSchema.parse(await res.json()).runs;
 }
@@ -163,12 +179,12 @@ describe("E-group: file-backed DB + real HTTP restart E2E", () => {
 
     const second = await boot(dir, clock);
 
-    const machinesRes = await fetch(`${second.baseUrl}/api/machines`);
+    const machinesRes = await fetch(`${second.baseUrl}/api/machines`, { headers: sessionHeaders() });
     expect(machinesRes.status).toBe(200);
     const machineList = machineListResponseSchema.parse(await machinesRes.json()).machines;
     expect(machineList.find((m) => m.id === MACHINE_ID)).toMatchObject({ name: "e2e-host" });
 
-    const loopsRes = await fetch(`${second.baseUrl}/api/loops`);
+    const loopsRes = await fetch(`${second.baseUrl}/api/loops`, { headers: sessionHeaders() });
     const loopList = loopListResponseSchema.parse(await loopsRes.json()).loops;
     expect(loopList.find((l) => l.id === loopId)).toMatchObject({
       cron: "0 10 * * *",
@@ -187,7 +203,7 @@ describe("E-group: file-backed DB + real HTTP restart E2E", () => {
     await makeDaemon(rs).pollOnce();
     const loopId = await createScheduledLoop(rs, "0 10 * * *");
 
-    const loopsRes = await fetch(`${rs.baseUrl}/api/loops`);
+    const loopsRes = await fetch(`${rs.baseUrl}/api/loops`, { headers: sessionHeaders() });
     const loopList = loopListResponseSchema.parse(await loopsRes.json()).loops;
     const summary = loopList.find((l) => l.id === loopId);
     expect(summary).toMatchObject({ cron: "0 10 * * *", timezone: "UTC", enabled: true });
@@ -329,7 +345,7 @@ describe("E-group: file-backed DB + real HTTP restart E2E", () => {
 
     // Trigger + claim over real HTTP; the report never arrives (machine
     // "dies" mid-run together with the server).
-    await fetch(`${first.baseUrl}/api/loops/${loopId}/run`, { method: "POST" });
+    await fetch(`${first.baseUrl}/api/loops/${loopId}/run`, { method: "POST", headers: sessionHeaders() });
     const claimRes = await fetch(`${first.baseUrl}/api/machine/poll`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${TOKEN}` },

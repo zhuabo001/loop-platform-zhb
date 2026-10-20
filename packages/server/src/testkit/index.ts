@@ -10,8 +10,10 @@ import { asc, eq } from "drizzle-orm";
 
 import { machineIdFromToken, sha256 } from "@loopzhb/protocol/node";
 
+import { createSessionService } from "../auth/session.js";
 import type { RunCoordinatorDependencies } from "../coordinator/index.js";
 import type { AuthConfig } from "../config.js";
+import { createManagementAccess, type ManagementAccess } from "../management/access.js";
 import type { Db } from "../db/index.js";
 import {
   artifactBlobs,
@@ -412,6 +414,108 @@ export async function seedClaimedMachine(
   overrides: Partial<NewMachine> = {},
 ): Promise<string> {
   return seedMachineForToken(db, token, { teamId, ...overrides });
+}
+
+// ---- Slice 5: management-session fixtures (ADR-011 决策 23) ----
+
+/**
+ * The full management fixture in one call: User + personal Team + owner
+ * Membership + a live Login Session — the state a browser reaches only through
+ * the GitHub login flow, stated explicitly for tests.
+ *
+ * The expiry is computed from the SAME clock the app under test uses. This is
+ * load-bearing: `seedSession`'s default expiry is FIXTURE_T0 + 7d, so a boot
+ * test whose FakeClock sits in August would otherwise mint an already-expired
+ * credential.
+ *
+ * `teamId` defaults to `TEST_TEAM_ID` so `seedClaimedMachineById` machines are
+ * visible to this session without a second argument.
+ */
+export async function seedManagementSession(
+  db: Db,
+  opts: {
+    clock?: Clock;
+    teamId?: string;
+    githubUserId?: string;
+    username?: string;
+    credential?: string;
+    expiresAt?: string;
+  } = {},
+): Promise<{ credential: string; userId: string; teamId: string }> {
+  const teamId = opts.teamId ?? TEST_TEAM_ID;
+  const userId = opts.githubUserId ?? "424242";
+  // Idempotent on purpose: a REBOOT fixture re-runs its boot on the same
+  // dataDir, and must re-attach to the persisted identity rather than collide
+  // on the primary keys.
+  const userRow = (await db.select({ id: users.id }).from(users).where(eq(users.id, userId)).limit(1))[0];
+  if (userRow === undefined) {
+    await seedUser(db, { id: userId, username: opts.username ?? "tester" });
+    await seedTeam(db, { id: teamId, ownerUserId: userId, name: opts.username ?? "tester" });
+    await seedMembership(db, { userId, teamId });
+  }
+  // Derived from the user id so an A/B world can seed two sessions in one DB
+  // without a collision, and so a reboot can recompute the same credential.
+  const credential = opts.credential ?? `sk_management_${userId}`;
+  const credentialHash = sha256(credential);
+  const sessionRow = (
+    await db.select({ credentialHash: authSessions.credentialHash }).from(authSessions).where(eq(authSessions.credentialHash, credentialHash)).limit(1)
+  )[0];
+  if (sessionRow === undefined) {
+    const now = (opts.clock ?? new FakeClock()).now();
+    await seedSession(db, {
+      userId,
+      credential,
+      credentialHash,
+      createdAt: now.toISOString(),
+      expiresAt: opts.expiresAt ?? new Date(now.getTime() + 7 * 24 * 3600 * 1000).toISOString(),
+    });
+  }
+  return { credential, userId, teamId };
+}
+
+/** The gate the production assembly uses, built over the test's own db/clock. */
+export function createTestManagementAccess(db: Db, clock: Clock): ManagementAccess {
+  return createManagementAccess({ db, sessions: createSessionService({ db, clock }) });
+}
+
+/**
+ * A PASS-THROUGH gate for assemblies that replace every dependency with a
+ * double (the HTTP taxonomy pin, the Dashboard route tests). It is NOT a
+ * security fixture — tests that assert the gate must use
+ * `createTestManagementAccess` with a real Session. Naming it "permissive"
+ * keeps the intent greppable.
+ */
+export function permissiveManagementAccess(teamId: string = TEST_TEAM_ID): ManagementAccess {
+  return {
+    sessionGate: async (_c, next) => next(),
+    loopGate: async (_c, next) => next(),
+    runGate: async (_c, next) => next(),
+    teamIdOf: () => teamId,
+  };
+}
+
+/**
+ * Wrap a Hono app so that management requests carry a Session cookie WITHOUT
+ * touching each call site. A caller that sets its own `cookie` header wins
+ * (negative fixtures and OAuth tests must not be silently authenticated).
+ * Other app members are forwarded unchanged.
+ */
+export function withManagementSession<T extends object>(app: T, credential: string): T {
+  return new Proxy(app, {
+    get(target, prop, receiver) {
+      if (prop === "request") {
+        return (input: unknown, init?: { headers?: Headers | Record<string, string> } & Record<string, unknown>) => {
+          const headers = new Headers(init?.headers);
+          if (!headers.has("cookie")) headers.set("cookie", `loopzhb_session=${credential}`);
+          return (target as { request(input: unknown, init?: unknown): Promise<Response> }).request(input, {
+            ...init,
+            headers,
+          });
+        };
+      }
+      return Reflect.get(target, prop, receiver);
+    },
+  });
 }
 
 // ---- Slice 2: Set-Cookie assertion helper ----

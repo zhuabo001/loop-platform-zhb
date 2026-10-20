@@ -127,16 +127,23 @@ export function parseAuthConfig(env: ServerConfigEnv, host: string, port: number
   return { origin, githubCallbackUrl: origin + GITHUB_CALLBACK_PATH, githubClientId, githubClientSecret };
 }
 
-/** The Phase 1 unauthenticated-exposure warning, or null on loopback. Pure so
- *  the policy is unit-testable without booting. */
+/** The non-loopback exposure warning, or null on loopback. Pure so the policy
+ *  is unit-testable without booting.
+ *
+ *  Batch 3 slice 5 rewrote the message: the management JSON surface now
+ *  requires a Login Session and machine enrollment is closed (machines are
+ *  claimed offline), so the old "NO authentication" claim is false. What
+ *  remains true is that public exposure needs Phase 6 hardening. */
 export function unauthenticatedExposureWarning(host: string): string | null {
   if (isLoopbackHost(host)) return null;
   return [
     `⚠️  LOOPZHB_HOST=${host}: listening on a NON-loopback address.`,
-    "⚠️  Phase 1 has NO authentication on /api/machine/* or the management surface",
-    "⚠️  (/api/machines, /api/loops*, /api/runs*) — any reachable client can enroll",
-    "⚠️  machines, create loops, drive runs and CANCEL them.",
-    "⚠️  Expose this only on a trusted network / inside a container until Phase 5 auth lands.",
+    "⚠️  The management API (/api/machines, /api/loops*, /api/runs*) requires a",
+    "⚠️  GitHub login Session, and machine enrollment is closed — machines must be",
+    "⚠️  claimed offline with claim:legacy before they can poll.",
+    "⚠️  The Dashboard is mounted ONLY on a loopback bind, so it is absent here.",
+    "⚠️  Public exposure still needs the Phase 6 hardening (TLS termination, rate",
+    "⚠️  limits, CSRF/origin intent checks) — keep this on a trusted network.",
   ].join("\n");
 }
 

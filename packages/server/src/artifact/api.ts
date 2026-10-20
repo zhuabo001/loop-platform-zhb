@@ -79,19 +79,39 @@ export type MachineLoopArtifactsReadResult =
 export interface ArtifactApi {
   /** PATCH /api/loops/:id/artifact-dir — management, no credential. */
   updateConfig(loopId: string, command: { artifactDir: string | null }): Promise<UpdateArtifactConfigResult>;
-  /** GET /api/loops/:id/artifacts — management read: the current file view. */
-  readLoop(loopId: string): Promise<ReadLoopArtifactsResult>;
-  /** GET /api/runs/:id/artifacts — management read: bound snapshot or explicit
-   *  missing. `expectedLoopId` is the nested Dashboard page's parent path: a
-   *  mismatch folds into `run_not_found` at the identity step, BEFORE any
-   *  attribution/snapshot failure could leak the run's existence (#111). */
-  readRun(runId: string, expectedLoopId?: string): Promise<ReadRunArtifactsResult>;
-  /** GET /api/loops/:id/artifacts/diff — management read: structural diff of two same-loop snapshots. */
-  diffSnapshots(loopId: string, query: { from?: string; to: string }): Promise<ReadDiffResult>;
+
+  // ---- management reads: Team-Scoped (Phase 5 Batch 3 slice 5, 决策 26) ----
+  // These are the ONLY read methods the management HTTP routes may call. The
+  // ownership comparison happens before attribution, snapshot parsing and any
+  // blob open.
+  /** GET /api/loops/:id/artifacts — the current file view. */
+  readLoopForTeam(loopId: string, teamId: string): Promise<ReadLoopArtifactsResult>;
+  /** GET /api/runs/:id/artifacts — bound snapshot or explicit missing. */
+  readRunForTeam(runId: string, teamId: string, expectedLoopId?: string): Promise<ReadRunArtifactsResult>;
+  /** GET /api/loops/:id/artifacts/diff — structural diff of two same-loop snapshots. */
+  diffSnapshotsForTeam(loopId: string, teamId: string, query: { from?: string; to: string }): Promise<ReadDiffResult>;
   /** GET /api/loops/:id/artifacts/download — opens the verified blob stream
    *  for one manifest entry; the ROUTE owns response composition, the
    *  mid-stream pump and abort cleanup (决策 27). */
-  openDownload(loopId: string, query: { snapshotId: string; path: string }): Promise<OpenArtifactDownloadResult>;
+  openDownloadForTeam(
+    loopId: string,
+    teamId: string,
+    query: { snapshotId: string; path: string },
+  ): Promise<OpenArtifactDownloadResult>;
+
+  // ---- TEMPORARY: the un-gated Dashboard (slice 6 removes this arm) --------
+  // Named `Unscoped` so the escape hatch is greppable and cannot be mistaken
+  // for the management surface. `expectedLoopId` is the nested Dashboard
+  // page's parent path: a mismatch folds into `run_not_found` at the identity
+  // step, BEFORE any attribution/snapshot failure could leak the run's
+  // existence (#111).
+  readLoopUnscoped(loopId: string): Promise<ReadLoopArtifactsResult>;
+  readRunUnscoped(runId: string, expectedLoopId?: string): Promise<ReadRunArtifactsResult>;
+  diffSnapshotsUnscoped(loopId: string, query: { from?: string; to: string }): Promise<ReadDiffResult>;
+  openDownloadUnscoped(
+    loopId: string,
+    query: { snapshotId: string; path: string },
+  ): Promise<OpenArtifactDownloadResult>;
   /** GET /api/machine/loops/:id/artifacts — the restart/conflict recovery read. */
   readMachineLoop(token: string, loopId: string): Promise<MachineLoopArtifactsReadResult>;
   /** POST /api/machine/sync. */
@@ -119,30 +139,58 @@ export function createArtifactApi(home: ArtifactHomeDeps): ArtifactApi {
       return updateArtifactConfig({ db, clock }, loopId, { artifactDir: command.artifactDir });
     },
 
-    readLoop(loopId) {
+    readLoopForTeam(loopId, teamId) {
       return withStorageError(
-        () => readLoopArtifactsView(reads, loopId),
+        () => readLoopArtifactsView(reads, loopId, { kind: "team", teamId }),
         (cause) => ({ ok: false, failure: "storage_error", cause }),
       );
     },
 
-    readRun(runId, expectedLoopId) {
+    readRunForTeam(runId, teamId, expectedLoopId) {
       return withStorageError(
-        () => readRunArtifactsView(reads, runId, expectedLoopId),
+        () => readRunArtifactsView(reads, runId, { kind: "team", teamId }, expectedLoopId),
         (cause) => ({ ok: false, failure: "storage_error", cause }),
       );
     },
 
-    diffSnapshots(loopId, query) {
+    diffSnapshotsForTeam(loopId, teamId, query) {
       return withStorageError(
-        () => diffLoopSnapshots(reads, loopId, query),
+        () => diffLoopSnapshots(reads, loopId, query, { kind: "team", teamId }),
         (cause) => ({ ok: false, failure: "storage_error", cause }),
       );
     },
 
-    openDownload(loopId, query) {
+    openDownloadForTeam(loopId, teamId, query) {
       return withStorageError(
-        () => openArtifactDownload(reads, loopId, query),
+        () => openArtifactDownload(reads, loopId, query, { kind: "team", teamId }),
+        (cause) => ({ ok: false, failure: "storage_error", cause }),
+      );
+    },
+
+    readLoopUnscoped(loopId) {
+      return withStorageError(
+        () => readLoopArtifactsView(reads, loopId, { kind: "unscoped" }),
+        (cause) => ({ ok: false, failure: "storage_error", cause }),
+      );
+    },
+
+    readRunUnscoped(runId, expectedLoopId) {
+      return withStorageError(
+        () => readRunArtifactsView(reads, runId, { kind: "unscoped" }, expectedLoopId),
+        (cause) => ({ ok: false, failure: "storage_error", cause }),
+      );
+    },
+
+    diffSnapshotsUnscoped(loopId, query) {
+      return withStorageError(
+        () => diffLoopSnapshots(reads, loopId, query, { kind: "unscoped" }),
+        (cause) => ({ ok: false, failure: "storage_error", cause }),
+      );
+    },
+
+    openDownloadUnscoped(loopId, query) {
+      return withStorageError(
+        () => openArtifactDownload(reads, loopId, query, { kind: "unscoped" }),
         (cause) => ({ ok: false, failure: "storage_error", cause }),
       );
     },

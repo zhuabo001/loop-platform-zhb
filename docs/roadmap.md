@@ -246,7 +246,8 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
   - 片 2（GitHub 登录与持久 Session）已完成：五个认证路由、浏览器绑定的一次性 state + PKCE、凭据哈希即主键的 7 天绝对有效期 Session、固定八值失败分类；AU1–AU12 与 SE1–SE8 落地。设计修正：Session CSRF token 改为凭据派生，迁移 0007 撤销（journal 保持 7 条）。三轨审查 0 项 P1/P2，2 项 P3 已修复。
   - 片 3（关闭自注册与未认领机器执行隔离）已完成：统一五步凭据门（形状 → 派生 id → 全量 tokenHash → 已认领 → 未撤销，五类拒绝折叠为同一 401）、删除生产自注册连实现、生产 Artifact namespace 切换到 `machines.teamId`、调度扫描/tick/enqueue 三处资格边界与停机排空。首轮三轨 3 P2 + 2 P3（[#121](https://github.com/zhuabo001/loop-platform-zhb/issues/121)/[#122](https://github.com/zhuabo001/loop-platform-zhb/issues/122)/[#123](https://github.com/zhuabo001/loop-platform-zhb/issues/123)）已整改，二轮独立三轨无新增 P1/P2，三项已核销关闭。
   - 片 4（离线认领与 Artifact namespace 迁移）已完成：`claim:legacy` 离线命令、Server 与 CLI 共用的 dataDir 独占锁（PGlite 无跨进程锁，ADR-011 决策 20）、只读 dry-run、按「先复制验证、后单事务」迁移历史、幂等 no-op 与安全重试。LM3–LM10 落地，规则见 ADR-011 决策 20–22。
-  - 未完成：片 5（管理 API Session 门禁与团队过滤）、片 6（Dashboard 登录态）、片 7（生产装配、升级演练与批次收口）。
+  - 片 5（管理 API Session 门禁与团队过滤）已完成：`/api/*` 默认拒绝的 Session 门禁（仅精确豁免 `/api/session` 与 `/api/machine/*`，斜杠是安全边界）、`/api/loops/:id/*` 与 `/api/runs/:id/*` 的路径归属门禁（Run→Loop→Machine→Team，统一扁平 404）、五个管理查询与 Loop 创建的 SQL 团队过滤（过滤先于排序与限量）、Artifact 管理读的归属前置（先于 attribution/snapshot/blob）。`createServerApp` 改为 options object 且 management 必填，`bootstrapServer` 无条件接线（ADR-011 决策 23–28）。MG1–MG10 落地，八项变异全部被抓住；既有测试迁移为「已登录 + 已认领」世界。如实登记：Dashboard 在片 6 前仍未认证、未知 `/api/*` 匿名响应由 404 变 401、归属中间件依赖本批「无在线归属变更」的不变量；#56 不核销。
+  - 未完成：片 6（Dashboard 登录态）、片 7（生产装配、升级演练与批次收口）。
 
 ### 右移项
 

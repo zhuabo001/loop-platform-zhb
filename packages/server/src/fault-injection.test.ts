@@ -51,7 +51,14 @@ import { createOwnerControl } from "./owner/index.js";
 import { createScheduleAdmin } from "./schedule/index.js";
 import { RECLAIM_RUN_ERROR } from "./store/runs.js";
 import { createInactivitySweep, type InactivitySweep } from "./sweep/index.js";
-import { FakeClock, makeTestFactories, seedClaimedMachineIfAbsent } from "./testkit/index.js";
+import {
+  createTestManagementAccess,
+  FakeClock,
+  makeTestFactories,
+  seedClaimedMachineIfAbsent,
+  seedManagementSession,
+  withManagementSession,
+} from "./testkit/index.js";
 
 const TOKEN = "dk_fault_machine";
 const handles: DbHandle[] = [];
@@ -86,13 +93,18 @@ async function bootFake(dataDir?: string): Promise<FakeBoot> {
   // machine the daemon's token polls as (idempotent: re-boots of the same
   // dataDir re-read the persisted row).
   await seedClaimedMachineIfAbsent(handle.db, TOKEN);
+  const { credential } = await seedManagementSession(handle.db, { clock });
   return {
-    app: createServerApp(
-      coordinator,
-      admin,
-      createLifecycleAdmin({ db: handle.db, clock }),
-      createScheduleAdmin({ db: handle.db, clock }),
-      ownerControl,
+    app: withManagementSession(
+      createServerApp({
+        coordinator,
+        admin,
+        lifecycle: createLifecycleAdmin({ db: handle.db, clock }),
+        schedule: createScheduleAdmin({ db: handle.db, clock }),
+        ownerControl,
+        management: createTestManagementAccess(handle.db, clock),
+      }),
+      credential,
     ),
     db: handle.db,
     handle,

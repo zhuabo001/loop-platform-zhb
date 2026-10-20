@@ -31,7 +31,7 @@ import { createLifecycleAdmin } from "../loop-lifecycle/admin.js";
 import { createOwnerControl } from "../owner/index.js";
 import { createScheduleAdmin } from "../schedule/index.js";
 import { waitForListening } from "../start.js";
-import { FakeClock, seedClaimedMachineById, seedLoop, seedRun } from "../testkit/index.js";
+import { FakeClock, permissiveManagementAccess, seedClaimedMachineById, seedLoop, seedRun } from "../testkit/index.js";
 import { createServerApp } from "../http/app.js";
 import { createDashboardRead, type DashboardArtifactRead, type DashboardRead } from "./index.js";
 import { dashboardCsp } from "./routes.js";
@@ -70,13 +70,16 @@ interface FreshOptions {
 /** Build an app WITHOUT the dashboard (the pre-Batch-3 shape), for the
  *  "unmounted 404 is indistinguishable" assertions. */
 function appWithoutDashboard(): ReturnType<typeof createServerApp> {
-  return createServerApp(
+  return createServerApp({
     coordinator,
     admin,
-    createLifecycleAdmin({ db, clock }),
-    createScheduleAdmin({ db, clock }),
-    createOwnerControl({ db, clock }),
-  );
+    lifecycle: createLifecycleAdmin({ db, clock }),
+    schedule: createScheduleAdmin({ db, clock }),
+    ownerControl: createOwnerControl({ db, clock }),
+    // The Dashboard surface is not session-gated until slice 6; these tests
+    // replace every management dependency with a double.
+    management: permissiveManagementAccess(),
+  });
 }
 
 function buildApp(options: FreshOptions & { csrfToken: string }): ReturnType<typeof createServerApp> {
@@ -94,15 +97,15 @@ function buildApp(options: FreshOptions & { csrfToken: string }): ReturnType<typ
       }),
     csrfToken: options.csrfToken,
   });
-  return createServerApp(
+  return createServerApp({
     coordinator,
     admin,
-    createLifecycleAdmin({ db, clock }),
-    createScheduleAdmin({ db, clock }),
-    createOwnerControl({ db, clock }),
-    undefined,
-    routes,
-  );
+    lifecycle: createLifecycleAdmin({ db, clock }),
+    schedule: createScheduleAdmin({ db, clock }),
+    ownerControl: createOwnerControl({ db, clock }),
+    management: permissiveManagementAccess(),
+    dashboard: routes,
+  });
 }
 
 async function fresh(options: FreshOptions = {}): Promise<void> {
