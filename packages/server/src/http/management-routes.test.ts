@@ -24,6 +24,7 @@ import {
   makeTestAuthConfig,
   seedArtifactBlob,
   seedArtifactManifest,
+  seedArtifactSyncSession,
   seedLease,
   seedLoop,
   seedMachine,
@@ -89,6 +90,47 @@ async function fresh(): Promise<Rig> {
   });
   await seedRun(db, { id: "run-a-bound", loopId: "loop-a", machineId: "m-aaaaaaaaaaaaaaaa", artifactSnapshotId: "amf-a" });
 
+  // Committed and pending sync sessions across ALL THREE worlds. The zero-write
+  // oracle snapshots `artifact_sync_sessions`, and the table was empty here and
+  // in the E2E: an empty table cannot prove a refusal left a receipt (UPDATE)
+  // or a pending session (DELETE) alone. One committed row per team plus a
+  // pending row on the unclaimed machine closes that hole.
+  await seedArtifactSyncSession(db, {
+    id: "sync-a",
+    namespaceId: TEST_TEAM_ID,
+    machineId: "m-aaaaaaaaaaaaaaaa",
+    loopId: "loop-a",
+    requestId: "req-a",
+    normalizedManifest: [{ path: "a.txt", hash: blob.hash, size: blob.size }],
+    negotiatedHashes: [blob.hash],
+    receipt: { artifactSnapshotId: "amf-a", manifestRevision: 1 },
+  });
+  await seedArtifactManifest(db, { id: "amf-b", namespaceId: TEAM_B, machineId: "m-bbbbbbbbbbbbbbbb", loopId: "loop-b" });
+  await seedArtifactSyncSession(db, {
+    id: "sync-b",
+    namespaceId: TEAM_B,
+    machineId: "m-bbbbbbbbbbbbbbbb",
+    loopId: "loop-b",
+    requestId: "req-b",
+    receipt: { artifactSnapshotId: "amf-b", manifestRevision: 1 },
+  });
+  await seedArtifactManifest(db, {
+    id: "amf-u",
+    namespaceId: "m-cccccccccccccccc",
+    machineId: "m-cccccccccccccccc",
+    loopId: "loop-u",
+  });
+  await seedArtifactSyncSession(db, {
+    id: "sync-u",
+    namespaceId: "m-cccccccccccccccc",
+    machineId: "m-cccccccccccccccc",
+    loopId: "loop-u",
+    requestId: "req-u",
+    // PENDING on purpose: the unclaimed world's in-flight session is the row a
+    // "clean up on refusal" bug would delete.
+    receipt: null,
+  });
+
   const auth = createAuthModule({
     authConfig: makeTestAuthConfig(),
     db,
@@ -116,7 +158,7 @@ async function fresh(): Promise<Rig> {
   return { db, raw, app: withManagementSession(raw, credential) };
 }
 
-const json = (cookie: string, body: unknown = {}) => ({
+const json = (cookie: string) => ({
   "content-type": "application/json",
   cookie: `loopzhb_session=${cookie}`,
 });
@@ -179,7 +221,7 @@ describe("MG6/MG7: cross-team and unclaimed resources are the flat 404", () => {
     const write = (method: string, path: string, body: unknown = {}) =>
       method === "GET" || method === "HEAD"
         ? rig.app.request(path, { method, headers: json(credential) })
-        : rig.app.request(path, { method, headers: json(credential, body), body: JSON.stringify(body) });
+        : rig.app.request(path, { method, headers: json(credential), body: JSON.stringify(body) });
 
     for (const id of ["loop-b", "loop-u", "loop-missing"]) {
       const calls: ReadonlyArray<readonly [string, string]> = [

@@ -14,11 +14,15 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
+import { createProductionArtifactHome } from "./artifact/production.js";
 import { closeDb, type Db } from "./db/index.js";
 import { bootstrapServer, type BootedServer } from "./start.js";
 import {
   FakeClock,
   makeTestAuthConfig,
+  seedArtifactBlob,
+  seedArtifactManifest,
+  seedArtifactSyncSession,
   seedLease,
   seedLoop,
   seedMachine,
@@ -75,6 +79,39 @@ async function boot(): Promise<World> {
   await seedLoop(db, { id: "loop-u", machineId: MACHINE_U });
   await seedRun(db, { id: "run-u", loopId: "loop-u", machineId: MACHINE_U, phase: "pending" });
   await seedLease(db, { tokenHash: "hash-u-run", runId: "run-u", loopId: "loop-u", machineId: MACHINE_U });
+
+  // A real artifact history on EVERY world, written through the production
+  // blob layout (`<dataDir>/blobs`, the same root bootstrapServer uses). The
+  // zero-write oracle snapshots the three artifact tables; empty ones cannot
+  // prove a refusal left a receipt, a committed manifest and a pending session
+  // alone. Only team A owns a session here — B's rows and the unclaimed
+  // machine's legacy per-machine namespace rows are the must-not-be-touched
+  // fixtures.
+  const artifacts = createProductionArtifactHome({ db, dataDir, clock });
+  async function seedHistory(namespaceId: string, machineId: string, loopId: string, text: string, receipted: boolean) {
+    const blob = await seedArtifactBlob(db, artifacts.blobStore, {
+      namespaceId,
+      bytes: new TextEncoder().encode(text),
+    });
+    const entries = [{ path: `${loopId}.txt`, hash: blob.hash, size: blob.size }];
+    const manifestId = `amf-${loopId}`;
+    await seedArtifactManifest(db, { id: manifestId, namespaceId, machineId, loopId, entries });
+    await seedArtifactSyncSession(db, {
+      id: `sync-${loopId}`,
+      namespaceId,
+      machineId,
+      loopId,
+      requestId: `req-${loopId}`,
+      normalizedManifest: entries,
+      negotiatedHashes: [blob.hash],
+      receipt: receipted ? { artifactSnapshotId: manifestId, manifestRevision: 1 } : null,
+    });
+  }
+  await seedHistory(TEST_TEAM_ID, MACHINE_A, "loop-a", "team a bytes", true);
+  await seedHistory(TEAM_B, MACHINE_B, "loop-b", "team b bytes", true);
+  // The unclaimed machine's history lives in the pre-claim per-machine
+  // namespace (ADR-011 slice 4); its sync session is still PENDING.
+  await seedHistory(MACHINE_U, MACHINE_U, "loop-u", "unclaimed bytes", false);
 
   return { booted, db, credential, clock };
 }

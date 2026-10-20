@@ -59,4 +59,39 @@ describe("withManagementSession", () => {
       cookie: "loopzhb_session=explicit",
     });
   });
+
+  it("preserves a Request input's own headers instead of replacing them", async () => {
+    // The failure this pins: Hono's `new Request(input, init)` lets `init.
+    // headers` REPLACE the input's headers, so a wrapper that always builds a
+    // fresh Headers silently strips an explicit cookie (and unrelated headers)
+    // carried by a Request — turning a negative fixture into a logged-in one.
+    const app = new Hono();
+    app.get("/api/echo", (c) =>
+      c.json({ cookie: c.req.header("cookie") ?? null, marker: c.req.header("x-marker") ?? null }),
+    );
+    const wrapped = withManagementSession(app, "sk_injected");
+
+    const explicit = await wrapped.request(
+      new Request("http://localhost/api/echo", {
+        headers: { cookie: "loopzhb_session=explicit", "x-marker": "keep" },
+      }),
+    );
+    expect(await explicit.json()).toEqual({ cookie: "loopzhb_session=explicit", marker: "keep" });
+
+    const bare = await wrapped.request(
+      new Request("http://localhost/api/echo", { headers: { "x-marker": "keep" } }),
+    );
+    expect(await bare.json()).toEqual({ cookie: "loopzhb_session=sk_injected", marker: "keep" });
+  });
+
+  it("keeps Hono's explicit init.headers override semantics", async () => {
+    const app = new Hono();
+    app.get("/api/echo", (c) => c.json({ cookie: c.req.header("cookie") ?? null }));
+    const wrapped = withManagementSession(app, "sk_injected");
+
+    const res = await wrapped.request(new Request("http://localhost/api/echo", { headers: { cookie: "loopzhb_session=from-request" } }), {
+      headers: { cookie: "loopzhb_session=from-init" },
+    });
+    expect(await res.json()).toEqual({ cookie: "loopzhb_session=from-init" });
+  });
 });

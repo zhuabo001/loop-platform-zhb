@@ -499,13 +499,29 @@ export function permissiveManagementAccess(teamId: string = TEST_TEAM_ID): Manag
  * touching each call site. A caller that sets its own `cookie` header wins
  * (negative fixtures and OAuth tests must not be silently authenticated).
  * Other app members are forwarded unchanged.
+ *
+ * The baseline for "does the caller already carry a cookie" depends on the
+ * call shape. When `init.headers` is given it REPLACES everything (Hono does
+ * `new Request(input, init)` and the fetch spec overwrites the input's header
+ * list wholesale), so init is the only truth — that is Hono's own override
+ * semantics and the helper preserves them. But when `init.headers` is ABSENT
+ * and the input is a `Request`, the input's headers survive unless we supply
+ * a `headers` member — so the baseline must be read FROM the Request. Building
+ * an empty `Headers` there would strip an explicit cookie (and every other
+ * header) and silently re-authenticate a negative fixture with the injected
+ * session.
  */
 export function withManagementSession<T extends object>(app: T, credential: string): T {
   return new Proxy(app, {
     get(target, prop, receiver) {
       if (prop === "request") {
         return (input: unknown, init?: { headers?: Headers | Record<string, string> } & Record<string, unknown>) => {
-          const headers = new Headers(init?.headers);
+          const headers =
+            init?.headers !== undefined
+              ? new Headers(init.headers as ConstructorParameters<typeof Headers>[0])
+              : input instanceof Request
+                ? new Headers(input.headers)
+                : new Headers();
           if (!headers.has("cookie")) headers.set("cookie", `loopzhb_session=${credential}`);
           return (target as { request(input: unknown, init?: unknown): Promise<Response> }).request(input, {
             ...init,

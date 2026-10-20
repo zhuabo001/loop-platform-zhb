@@ -542,3 +542,13 @@ server 较片 4 基线（1220 + 3 skipped）**+47**，恰为新增的七个套�
 ### 结论（片 5）
 
 片 5 结束了「机器自注册已关、管理面仍匿名」的中间态：管理 JSON API 默认拒绝、只认 Session；登录后只能看见与操作自己团队；未认领、跨团队与不存在的资源在管理入口统一扁平 404；归属检查先于 attribution、快照与 blob。MG1–MG10 全覆盖，五道质量门全绿，八项变异全部被抓住。如实登记四条：**生产组合根从片 7 提前接线**（ADR-011 决策 28）、**Dashboard 在片 6 前仍未认证**、**未知 `/api/*` 的匿名响应由 404 变 401**、**归属中间件依赖本批「无在线归属变更」的不变量**。本片不核销 #56。
+
+### 三轨审查 Round 1 与修复（2026-10-20，片 5）
+
+审查记录：`docs/handoff/codex-handoff-phase5-batch3-slice5-code-review.md`（按约定 gitignore，不入库）。固定范围 `f646b4f...b48e918`。结论：Standards 0 项 P1/P2 + 1 项 P3，Specs 0 项 P1/P2 + 1 项 P3，Adversarial 0 项发现。两项 P3 均已在实现侧修复并各自经变异证明。
+
+**Standards P3 — `withManagementSession` 丢弃 Request 自身头部。** 原因：helper 无条件下 `new Headers(init?.headers)` 并把结果塞回 `init.headers`；Hono 对 `Request` 输入执行 `new Request(input, init)`，而 fetch 规范规定 init 的 headers **整体替换** 输入的头部列表。于是 `app.request(new Request(...))` 形态下，调用方显式设置的 cookie 与全部其他头部被丢弃，负例身份可被注入会话静默认证（违反 helper 自述契约）。修复：`init.headers` 显式给出时以其为基线（保留 Hono 的 init 覆盖语义）；未给出且输入为 `Request` 时以该 Request 的头部为基线；否则空基线。只在基线没有 cookie 时才注入。新增 2 项回归：Request 携带显式 cookie + 其他头（必须都保留）、Request 无 cookie（注入且保留其他头）、以及 init 覆盖 Request 的 Hono 语义。变异：把 helper 退回旧的一行实现 ⇒ 新用例红（1 项），恢复后绿。
+
+**Specs P3 — 零写入 oracle 的 Artifact 历史 fixture 为空。** 原因：`snapshotBusinessState` 已包含 `artifact_sync_sessions`，但 `http/management-routes.test.ts` 的夹具只有 manifest/blob 没有 sync session，生产根 E2E 的三张 Artifact 表全空；空表相等无法证明拒绝路径没有 UPDATE 既有 receipt 或 DELETE pending session（计划要求非空世界）。修复：management-routes 夹具在 A/B/未认领三个世界各补 manifest + sync session（A、B 为带 receipt 的 committed；未认领为 pending，即「清理式 bug」会删的那一行）；生产根 E2E 经 `createProductionArtifactHome` 的真实 LocalBlobStore 在 `<dataDir>/blobs` 下补齐 A/B/未认领的 blob + manifest + sync session（B 用 `TEAM_B` namespace；未认领沿用片 4 之前的每机器 legacy namespace，且 session 保持 pending）。变异：在拒绝 helper 内注入 `delete artifactSyncSessions` ⇒ MG6 零写入与 MG9 历史保留各红一项，恢复后全绿。
+
+**复审后质量门**：`pnpm test` server **1269 + 3 skipped**（较修复前 +2，为 helper 的两项新回归）、daemon 790 + 7 skipped、protocol 292，全绿；`pnpm typecheck`、`pnpm build`、`db:check`（零漂移，journal 仍 7 条）、`git diff --check` 全部 EXIT=0。修复仅触及测试与 testkit，生产代码零改动，wire 与迁移均无变化。
