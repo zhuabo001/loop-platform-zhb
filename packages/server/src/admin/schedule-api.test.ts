@@ -12,7 +12,7 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import type { CreateLoopRequest, UpdateScheduleRequest } from "@loopzhb/protocol";
 
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
-import { FakeClock, seedMachine } from "../testkit/index.js";
+import { FakeClock, seedClaimedMachineById, TEST_TEAM_ID } from "../testkit/index.js";
 import { createLoopAdmin, newUuidLoopId, type LoopAdmin } from "./index.js";
 import { updateSchedule } from "../schedule/index.js";
 
@@ -25,6 +25,7 @@ describe("A-group: schedule API surface", () => {
   let db: Db;
   let clock: FakeClock;
   let admin: LoopAdmin;
+  const createLoop = (input: Parameters<LoopAdmin["createLoop"]>[0]) => admin.createLoop(input, TEST_TEAM_ID);
   let machineId: string;
 
   beforeEach(async () => {
@@ -35,7 +36,7 @@ describe("A-group: schedule API surface", () => {
 
     // Register a test machine
     machineId = "m-0123456789abcdef";
-    await seedMachine(db, machineId);
+    await seedClaimedMachineById(db, machineId);
 
     admin = createLoopAdmin({ db, clock, newLoopId: newUuidLoopId });
   });
@@ -48,7 +49,7 @@ describe("A-group: schedule API surface", () => {
         name: "manual-loop",
       };
 
-      const result = await admin.createLoop(req);
+      const result = await createLoop(req);
 
       expect(result.created).toBe(true);
       if (!result.created) return;
@@ -68,7 +69,7 @@ describe("A-group: schedule API surface", () => {
         cron: "0 9 * * 1-5",
       };
 
-      const result = await admin.createLoop(req);
+      const result = await createLoop(req);
 
       expect(result.created).toBe(true);
       if (!result.created) return;
@@ -89,7 +90,7 @@ describe("A-group: schedule API surface", () => {
         timezone: "Asia/Shanghai",
       };
 
-      const result = await admin.createLoop(req);
+      const result = await createLoop(req);
 
       expect(result.created).toBe(true);
       if (!result.created) return;
@@ -105,7 +106,7 @@ describe("A-group: schedule API surface", () => {
     let loopId: string;
 
     beforeEach(async () => {
-      const result = await admin.createLoop({
+      const result = await createLoop({
         machineId,
         taskFile: "/srv/TASK.md",
         name: "test-loop",

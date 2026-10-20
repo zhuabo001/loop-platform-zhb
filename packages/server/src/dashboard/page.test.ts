@@ -72,7 +72,21 @@ const TEST_CSRF = "test-csrf-token";
 
 function render(loops: DashboardLoop[], listCap = 100): string {
   const snapshot: DashboardSnapshot = { generatedAt: iso(0), loops, listCap };
-  return renderDashboardPage(buildDashboardPageModel(snapshot), { csrfToken: TEST_CSRF });
+  return renderDashboardPage(buildDashboardPageModel(snapshot), {
+    csrfToken: TEST_CSRF,
+    account: { username: "octocat", teamName: "octocat 的个人团队" },
+  });
+}
+
+/** The Run form for one loop. The page header now also carries the LOGOUT
+ *  form, so "the first form" is no longer the Run form (slice 6). */
+function runFormFor(page: string, loopId: string): string {
+  const marker = `action="/dashboard/loops/${encodeURIComponent(loopId)}/run"`;
+  const start = page.indexOf(marker);
+  if (start < 0) throw new Error(`no run form for ${loopId}`);
+  const open = page.lastIndexOf("<form ", start);
+  const end = page.indexOf("</form>", start);
+  return page.slice(open, end);
 }
 
 describe("formatUtc", () => {
@@ -157,6 +171,34 @@ describe("renderDashboardPage", () => {
     const page = render([]);
     expect(page).toContain("暂无 Loop");
     expect(page).not.toContain('class="card"');
+  });
+
+  it("shows the current account and a logout form bound to the session token", () => {
+    const page = render([]);
+    expect(page).toContain("当前账号：octocat");
+    expect(page).toContain("团队：octocat 的个人团队");
+
+    const logout = page.slice(page.indexOf('class="logout-form"'), page.indexOf("</form>"));
+    expect(logout).toContain('method="post"');
+    expect(logout).toContain('action="/auth/logout"');
+    expect(logout.match(/name="[^"]*"/g)).toEqual(['name="csrf"']);
+    expect(logout).toContain(`value="${TEST_CSRF}"`);
+    expect(logout).toContain('<button type="submit">退出登录</button>');
+  });
+
+  it("escapes the account block and points an empty team at the offline claim command", () => {
+    const snapshot: DashboardSnapshot = { generatedAt: iso(0), loops: [], listCap: 100 };
+    const page = renderDashboardPage(buildDashboardPageModel(snapshot), {
+      csrfToken: TEST_CSRF,
+      account: { username: `<img src=x onerror="alert(1)">`, teamName: "A & B" },
+    });
+
+    expect(page).not.toContain("<img");
+    expect(page).toContain("当前账号：&lt;img");
+    expect(page).toContain("团队：A &amp; B");
+    // The claim hint renders the placeholders as TEXT, never markup.
+    expect(page).toContain("claim:legacy");
+    expect(page).toContain("&lt;目录&gt;");
   });
 
   it("escapes every dynamic value instead of letting it reach the markup", () => {
@@ -246,7 +288,10 @@ describe("renderDashboardPage", () => {
       dashLoop(loopSummary({ id: "loop-2" })),
     ]);
 
-    expect(page.match(/<form /g)).toHaveLength(2);
+    // One logout form in the header + one Run form per card.
+    expect(page.match(/class="logout-form"/g)).toHaveLength(1);
+    expect(page.match(/class="run-form"/g)).toHaveLength(2);
+    expect(page.match(/<form /g)).toHaveLength(3);
     expect(page.match(/<form class="run-form" method="post" action="\/dashboard\/loops\/loop-1\/run">/g)).toHaveLength(1);
     expect(page).toContain(`<input type="hidden" name="csrf" value="${TEST_CSRF}">`);
     // An available card's bytes are exactly what they were before the disabled
@@ -257,7 +302,7 @@ describe("renderDashboardPage", () => {
     // (400), so a NAMED submit button would break every real click, and a
     // second named input would break it just as silently. Exactly one named
     // control, and it is the token — `disabled` has no name, so it is free.
-    const form = page.slice(page.indexOf("<form "), page.indexOf("</form>"));
+    const form = runFormFor(page, "loop-1");
     expect(form.match(/name="[^"]*"/g)).toEqual(['name="csrf"']);
     expect(form).not.toContain("<button type=\"submit\" name=");
 
@@ -327,7 +372,7 @@ describe("renderDashboardPage", () => {
 
     // Even disabled, the form still carries exactly the one named control: the
     // server would 400 any extra field, disabled or not.
-    const form = page.slice(page.indexOf("<form "), page.indexOf("</form>"));
+    const form = runFormFor(page, "late");
     expect(form.match(/name="[^"]*"/g)).toEqual(['name="csrf"']);
     expect(form).toContain('<button type="submit" disabled>Run Now</button>');
   });
@@ -336,7 +381,7 @@ describe("renderDashboardPage", () => {
     const hostileId = `a"/><script>alert(1)</script>`;
     const page = render([dashLoop(loopSummary({ id: hostileId }))]);
 
-    const action = page.match(/action="([^"]*)"/)?.[1];
+    const action = page.match(/action="([^"]*\/run)"/)?.[1];
     expect(action).toBe(`/dashboard/loops/${encodeURIComponent(hostileId)}/run`);
     // No raw quote or angle bracket survives inside the attribute…
     expect(action).not.toContain('"');

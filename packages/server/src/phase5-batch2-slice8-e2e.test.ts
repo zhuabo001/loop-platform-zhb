@@ -64,7 +64,14 @@ import { createChokidarWatcher, type ArtifactWatcherFactory } from "../../daemon
 import { closeDb } from "./db/index.js";
 import { artifactManifests, loops, runs } from "./db/schema.js";
 import { bootstrapServer, waitForListening, type BootedServer } from "./start.js";
-import { FakeClock, FakeCronFactory } from "./testkit/index.js";
+import {
+  FakeClock,
+  FakeCronFactory,
+  makeTestAuthConfig,
+  seedClaimedMachineIfAbsent,
+  seedManagementSession,
+  TEST_TEAM_ID,
+} from "./testkit/index.js";
 
 const TOKEN = "dk_slice8_e2e_machine";
 const MACHINE_ID = machineIdFromToken(TOKEN);
@@ -147,12 +154,21 @@ async function shutdown(rs: RunningServer): Promise<void> {
   }
 }
 
+let sessionCredential = "";
+
+/** Every management request carries the Login Session (slice 5). */
+function sessionHeaders(extra: ConstructorParameters<typeof Headers>[0] = {}): Headers {
+  const headers = new Headers(extra);
+  if (!headers.has("cookie")) headers.set("cookie", `loopzhb_session=${sessionCredential}`);
+  return headers;
+}
+
 /** One server lifetime — production boot order (listener bound BEFORE the
  *  scheduler starts), FakeClock + FakeCronFactory through the internal
  *  override seam so nothing fires autonomously. */
 async function bootServer(dataDir: string, clock: FakeClock): Promise<RunningServer> {
   const cronFactory = new FakeCronFactory();
-  const booted = await bootstrapServer({ host: "127.0.0.1", port: 0, dataDir }, { clock, cronFactory });
+  const booted = await bootstrapServer({ auth: makeTestAuthConfig(), host: "127.0.0.1", port: 0, dataDir }, { clock, cronFactory });
   const server = serve({ fetch: booted.app.fetch, port: 0, hostname: "127.0.0.1" });
   try {
     await waitForListening(server);
@@ -166,6 +182,12 @@ async function bootServer(dataDir: string, clock: FakeClock): Promise<RunningSer
   const port = typeof address === "object" && address !== null ? address.port : 0;
   const rs: RunningServer = { ...booted, server, baseUrl: `http://127.0.0.1:${port}` };
   runningServers.add(rs);
+  // Phase 5 Batch 3 slice 3: poll no longer self-registers — state the claimed
+  // machine this daemon's token polls as (idempotent across boots of the same
+  // dataDir, which re-reads the persisted row instead of re-inserting).
+  await seedClaimedMachineIfAbsent(rs.handle.db, TOKEN);
+  // Idempotent across boots of the same dataDir.
+  sessionCredential = (await seedManagementSession(rs.handle.db, { clock })).credential;
   try {
     await rs.scheduler.start();
     return rs;
@@ -393,7 +415,7 @@ async function manifestPaths(db: Db, loopId: string): Promise<string[]> {
 /** Every blob the manifest names must exist on disk (no partial manifest). */
 async function expectBlobsOnDisk(dataDir: string, manifest: { entries: ReadonlyArray<{ hash: string }> }): Promise<void> {
   for (const entry of manifest.entries) {
-    await readFile(path.join(dataDir, "blobs", MACHINE_ID, entry.hash));
+    await readFile(path.join(dataDir, "blobs", TEST_TEAM_ID, entry.hash));
   }
 }
 
@@ -416,7 +438,7 @@ async function createLoop(rs: RunningServer, name: string, artifactDir?: string)
   if (artifactDir !== undefined) body.artifactDir = artifactDir;
   const res = await fetch(`${rs.baseUrl}/api/loops`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: sessionHeaders({ "content-type": "application/json" }),
     body: JSON.stringify(body),
   });
   expect(res.status).toBe(201);
@@ -426,14 +448,14 @@ async function createLoop(rs: RunningServer, name: string, artifactDir?: string)
 async function patchArtifactDir(rs: RunningServer, loopId: string, artifactDir: string | null): Promise<void> {
   const res = await fetch(`${rs.baseUrl}/api/loops/${loopId}/artifact-dir`, {
     method: "PATCH",
-    headers: { "content-type": "application/json" },
+    headers: sessionHeaders({ "content-type": "application/json" }),
     body: JSON.stringify({ artifactDir }),
   });
   expect(res.status).toBe(200);
 }
 
 async function triggerRun(rs: RunningServer, loopId: string): Promise<string> {
-  const res = await fetch(`${rs.baseUrl}/api/loops/${loopId}/run`, { method: "POST" });
+  const res = await fetch(`${rs.baseUrl}/api/loops/${loopId}/run`, { method: "POST", headers: sessionHeaders() });
   expect(res.status).toBe(202);
   const body = triggerRunResponseSchema.parse(await res.json());
   if (!body.enqueued) throw new Error("expected the trigger to enqueue");
@@ -441,7 +463,7 @@ async function triggerRun(rs: RunningServer, loopId: string): Promise<string> {
 }
 
 async function currentView(rs: RunningServer, loopId: string) {
-  const res = await fetch(`${rs.baseUrl}/api/loops/${loopId}/artifacts`);
+  const res = await fetch(`${rs.baseUrl}/api/loops/${loopId}/artifacts`, { headers: sessionHeaders() });
   expect(res.status).toBe(200);
   return loopArtifactsResponseSchema.parse(await res.json());
 }
@@ -449,6 +471,7 @@ async function currentView(rs: RunningServer, loopId: string) {
 async function downloadBytes(rs: RunningServer, loopId: string, snapshotId: string, artifactPath: string): Promise<Buffer> {
   const res = await fetch(
     `${rs.baseUrl}/api/loops/${loopId}/artifacts/download?snapshotId=${snapshotId}&path=${encodeURIComponent(artifactPath)}`,
+    { headers: sessionHeaders() },
   );
   expect(res.status).toBe(200);
   return Buffer.from(await res.arrayBuffer());
@@ -470,7 +493,7 @@ describe("slice 8 fault-integration E2E (real HTTP + file PGlite + local BlobSto
 
     const dial = makeDial(rs.baseUrl);
     const stack = makeDaemonStack(dial, [root]);
-    await stack.runtime.pollOnce(); // machine self-registration
+    await stack.runtime.pollOnce(); // first poll after the claim fixture
     const loopId = await createLoop(rs, "ai1-loop", root);
     await stack.runtime.pollOnce(); // delivers the watch set → apply → subscribe → startup scan
 
@@ -562,7 +585,9 @@ describe("slice 8 fault-integration E2E (real HTTP + file PGlite + local BlobSto
     expect((await downloadBytes(rs, loopId, snapshot1, "app.js")).equals(snapshot1Bytes)).toBe(true);
 
     // The structural diff shows exactly the three change classes.
-    const diffRes = await fetch(`${rs.baseUrl}/api/loops/${loopId}/artifacts/diff?from=${snapshot1}&to=${snapshot2}`);
+    const diffRes = await fetch(`${rs.baseUrl}/api/loops/${loopId}/artifacts/diff?from=${snapshot1}&to=${snapshot2}`, {
+      headers: sessionHeaders(),
+    });
     expect(diffRes.status).toBe(200);
     const diff = artifactDiffResponseSchema.parse(await diffRes.json());
     expect(diff.added.map((e) => e.path)).toEqual(["notes.txt"]);
@@ -855,7 +880,7 @@ describe("slice 8 fault-integration E2E (real HTTP + file PGlite + local BlobSto
       expect(manifest.configRevision).toBe(finalLoop.artifactConfigRevision);
       await expectBlobsOnDisk(dataDir, manifest);
     }
-    const blobNames = await readdir(path.join(dataDir, "blobs", MACHINE_ID));
+    const blobNames = await readdir(path.join(dataDir, "blobs", TEST_TEAM_ID));
     expect(blobNames.length).toBeGreaterThan(0);
     expect(blobNames.every((name) => /^[0-9a-f]{64}$/.test(name))).toBe(true);
   }, 90_000);
@@ -903,7 +928,7 @@ describe("slice 8 fault-integration E2E (real HTTP + file PGlite + local BlobSto
     // prepare, no PUT, no commit, no error reports.
     expect(dial.artifactCalls()).toEqual([]);
     expect(stack.tracked).toEqual([]);
-    // And the blob root was never even created for this machine.
-    await expect(readdir(path.join(dataDir, "blobs", MACHINE_ID))).rejects.toThrow();
+    // And the blob root was never even created for this team's namespace.
+    await expect(readdir(path.join(dataDir, "blobs", TEST_TEAM_ID))).rejects.toThrow();
   }, 90_000);
 });

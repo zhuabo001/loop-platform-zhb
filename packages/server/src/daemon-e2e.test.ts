@@ -4,7 +4,7 @@
  * real booted server (file-backed PGlite via bootstrapServer, Hono
  * app.request adapted into the daemon's injectable fetch — no TCP port):
  *
- *   daemon poll (self-registers the machine) → GET /api/machines →
+ *   daemon poll (against the pre-seeded CLAIMED machine) → GET /api/machines →
  *   POST /api/loops → POST /api/loops/:id/run → daemon pollOnce (claim →
  *   Fake Runner → report) → GET observation APIs show done/exec + message.
  *
@@ -31,6 +31,8 @@ import { machineIdFromToken } from "@loopzhb/protocol/node";
 import { closeDb, type DbHandle } from "./db/index.js";
 import { runLeases } from "./db/schema.js";
 import { bootstrapServer, type BootedServer } from "./start.js";
+import { makeTestAuthConfig, seedClaimedMachineForToken, seedManagementSession, withManagementSession } from "./testkit/index.js";
+import { systemClock } from "./time.js";
 
 const TOKEN = "dk_e2e_machine";
 const handles: DbHandle[] = [];
@@ -41,9 +43,14 @@ afterEach(async () => {
 
 async function boot(): Promise<BootedServer> {
   const dataDir = await mkdtemp(path.join(tmpdir(), `loopzhb-e2e-${process.pid}-`));
-  const b = await bootstrapServer({ host: "127.0.0.1", port: 3000, dataDir });
+  const b = await bootstrapServer({ auth: makeTestAuthConfig(), host: "127.0.0.1", port: 3000, dataDir });
   handles.push(b.handle);
-  return b;
+  // Phase 5 Batch 3 slice 3: poll no longer self-registers — state the claimed
+  // machine this daemon's token polls as.
+  await seedClaimedMachineForToken(b.handle.db, TOKEN);
+  // Slice 5: the management surface requires a Login Session.
+  const { credential } = await seedManagementSession(b.handle.db, { clock: systemClock });
+  return { ...b, app: withManagementSession(b.app, credential) };
 }
 
 /** Adapt the Hono app into the daemon's fetch: strip the origin, keep
@@ -56,7 +63,7 @@ function appFetch(app: BootedServer["app"]): typeof fetch {
 }
 
 describe("daemon E2E: the full HTTP user chain", () => {
-  it("register → create → trigger → execute → observe; second poll re-executes nothing", async () => {
+  it("seeded claimed machine → create → trigger → execute → observe; second poll re-executes nothing", async () => {
     const b = await boot();
     const client = createMachineClient({
       baseUrl: "http://e2e.local",
@@ -79,7 +86,7 @@ describe("daemon E2E: the full HTTP user chain", () => {
       machineCredential: TOKEN,
     });
 
-    // 1. First poll: self-registration only — nothing is pending yet.
+    // 1. First poll after the claimed-machine fixture: heartbeat only — nothing pending yet.
     await runtime.pollOnce();
     expect(runnerCalls).toBe(0);
 
@@ -206,7 +213,7 @@ describe("daemon E2E: the full HTTP user chain", () => {
     });
 
     const machineId = machineIdFromToken(TOKEN);
-    await runtime.pollOnce(); // register only
+    await runtime.pollOnce(); // first poll after the claimed-machine fixture
 
     // Two loops → two pending runs (a second trigger on the SAME loop would
     // supersede the first pending, T7). Dispatch order between them is the

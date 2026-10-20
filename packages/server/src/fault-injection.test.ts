@@ -51,7 +51,14 @@ import { createOwnerControl } from "./owner/index.js";
 import { createScheduleAdmin } from "./schedule/index.js";
 import { RECLAIM_RUN_ERROR } from "./store/runs.js";
 import { createInactivitySweep, type InactivitySweep } from "./sweep/index.js";
-import { FakeClock, makeTestFactories } from "./testkit/index.js";
+import {
+  createTestManagementAccess,
+  FakeClock,
+  makeTestFactories,
+  seedClaimedMachineIfAbsent,
+  seedManagementSession,
+  withManagementSession,
+} from "./testkit/index.js";
 
 const TOKEN = "dk_fault_machine";
 const handles: DbHandle[] = [];
@@ -82,13 +89,22 @@ async function bootFake(dataDir?: string): Promise<FakeBoot> {
   const sweepLogs: string[] = [];
   const sweep = createInactivitySweep({ db: handle.db, clock, log: (line) => sweepLogs.push(line) });
   const ownerControl = createOwnerControl({ db: handle.db, clock });
+  // Phase 5 Batch 3 slice 3: poll no longer self-registers — state the claimed
+  // machine the daemon's token polls as (idempotent: re-boots of the same
+  // dataDir re-read the persisted row).
+  await seedClaimedMachineIfAbsent(handle.db, TOKEN);
+  const { credential } = await seedManagementSession(handle.db, { clock });
   return {
-    app: createServerApp(
-      coordinator,
-      admin,
-      createLifecycleAdmin({ db: handle.db, clock }),
-      createScheduleAdmin({ db: handle.db, clock }),
-      ownerControl,
+    app: withManagementSession(
+      createServerApp({
+        coordinator,
+        admin,
+        lifecycle: createLifecycleAdmin({ db: handle.db, clock }),
+        schedule: createScheduleAdmin({ db: handle.db, clock }),
+        ownerControl,
+        management: createTestManagementAccess(handle.db, clock),
+      }),
+      credential,
     ),
     db: handle.db,
     handle,
@@ -205,7 +221,7 @@ describe("T5 — the sleeping daemon's late report reconciles the sweep's misjud
     const gate = createGatedRunner();
     const daemon = createDaemon(b.app, gate.runner, seenReports);
 
-    await daemon.pollOnce(); // register only — nothing pending yet
+    await daemon.pollOnce(); // first poll after the claimed-machine fixture — nothing pending yet
     const { loopId, runId } = await createLoopAndTrigger(b.app);
 
     // The daemon claims the run and the "laptop sleeps" inside the runner.
@@ -264,7 +280,7 @@ describe("T6 — a canceled run's late report is intercepted", () => {
     const gate = createGatedRunner();
     const daemon = createDaemon(b.app, gate.runner);
 
-    await daemon.pollOnce(); // register
+    await daemon.pollOnce(); // first poll after the claimed-machine fixture
     const { loopId, runId } = await createLoopAndTrigger(b.app);
 
     // The daemon claims the run; the runner is mid-execution holding the
@@ -308,7 +324,7 @@ describe("delivery response lost — the orphaned run converges to an observable
     const gate = createGatedRunner();
     const daemon = createDaemon(b.app, gate.runner);
 
-    await daemon.pollOnce(); // register
+    await daemon.pollOnce(); // first poll after the claimed-machine fixture
     const { loopId, runId } = await createLoopAndTrigger(b.app);
 
     // A RAW poll completes the claim server-side; the daemon never processes
@@ -358,7 +374,7 @@ describe("T4 — a server restart never loses an in-flight run", () => {
     const gate = createGatedRunner();
     const daemon = createDaemon(a.app, gate.runner, undefined, switchableFetch);
 
-    await daemon.pollOnce(); // register against A
+    await daemon.pollOnce(); // first poll after the claimed-machine fixture (A)
     const { loopId, runId } = await createLoopAndTrigger(a.app);
 
     // A claims the run; the runner is mid-execution holding the credential.

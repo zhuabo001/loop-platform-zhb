@@ -26,8 +26,9 @@
 2. Agent 只在用户本机由 daemon 启动；代码、凭证、本地工具默认不离开该机器。
 3. HTTP 重试、Server 重启、电脑休眠**不导致**重复执行、丢失最终报告或越权操作。
 
-**部署边界**：认证（Phase 5）完成之前，server 仅允许 localhost / 受信网络使用，
-**不得公开暴露**——机器注册与触发端点在 auth 之前没有任何身份边界。
+**部署边界**：server 仍仅允许 localhost / 受信网络使用，**不得公开暴露**。Batch 3
+已交付登录、团队隔离与离线认领，机器自注册与匿名管理入口均不存在；公开暴露仍需
+Phase 6 的 TLS、限流、同源意图与 body/rate caps 等硬化。
 
 ## 里程碑
 
@@ -214,7 +215,7 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
   - ArtifactHome 状态机：prepare/PUT/commit、Loop CAS、requestId 幂等与固定回执、当前视图与不可变快照读取；并发、交错与故障注入验收（AC4–AC6/AC9、AB5/AB7）。
   - 生产休眠：AD1–AD4 全部在测——Artifact 路由未挂载、Create/Poll 行为不变、Report 忽略新字段、启动不构造 BlobStore、Daemon 不发同步请求。
   - 收口：内部集成链（文件型 PGlite + 本地 BlobStore 的真实磁盘路径）与五道质量门全绿；收口三轨复审零阻断，唯一 P3 证据措辞项经定点复核核销。
-  - 批次 PR #68（分支 `feat/phase5-batch1-dev`）已于 2026-10-03 转待合入；Batch 3（认证）另行规划。
+  - 批次 PR #68（分支 `feat/phase5-batch1-dev`）已于 2026-10-03 转待合入；Batch 3（认证）已实施，见下文。
 - **Batch 2 — Artifact 持续同步、Run 快照与文件视图：已完成**（2026-10-07，分支 `feat/phase5-batch2-dev`，8 切片共用 PR [#84](https://github.com/zhuabo001/loop-platform-zhb/pull/84)，ADR-010 与 ADR-002 修订；权威计划 `docs/plan/codex-phase5-batch2-plan.md`；验收证据 `docs/tests/phase5-acceptance.md` Batch 2 段）
   - 片 1（契约、归属与生产边界）已完成：错误码 11 与重试类 5、客户端失败分类法与落库域、Delivery Artifact 配置、10 个端点的 wire 形状（含读取端 DTO）冻结；Machine namespace 归属解析器与生产门面（Blob 根 `<dataDir>/blobs`）实现但不接线；HTTP 失败映射矩阵逐操作域固定。AD1–AD4 休眠守卫零修改全绿。
   - 片 1 三轨审查唯一须处理项 [#83](https://github.com/zhuabo001/loop-platform-zhb/issues/83)（读取失败域遗漏 `attribution_missing`）已修复（`0a0b5a9`，变异验证），并经第二轮独立复审核销关闭（2026-10-04）。
@@ -241,11 +242,20 @@ Task File + 跨 run state + open/closed loop（goal/finish 语义）+ 最小 Das
   - 片 8（故障集成验收与批次收口）已实现：`phase5-batch2-slice8-e2e.test.ts` 为本批首个「真实 HTTP + 文件型 PGlite + 本地 BlobStore + 生产形态 Daemon runtime（cli.ts 组合根逐字段镜像，仅换 Fake Runner 与记录/改写型 fetch dial）+ 真实 chokidar + 真实临时目录」集成面——AI1 idle 编辑/删除收敛与同内容改写抑制、AI2 真实 socket 双 Run 快照绑定与冻结、AI3 配置换代/移除的 watcher 换代与旧根零流量、AI4 断网退避恢复、AI5 真实服务端响应丢失三腿 + 会话过期原地续期（片 4 假服务端的语义平价核心）、AI6 daemon/server 双重启后旧快照与下载字节稳定（U2 残余钉为恰 +1 revision、零 PUT、无部分 manifest/旧代际提交/句柄残留）、AI7 生产启用 + 旧 Loop 不上传 e2e 守卫（取代 Batch 1 休眠守卫套件，基础回归保留）；变异验证 M1–M7 全部转红。批次文档收口：`docs/tests/phase5-acceptance.md` Batch 2 段、ADR-010/ADR-002 修订记录、CONTEXT.md 词汇 +5、本状态块；验收证据见该验收记录。
   - **片 8 已完成并收口**（2026-10-07）：收口三轨复核 Round1 产生 3 项 P2——[#114](https://github.com/zhuabo001/loop-platform-zhb/issues/114)（watcher 关闭完成/顺序验收假绿）、[#115](https://github.com/zhuabo001/loop-platform-zhb/issues/115)（AI7 未验证 Report wire 键缺席）、[#116](https://github.com/zhuabo001/loop-platform-zhb/issues/116)（AI4 在 commit 响应落定前统计），均为新增验收 oracle 的检测能力缺口而非产品缺陷；修复提交 `1886409`/`54e17cf`（测试 oracle 加固与验收记录修订，变异验证 M8–M11），经独立复审核销，三项已全部 CLOSED；2 项 P3 措辞项已在验收记录定点修正。**Batch 2 全部 8 片收口，批次完成；批次 PR #84 保持 OPEN，合入另行授权**。
 
+- **Batch 3 — GitHub 登录、个人团队与旧数据认领：进行中（片 1–7 已实现；片 7 三轨复审 Round 1/2 通过，#124/#125 待修复提交后独立核销）**（分支 `feat/phase5-batch3-dev`，批次 PR [#119](https://github.com/zhuabo001/loop-platform-zhb/pull/119) 保持 OPEN、合入另行授权，ADR-011，权威计划 `docs/plan/codex-phase5-batch3-slices-plan.md`，验收证据 `docs/tests/phase5-acceptance.md` Batch 3 段）
+  - 片 1（身份模型、迁移 0006 与认证配置）已完成：users/teams/memberships/auth_sessions 四表加法迁移、`machines.team_id`/`revoked_at` 可空列、每用户唯一个人团队的部分唯一索引、Team id 的 namespace CHECK；OAuth 三件套与 origin 在任何资源打开前校验，无匿名回退。LM1–LM2 与配置矩阵（CF/ST-FAIL）落地；两项 P2（[#117](https://github.com/zhuabo001/loop-platform-zhb/issues/117)/[#118](https://github.com/zhuabo001/loop-platform-zhb/issues/118)）已整改并经独立复审核销。
+  - 片 2（GitHub 登录与持久 Session）已完成：五个认证路由、浏览器绑定的一次性 state + PKCE、凭据哈希即主键的 7 天绝对有效期 Session、固定八值失败分类；AU1–AU12 与 SE1–SE8 落地。设计修正：Session CSRF token 改为凭据派生，迁移 0007 撤销（journal 保持 7 条）。三轨审查 0 项 P1/P2，2 项 P3 已修复。
+  - 片 3（关闭自注册与未认领机器执行隔离）已完成：统一五步凭据门（形状 → 派生 id → 全量 tokenHash → 已认领 → 未撤销，五类拒绝折叠为同一 401）、删除生产自注册连实现、生产 Artifact namespace 切换到 `machines.teamId`、调度扫描/tick/enqueue 三处资格边界与停机排空。首轮三轨 3 P2 + 2 P3（[#121](https://github.com/zhuabo001/loop-platform-zhb/issues/121)/[#122](https://github.com/zhuabo001/loop-platform-zhb/issues/122)/[#123](https://github.com/zhuabo001/loop-platform-zhb/issues/123)）已整改，二轮独立三轨无新增 P1/P2，三项已核销关闭。
+  - 片 4（离线认领与 Artifact namespace 迁移）已完成：`claim:legacy` 离线命令、Server 与 CLI 共用的 dataDir 独占锁（PGlite 无跨进程锁，ADR-011 决策 20）、只读 dry-run、按「先复制验证、后单事务」迁移历史、幂等 no-op 与安全重试。LM3–LM10 落地，规则见 ADR-011 决策 20–22。
+  - 片 5（管理 API Session 门禁与团队过滤）已完成：`/api/*` 默认拒绝的 Session 门禁（仅精确豁免 `/api/session` 与 `/api/machine/*`，斜杠是安全边界）、`/api/loops/:id/*` 与 `/api/runs/:id/*` 的路径归属门禁（Run→Loop→Machine→Team，统一扁平 404）、五个管理查询与 Loop 创建的 SQL 团队过滤（过滤先于排序与限量）、Artifact 管理读的归属前置（先于 attribution/snapshot/blob）。`createServerApp` 改为 options object 且 management 必填，`bootstrapServer` 无条件接线（ADR-011 决策 23–28）。MG1–MG10 落地，八项变异全部被抓住；既有测试迁移为「已登录 + 已认领」世界。如实登记：Dashboard 在片 6 前仍未认证、未知 `/api/*` 匿名响应由 404 变 401、归属中间件依赖本批「无在线归属变更」的不变量；#56 不核销。
+  - 片 6（Dashboard 登录态与团队视图）已完成：`/` 与 `/dashboard/*` 的 Session 门禁（匿名 GET → 303 `/login`，匿名 POST → 401，认证先于表单解析）、`/dashboard/loops/:id` 路径归属门禁（扁平 404）、Dashboard 列表与 Artifact 页面改用团队范围读取、全部无 scope 出口与 `ReadScope.unscoped` 删除、表单切换为 Session 派生 CSRF（进程级 token 删除）、页头账号信息与退出表单、空团队认领指引。DG1–DG6 落地，十项变异全部被抓住（含一项编译期变异）；既有测试迁移为「已登录 + 已认领」世界。如实登记：孤儿/未认领 Loop 从 Dashboard 消失、重启不再使 CSRF token 失效（跨 Session 才是边界）、四个 Artifact 页面暂无账号/退出控件；#56/#61 不核销。
+  - 片 7（生产装配、升级演练与批次收口）已完成：BI1–BI6 在真实 HTTP + 文件型 PGlite + 本地 BlobStore + 生产 daemon 模块下走通「旧库升级 → 首次登录 → 旧数据不可见 → 停服认领 → 重启 → 原 Daemon 执行与同步 → 旧快照字节保真」；PG7/PG8 钉住新库、旧库与连续重启均不恢复自注册；默认门禁加入 OS 级跨进程锁探针，`LOOPZHB_SUBPROCESS_DRILL=1` 的构建产物 drill 以真实 `dist/start.js`、`dist/claim/main.js` 与 daemon CLI 复核同一链路；M12–M15 全部被抓住。清理旧测试的匿名管理/自注册假设与过时启动文案，README 补齐 OAuth 与升级说明。真实 GitHub OAuth 人工 smoke 发现并修复了「浏览器 keep-alive 使停止回调不返回、锁不释放」的缺陷（[#124](https://github.com/zhuabo001/loop-platform-zhb/issues/124) 保持 OPEN、待独立复审；ADR-011 决策 38；SD1/SD2 与真实 `dist/start.js` 重放验证）。片 7 实现与五道质量门完成；三轨复审 Round 1/2 通过，1 P2（#125，迁移夹具 schedule 保真退化）与 2 项 P3（BI 认领前后整行 oracle、验收文案）已修复并经独立变异复核，剩余文档归档 P3 已处理。**#124/#125 待修复提交与受审快照核对后由独立复审核销，之后 Batch 3 收口**；PR #119 保持 OPEN，合入另行授权。如实登记：默认 BI 链的「原 Daemon」是生产模块在测试进程内运行，真实子进程证据由 opt-in drill 单独提供；三个 opt-in real-Claude 套件只做机械迁移、未执行；#124 与 #125 已修复、技术复核通过，保持 OPEN 待提交后核销；#56/#61 不核销，Phase 5 仍待 Batch 4–6。
+
 ### 右移项
 
 - [Issue #11](https://github.com/zhuabo001/loop-platform-zhb/issues/11) / [Issue #72](https://github.com/zhuabo001/loop-platform-zhb/issues/72)：Phase 6 阻塞项（真实 Postgres 多物理连接并发验收），指针见 Phase 6 节。
-- [Issue #56](https://github.com/zhuabo001/loop-platform-zhb/issues/56)：Phase 5 认证层加固（状态变更路由同源意图校验、`Content-Type` 门禁、拒绝空体）——随团队与认证层（Batch 3）处理。
-- [Issue #61](https://github.com/zhuabo001/loop-platform-zhb/issues/61)：运行时 preload 环境隔离的防回归证据与验收环境记录——随 Phase 5 后续批次处理。
+- [Issue #56](https://github.com/zhuabo001/loop-platform-zhb/issues/56)：Phase 5 认证层加固（状态变更路由同源意图校验、`Content-Type` 门禁、拒绝空体）——随 Batch 4 处理；Batch 3 不核销。
+- [Issue #61](https://github.com/zhuabo001/loop-platform-zhb/issues/61)：运行时 preload 环境隔离的防回归证据与验收环境记录——随 Batch 6 处理。
 
 ## Phase 6 — 生产硬化（独立阶段）
 

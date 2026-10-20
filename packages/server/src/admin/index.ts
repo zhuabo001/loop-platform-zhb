@@ -24,8 +24,7 @@ import { normalizeGoal } from "@loopzhb/protocol";
 import { planArtifactConfigUpdate } from "../artifact/config.js";
 import type { Db } from "../db/index.js";
 import { loops, machines, runs, type Loop } from "../db/schema.js";
-import { getMachine } from "../store/machines.js";
-import { getLoop } from "../store/runs.js";
+import { getTeamMachine } from "../store/machines.js";
 import type { Clock } from "../time.js";
 import { validateSchedule } from "../schedule/index.js";
 import { ArtifactDirValidationError, LoopValidationError } from "./errors.js";
@@ -132,6 +131,68 @@ export type CreateLoopResult =
   | { created: false; reason: "machine_not_found" };
 
 export function createLoopAdmin(deps: LoopAdminDeps) {
+  /**
+   * The shared list queries. Both are TEAM-SCOPED in SQL, with the filter
+   * applied BEFORE ORDER BY and LIMIT: filtering after truncation would let
+   * another team's newer rows consume the cap. There is no unscoped arm —
+   * slice 6 deleted the Dashboard's temporary exit (ADR-011 决策 24/30).
+   *
+   * The loop query INNER JOINs machines, so an orphan loop (missing machine
+   * row) is invisible to every caller — including the Dashboard.
+   */
+  async function queryMachines(teamId: string): Promise<MachineSummary[]> {
+    const rows = await deps.db
+      .select(machineSummaryColumns)
+      .from(machines)
+      .where(eq(machines.teamId, teamId))
+      .orderBy(asc(machines.name), asc(machines.id))
+      .limit(MACHINE_LIST_CAP);
+    return rows.map(toMachineSummary);
+  }
+
+  async function queryLoops(teamId: string): Promise<LoopSummary[]> {
+    const loopRows = await deps.db
+      .select(loopSummaryColumns)
+      .from(loops)
+      .innerJoin(machines, eq(machines.id, loops.machineId))
+      .where(eq(machines.teamId, teamId))
+      .orderBy(desc(loops.updatedAt), asc(loops.id))
+      .limit(LOOP_LIST_CAP);
+    if (loopRows.length === 0) return [];
+
+    const runRows = await deps.db
+      .selectDistinctOn([runs.loopId], runSummaryColumns)
+      .from(runs)
+      .where(
+        and(
+          inArray(
+            runs.loopId,
+            loopRows.map((l) => l.id),
+          ),
+          eq(runs.role, "exec"),
+        ),
+      )
+      .orderBy(asc(runs.loopId), desc(runs.ts), desc(runs.id));
+    const latestByLoop = new Map<string, RunSummaryRow>(runRows.map((row) => [row.loopId, row]));
+
+    const now = deps.clock.now();
+    return loopRows.map((row) => {
+      const lastRun = latestByLoop.get(row.id);
+      return toLoopSummary(row, lastRun ? toRunSummary(lastRun) : null, nextFireAtIso(row, now));
+    });
+  }
+
+  /** A narrow ownership existence read for listRuns — the join IS the check. */
+  async function loopInTeam(loopId: string, teamId: string): Promise<boolean> {
+    const rows = await deps.db
+      .select({ id: loops.id })
+      .from(loops)
+      .innerJoin(machines, eq(machines.id, loops.machineId))
+      .where(and(eq(loops.id, loopId), eq(machines.teamId, teamId)))
+      .limit(1);
+    return rows.length > 0;
+  }
+
   return {
     /**
      * Create a loop bound to an ALREADY-REGISTERED machine. Validation order
@@ -146,8 +207,14 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
      * Phase 3 Batch 2: Supports cron/timezone for scheduled loops. Validates
      * schedule semantics before insertion. Sets scheduleRevision=0 and
      * scheduleActivatedAt for active scheduled loops.
+     *
+     * Phase 5 Batch 3 slice 5 (ADR-011 决策 24): `teamId` is the Session's
+     * Team Scope. The machine lookup is team-scoped, so another team's or an
+     * unclaimed machine is the SAME `machine_not_found` (→ flat 404) as a
+     * missing one. This is the one management write whose resource id arrives
+     * in the body, so it cannot ride the path gate.
      */
-    async createLoop(input: CreateLoopRequest): Promise<CreateLoopResult> {
+    async createLoop(input: CreateLoopRequest, teamId: string): Promise<CreateLoopResult> {
       if (input.name !== undefined && input.name.length > LOOP_NAME_CAP) {
         throw new LoopValidationError("name");
       }
@@ -204,7 +271,7 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
         artifactConfigRevision = plan.writes.artifactConfigRevision;
       }
 
-      const machine = await getMachine(deps.db, input.machineId);
+      const machine = await getTeamMachine(deps.db, input.machineId, teamId);
       if (!machine) return { created: false as const, reason: "machine_not_found" as const };
 
       // Validate and normalize schedule if provided. A timezone WITHOUT a cron
@@ -261,14 +328,11 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
       return { created: true as const, loop: toLoopSummary(row, null, nextFireAtIso(row, deps.clock.now())), row };
     },
 
-    /** `name ASC, id ASC`, capped — the machine picker for loop creation. */
-    async listMachines(): Promise<MachineSummary[]> {
-      const rows = await deps.db
-        .select(machineSummaryColumns)
-        .from(machines)
-        .orderBy(asc(machines.name), asc(machines.id))
-        .limit(MACHINE_LIST_CAP);
-      return rows.map(toMachineSummary);
+    /** `name ASC, id ASC`, capped — the machine picker for loop creation.
+     *  Team-scoped (ADR-011 决策 24): unclaimed and other-team machines never
+     *  appear. */
+    async listMachines(teamId: string): Promise<MachineSummary[]> {
+      return queryMachines(teamId);
     },
 
     /**
@@ -280,45 +344,27 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
      * (ADR-003 决策 6), so a run re-enters the top after a lifecycle write.
      *
      * Phase 3 Batch 2: Computes nextFireAt for active scheduled loops.
+     *
+     * Phase 5 Batch 3 slice 5: TEAM-SCOPED in SQL (join + WHERE before ORDER
+     * BY/LIMIT). Unclaimed loops belong to no session team and never appear.
      */
-    async listLoops(): Promise<LoopSummary[]> {
-      const loopRows = await deps.db
-        .select(loopSummaryColumns)
-        .from(loops)
-        .orderBy(desc(loops.updatedAt), asc(loops.id))
-        .limit(LOOP_LIST_CAP);
-      if (loopRows.length === 0) return [];
-
-      const runRows = await deps.db
-        .selectDistinctOn([runs.loopId], runSummaryColumns)
-        .from(runs)
-        .where(
-          and(
-            inArray(
-              runs.loopId,
-              loopRows.map((l) => l.id),
-            ),
-            eq(runs.role, "exec"),
-          ),
-        )
-        .orderBy(asc(runs.loopId), desc(runs.ts), desc(runs.id));
-      const latestByLoop = new Map<string, RunSummaryRow>(runRows.map((row) => [row.loopId, row]));
-
-      const now = deps.clock.now();
-      return loopRows.map((row) => {
-        const lastRun = latestByLoop.get(row.id);
-        return toLoopSummary(row, lastRun ? toRunSummary(lastRun) : null, nextFireAtIso(row, now));
-      });
+    async listLoops(teamId: string): Promise<LoopSummary[]> {
+      return queryLoops(teamId);
     },
 
     /**
      * Single-loop summary by id (the PATCH /schedule response shape):
      * the summary row plus its latest EXEC run and computed nextFireAt.
-     * `undefined` when the loop does not exist.
+     * `undefined` when the loop does not exist OR belongs to another team.
      */
-    async getLoopSummary(loopId: string): Promise<LoopSummary | undefined> {
+    async getLoopSummary(loopId: string, teamId: string): Promise<LoopSummary | undefined> {
       const row = (
-        await deps.db.select(loopSummaryColumns).from(loops).where(eq(loops.id, loopId)).limit(1)
+        await deps.db
+          .select(loopSummaryColumns)
+          .from(loops)
+          .innerJoin(machines, eq(machines.id, loops.machineId))
+          .where(and(eq(loops.id, loopId), eq(machines.teamId, teamId)))
+          .limit(1)
       )[0];
       if (!row) return undefined;
 
@@ -334,10 +380,10 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
     },
 
     /** `ts DESC, id DESC`, capped; `undefined` when the loop does not exist
-     *  (the route's 404). All phases/roles are listed — superseded
-     *  (`canceled/skipped`) runs stay visible (goal §4). */
-    async listRuns(loopId: string): Promise<RunSummary[] | undefined> {
-      if ((await getLoop(deps.db, loopId)) === undefined) return undefined;
+     *  OR belongs to another team (the route's flat 404). All phases/roles are
+     *  listed — superseded (`canceled/skipped`) runs stay visible (goal §4). */
+    async listRuns(loopId: string, teamId: string): Promise<RunSummary[] | undefined> {
+      if (!(await loopInTeam(loopId, teamId))) return undefined;
       const rows = await deps.db
         .select(runSummaryColumns)
         .from(runs)

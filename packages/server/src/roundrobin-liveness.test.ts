@@ -34,7 +34,17 @@ import { createLifecycleAdmin } from "./loop-lifecycle/admin.js";
 import { createOwnerControl } from "./owner/index.js";
 import { createScheduleAdmin } from "./schedule/index.js";
 import { createInactivitySweep } from "./sweep/index.js";
-import { FakeClock, seedLease, seedLoop, seedRun, snapshotRuns } from "./testkit/index.js";
+import {
+  createTestManagementAccess,
+  FakeClock,
+  seedClaimedMachineForToken,
+  seedLease,
+  seedLoop,
+  seedManagementSession,
+  seedRun,
+  snapshotRuns,
+  withManagementSession,
+} from "./testkit/index.js";
 
 const TOKEN = "dk_liveness_machine";
 const RUN_COUNT = 25;
@@ -59,14 +69,22 @@ async function bootLiveness() {
   });
   const admin = createLoopAdmin({ db: handle.db, clock, newLoopId: newUuidLoopId });
   const ownerControl = createOwnerControl({ db: handle.db, clock });
-  const app = createServerApp(
-    coordinator,
-    admin,
-    createLifecycleAdmin({ db: handle.db, clock }),
-    createScheduleAdmin({ db: handle.db, clock }),
-    ownerControl,
+  const { credential } = await seedManagementSession(handle.db, { clock });
+  const app = withManagementSession(
+    createServerApp({
+      coordinator,
+      admin,
+      lifecycle: createLifecycleAdmin({ db: handle.db, clock }),
+      schedule: createScheduleAdmin({ db: handle.db, clock }),
+      ownerControl,
+      management: createTestManagementAccess(handle.db, clock),
+    }),
+    credential,
   );
   const sweep = createInactivitySweep({ db: handle.db, clock, log: () => {} });
+  // Pre-seed the daemon's machine as CLAIMED so poll gate passes (Phase 5
+  // Batch 3 slice 3: auto-registration removed; unknown tokens → 401).
+  await seedClaimedMachineForToken(handle.db, TOKEN);
   return { app, sweep, handle, clock };
 }
 

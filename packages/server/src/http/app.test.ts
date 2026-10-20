@@ -32,7 +32,6 @@ import { eq } from "drizzle-orm";
 
 import { createLoopAdmin, type LoopAdmin } from "../admin/index.js";
 import { createLifecycleAdmin } from "../loop-lifecycle/admin.js";
-import { LoopValidationError } from "../admin/errors.js";
 import { InvalidMachineCredentialError, RunCapabilityInvalidError } from "../coordinator/errors.js";
 import { ScheduleRevisionExhaustedError, ScheduleValidationError, createScheduleAdmin, type ScheduleAdmin } from "../schedule/index.js";
 import { CapabilityDeclarationInvalidError } from "../store/machines.js";
@@ -42,18 +41,26 @@ import { loops, machines } from "../db/schema.js";
 import { createOwnerControl, type OwnerControl } from "../owner/index.js";
 import {
   FakeClock,
+  makeTestAuthConfig,
   seedLease,
   seedLoop,
   seedMachine,
-  seedMachineForToken,
+  createTestManagementAccess,
+  permissiveManagementAccess,
+  seedClaimedMachineById,
+  seedClaimedMachineForToken,
+  seedManagementSession,
   seedRun,
   snapshotLoops,
   snapshotRuns,
   staticAttribution,
   testDeps,
+  TEST_TEAM_ID,
+  withManagementSession,
 } from "../testkit/index.js";
 import { createArtifactApi, type ArtifactApi } from "../artifact/api.js";
 import { createMemoryBlobStore } from "../artifact/blob-store-memory.js";
+import { createAuthModule } from "../auth/index.js";
 import { createRunCoordinator, type RunCoordinator } from "../coordinator/index.js";
 import { createServerApp } from "./app.js";
 
@@ -70,6 +77,8 @@ let clock: FakeClock;
 let coordinator: RunCoordinator;
 let admin: LoopAdmin;
 let ownerControl: OwnerControl;
+let rawApp: ReturnType<typeof createServerApp>;
+let sessionCredential: string;
 let app: ReturnType<typeof createServerApp>;
 
 async function fresh(): Promise<void> {
@@ -81,7 +90,20 @@ async function fresh(): Promise<void> {
   let loopN = 0;
   admin = createLoopAdmin({ db, clock, newLoopId: () => `loop-${++loopN}` });
   ownerControl = createOwnerControl({ db, clock });
-  app = createServerApp(coordinator, admin, createLifecycleAdmin({ db, clock }), createScheduleAdmin({ db, clock }), ownerControl);
+  const management = createTestManagementAccess(db, clock);
+  rawApp = createServerApp({
+    coordinator,
+    admin,
+    lifecycle: createLifecycleAdmin({ db, clock }),
+    schedule: createScheduleAdmin({ db, clock }),
+    ownerControl,
+    management,
+  });
+  // Every request rides an authenticated Session unless the test sets its own
+  // cookie (slice 5). `rawApp` stays available for the anonymous negatives.
+  const { credential } = await seedManagementSession(db, { clock });
+  sessionCredential = credential;
+  app = withManagementSession(rawApp, credential);
 }
 
 async function pollReq(body: unknown = {}, token: string | null = TOKEN): Promise<Response> {
@@ -143,7 +165,14 @@ async function expectJsonError(res: Response, status: number, body: { error: str
 describe("createServerApp: seam properties", () => {
   it("returns an independent app per call and constructs with no DB/env/listener side effects", async () => {
     await fresh();
-    const other = createServerApp(coordinator, admin, createLifecycleAdmin({ db, clock }), createScheduleAdmin({ db, clock }), ownerControl);
+    const other = createServerApp({
+      coordinator,
+      admin,
+      lifecycle: createLifecycleAdmin({ db, clock }),
+      schedule: createScheduleAdmin({ db, clock }),
+      ownerControl,
+      management: createTestManagementAccess(db, clock),
+    });
     expect(other).not.toBe(app);
     // Both serve independently.
     expect((await app.request("/api/machine/poll", { method: "GET" })).status).toBe(404);
@@ -152,19 +181,19 @@ describe("createServerApp: seam properties", () => {
 });
 
 describe("POST /api/machine/poll", () => {
-  it("self-registers and returns a schema-valid empty delivery list", async () => {
+  it("rejects an unknown (well-shaped) device token — auto-registration is removed (PG3)", async () => {
     await fresh();
+    // No machine row exists for this token — since Phase 5 Batch 3 slice 3 the
+    // server no longer self-registers; the unified 401 fires immediately.
     const res = await pollReq({ host: "mbp.local" });
-    expect(res.status).toBe(200);
-    expect(res.headers.get("content-type")).toMatch(/application\/json/);
-    const json = await res.json();
-    expect(json).toEqual({ deliveries: [] });
-    expect(pollResponseSchema.parse(json)).toBeTruthy();
+    expect(res.status).toBe(401);
+    // Zero writes: the machines table remains empty.
+    expect(await db.select().from(machines)).toEqual([]);
   });
 
   it("delivers a schema-valid Delivery end-to-end over HTTP", async () => {
     await fresh();
-    const machineId = await seedMachineForToken(db, TOKEN);
+    const machineId = await seedClaimedMachineForToken(db, TOKEN);
     await seedLoop(db, { id: "loop-1", taskFile: "/srv/loop/README.md" });
     await seedRun(db, { id: "run-1", machineId });
 
@@ -202,7 +231,7 @@ describe("POST /api/machine/poll", () => {
     await fresh();
     await expectJsonError(await pollReq({}, "rk_not_a_device_token"), 401, { error: "invalid machine credential" });
     // Mismatched full hash at the derived id (enrolled under another token).
-    const id = await seedMachineForToken(db, "dk_enrolled_elsewhere", {});
+    const id = await seedClaimedMachineForToken(db, "dk_enrolled_elsewhere");
     await db.update(machines).set({ tokenHash: sha256("dk_somebody_else") }).where(eq(machines.id, id));
     await expectJsonError(await pollReq({}, "dk_enrolled_elsewhere"), 401, { error: "invalid machine credential" });
   });
@@ -217,8 +246,8 @@ describe("POST /api/machine/poll", () => {
 describe("POST /api/machine/report", () => {
   it("finalizes over HTTP and returns a schema-valid {ok:true}; repeat → 401 with code", async () => {
     await fresh();
-    const machineId = await seedMachineForToken(db, TOKEN);
-    await seedLoop(db, { id: "loop-1" });
+    const machineId = await seedClaimedMachineForToken(db, TOKEN);
+    await seedLoop(db, { id: "loop-1", machineId });
     await seedRun(db, { id: "run-1", machineId });
     const pollJson = pollResponseSchema.parse(
       await (await pollReq({ capabilities: ["terminal-journal-v1"] })).json(),
@@ -263,7 +292,7 @@ describe("POST /api/machine/report", () => {
 
   it("a forged body.runId cannot steer the finalize (lease is authoritative)", async () => {
     await fresh();
-    const machineId = await seedMachineForToken(db, TOKEN);
+    const machineId = await seedClaimedMachineForToken(db, TOKEN);
     await seedLoop(db, { id: "loop-1" });
     await seedRun(db, { id: "run-1", machineId, phase: "running" });
     await seedLease(db, { tokenHash: sha256("rk_real"), runId: "run-1", machineId });
@@ -280,7 +309,7 @@ describe("POST /api/machine/report", () => {
 describe("POST /api/loops", () => {
   it("201 with a schema-valid LoopSummary for a registered machine — and NO run", async () => {
     await fresh();
-    await seedMachine(db, MACHINE_ID);
+    await seedClaimedMachineById(db, MACHINE_ID);
     const res = await createLoopReq({
       machineId: MACHINE_ID,
       name: "react-doctor",
@@ -339,7 +368,7 @@ describe("POST /api/loops", () => {
 
   it("400 for malformed machineId, empty/NUL strings and over-cap fields", async () => {
     await fresh();
-    await seedMachine(db, MACHINE_ID);
+    await seedClaimedMachineById(db, MACHINE_ID);
     const bad = [
       { machineId: "m-UPPERCASED789AB" }, // not m-<16 lowercase hex>
       { machineId: "" },
@@ -359,7 +388,7 @@ describe("POST /api/loops", () => {
 
   it("strips not-yet-open fields — the row keeps Phase-1 fixed defaults (ADR-002 决策 6)", async () => {
     await fresh();
-    await seedMachine(db, MACHINE_ID);
+    await seedClaimedMachineById(db, MACHINE_ID);
     const res = await createLoopReq({
       machineId: MACHINE_ID,
       taskFile: "/home/dev/TASK.md",
@@ -379,7 +408,7 @@ describe("POST /api/loops", () => {
 
   it("413 over the shared 2 MiB body cap", async () => {
     await fresh();
-    await seedMachine(db, MACHINE_ID);
+    await seedClaimedMachineById(db, MACHINE_ID);
     const res = await createLoopReq({ machineId: MACHINE_ID, taskFile: "/t", name: "x".repeat(2 * 1024 * 1024) });
     await expectJsonError(res, 413, { error: "request body too large" });
     expect(await snapshotLoops(db)).toEqual([]);
@@ -387,7 +416,7 @@ describe("POST /api/loops", () => {
 
   it("400 (never 500) for an invalid cron — ScheduleValidationError maps into the taxonomy", async () => {
     await fresh();
-    await seedMachine(db, MACHINE_ID);
+    await seedClaimedMachineById(db, MACHINE_ID);
     const bad = [
       { machineId: MACHINE_ID, taskFile: "/t", cron: "not a cron" },
       { machineId: MACHINE_ID, taskFile: "/t", cron: "@daily" }, // macros rejected
@@ -402,7 +431,7 @@ describe("POST /api/loops", () => {
 
   it("400 for an invalid timezone — including timezone-ONLY creation (no cron)", async () => {
     await fresh();
-    await seedMachine(db, MACHINE_ID);
+    await seedClaimedMachineById(db, MACHINE_ID);
     // Timezone-only creation must not bypass validation: a manual-only loop
     // still persists its timezone, so an invalid one is rejected up front.
     await expectJsonError(
@@ -420,7 +449,7 @@ describe("POST /api/loops", () => {
 
   it("201 for timezone-only creation — timezone persisted, cron stays null", async () => {
     await fresh();
-    await seedMachine(db, MACHINE_ID);
+    await seedClaimedMachineById(db, MACHINE_ID);
     const res = await createLoopReq({ machineId: MACHINE_ID, taskFile: "/t", timezone: "Asia/Shanghai" });
     expect(res.status).toBe(201);
     const parsed = createLoopResponseSchema.parse(await res.json());
@@ -432,7 +461,7 @@ describe("POST /api/loops", () => {
 
   it("201 for scheduled creation — cron normalized, nextFireAt computed", async () => {
     await fresh();
-    await seedMachine(db, MACHINE_ID);
+    await seedClaimedMachineById(db, MACHINE_ID);
     const res = await createLoopReq({
       machineId: MACHINE_ID,
       taskFile: "/t",
@@ -451,7 +480,9 @@ describe("POST /api/loops", () => {
 describe("POST /api/loops/:id/run", () => {
   it("202 enqueues exactly one pending exec run (empty body normalizes to {})", async () => {
     await fresh();
-    await seedMachine(db, "m-test");
+    // Phase 5 Batch 3 slice 3: the enqueue boundary requires an execution-
+    // eligible machine — the manually triggered loop's machine is CLAIMED.
+    await seedClaimedMachineById(db, "m-test");
     await seedLoop(db, { id: "loop-1" });
     const res = await triggerReq("loop-1"); // NO body at all
     expect(res.status).toBe(202);
@@ -465,7 +496,7 @@ describe("POST /api/loops/:id/run", () => {
 
   it("inherits T7 over HTTP: re-trigger atomically supersedes the stale pending run", async () => {
     await fresh();
-    await seedMachine(db, "m-test");
+    await seedClaimedMachineById(db, "m-test");
     await seedLoop(db, { id: "loop-1" });
     await triggerReq("loop-1", {});
     // Unknown keys strip away; the second trigger supersedes the first.
@@ -479,7 +510,7 @@ describe("POST /api/loops/:id/run", () => {
 
   it("200 no-op with zero writes while a run is running", async () => {
     await fresh();
-    await seedMachine(db, "m-test");
+    await seedClaimedMachineById(db, "m-test");
     await seedLoop(db, { id: "loop-1" });
     await seedRun(db, { id: "run-live", phase: "running" });
     const before = await snapshotRuns(db);
@@ -497,9 +528,32 @@ describe("POST /api/loops/:id/run", () => {
     expect(await snapshotRuns(db)).toEqual([]);
   });
 
+  it("404 + zero writes when the loop's machine is not execution-eligible (unclaimed) — the queued pending survives", async () => {
+    await fresh();
+    // The ORDINARY pre-claim world: the machine row exists but no team owns it
+    // (Phase 5 Batch 3 slice 3 — before slice 4's offline claim). Slice 5's
+    // ownership gate now refuses this loop BEFORE the enqueue boundary, so the
+    // 404 is shared with "unknown loop" even more literally than before.
+    await seedMachine(db, "m-test");
+    await seedLoop(db, { id: "loop-1" });
+    await seedRun(db, { id: "old-pending", ts: "2026-07-01T00:00:01.000Z" });
+    const runsBefore = await snapshotRuns(db);
+    const loopsBefore = await snapshotLoops(db);
+
+    // A flat 404 — the same classification as an unknown loop (Batch plan §1:
+    // 未认领、其他团队和不存在的资源，对管理入口统一返回 404). It must NOT
+    // fall through to the 200 `running_exists` shape, which would mislabel a
+    // refusal as a benign queue state.
+    await expectJsonError(await triggerReq("loop-1", {}), 404, { error: "not found" });
+
+    expect(await snapshotRuns(db)).toEqual(runsBefore);
+    expect(await snapshotLoops(db)).toEqual(loopsBefore);
+    expect(runsBefore[0]).toMatchObject({ id: "old-pending", phase: "pending", outcome: null });
+  });
+
   it("400 for malformed or non-object JSON, zero writes", async () => {
     await fresh();
-    await seedMachine(db, "m-test");
+    await seedClaimedMachineById(db, "m-test");
     await seedLoop(db, { id: "loop-1" });
     for (const body of ["{", "[1]", '"str"', "null"]) {
       await expectJsonError(await triggerReq("loop-1", body), 400, { error: "invalid request" });
@@ -511,8 +565,8 @@ describe("POST /api/loops/:id/run", () => {
 describe("POST /api/runs/:id/cancel", () => {
   it("200 {canceled:true} on a running run — the capability is revoked in the same transaction (T6's HTTP face)", async () => {
     await fresh();
-    const machineId = await seedMachineForToken(db, TOKEN);
-    await seedLoop(db, { id: "loop-1" });
+    const machineId = await seedClaimedMachineForToken(db, TOKEN);
+    await seedLoop(db, { id: "loop-1", machineId });
     await seedRun(db, { id: "run-1", machineId });
     const runToken = pollResponseSchema.parse(
       await (await pollReq({ capabilities: ["terminal-journal-v1"] })).json(),
@@ -541,6 +595,8 @@ describe("POST /api/runs/:id/cancel", () => {
 
   it("200 {canceled:true} on a pending run (no lease existed)", async () => {
     await fresh();
+    await seedClaimedMachineById(db, "m-test");
+    await seedLoop(db, { id: "loop-1" });
     await seedRun(db, { id: "run-1", phase: "pending" });
     const res = await cancelReq("run-1", { futureField: 1 }); // unknown keys strip away
     expect(res.status).toBe(200);
@@ -550,6 +606,8 @@ describe("POST /api/runs/:id/cancel", () => {
 
   it("200 {canceled:false,not_cancelable} for an already-terminal run — the repeat cancel is idempotent, zero writes", async () => {
     await fresh();
+    await seedClaimedMachineById(db, "m-test");
+    await seedLoop(db, { id: "loop-1" });
     await seedRun(db, { id: "run-1", phase: "done", outcome: "exec", message: "finished" });
     const before = await snapshotRuns(db);
 
@@ -570,6 +628,8 @@ describe("POST /api/runs/:id/cancel", () => {
 
   it("400 for malformed or non-object JSON, zero writes", async () => {
     await fresh();
+    await seedClaimedMachineById(db, "m-test");
+    await seedLoop(db, { id: "loop-1" });
     await seedRun(db, { id: "run-1", phase: "running" });
     for (const body of ["{", "[1]", '"str"', "null"]) {
       await expectJsonError(await cancelReq("run-1", body), 400, { error: "invalid request" });
@@ -579,6 +639,9 @@ describe("POST /api/runs/:id/cancel", () => {
 
   it("413 over the shared 2 MiB body cap", async () => {
     await fresh();
+    await seedClaimedMachineById(db, "m-test");
+    await seedLoop(db, { id: "loop-1" });
+    await seedRun(db, { id: "run-1", phase: "running" });
     const huge = JSON.stringify({ pad: "x".repeat(3 * 1024 * 1024) });
     await expectJsonError(await cancelReq("run-1", huge), 413, { error: "request body too large" });
   });
@@ -594,6 +657,7 @@ describe("GET observation surface", () => {
       roots: ["/secret/root"],
       hostname: "mbp.local",
       createdAt: "2026-07-01T00:00:00.000Z",
+      teamId: TEST_TEAM_ID,
     });
     const res = await app.request("/api/machines");
     expect(res.status).toBe(200);
@@ -617,7 +681,7 @@ describe("GET observation surface", () => {
 
   it("GET /api/loops returns schema-valid summaries with lastRun, no unopened fields", async () => {
     await fresh();
-    await seedMachine(db, "m-test");
+    await seedClaimedMachineById(db, "m-test");
     await seedLoop(db, {
       id: "loop-1",
       workflow: "secret-js-body",
@@ -682,7 +746,7 @@ describe("GET observation surface", () => {
 
   it("GET /api/loops/:id/runs returns schema-valid runs; 404 for an unknown loop", async () => {
     await fresh();
-    await seedMachine(db, "m-test");
+    await seedClaimedMachineById(db, "m-test");
     await seedLoop(db, { id: "loop-1" });
     await seedRun(db, { id: "run-1", loopId: "loop-1", ts: "2026-07-01T00:00:01.000Z" });
 
@@ -697,7 +761,7 @@ describe("GET observation surface", () => {
 
   it("never exposes unopened Run columns through lastRun or the Run list", async () => {
     await fresh();
-    await seedMachine(db, "m-test");
+    await seedClaimedMachineById(db, "m-test");
     await seedLoop(db, { id: "loop-1" });
     await seedRun(db, {
       id: "run-1",
@@ -765,18 +829,19 @@ describe("unified error surface", () => {
 
   it("500 + internal server error without leaking exception, stack or DB details", async () => {
     await fresh();
-    const sabotaged = createServerApp(
-      {
+    const sabotaged = createServerApp({
+      coordinator: {
         ...coordinator,
         poll: () => {
           throw new Error("pg connection failed: password=hunter2 at db.internal:5432");
         },
       },
       admin,
-      createLifecycleAdmin({ db, clock }),
-      createScheduleAdmin({ db, clock }),
+      lifecycle: createLifecycleAdmin({ db, clock }),
+      schedule: createScheduleAdmin({ db, clock }),
       ownerControl,
-    );
+      management: createTestManagementAccess(db, clock),
+    });
     const res = await sabotaged.request("/api/machine/poll", {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${TOKEN}` },
@@ -902,7 +967,15 @@ describe("the taxonomy pin (review STD-5) — the adapter's full (status, code) 
       reportSyncError: async () => ({ ok: false, failure: artifactFailure }),
     } as unknown as ArtifactApi;
 
-    const fake = createServerApp(coordinator, admin, lifecycle, schedule, ownerControl, undefined, undefined, artifacts);
+    const fake = createServerApp({
+      coordinator,
+      admin,
+      lifecycle,
+      schedule,
+      ownerControl,
+      artifacts,
+      management: permissiveManagementAccess(),
+    });
     const observed = new Set<string>();
     const record = async (res: Response): Promise<void> => {
       const body = (await res.json()) as { code?: string };
@@ -1072,22 +1145,26 @@ describe("AD1: the six slice-2 artifact routes AND the four slice-7 read routes 
 
   async function freshWithArtifacts(): Promise<void> {
     await fresh();
-    artifactApp = createServerApp(
+    // The ownership gates resolve these ids before the facade runs.
+    await seedClaimedMachineById(db, "m-test");
+    await seedLoop(db, { id: "loop-1" });
+    await seedRun(db, { id: "run-1", loopId: "loop-1" });
+    const rawArtifactApp = createServerApp({
       coordinator,
       admin,
-      createLifecycleAdmin({ db, clock }),
-      createScheduleAdmin({ db, clock }),
+      lifecycle: createLifecycleAdmin({ db, clock }),
+      schedule: createScheduleAdmin({ db, clock }),
       ownerControl,
-      undefined,
-      undefined,
-      createArtifactApi({
+      management: createTestManagementAccess(db, clock),
+      artifacts: createArtifactApi({
         db,
         clock,
         ids: { syncId: () => "sync-1", manifestId: () => "amf-1" },
         blobStore: createMemoryBlobStore(),
-        attribution: staticAttribution({}),
+        attribution: staticAttribution({ "m-test": TEST_TEAM_ID }),
       }),
-    );
+    });
+    artifactApp = withManagementSession(rawArtifactApp, sessionCredential);
   }
 
   it("the mounted routes answer the unified 401 without a credential (never the flat 404)", async () => {
@@ -1115,18 +1192,22 @@ describe("AD1: the six slice-2 artifact routes AND the four slice-7 read routes 
   it("the four slice-7 read paths answer through the facade; the wrong-method control stays a 401", async () => {
     await freshWithArtifacts();
     const canonicalBody = await (await artifactApp.request("/nope")).text();
-    // Unknown ids: the facade's code-less 404 family — byte-identical to the
+    // Slice 5: the ownership gate resolves loop-1/run-1 BEFORE the facade, so
+    // an owned-but-empty loop/run is the facade's own answer (200), while an
+    // unknown SNAPSHOT stays the code-less 404 family — byte-identical to the
     // notFound body (existence never leaks across scopes).
-    const probes: ReadonlyArray<readonly [string, string]> = [
-      ["GET", "/api/loops/loop-1/artifacts"], // current-view file list
-      ["GET", `/api/loops/loop-1/artifacts/download?snapshotId=amf-1&path=a.txt`], // download
-      ["GET", "/api/loops/loop-1/artifacts/diff?to=amf-1"], // structural diff
-      ["GET", "/api/runs/run-1/artifacts"], // run snapshot view
+    for (const path of ["/api/loops/loop-1/artifacts", "/api/runs/run-1/artifacts"]) {
+      const res = await artifactApp.request(path);
+      expect(res.status, path).toBe(200);
+    }
+    const notFoundProbes: string[] = [
+      `/api/loops/loop-1/artifacts/download?snapshotId=amf-1&path=a.txt`, // download
+      `/api/loops/loop-1/artifacts/diff?to=amf-1`, // structural diff
     ];
-    for (const [method, path] of probes) {
-      const res = await artifactApp.request(path, { method });
-      expect(res.status, `${method} ${path}`).toBe(404);
-      expect(await res.text(), `${method} ${path}`).toBe(canonicalBody);
+    for (const path of notFoundProbes) {
+      const res = await artifactApp.request(path);
+      expect(res.status, path).toBe(404);
+      expect(await res.text(), path).toBe(canonicalBody);
     }
     // Mounted-ness proof: malformed queries are the route's own 400 — a
     // dormant path would still be the flat 404 above.
@@ -1150,7 +1231,7 @@ describe("AD2(a): create persists artifactDir atomically through the shared plan
   // configured loop is born at config generation 1 (0 = never configured).
   it("201 persists an absolute dir at generation 1 and emits it in the response", async () => {
     await fresh();
-    await seedMachine(db, MACHINE_ID);
+    await seedClaimedMachineById(db, MACHINE_ID);
     const res = await createLoopReq({
       machineId: MACHINE_ID,
       taskFile: "/home/dev/TASK.md",
@@ -1174,7 +1255,7 @@ describe("AD2(a): create persists artifactDir atomically through the shared plan
 
   it("a relative dir WITH an explicit workdir is legal and persists VERBATIM (no server-side resolution)", async () => {
     await fresh();
-    await seedMachine(db, MACHINE_ID);
+    await seedClaimedMachineById(db, MACHINE_ID);
     const res = await createLoopReq({
       machineId: MACHINE_ID,
       workdir: "/home/dev/project",
@@ -1189,7 +1270,7 @@ describe("AD2(a): create persists artifactDir atomically through the shared plan
 
   it("a RELATIVE dir without a workdir is a coded 400 and writes ZERO rows (the PATCH classification)", async () => {
     await fresh();
-    await seedMachine(db, MACHINE_ID);
+    await seedClaimedMachineById(db, MACHINE_ID);
     await expectJsonError(
       await createLoopReq({ machineId: MACHINE_ID, taskFile: "/home/dev/TASK.md", artifactDir: "dist" }),
       400,
@@ -1200,7 +1281,7 @@ describe("AD2(a): create persists artifactDir atomically through the shared plan
 
   it("omitting artifactDir keeps null/0; an explicit null is still 400", async () => {
     await fresh();
-    await seedMachine(db, MACHINE_ID);
+    await seedClaimedMachineById(db, MACHINE_ID);
     const res = await createLoopReq({ machineId: MACHINE_ID, taskFile: "/t/TASK.md" });
     expect(res.status).toBe(201);
     const [row] = await db.select().from(loops);
@@ -1213,5 +1294,59 @@ describe("AD2(a): create persists artifactDir atomically through the shared plan
       error: "invalid request",
     });
     expect(await snapshotLoops(db)).toHaveLength(1);
+  });
+});
+
+describe("Batch 3 slice 2: the auth surface mount", () => {
+  const AUTH_PATHS: [string, string][] = [
+    ["GET", "/login"],
+    ["GET", "/auth/github"],
+    ["GET", "/auth/github/callback"],
+    ["POST", "/auth/logout"],
+    ["GET", "/api/session"],
+  ];
+
+  it("auth ABSENT: all five paths stay indistinguishable from unknown routes", async () => {
+    await fresh();
+    for (const [method, path] of AUTH_PATHS) {
+      const res = await app.request(path, { method });
+      expect([method, path, res.status]).toEqual([method, path, 404]);
+      expect(await res.json()).toEqual({ error: "not found" });
+    }
+  });
+
+  it("auth PRESENT: the five routes are mounted with their handlers and middleware", async () => {
+    await fresh();
+    const auth = createAuthModule({
+      authConfig: makeTestAuthConfig(),
+      db,
+      clock,
+      // Never reached by these probes (the callback probe fails before the
+      // adapter); a throwing stub proves it.
+      fetchImpl: (() => {
+        throw new Error("unexpected GitHub call");
+      }) as typeof fetch,
+    }).routes;
+    const withAuth = createServerApp({
+      coordinator,
+      admin,
+      lifecycle: createLifecycleAdmin({ db, clock }),
+      schedule: createScheduleAdmin({ db, clock }),
+      ownerControl,
+      management: createTestManagementAccess(db, clock),
+      auth,
+    });
+
+    expect((await withAuth.request("/login")).status).toBe(200);
+    const start = await withAuth.request("/auth/github");
+    expect(start.status).toBe(303);
+    expect(start.headers.get("location")).toMatch(/^https:\/\/github\.com\/login\/oauth\/authorize\?/);
+    // The callback's first verdict needs no adapter call.
+    const callback = await withAuth.request("/auth/github/callback");
+    expect(callback.status).toBe(303);
+    expect(callback.headers.get("location")).toBe("/login?error=state_missing");
+    // Logout middleware chain: 415 before any session/CSRF logic.
+    expect((await withAuth.request("/auth/logout", { method: "POST" })).status).toBe(415);
+    expect((await withAuth.request("/api/session")).status).toBe(401);
   });
 });

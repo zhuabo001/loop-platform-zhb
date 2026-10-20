@@ -15,3 +15,4 @@ export * from "./terminal-policy.js";
 export * from "./artifact.js";
 export * from "./artifact-view.js";
 export * from "./artifact-policy.js";
+export * from "./session.js";

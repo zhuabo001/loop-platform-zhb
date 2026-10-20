@@ -30,6 +30,7 @@ import type {
 import type { Db } from "../db/index.js";
 import { loops, type ArtifactManifestRow, type Loop } from "../db/schema.js";
 import { getRun } from "../store/runs.js";
+import { getLoopTeam, teamMatches } from "../store/scope.js";
 import type { ArtifactAttributionResolver } from "./attribution.js";
 import type { BlobStore, BlobStreamChunk } from "./blob-store.js";
 import { readCurrentArtifactView } from "./config.js";
@@ -68,16 +69,35 @@ export type OpenArtifactDownloadResult =
     }
   | { ok: false; failure: ArtifactReadFailure; cause?: unknown };
 
-/** Loop row lookup + per-operation attribution, in the frozen order. The loop
- *  row read IS the identity-discovery step for credential-less management
- *  reads (决策 27). */
+/**
+ * The read's ownership scope (Phase 5 Batch 3 slices 5–6, ADR-011 决策 24/26/30).
+ *
+ * A discriminated union, NOT an optional `teamId`: an optional parameter makes
+ * `undefined` silently mean "everyone's data", which is exactly the failure the
+ * slice exists to prevent. Slice 6 deleted the temporary `unscoped` arm — the
+ * Dashboard now reads through the same team scope as the management routes.
+ */
+export type ReadScope = { kind: "team"; teamId: string };
+
+/** Loop row lookup + ownership + per-operation attribution, in the frozen
+ *  order. The loop row read IS the identity-discovery step for credential-less
+ *  management reads (决策 27).
+ *
+ *  The team comparison sits AFTER the loop row and BEFORE attribution /
+ *  snapshot / blob resolution: an unclaimed or cross-team loop must fold into
+ *  the flat `loop_not_found` (404), never into `attribution_missing` (403) —
+ *  and must never reach a snapshot parse or a file open. */
 type LoopScope =
   | { ok: true; loop: Loop; namespaceId: string }
   | { ok: false; failure: ArtifactReadFailure; cause?: unknown };
 
-async function resolveLoopScope(home: ArtifactReadHome, loopId: string): Promise<LoopScope> {
+async function resolveLoopScope(home: ArtifactReadHome, loopId: string, scope: ReadScope): Promise<LoopScope> {
   const loop = (await home.db.select().from(loops).where(eq(loops.id, loopId)).limit(1))[0];
   if (!loop) return { ok: false, failure: "loop_not_found" };
+  const ownership = await getLoopTeam(home.db, loopId);
+  if (!ownership.found || !teamMatches(ownership.teamId, scope.teamId)) {
+    return { ok: false, failure: "loop_not_found" };
+  }
   const resolved = await home.attribution.resolve({ machineId: loop.machineId });
   if (!resolved.ok) return { ok: false, failure: "attribution_missing" };
   return { ok: true, loop, namespaceId: resolved.namespaceId };
@@ -87,8 +107,12 @@ async function resolveLoopScope(home: ArtifactReadHome, loopId: string): Promise
  *  is NOT an error: the frozen view shape is nullable (the Dashboard renders
  *  the 未配置 state); `artifact_dir_unconfigured` stays a union member with no
  *  slice-7 route returning it (决策 27). */
-export async function readLoopArtifactsView(home: ArtifactReadHome, loopId: string): Promise<ReadLoopArtifactsResult> {
-  const scope = await resolveLoopScope(home, loopId);
+export async function readLoopArtifactsView(
+  home: ArtifactReadHome,
+  loopId: string,
+  readScope: ReadScope,
+): Promise<ReadLoopArtifactsResult> {
+  const scope = await resolveLoopScope(home, loopId, readScope);
   if (!scope.ok) return scope;
   const view = await readCurrentArtifactView(home.db, loopId);
   // Unreachable (the scope read above just saw the row; PGlite is one
@@ -129,11 +153,12 @@ export async function readLoopArtifactsView(home: ArtifactReadHome, loopId: stri
  *  must stay indistinguishable from never-existed on EVERY path, including
  *  the `attribution_missing` failure — otherwise 403-vs-404 under a foreign
  *  parent leaks the run's existence across scopes (决策 13/27). With the
- *  matching parent the failure domain is unchanged; absent (the flat JSON
- *  route) the read is unscoped. */
+ *  matching parent the failure domain is unchanged; the flat JSON route simply
+ *  omits the parent and supplies the same explicit team scope. */
 export async function readRunArtifactsView(
   home: ArtifactReadHome,
   runId: string,
+  readScope: ReadScope,
   expectedLoopId?: string,
 ): Promise<ReadRunArtifactsResult> {
   const run = await getRun(home.db, runId);
@@ -143,6 +168,14 @@ export async function readRunArtifactsView(
   }
   const loop = (await home.db.select().from(loops).where(eq(loops.id, run.loopId)).limit(1))[0];
   if (!loop) return { ok: false, failure: "loop_not_found" }; // defensive: FK makes this unreachable
+  // Ownership BEFORE attribution and BEFORE the snapshot read: a cross-team
+  // run folds into `run_not_found` so its existence never leaks (决策 26).
+  if (readScope.kind === "team") {
+    const ownership = await getLoopTeam(home.db, loop.id);
+    if (!ownership.found || !teamMatches(ownership.teamId, readScope.teamId)) {
+      return { ok: false, failure: "run_not_found" };
+    }
+  }
   const resolved = await home.attribution.resolve({ machineId: loop.machineId });
   if (!resolved.ok) return { ok: false, failure: "attribution_missing" };
   if (run.artifactSnapshotId === null) {
@@ -177,8 +210,9 @@ export async function openArtifactDownload(
   home: ArtifactReadHome,
   loopId: string,
   query: { snapshotId: string; path: string },
+  readScope: ReadScope,
 ): Promise<OpenArtifactDownloadResult> {
-  const scope = await resolveLoopScope(home, loopId);
+  const scope = await resolveLoopScope(home, loopId, readScope);
   if (!scope.ok) return scope;
   const manifest = await readArtifactSnapshot(home.db, query.snapshotId);
   if (!manifest || manifest.loopId !== loopId) return { ok: false, failure: "snapshot_not_found" };
@@ -246,8 +280,9 @@ export async function diffLoopSnapshots(
   home: ArtifactReadHome,
   loopId: string,
   query: { from?: string; to: string },
+  readScope: ReadScope,
 ): Promise<ReadDiffResult> {
-  const scope = await resolveLoopScope(home, loopId);
+  const scope = await resolveLoopScope(home, loopId, readScope);
   if (!scope.ok) return scope;
   const to = await readArtifactSnapshot(home.db, query.to);
   if (!to || to.loopId !== loopId) return { ok: false, failure: "snapshot_not_found" };

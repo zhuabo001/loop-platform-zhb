@@ -60,6 +60,7 @@ import { closeDb, type DbHandle } from "./db/index.js";
 import { loops, runLeases } from "./db/schema.js";
 import { DaemonControlObserver, DaemonLogObserver, DetachedProcessSupervisor } from "./real-claude-e2e-harness.js";
 import { bootstrapServer, waitForListening } from "./start.js";
+import { makeTestAuthConfig, seedClaimedMachineIfAbsent, seedManagementSession } from "./testkit/index.js";
 
 const ENABLED = process.env.LOOPZHB_REAL_CLAUDE_E2E === "1";
 const TOKEN = "dk_e2e_batch2_real_claude";
@@ -143,8 +144,17 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 2 real Claude E2E (opt-in)", () => {
       // 2. Production server: file PGlite + real HTTP listener.
       const dataDir = await mkdtemp(path.join(tmpdir(), `loopzhb-b2real-data-${process.pid}-`));
       tempDirs.push(dataDir);
-      const booted = await bootstrapServer({ host: "127.0.0.1", port: 0, dataDir });
+      const booted = await bootstrapServer({ auth: makeTestAuthConfig(), host: "127.0.0.1", port: 0, dataDir });
       handles.push(booted.handle);
+      // Phase 5 Batch 3 slice 3: poll no longer self-registers — state the
+      // claimed machine this daemon's token polls as.
+      await seedClaimedMachineIfAbsent(booted.handle.db, TOKEN);
+      // Slice 5: every management route requires a Login Session.
+      const sessionCredential = (await seedManagementSession(booted.handle.db, {})).credential;
+      const sessionHeaders = (extra: Record<string, string> = {}): Record<string, string> => ({
+        cookie: `loopzhb_session=${sessionCredential}`,
+        ...extra,
+      });
       const server = serve({ fetch: booted.app.fetch, port: 0, hostname: "127.0.0.1" });
       servers.push(server);
       await waitForListening(server);
@@ -204,20 +214,22 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 2 real Claude E2E (opt-in)", () => {
         console.log(`[b2-real] Claude version: ${provenance.version}`);
         console.log(`[b2-real] Claude sha256: ${provenance.sha256}`);
 
-        // 5. Machine registration.
+        // 5. Daemon readiness: the machine ROW exists from the start (Phase 5
+        //    Batch 3 slice 3 removed self-registration), so wait for `lastSeen`
+        //    — written only by the daemon's own poll contact.
         const machineId = machineIdFromToken(TOKEN);
         await waitFor(async () => {
-          const res = await fetch(`${baseUrl}/api/machines`);
+          const res = await fetch(`${baseUrl}/api/machines`, { headers: sessionHeaders() });
           if (!res.ok) return false;
-          const body = (await res.json()) as { machines?: Array<{ id: string }> };
-          return body.machines?.some((m) => m.id === machineId) ?? false;
+          const body = (await res.json()) as { machines?: Array<{ id: string; lastSeen: string | null }> };
+          return body.machines?.some((m) => m.id === machineId && m.lastSeen !== null) ?? false;
         }, REGISTER_TIMEOUT_MS);
 
         // 6. The Closed Loop (goal + far-future cron to prove the finish
         //    disables an ENABLED schedule).
         const createRes = await fetch(`${baseUrl}/api/loops`, {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers: sessionHeaders({ "content-type": "application/json" }),
           body: JSON.stringify({
             machineId,
             name: "b2-real-claude",
@@ -232,13 +244,13 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 2 real Claude E2E (opt-in)", () => {
 
         const waitRunTerminal = async (runId: string) => {
           await waitFor(async () => {
-            const res = await fetch(`${baseUrl}/api/loops/${loop.id}/runs`);
+            const res = await fetch(`${baseUrl}/api/loops/${loop.id}/runs`, { headers: sessionHeaders() });
             if (!res.ok) return false;
             const body = runListResponseSchema.parse(await res.json());
             const run = body.runs.find((r) => r.id === runId);
             return run !== undefined && (run.phase === "done" || run.phase === "error");
           }, AGENT_TIMEOUT_MS);
-          const res = await fetch(`${baseUrl}/api/loops/${loop.id}/runs`);
+          const res = await fetch(`${baseUrl}/api/loops/${loop.id}/runs`, { headers: sessionHeaders() });
           const run = runListResponseSchema.parse(await res.json()).runs.find((r) => r.id === runId);
           if (run === undefined) throw new Error(`run ${runId} missing`);
           return run;
@@ -246,7 +258,9 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 2 real Claude E2E (opt-in)", () => {
 
         // ---- RUN 1: report the step-1 state ----
         const trigger1 = triggerRunResponseSchema.parse(
-          await (await fetch(`${baseUrl}/api/loops/${loop.id}/run`, { method: "POST" })).json(),
+          await (
+            await fetch(`${baseUrl}/api/loops/${loop.id}/run`, { method: "POST", headers: sessionHeaders() })
+          ).json(),
         );
         if (!trigger1.enqueued) throw new Error("expected run 1 to enqueue");
         const run1 = await waitRunTerminal(trigger1.runId);
@@ -263,7 +277,9 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 2 real Claude E2E (opt-in)", () => {
 
         // ---- RUN 2: observe prev-state and finish ----
         const trigger2 = triggerRunResponseSchema.parse(
-          await (await fetch(`${baseUrl}/api/loops/${loop.id}/run`, { method: "POST" })).json(),
+          await (
+            await fetch(`${baseUrl}/api/loops/${loop.id}/run`, { method: "POST", headers: sessionHeaders() })
+          ).json(),
         );
         if (!trigger2.enqueued) throw new Error("expected run 2 to enqueue");
         const run2 = await waitRunTerminal(trigger2.runId);
@@ -280,12 +296,15 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 2 real Claude E2E (opt-in)", () => {
 
         // Completed guards: Run Now and schedule re-enable are both the
         // coded 409 — the far-future cron stays disarmed until a Reopen.
-        const runNow = await fetch(`${baseUrl}/api/loops/${loop.id}/run`, { method: "POST" });
+        const runNow = await fetch(`${baseUrl}/api/loops/${loop.id}/run`, {
+          method: "POST",
+          headers: sessionHeaders(),
+        });
         expect(runNow.status).toBe(409);
         expect(((await runNow.json()) as { code?: string }).code).toBe(LOOP_COMPLETED_CODE);
         const enableSchedule = await fetch(`${baseUrl}/api/loops/${loop.id}/schedule`, {
           method: "PATCH",
-          headers: { "content-type": "application/json" },
+          headers: sessionHeaders({ "content-type": "application/json" }),
           body: JSON.stringify({ enabled: true }),
         });
         expect(enableSchedule.status).toBe(409);

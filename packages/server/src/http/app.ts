@@ -17,9 +17,11 @@
  * schemas; Zod issues, exception messages, stacks and DB details go to the
  * server log only.
  *
- * The management routes carry NO credential at all (Phase 1: localhost /
- * trusted network is the whole security boundary — see config.ts's
- * unauthenticated-exposure warning). The trigger route owns no lifecycle
+ * Every management route is behind the shared Login Session gate (Batch 3
+ * slice 5, ADR-011 决策 23): `sessionGate` resolves the team BEFORE any
+ * handler, and the ownership gates answer a flat 404. Non-loopback binds are
+ * warned about by config.ts's `nonLoopbackExposureWarning`. The trigger route
+ * owns no lifecycle
  * logic: it delegates to `coordinator.enqueueExecRun` (ADR-001 T7); the
  * cancel route delegates to `ownerControl.cancelRun` (ADR-001 T6) — the
  * coordinator's three-method interface is NOT the HTTP permission surface.
@@ -40,6 +42,7 @@
  */
 import { bodyLimit } from "hono/body-limit";
 import { Hono, type Context } from "hono";
+import type { AuthRoutes } from "../auth/index.js";
 import type { DashboardRoutes } from "../dashboard/routes.js";
 import {
   DASHBOARD_ARTIFACT_CONFIG_PATH,
@@ -81,6 +84,7 @@ import { InvalidMachineCredentialError, RunCapabilityInvalidError } from "../coo
 import type { RunCoordinator } from "../coordinator/index.js";
 import type { Loop } from "../db/schema.js";
 import type { LifecycleAdmin } from "../loop-lifecycle/admin.js";
+import type { ManagementAccess, ManagementEnv } from "../management/access.js";
 import type { OwnerControl } from "../owner/index.js";
 import {
   ScheduleRevisionExhaustedError,
@@ -256,31 +260,53 @@ async function parseJsonBodyOrEmpty(c: Context): Promise<unknown> {
   }
 }
 
-export function createServerApp(
-  coordinator: RunCoordinator,
-  admin: LoopAdmin,
-  lifecycle: LifecycleAdmin,
-  schedule: ScheduleAdmin,
-  ownerControl: OwnerControl,
-  onScheduleCommitted?: (loop: Loop) => void,
+/**
+ * The assembly seam (converted to an options object in Batch 3 slice 5, when
+ * the ninth positional argument made mis-ordering a real hazard).
+ *
+ * `management` is REQUIRED: a production assembly cannot omit the Session gate
+ * (slice 5, ADR-011 决策 23/28), and a test assembly cannot forget it silently
+ * — omitting it does not compile.
+ */
+export interface ServerAppDeps {
+  coordinator: RunCoordinator;
+  admin: LoopAdmin;
+  lifecycle: LifecycleAdmin;
+  schedule: ScheduleAdmin;
+  ownerControl: OwnerControl;
+  /** Session + ownership gates for the management JSON surface. */
+  management: ManagementAccess;
+  /** The ONE schedule-commit seam (Batch 2 plan §2): invoked synchronously
+   *  after a committed create/PATCH with the authoritative loop row. */
+  onScheduleCommitted?: (loop: Loop) => void;
   /**
    * The local Dashboard (Batch 3). Present ONLY when the server is bound to a
    * loopback address — `bootstrapServer` decides, so this module never reads
    * config. Its presence means every request MUST address a loopback host
-   * (see `hostGate` below); absent, the app stays exactly the JSON seam it
-   * has always been, which is why the 11 existing call sites are unchanged.
+   * (see `hostGate` below).
    */
-  dashboard?: DashboardRoutes,
+  dashboard?: DashboardRoutes;
   /**
    * The artifact facade (Batch 2 slice 2) — the narrow interface wired by
-   * `bootstrapServer`. ABSENT means the six artifact routes are NOT mounted
-   * (every artifact path stays indistinguishable from an unknown route), so
-   * every pre-existing call site is unchanged and the dormancy guard keeps a
-   * clean control.
+   * `bootstrapServer`. ABSENT means the artifact routes are NOT mounted (every
+   * artifact path stays indistinguishable from an unknown route), which keeps
+   * the dormancy guard a clean control.
    */
-  artifacts?: ArtifactApi,
-): Hono {
-  const app = new Hono();
+  artifacts?: ArtifactApi;
+  /**
+   * The auth surface (Batch 3 slice 2): the five login/session routes. Absent
+   * ⇒ `/login`, `/auth/*` and `/api/session` stay indistinguishable from
+   * unknown routes. `bootstrapServer` always builds it (config.auth is
+   * REQUIRED) — the absence is a test-assembly choice, never a production
+   * state.
+   */
+  auth?: AuthRoutes;
+}
+
+export function createServerApp(deps: ServerAppDeps): Hono<ManagementEnv> {
+  const { coordinator, admin, lifecycle, schedule, ownerControl, management, onScheduleCommitted, dashboard, artifacts, auth } =
+    deps;
+  const app = new Hono<ManagementEnv>();
 
   // Registered BEFORE any route: this is the DNS-rebinding gate, and a
   // loopback-bound server has no legitimate non-loopback Host. It must also
@@ -289,6 +315,39 @@ export function createServerApp(
   // registration would leave a bypass (the JSON API is what a rebinding
   // attacker reads first: /api/loops hands over every loop id).
   if (dashboard !== undefined) app.use("*", dashboard.hostGate);
+
+  // ---- management gates (Batch 3 slice 5, ADR-011 决策 23/25) --------------
+  // Registered AFTER hostGate (a hostile Host is answered before authentication)
+  // and BEFORE every /api route. The session gate is DENY-BY-DEFAULT on
+  // "/api/*" with an explicit exemption predicate inside the module; the
+  // ownership gates read the path id and answer a flat 404 before the handler.
+  app.use("/api/*", management.sessionGate);
+  app.use("/api/loops/:id", management.loopGate);
+  app.use("/api/loops/:id/*", management.loopGate);
+  app.use("/api/runs/:id", management.runGate);
+  app.use("/api/runs/:id/*", management.runGate);
+
+  // ---- dashboard gates (Batch 3 slice 6, ADR-011 决策 29/30) ---------------
+  // Registered after hostGate and after the management gates: a hostile Host
+  // is answered before authentication, and an anonymous dashboard POST is
+  // answered before form parsing (401, never 413/415). `/dashboard/*` covers
+  // `/dashboard` and every child; `/` needs its own registration.
+  if (dashboard !== undefined) {
+    app.use("/", dashboard.pageGate);
+    app.use("/dashboard/*", dashboard.pageGate);
+    app.use("/dashboard/loops/:id", dashboard.loopGate);
+    app.use("/dashboard/loops/:id/*", dashboard.loopGate);
+  }
+
+  /** The Team Scope established by sessionGate. A management route reaching a
+   *  handler without one is an assembly bug, not a request to serve unscoped. */
+  const teamOf = (c: Context<ManagementEnv>): string => {
+    // The access object is the single authority (the production gate stores
+    // the team in the context; a test assembly may supply its own).
+    const teamId = management.teamIdOf(c);
+    if (teamId === undefined) throw new Error("management route reached without a session gate");
+    return teamId;
+  };
 
   /**
    * The ONE schedule-commit seam (Batch 2 plan §2): invoked synchronously after
@@ -374,14 +433,14 @@ export function createServerApp(
     }
   });
 
-  // ---- local management routes (no credential — Phase 1 loopback boundary) ----
+  // ---- management routes (Login Session gate + team scope, ADR-011 决策 23) ----
 
-  app.get("/api/machines", async (c) => c.json({ machines: await admin.listMachines() }));
+  app.get("/api/machines", async (c) => c.json({ machines: await admin.listMachines(teamOf(c)) }));
 
-  app.get("/api/loops", async (c) => c.json({ loops: await admin.listLoops() }));
+  app.get("/api/loops", async (c) => c.json({ loops: await admin.listLoops(teamOf(c)) }));
 
   app.get("/api/loops/:id/runs", async (c) => {
-    const list = await admin.listRuns(c.req.param("id"));
+    const list = await admin.listRuns(c.req.param("id"), teamOf(c));
     if (list === undefined) return jsonError(c, 404, "not found");
     return c.json({ runs: list });
   });
@@ -395,7 +454,7 @@ export function createServerApp(
       return jsonError(c, 400, "invalid request");
     }
     try {
-      const result = await admin.createLoop(parsed.data);
+      const result = await admin.createLoop(parsed.data, teamOf(c));
       if (!result.created) return jsonError(c, 404, "not found");
 
       // Hot-register the schedule through the seam with the authoritative row
@@ -441,6 +500,13 @@ export function createServerApp(
       return c.json({ enqueued: true, runId: result.runId, supersededRunIds: result.supersededRunIds }, 202);
     }
     if (result.reason === "loop_not_found") return jsonError(c, 404, "not found");
+    // Phase 5 Batch 3 slice 3 (ADR-011 + Batch plan §1): a loop whose machine
+    // is orphan, unclaimed or revoked adds no run and supersedes nothing. The
+    // refusal is a flat 404 like an unknown loop — the same "not a resource
+    // you can act on" classification the slice-5 management scope will use for
+    // unclaimed machines, and deliberately NOT the `running_exists` fallback
+    // below (that would mislabel a refusal as a benign queue state).
+    if (result.reason === "machine_ineligible") return jsonError(c, 404, "not found");
     if (result.reason === "loop_completed") {
       // Phase 4 (ADR-009 决策 10): Run Now on a Completed loop is a flat 409
       // with the additive code — the success union's reason literals stay
@@ -495,7 +561,7 @@ export function createServerApp(
 
       // The wire response is the admin view (LoopSummary with lastRun and
       // computed nextFireAt) — never the raw DB row (ADR-002 wire boundary).
-      const loopSummary = await admin.getLoopSummary(result.loop.id);
+      const loopSummary = await admin.getLoopSummary(result.loop.id, teamOf(c));
       if (!loopSummary) return jsonError(c, 404, "not found");
 
       return c.json({ loop: loopSummary }, 200);
@@ -536,7 +602,7 @@ export function createServerApp(
       if (result.reason === "goal_revision_exhausted") return jsonError(c, 409, "goal revision exhausted");
       return jsonError(c, 400, "invalid request");
     }
-    const loopSummary = await admin.getLoopSummary(result.loop.id);
+    const loopSummary = await admin.getLoopSummary(result.loop.id, teamOf(c));
     if (!loopSummary) return jsonError(c, 404, "not found");
     return c.json({ loop: loopSummary }, 200);
   });
@@ -563,7 +629,7 @@ export function createServerApp(
       console.warn("[http] update-task-file conflict", c.req.param("id"), result.reason);
       return jsonError(c, 409, "a run is in progress");
     }
-    const loopSummary = await admin.getLoopSummary(result.loop.id);
+    const loopSummary = await admin.getLoopSummary(result.loop.id, teamOf(c));
     if (!loopSummary) return jsonError(c, 404, "not found");
     return c.json({ loop: loopSummary }, 200);
   });
@@ -590,16 +656,16 @@ export function createServerApp(
     // Re-arm the schedule through the seam with the authoritative row (the
     // reopen already committed — a seam failure never fails the request).
     commitSchedule(result.loop);
-    const loopSummary = await admin.getLoopSummary(result.loop.id);
+    const loopSummary = await admin.getLoopSummary(result.loop.id, teamOf(c));
     if (!loopSummary) return jsonError(c, 404, "not found");
     return c.json({ loop: loopSummary }, 200);
   });
 
   // ---- Phase 5 artifact routes (Batch 2 slice 2, ADR-010 决策 22) ----
-  // Mounted ONLY when the production facade is wired. Management config needs
-  // no credential (loopback boundary); machine routes verify an EXISTING
-  // machine (never registering) and every domain failure rides the frozen
-  // `ARTIFACT_FAILURE_HTTP` table verbatim.
+  // Mounted ONLY when the production facade is wired. Management reads/config
+  // sit behind the Login Session gate; machine routes verify an EXISTING,
+  // claimed, non-revoked machine (never registering) and every domain failure
+  // rides the frozen `ARTIFACT_FAILURE_HTTP` table verbatim.
   if (artifacts !== undefined) {
     /** The table entry as a JSON error — the ONE failure shaper. */
     const artifactError = (c: Context, failure: ArtifactInternalFailure): Response => {
@@ -632,7 +698,7 @@ export function createServerApp(
       }
       const result = await artifacts.updateConfig(c.req.param("id"), parsed.data);
       if (!result.ok) return artifactError(c, result.failure);
-      const loopSummary = await admin.getLoopSummary(result.loop.id);
+      const loopSummary = await admin.getLoopSummary(result.loop.id, teamOf(c));
       if (!loopSummary) return jsonError(c, 404, "not found");
       return c.json({ loop: loopSummary }, 200);
     });
@@ -664,13 +730,13 @@ export function createServerApp(
     };
 
     app.get("/api/loops/:id/artifacts", async (c) => {
-      const result = await artifacts.readLoop(c.req.param("id"));
+      const result = await artifacts.readLoopForTeam(c.req.param("id"), teamOf(c));
       if (!result.ok) return artifactError(c, result.failure);
       return c.json(result.response);
     });
 
     app.get("/api/runs/:id/artifacts", async (c) => {
-      const result = await artifacts.readRun(c.req.param("id"));
+      const result = await artifacts.readRunForTeam(c.req.param("id"), teamOf(c));
       if (!result.ok) return artifactError(c, result.failure);
       return c.json(result.response);
     });
@@ -678,7 +744,7 @@ export function createServerApp(
     app.get("/api/loops/:id/artifacts/diff", async (c) => {
       const query = parseDiffQuery(c);
       if (query === undefined) return jsonError(c, 400, "invalid request");
-      const result = await artifacts.diffSnapshots(c.req.param("id"), query);
+      const result = await artifacts.diffSnapshotsForTeam(c.req.param("id"), teamOf(c), query);
       if (!result.ok) return artifactError(c, result.failure);
       return c.json(result.response);
     });
@@ -686,7 +752,7 @@ export function createServerApp(
     app.get("/api/loops/:id/artifacts/download", async (c) => {
       const query = parseDownloadQuery(c);
       if (query === undefined) return jsonError(c, 400, "invalid request");
-      const result = await artifacts.openDownload(c.req.param("id"), query);
+      const result = await artifacts.openDownloadForTeam(c.req.param("id"), teamOf(c), query);
       if (!result.ok) {
         // R3 (决策 27): at THIS route only, a blob gone from disk under a live
         // manifest entry means the path's bytes are missing — the code-less
@@ -838,6 +904,18 @@ export function createServerApp(
         throw err;
       }
     });
+  }
+
+  // The auth surface (Batch 3 slice 2). Registered before the dashboard
+  // block; ordering vs the global hostGate is irrelevant (the gate is
+  // middleware, applied to every request regardless of route). These routes
+  // never read Host — the callback URL is config-frozen (ADR-011 决策 5).
+  if (auth !== undefined) {
+    app.get("/login", auth.loginPage);
+    app.get("/auth/github", auth.githubStart);
+    app.get("/auth/github/callback", auth.githubCallback);
+    app.post("/auth/logout", auth.formContentType, auth.bodyCap, auth.logout);
+    app.get("/api/session", auth.sessionApi);
   }
 
   // The Dashboard's two HTML routes. Registered last, but their gate is the

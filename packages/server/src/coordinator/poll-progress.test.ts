@@ -21,6 +21,7 @@ import {
   FakeClock,
   seedLease,
   seedLoop,
+  seedClaimedMachineForToken,
   seedMachineForToken,
   seedRun,
   snapshotRuns,
@@ -46,7 +47,7 @@ async function fresh(): Promise<void> {
   handles.push(h);
   db = h.db;
   clock = new FakeClock();
-  machineId = await seedMachineForToken(db, TOKEN);
+  machineId = await seedClaimedMachineForToken(db, TOKEN);
   await seedLoop(db, { id: "loop-1" });
   coordinator = createRunCoordinator(testDeps(db, clock));
 }

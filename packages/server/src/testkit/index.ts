@@ -6,22 +6,34 @@
  * factories with predictable sequences, and tiny row-seeding helpers so each
  * test states its fixture in one line.
  */
-import { asc } from "drizzle-orm";
+import { asc, eq } from "drizzle-orm";
 
 import { machineIdFromToken, sha256 } from "@loopzhb/protocol/node";
 
+import { createSessionService } from "../auth/session.js";
 import type { RunCoordinatorDependencies } from "../coordinator/index.js";
+import type { AuthConfig } from "../config.js";
+import { createManagementAccess, type ManagementAccess } from "../management/access.js";
 import type { Db } from "../db/index.js";
 import {
+  artifactBlobs,
+  artifactManifests,
+  artifactSyncSessions,
+  authSessions,
   loops,
   machines,
+  memberships,
   runLeases,
   runs,
+  teams,
+  users,
   type Loop,
   type NewLoop,
   type NewMachine,
   type NewRun,
   type NewRunLease,
+  type NewTeam,
+  type NewUser,
   type Run,
   type RunLeaseRow,
 } from "../db/schema.js";
@@ -117,12 +129,24 @@ export function testDeps(
   return { db, clock, ...makeTestFactories(), ...overrides };
 }
 
-export async function seedMachine(db: Db, id: string, tokenHash = `hash-${id}`): Promise<void> {
-  await db.insert(machines).values({ id, name: "", tokenHash, createdAt: "2026-07-01T00:00:00.000Z" });
+/** Seed a machine by ID. `overrides` carries anything the fixture needs to
+ *  state explicitly — `teamId` for a claimed machine, `revokedAt` for a
+ *  revoked one; the omitted fields stay at their neutral values (teamId null =
+ *  UNCLAIMED). */
+export async function seedMachine(db: Db, id: string, overrides: Partial<NewMachine> = {}): Promise<void> {
+  await db.insert(machines).values({
+    id,
+    name: "",
+    tokenHash: `hash-${id}`,
+    createdAt: "2026-07-01T00:00:00.000Z",
+    ...overrides,
+  });
 }
 
-/** Seed the machine a given device token would self-register as (derived id +
- *  full hash — exactly what a first poll would have created). Returns the id. */
+/** Seed a machine row at the id a device token derives to — the row's id and
+ *  full token hash are exactly what the credential gate compares against.
+ *  `teamId` defaults to NULL: the row is UNCLAIMED, which the poll gate
+ *  rejects (PG5). Use `seedClaimedMachineForToken` for an eligible machine. */
 export async function seedMachineForToken(
   db: Db,
   token: string,
@@ -136,6 +160,47 @@ export async function seedMachineForToken(
     createdAt: "2026-07-01T00:00:00.000Z",
     ...overrides,
   });
+  return id;
+}
+
+/** The standard Team fixture id — same `t-<hex16>` shape ADR-011 决策 2 mints,
+ *  and legal under the BlobStore's NAMESPACE_ID_RE. */
+export const TEST_TEAM_ID = "t-0123456789abcdef";
+
+/** Seed a machine row BY ID as claimed by the standard test team and not
+ *  revoked — the execution-eligible fixture for tests that know only a
+ *  machine id (loops, artifact reads, the scheduler). Token-based callers use
+ *  `seedClaimedMachine` instead. */
+export async function seedClaimedMachineById(db: Db, id: string): Promise<void> {
+  await seedMachine(db, id, { teamId: TEST_TEAM_ID });
+}
+
+/**
+ * Seed a machine for a device token as CLAIMED and NOT REVOKED — the
+ * execution-eligible fixture (Phase 5 Batch 3 slice 3, ADR-011).
+ *
+ * Slice 3 removed production self-registration, so every test that polls must
+ * state its machine explicitly. `seedMachineForToken` alone produces an
+ * UNCLAIMED row (teamId NULL), which the poll gate now rejects with the
+ * unified 401 — that is the PG5 fixture. This helper is the PG6 one.
+ */
+export async function seedClaimedMachineForToken(
+  db: Db,
+  token: string,
+  overrides: Partial<NewMachine> = {},
+): Promise<string> {
+  return seedMachineForToken(db, token, { teamId: TEST_TEAM_ID, ...overrides });
+}
+
+/**
+ * Idempotent variant for REBOOT scenarios: a second boot of the same dataDir
+ * re-reads the persisted row instead of inserting a duplicate. Returns the
+ * machine id either way.
+ */
+export async function seedClaimedMachineIfAbsent(db: Db, token: string): Promise<string> {
+  const id = machineIdFromToken(token);
+  const existing = await db.select({ id: machines.id }).from(machines).where(eq(machines.id, id));
+  if (existing.length === 0) await seedClaimedMachineForToken(db, token);
   return id;
 }
 
@@ -191,4 +256,312 @@ export async function snapshotLeases(db: Db): Promise<RunLeaseRow[]> {
   return db.select().from(runLeases).orderBy(asc(runLeases.tokenHash));
 }
 
+/**
+ * EVERY business table, deterministically ordered — the zero-write oracle for
+ * the Phase 5 Batch 3 slice 3 refusal paths (Batch plan §1 验收: 对比拒绝前后
+ * Machine、Run、Lease 和 Artifact 状态，证明零业务写入).
+ *
+ * Pair it with a POPULATED fixture: an empty table trivially "stays equal",
+ * so a refusal test that seeds nothing proves almost nothing (review issue
+ * #123 — a mutation inserting a real Run row left the old oracle green).
+ */
+export async function snapshotBusinessState(db: Db) {
+  return {
+    machines: await db.select().from(machines).orderBy(asc(machines.id)),
+    loops: await db.select().from(loops).orderBy(asc(loops.id)),
+    runs: await db.select().from(runs).orderBy(asc(runs.id)),
+    runLeases: await snapshotLeases(db),
+    artifactSyncSessions: await db.select().from(artifactSyncSessions).orderBy(asc(artifactSyncSessions.id)),
+    artifactManifests: await db.select().from(artifactManifests).orderBy(asc(artifactManifests.id)),
+    artifactBlobs: await db
+      .select()
+      .from(artifactBlobs)
+      .orderBy(asc(artifactBlobs.namespaceId), asc(artifactBlobs.hash)),
+  };
+}
+
+/**
+ * The IDENTITY half of the zero-write oracle (Phase 5 Batch 3 slice 4): users,
+ * teams, memberships and auth_sessions. Compose it with
+ * `snapshotBusinessState` when a refusal must prove it touched NEITHER the
+ * business tables nor the identity tables — the offline claim reads both.
+ *
+ * Same rule as `snapshotBusinessState`: pair it with a POPULATED fixture.
+ */
+export async function snapshotIdentityState(db: Db) {
+  return {
+    users: await db.select().from(users).orderBy(asc(users.id)),
+    teams: await db.select().from(teams).orderBy(asc(teams.id)),
+    memberships: await db.select().from(memberships).orderBy(asc(memberships.userId), asc(memberships.teamId)),
+    authSessions: await db.select().from(authSessions).orderBy(asc(authSessions.credentialHash)),
+  };
+}
+
 export { staticAttribution } from "./artifact-attribution.js";
+// NOTE: `./claim-fixtures.js` is deliberately NOT re-exported here. It imports
+// this barrel, so re-exporting it would close a module cycle; the claim tests
+// import it directly instead.
+export {
+  artifactBlobPath,
+  makeArtifactBlob,
+  plantRawBlobFile,
+  seedArtifactBlob,
+  seedArtifactManifest,
+  seedArtifactSyncSession,
+  unlinkArtifactBlobFile,
+} from "./artifact-history.js";
+
+// ---- Phase 5 Batch 3 identity fixtures (ADR-011) ----
+//
+// Explicit row seeders for the identity model — there is deliberately NO
+// production self-registration path for any of these (Slice 1 停止边界):
+// users/teams/memberships come from the slice-2 login transaction, machine
+// claiming from the slice-4 offline CLI. Tests state their identity fixture
+// in one line, the same way they state machines and loops.
+
+/** A valid AuthConfig for boots that must pass the ADR-011 决策 5 gate.
+ *  Loopback origin + fake GitHub credentials; override per test. */
+export function makeTestAuthConfig(overrides: Partial<AuthConfig> = {}): AuthConfig {
+  const origin = "http://127.0.0.1:3000";
+  return {
+    origin,
+    githubCallbackUrl: `${origin}/auth/github/callback`,
+    githubClientId: "test-gh-client-id",
+    githubClientSecret: "test-gh-client-secret",
+    ...overrides,
+  };
+}
+
+/** Seed a User (GitHub numeric id as decimal string). Returns the id. */
+export async function seedUser(db: Db, values: Partial<NewUser> = {}): Promise<string> {
+  const id = values.id ?? "424242";
+  await db.insert(users).values({
+    id,
+    username: "tester",
+    createdAt: "2026-07-01T00:00:00.000Z",
+    updatedAt: "2026-07-01T00:00:00.000Z",
+    ...values,
+  });
+  return id;
+}
+
+/** Seed a Team. The default id derives deterministically from the owner
+ *  (`t-<sha256("team:"+githubUserId)[:16]>` — the ADR-011 决策 2 minting
+ *  rule, so fixtures exercise the same shape production will). */
+export async function seedTeam(db: Db, values: Partial<NewTeam> & { ownerUserId: string }): Promise<string> {
+  const id = values.id ?? `t-${sha256(`team:${values.ownerUserId}`).slice(0, 16)}`;
+  await db.insert(teams).values({
+    id,
+    name: `team-${values.ownerUserId}`,
+    createdAt: "2026-07-01T00:00:00.000Z",
+    updatedAt: "2026-07-01T00:00:00.000Z",
+    ...values,
+  });
+  return id;
+}
+
+export async function seedMembership(
+  db: Db,
+  values: { userId: string; teamId: string; role?: "owner"; createdAt?: string },
+): Promise<void> {
+  await db.insert(memberships).values({
+    role: "owner",
+    createdAt: "2026-07-01T00:00:00.000Z",
+    ...values,
+  });
+}
+
+/** Seed the full first-login product in one call: User + personal Team +
+ *  owner Membership. The PG/MG/SE access-matrix fixture. */
+export async function seedPersonalIdentity(
+  db: Db,
+  opts: { githubUserId?: string; username?: string } = {},
+): Promise<{ userId: string; teamId: string }> {
+  const userId = await seedUser(db, { id: opts.githubUserId ?? "424242", username: opts.username ?? "tester" });
+  const teamId = await seedTeam(db, { ownerUserId: userId, name: opts.username ?? "tester" });
+  await seedMembership(db, { userId, teamId });
+  return { userId, teamId };
+}
+
+let sessionSeq = 0;
+
+/** Seed a Login Session row (ADR-011 决策 4: hash-only, absolute 7-day
+ *  lifetime). Returns BOTH the plaintext credential (for Cookie headers) and
+ *  its persisted hash. Default expiry pins the absolute-lifetime semantics:
+ *  FIXTURE_T0 + 7 days, computed — never sliding. */
+export async function seedSession(
+  db: Db,
+  values: { userId: string; credential?: string; credentialHash?: string; createdAt?: string; expiresAt?: string },
+): Promise<{ credential: string; credentialHash: string }> {
+  const credential = values.credential ?? `sk_test_${++sessionSeq}`;
+  const credentialHash = values.credentialHash ?? sha256(credential);
+  await db.insert(authSessions).values({
+    credentialHash,
+    userId: values.userId,
+    createdAt: values.createdAt ?? FIXTURE_T0.toISOString(),
+    expiresAt: values.expiresAt ?? new Date(FIXTURE_T0.getTime() + 7 * 24 * 3600 * 1000).toISOString(),
+  });
+  return { credential, credentialHash };
+}
+
+/** Seed a CLAIMED machine: the machine a given device token owns, already
+ *  bound to a team (the slice-4 claim's product). A machine seeded WITHOUT
+ *  teamId (plain `seedMachineForToken`) is the Unclaimed Machine fixture. */
+export async function seedClaimedMachine(
+  db: Db,
+  token: string,
+  teamId: string,
+  overrides: Partial<NewMachine> = {},
+): Promise<string> {
+  return seedMachineForToken(db, token, { teamId, ...overrides });
+}
+
+// ---- Slice 5: management-session fixtures (ADR-011 决策 23) ----
+
+/**
+ * The full management fixture in one call: User + personal Team + owner
+ * Membership + a live Login Session — the state a browser reaches only through
+ * the GitHub login flow, stated explicitly for tests.
+ *
+ * The expiry is computed from the SAME clock the app under test uses. This is
+ * load-bearing: `seedSession`'s default expiry is FIXTURE_T0 + 7d, so a boot
+ * test whose FakeClock sits in August would otherwise mint an already-expired
+ * credential.
+ *
+ * `teamId` defaults to `TEST_TEAM_ID` so `seedClaimedMachineById` machines are
+ * visible to this session without a second argument.
+ */
+export async function seedManagementSession(
+  db: Db,
+  opts: {
+    clock?: Clock;
+    teamId?: string;
+    githubUserId?: string;
+    username?: string;
+    credential?: string;
+    expiresAt?: string;
+  } = {},
+): Promise<{ credential: string; userId: string; teamId: string }> {
+  const teamId = opts.teamId ?? TEST_TEAM_ID;
+  const userId = opts.githubUserId ?? "424242";
+  // Idempotent on purpose: a REBOOT fixture re-runs its boot on the same
+  // dataDir, and must re-attach to the persisted identity rather than collide
+  // on the primary keys.
+  const userRow = (await db.select({ id: users.id }).from(users).where(eq(users.id, userId)).limit(1))[0];
+  if (userRow === undefined) {
+    await seedUser(db, { id: userId, username: opts.username ?? "tester" });
+    await seedTeam(db, { id: teamId, ownerUserId: userId, name: opts.username ?? "tester" });
+    await seedMembership(db, { userId, teamId });
+  }
+  // Derived from the user id so an A/B world can seed two sessions in one DB
+  // without a collision, and so a reboot can recompute the same credential.
+  const credential = opts.credential ?? `sk_management_${userId}`;
+  const credentialHash = sha256(credential);
+  const sessionRow = (
+    await db.select({ credentialHash: authSessions.credentialHash }).from(authSessions).where(eq(authSessions.credentialHash, credentialHash)).limit(1)
+  )[0];
+  if (sessionRow === undefined) {
+    const now = (opts.clock ?? new FakeClock()).now();
+    await seedSession(db, {
+      userId,
+      credential,
+      credentialHash,
+      createdAt: now.toISOString(),
+      expiresAt: opts.expiresAt ?? new Date(now.getTime() + 7 * 24 * 3600 * 1000).toISOString(),
+    });
+  }
+  return { credential, userId, teamId };
+}
+
+/** The gate the production assembly uses, built over the test's own db/clock. */
+export function createTestManagementAccess(db: Db, clock: Clock): ManagementAccess {
+  return createManagementAccess({ db, sessions: createSessionService({ db, clock }) });
+}
+
+/**
+ * A PASS-THROUGH gate for assemblies that replace every dependency with a
+ * double (the HTTP taxonomy pin, the Dashboard route tests). It is NOT a
+ * security fixture — tests that assert the gate must use
+ * `createTestManagementAccess` with a real Session. Naming it "permissive"
+ * keeps the intent greppable.
+ */
+export function permissiveManagementAccess(teamId: string = TEST_TEAM_ID): ManagementAccess {
+  return {
+    sessionGate: async (_c, next) => next(),
+    loopGate: async (_c, next) => next(),
+    runGate: async (_c, next) => next(),
+    teamIdOf: () => teamId,
+  };
+}
+
+/**
+ * Wrap a Hono app so that management requests carry a Session cookie WITHOUT
+ * touching each call site. A caller that sets its own `cookie` header wins
+ * (negative fixtures and OAuth tests must not be silently authenticated).
+ * Other app members are forwarded unchanged.
+ *
+ * The baseline for "does the caller already carry a cookie" depends on the
+ * call shape. When `init.headers` is given it REPLACES everything (Hono does
+ * `new Request(input, init)` and the fetch spec overwrites the input's header
+ * list wholesale), so init is the only truth — that is Hono's own override
+ * semantics and the helper preserves them. But when `init.headers` is ABSENT
+ * and the input is a `Request`, the input's headers survive unless we supply
+ * a `headers` member — so the baseline must be read FROM the Request. Building
+ * an empty `Headers` there would strip an explicit cookie (and every other
+ * header) and silently re-authenticate a negative fixture with the injected
+ * session.
+ */
+export function withManagementSession<T extends object>(app: T, credential: string): T {
+  return new Proxy(app, {
+    get(target, prop, receiver) {
+      if (prop === "request") {
+        return (input: unknown, init?: { headers?: Headers | Record<string, string> } & Record<string, unknown>) => {
+          const headers =
+            init?.headers !== undefined
+              ? new Headers(init.headers as ConstructorParameters<typeof Headers>[0])
+              : input instanceof Request
+                ? new Headers(input.headers)
+                : new Headers();
+          if (!headers.has("cookie")) headers.set("cookie", `loopzhb_session=${credential}`);
+          return (target as { request(input: unknown, init?: unknown): Promise<Response> }).request(input, {
+            ...init,
+            headers,
+          });
+        };
+      }
+      return Reflect.get(target, prop, receiver);
+    },
+  });
+}
+
+// ---- Slice 2: Set-Cookie assertion helper ----
+
+export interface ParsedSetCookie {
+  name: string;
+  value: string;
+  /** Attribute keys lowercased; flag attributes (HttpOnly, Secure) are true. */
+  attrs: Record<string, string | true>;
+}
+
+/** Parse ALL Set-Cookie headers of a response (a 303 can carry both a session
+ *  cookie and a tx-cookie clear). Uses `headers.getSetCookie()` — never
+ *  `get()`, which would smash the values together. */
+export function parseSetCookies(res: Response): ParsedSetCookie[] {
+  return res.headers.getSetCookie().map((line) => {
+    const [nameValue, ...attrParts] = line.split(";");
+    const eq = nameValue!.indexOf("=");
+    const attrs: Record<string, string | true> = {};
+    for (const part of attrParts) {
+      const trimmed = part.trim();
+      const i = trimmed.indexOf("=");
+      if (i === -1) attrs[trimmed.toLowerCase()] = true;
+      else attrs[trimmed.slice(0, i).trim().toLowerCase()] = trimmed.slice(i + 1).trim();
+    }
+    return { name: nameValue!.slice(0, eq), value: nameValue!.slice(eq + 1), attrs };
+  });
+}
+
+/** The value of one named Set-Cookie, or undefined when absent. */
+export function setCookieValue(res: Response, name: string): string | undefined {
+  return parseSetCookies(res).find((c) => c.name === name)?.value;
+}

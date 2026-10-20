@@ -1,7 +1,8 @@
 /**
- * The Dashboard's CSRF primitive (Batch 3 plan §2 切片二): ONE token per
- * server bootstrap, held only in that instance's memory, submitted as a hidden
- * form field and verified BEFORE the coordinator is ever called.
+ * The Dashboard's CSRF primitives (Batch 3 plan §2 切片二; session-derived
+ * since slice 6). The expected token now comes from the Login Session
+ * (`sha256(credential + ":csrf")`, ADR-011 决策 11/31), is submitted as a
+ * hidden form field and verified BEFORE the coordinator is ever called.
  *
  * Why not `c.req.parseBody()`: it collapses repeated keys (last one wins), so
  * a body carrying the token twice is indistinguishable from one carrying it
@@ -12,13 +13,7 @@
  * The token never reaches a URL, a log line or an error body; only the
  * rendered form carries it, on a response marked `Cache-Control: no-store`.
  */
-import { randomBytes, timingSafeEqual } from "node:crypto";
-
-/** 32 bytes of CSPRNG, base64url so the value is attribute- and
- *  query-safe without escaping. */
-export function mintCsrfToken(): string {
-  return randomBytes(32).toString("base64url");
-}
+import { timingSafeEqual } from "node:crypto";
 
 /** The single form field the Dashboard's own form submits. */
 export const CSRF_FIELD = "csrf";
@@ -81,6 +76,33 @@ export function checkCsrfFormFields(
 }
 
 /**
+ * Extract the submitted token from a body that carries ONLY the CSRF field —
+ * the token-only form's extraction half, WITHOUT the comparison, so the
+ * session-level CSRF check (slice 2: constant-time compare of the submitted
+ * token against the token DERIVED from the session credential) can share the
+ * frozen well-formedness/duplicate rules instead of re-deriving them. Verdict
+ * order is the frozen contract: `bad_form` (a stray field means this is not
+ * the form we rendered) is judged before ANY token verdict.
+ *
+ * `checkCsrfForm` is exactly this extraction plus the constant-time compare;
+ * `checkCsrfFormFields` keeps its own whitelist two-pass (its pass-1 stray
+ * rule is `!allowedFields.includes(key)`), untouched by this extraction.
+ */
+export function extractSoleCsrfToken(
+  body: string,
+): { ok: true; token: string } | { ok: false; verdict: "bad_form" | "token_missing" | "token_duplicate" } {
+  if (!isWellFormedFormBody(body)) return { ok: false, verdict: "bad_form" };
+  const params = new URLSearchParams(body);
+  for (const key of new Set(params.keys())) {
+    if (key !== CSRF_FIELD) return { ok: false, verdict: "bad_form" };
+  }
+  const submitted = params.getAll(CSRF_FIELD);
+  if (submitted.length === 0) return { ok: false, verdict: "token_missing" };
+  if (submitted.length > 1) return { ok: false, verdict: "token_duplicate" };
+  return { ok: true, token: submitted[0]! };
+}
+
+/**
  * Pure verdict for an `application/x-www-form-urlencoded` body carrying ONLY
  * the CSRF token (the run form's frozen contract).
  *
@@ -98,11 +120,9 @@ export function checkCsrfFormFields(
  * renders contains no escapes at all.
  */
 export function checkCsrfForm(body: string, expected: string): CsrfVerdict {
-  const verdict = checkCsrfFormFields(body, expected, []);
-  if (verdict.ok) return "ok";
-  // `field_duplicate` is unreachable with an empty whitelist (no whitelisted
-  // field exists to repeat) — the cast narrows the type, not the runtime.
-  return verdict.verdict as Exclude<CsrfVerdict, "ok">;
+  const extracted = extractSoleCsrfToken(body);
+  if (!extracted.ok) return extracted.verdict;
+  return tokensEqual(extracted.token, expected) ? "ok" : "token_mismatch";
 }
 
 function isWellFormedFormBody(body: string): boolean {

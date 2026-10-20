@@ -21,7 +21,7 @@ import type { RunProgress, RunRole } from "@loopzhb/protocol";
 import type { Db } from "../db/index.js";
 import { loops, runLeases, runs, type Loop, type Run, type RunProgressRow } from "../db/schema.js";
 import { isOccurrence, isValidPersistedScheduleState, parseRfc3339Ms } from "../schedule/time-semantics.js";
-import { isHeartbeatWatermarkAnomalous } from "./machines.js";
+import { isHeartbeatWatermarkAnomalous, isMachineExecutionEligible } from "./machines.js";
 import { withGuardRetry } from "./guard-retry.js";
 import type { Clock } from "../time.js";
 import type { ExecTrigger, PendingPolicy } from "../coordinator/index.js";
@@ -65,6 +65,10 @@ export type EnqueueExecRunResult =
          *  HTTP (and app.ts's fallback would collapse it to `running_exists`
          *  if it ever were). */
         | "pending_exists"
+        /** Phase 5 Batch 3 slice 3 (ADR-011): the loop's machine is not
+         *  execution-eligible — missing (orphan), unclaimed (`teamId` NULL) or
+         *  revoked. Refused BEFORE any write. */
+        | "machine_ineligible"
         | "stale_revision"
         | "not_active"
         | "not_an_occurrence"
@@ -145,6 +149,10 @@ export async function getRun(db: Db, runId: string): Promise<Run | undefined> {
  * Then an existing pending run of ANY role is a zero-write `pending_exists` —
  * probed BEFORE the revision CAS, so a skip touches neither Run nor Loop, and
  * the supersede block is bypassed entirely. Scheduled triggers are always T7.
+ *
+ * Phase 5 Batch 3 slice 3 (ADR-011): the immutable execution-eligibility gate
+ * above the trigger branch — a loop whose machine is orphan, unclaimed or
+ * revoked is refused with zero writes before the transaction opens.
  */
 export async function enqueueExecRunTx(
   deps: RunStoreDeps,
@@ -156,6 +164,25 @@ export async function enqueueExecRunTx(
       const { db, clock, newRunId } = deps;
       const currentLoop = await getLoop(db, loop.id);
       if (!currentLoop) return { enqueued: false as const, reason: "loop_not_found" as const };
+
+      // Execution-eligibility gate (Phase 5 Batch 3 slice 3, ADR-011): the
+      // loop's machine must EXIST, be CLAIMED by a team and NOT be revoked —
+      // the same predicate the scheduler's boundaries use. Refused here, at
+      // the ONE write entry point that creates Runs, and BEFORE the
+      // transaction opens: zero writes — no new Run, no supersede of the
+      // existing pendings, no revision bump, no watermark advance (Batch 3
+      // plan §1: 未认领机器的 Loop 不新增自动调度或手动入队；保留现有
+      // pending、历史 Run、配置和 schedule 游标).
+      //
+      // The read is outside the transaction on purpose: neither input can
+      // change while the server runs (this batch has NO online claim and NO
+      // online revoke — slice 4's CLI requires a stopped server), so the
+      // snapshot is authoritative and the fail-closed refusal never needs a
+      // retry.
+      if (!(await isMachineExecutionEligible(db, currentLoop.machineId))) {
+        return { enqueued: false as const, reason: "machine_ineligible" as const };
+      }
+
       await deps.hooks?.afterEnqueueLoopResolve?.(loop.id);
 
       let canonicalFor: string | undefined;

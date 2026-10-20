@@ -18,9 +18,18 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { eq } from "drizzle-orm";
 
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
-import { loops, runs } from "../db/schema.js";
+import { loops, machines, runs } from "../db/schema.js";
 import { updateSchedule } from "../schedule/index.js";
-import { FakeClock, FakeCronFactory, seedMachine, seedLoop, snapshotRuns, testDeps } from "../testkit/index.js";
+import {
+  FakeClock,
+  FakeCronFactory,
+  seedClaimedMachineById,
+  seedLoop,
+  seedMachine,
+  snapshotRuns,
+  testDeps,
+  TEST_TEAM_ID,
+} from "../testkit/index.js";
 import { createRunCoordinator, type RunCoordinator } from "../coordinator/index.js";
 import { createScheduler, type Scheduler } from "./index.js";
 
@@ -33,6 +42,12 @@ afterEach(async () => {
 const OCCURRENCE_10AM = "2026-08-27T10:00:00.000Z";
 /** Activation strictly before the 10:00 occurrence (activation boundary). */
 const ACTIVATION_9AM = "2026-08-27T09:00:00.000Z";
+
+/** Drain the microtask AND 0ms-timer queues — the "a promise that COULD have
+ *  settled by now has settled" boundary for the interleaving assertions. */
+function settle(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
 
 describe("S-group: Scheduler registration and lifecycle", () => {
   let db: Db;
@@ -51,7 +66,7 @@ describe("S-group: Scheduler registration and lifecycle", () => {
     machineId = "m-test123456789a";
     logs = [];
 
-    await seedMachine(db, machineId);
+    await seedClaimedMachineById(db, machineId);
 
     coordinator = createRunCoordinator(testDeps(db, clock));
     cronFactory = new FakeCronFactory();
@@ -628,5 +643,235 @@ describe("S-group: Scheduler registration and lifecycle", () => {
       expect(loop!.lastScheduledAt).toBeNull();
       expect(logs).toEqual(["scheduler: enqueue_skipped loop=loop-1 reason=stale_revision"]);
     });
+  });
+});
+
+/**
+ * Phase 5 Batch 3 slice 3 (ADR-011): execution-eligibility boundaries.
+ *
+ * The scheduler treats a machine as execution-eligible only when it exists,
+ * is CLAIMED by a team (`teamId` non-null) and is NOT revoked. An unclaimed
+ * or revoked machine's loops must not schedule, catch up, or add Runs.
+ */
+describe("scheduler eligibility (Phase 5 Batch 3 slice 3)", () => {
+  let db: Db;
+  let clock: FakeClock;
+  let cronFactory: FakeCronFactory;
+  let logs: string[];
+
+  const CLAIMED = TEST_TEAM_ID;
+
+  beforeEach(async () => {
+    const h = await openMigratedDb();
+    handles.push(h);
+    db = h.db;
+    clock = new FakeClock(new Date("2026-08-27T12:30:00.000Z"));
+    cronFactory = new FakeCronFactory();
+    logs = [];
+  });
+
+  function makeScheduler(): Scheduler {
+    return createScheduler({
+      db,
+      coordinator: createRunCoordinator(testDeps(db, clock)),
+      clock,
+      cronFactory,
+      log: (line) => logs.push(line),
+    });
+  }
+
+  async function seedScheduledLoop(id: string, machineId: string): Promise<void> {
+    await seedLoop(db, {
+      id,
+      machineId,
+      cron: "0 10 * * *",
+      timezone: "UTC",
+      enabled: true,
+      scheduleRevision: 0,
+      // Down across the 10:00 tick (now 12:30) — an ELIGIBLE loop WOULD
+      // catch up, so a silent catch-up here proves the exclusion.
+      scheduleActivatedAt: "2026-08-27T09:00:00.000Z",
+    });
+  }
+
+  test("PE1: an UNCLAIMED machine's loop gets no job and no catch-up", async () => {
+    const machineId = "m-unclaimed000000";
+    await seedMachine(db, machineId); // teamId NULL — unclaimed
+    await seedScheduledLoop("loop-1", machineId);
+
+    const scheduler = makeScheduler();
+    await scheduler.start();
+
+    expect(cronFactory.activeCount()).toBe(0);
+    expect(await snapshotRuns(db)).toEqual([]);
+  });
+
+  test("PE2: a REVOKED machine's loop gets no job and no catch-up", async () => {
+    const machineId = "m-revoked0000000";
+    await db.insert(machines).values({
+      id: machineId,
+      name: "",
+      tokenHash: "hash-revoked",
+      teamId: CLAIMED,
+      revokedAt: "2026-08-27T09:00:00.000Z",
+      createdAt: "2026-07-01T00:00:00.000Z",
+    });
+    await seedScheduledLoop("loop-1", machineId);
+
+    const scheduler = makeScheduler();
+    await scheduler.start();
+
+    expect(cronFactory.activeCount()).toBe(0);
+    expect(await snapshotRuns(db)).toEqual([]);
+  });
+
+  test("PE3: a CLAIMED, non-revoked machine's loop registers and catches up (the control)", async () => {
+    const machineId = "m-eligible0000000";
+    await seedClaimedMachineById(db, machineId);
+    await seedScheduledLoop("loop-1", machineId);
+
+    const scheduler = makeScheduler();
+    await scheduler.start();
+
+    expect(cronFactory.activeCount()).toBe(1);
+    // The downtime's 10:00 occurrence was recovered — the exclusion in PE1/PE2
+    // is what suppressed it there, not a missing occurrence.
+    const runs = await snapshotRuns(db);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({ loopId: "loop-1", phase: "pending" });
+  });
+
+  test("PE4: a loop whose machine row does not exist is excluded (no FK, so this is reachable)", async () => {
+    await seedScheduledLoop("loop-1", "m-doesnotexist00");
+
+    const scheduler = makeScheduler();
+    await scheduler.start();
+
+    expect(cronFactory.activeCount()).toBe(0);
+    expect(await snapshotRuns(db)).toEqual([]);
+  });
+
+  test("PE5: an eligible loop that turns ineligible mid-flight has its TICK refused — no run, no cursor advance", async () => {
+    const machineId = "m-eligibleflip000";
+    await seedClaimedMachineById(db, machineId);
+    await seedScheduledLoop("loop-1", machineId);
+
+    const scheduler = makeScheduler();
+    await scheduler.start();
+    const runsAfterCatchup = await snapshotRuns(db);
+    expect(runsAfterCatchup).toHaveLength(1);
+
+    // The machine is revoked AFTER registration (no online revoke exists in
+    // this slice — slice 4's CLI must run with the server stopped — so this
+    // models a restart-interleaved or out-of-band revocation).
+    await db.update(machines).set({ revokedAt: clock.iso() }).where(eq(machines.id, machineId));
+
+    // The cron tick fires against the now-ineligible machine.
+    const before = await db.select().from(loops).where(eq(loops.id, "loop-1"));
+    await cronFactory.triggerAll();
+
+    expect(logs).toContain("scheduler: machine_ineligible loop=loop-1");
+    expect(await snapshotRuns(db)).toHaveLength(1); // NO new run
+    const after = await db.select().from(loops).where(eq(loops.id, "loop-1"));
+    expect(after[0]!.lastScheduledAt).toBe(before[0]!.lastScheduledAt); // cursor did not advance
+  });
+
+  /**
+   * Issue #121: the eligibility read is an AWAIT inside the tick, so the tick
+   * must be in the drain set from its very first synchronous moment. These two
+   * tests park the read on an injected barrier (the `isMachineEligible`
+   * TEST-ONLY seam — production always uses the store predicate) and prove the
+   * contract that the read alone used to break:
+   *   - stopAndDrain() does NOT return while the read is in flight;
+   *   - once released after a stop, the tick enqueues NOTHING (no run, no
+   *     cursor advance, no DB write into a closing database);
+   *   - a failing read is isolated (fixed `croner_error` classification stays
+   *     Croner's) and still settles the drain.
+   */
+  test("PD1: stopAndDrain waits for a tick parked on its eligibility read and the tick then enqueues nothing", async () => {
+    const machineId = "m-eligiblepark000";
+    await seedClaimedMachineById(db, machineId);
+    await seedScheduledLoop("loop-1", machineId);
+
+    let releaseRead: (() => void) | undefined;
+    let readStarted: (() => void) | undefined;
+    const readGate = new Promise<void>((resolve) => {
+      releaseRead = resolve;
+    });
+    const readEntered = new Promise<void>((resolve) => {
+      readStarted = resolve;
+    });
+    const scheduler = createScheduler({
+      db,
+      coordinator: createRunCoordinator(testDeps(db, clock)),
+      clock,
+      cronFactory,
+      log: (line) => logs.push(line),
+      isMachineEligible: async () => {
+        readStarted!();
+        await readGate;
+        return true; // the machine IS eligible — only the stop decides
+      },
+    });
+    await scheduler.start();
+
+    // The 10:00 occurrence was already recovered by the catch-up.
+    expect(await snapshotRuns(db)).toHaveLength(1);
+    const before = await db.select().from(loops).where(eq(loops.id, "loop-1"));
+
+    // Move past the NEXT occurrence (the next day's 10:00), so the parked
+    // tick — were it to run its enqueue after the stop — would add a run
+    // rather than being benignly skipped as `already_scheduled`. The run count
+    // below is therefore a real oracle for "no write after stop".
+    clock.advance(24 * 60 * 60 * 1000);
+
+    const [tick] = cronFactory.fireAll();
+    await readEntered; // the tick is parked INSIDE the eligibility read
+
+    let drained = false;
+    const drain = scheduler.stopAndDrain().then(() => {
+      drained = true;
+    });
+    await settle();
+    expect(drained).toBe(false); // the drain did NOT return early
+
+    releaseRead!();
+    await drain;
+    await tick;
+
+    expect(drained).toBe(true);
+    expect(await snapshotRuns(db)).toHaveLength(1); // NO run after the stop
+    const after = await db.select().from(loops).where(eq(loops.id, "loop-1"));
+    expect(after[0]!.lastScheduledAt).toBe(before[0]!.lastScheduledAt);
+    expect(after[0]!.revision).toBe(before[0]!.revision);
+    expect(logs).toEqual([]); // no enqueue path was even attempted
+  });
+
+  test("PD2: a failing eligibility read is isolated and still settles the drain", async () => {
+    const machineId = "m-eligiblefail000";
+    await seedClaimedMachineById(db, machineId);
+    await seedScheduledLoop("loop-1", machineId);
+
+    const scheduler = createScheduler({
+      db,
+      coordinator: createRunCoordinator(testDeps(db, clock)),
+      clock,
+      cronFactory,
+      log: (line) => logs.push(line),
+      isMachineEligible: async () => {
+        throw new Error("eligibility read failed (detail never logged)");
+      },
+    });
+    await scheduler.start();
+    expect(await snapshotRuns(db)).toHaveLength(1); // catch-up run only
+
+    const [tick] = cronFactory.fireAll();
+    // The rejection reaches Croner's `catch` in production (fixed
+    // `croner_error` line) — it is not swallowed by the drain set.
+    await expect(tick).rejects.toThrow("eligibility read failed");
+
+    await scheduler.stopAndDrain(); // settles: nothing is left in flight
+    expect(await snapshotRuns(db)).toHaveLength(1);
+    expect(logs).toEqual([]);
   });
 });

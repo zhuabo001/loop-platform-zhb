@@ -94,6 +94,10 @@ describe("round-trips", () => {
       roots: ["/Users/x/work", "/Users/x/play"],
       lastSeen: "2026-07-27T01:00:00.000Z",
       capabilities: null,
+      // Phase 5 Batch 3 (ADR-011): omitted team/revocation columns land on
+      // null — an Unclaimed Machine (the migration never auto-claims).
+      teamId: null,
+      revokedAt: null,
       createdAt: "2026-07-27T00:00:00.000Z",
     };
     await db.insert(machines).values(row);

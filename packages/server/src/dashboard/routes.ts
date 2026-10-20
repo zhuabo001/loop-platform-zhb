@@ -12,9 +12,10 @@
  *    rejects any request whose effective host is not loopback, and the caller
  *    registers it GLOBALLY (a dashboard-only gate would leave `/api/loops`
  *    readable and its ids usable for a blind trigger).
- *  - CSRF: a cross-origin form POST carries no token; the token is minted per
- *    bootstrap, never leaves this instance's memory, and is verified before
- *    the coordinator is called.
+ *  - CSRF: a cross-origin form POST carries no token; since slice 6 the token
+ *    is DERIVED from the presented Login Session (never stored) and verified
+ *    before the coordinator is called. The Session gate itself is registered
+ *    by the caller (see access.ts), before these handlers.
  *  - Response headers: no-store (the page holds a token), no-referrer (the URL
  *    carries loop ids), nosniff, and a CSP whose only allowance is the hash of
  *    the one inline stylesheet.
@@ -24,8 +25,6 @@
  * middleware returns a bare `new Response(...)` (verified on 4.12.32; that is
  * exactly the path `bodyLimit`'s onError takes).
  */
-import { createHash } from "node:crypto";
-
 import type { Context, Handler, MiddlewareHandler } from "hono";
 import { bodyLimit } from "hono/body-limit";
 
@@ -33,10 +32,12 @@ import type { ArtifactReadFailure } from "../artifact/error-mapping.js";
 import type { EnqueueExecRunResult } from "../store/runs.js";
 import { isLoopbackHost } from "../config.js";
 import { jsonError } from "../http/json-error.js";
-import { checkCsrfForm, checkCsrfFormFields } from "./csrf.js";
+import { checkCsrfFormFields } from "./csrf.js";
+import { checkSessionCsrfForm } from "../auth/session-csrf.js";
+import type { DashboardAccess } from "./access.js";
 import type { DashboardArtifactRead, DashboardRead } from "./index.js";
+import { dashboardJson, securityHeaders } from "./security.js";
 import {
-  DASHBOARD_CSS,
   renderArtifactDiffPage,
   renderDashboardErrorPage,
   renderDashboardPage,
@@ -57,43 +58,9 @@ export const DASHBOARD_FORM_CAP_BYTES = 4096;
 
 const FORM_CONTENT_TYPE = "application/x-www-form-urlencoded";
 
-/** The CSP's only allowance: the SHA-256 of the one inline <style>, in
- *  standard base64 (NOT base64url), derived from the constant so the header
- *  and the stylesheet can never drift. */
-export function dashboardStyleHash(css: string = DASHBOARD_CSS): string {
-  return createHash("sha256").update(css).digest("base64");
-}
-
-export function dashboardCsp(css: string = DASHBOARD_CSS): string {
-  return [
-    "default-src 'none'",
-    "script-src 'none'",
-    `style-src 'sha256-${dashboardStyleHash(css)}'`,
-    "base-uri 'none'",
-    "frame-ancestors 'none'",
-    "form-action 'self'",
-  ].join("; ");
-}
-
-/** The security headers EVERY dashboard response carries (see the module
- *  header for why they are applied explicitly rather than prepared). */
-export function securityHeaders(extra: Record<string, string> = {}): Headers {
-  const headers = new Headers({
-    "cache-control": "no-store",
-    "referrer-policy": "no-referrer",
-    "x-content-type-options": "nosniff",
-    "content-security-policy": dashboardCsp(),
-  });
-  for (const [name, value] of Object.entries(extra)) headers.set(name, value);
-  return headers;
-}
-
-function dashboardJson(status: 400 | 403 | 413 | 415 | 500, error: string): Response {
-  return new Response(JSON.stringify({ error }), {
-    status,
-    headers: securityHeaders({ "content-type": "application/json" }),
-  });
-}
+// Re-exported so existing importers (`auth/routes.ts`, the page tests) keep one
+// stable path while the bodies live in `security.ts`.
+export { dashboardCsp, dashboardStyleHash, securityHeaders } from "./security.js";
 
 /**
  * The request's effective host must be loopback, from BOTH sources that can
@@ -150,8 +117,9 @@ export interface DashboardRouteDeps {
    *  argument. That also means a dropped policy is invisible to the type
    *  checker — `mount.test.ts` pins the assembled behaviour instead. */
   enqueue: (loopId: string) => Promise<EnqueueExecRunResult>;
-  /** Minted once per bootstrap; test-only injectable (see start.ts). */
-  csrfToken: string;
+  /** The Session and ownership gates (slice 6). The same object also answers
+   *  the session-derived CSRF token every form carries. */
+  access: DashboardAccess;
 }
 
 export interface DashboardRoutes {
@@ -160,6 +128,12 @@ export interface DashboardRoutes {
    *  host, or it is answered with the ordinary 404. Registering it late, or
    *  per-route, would leave a bypass. */
   hostGate: MiddlewareHandler;
+  /** The HTML Session gate, mounted on `/` and `/dashboard/*` (ADR-011 决策
+   *  29). Anonymous GET/HEAD → 303 `/login`; other methods → 401. */
+  pageGate: MiddlewareHandler;
+  /** The loop-ownership gate, mounted on `/dashboard/loops/:id` and its
+   *  children; cross-team/unclaimed/missing → the flat 404. */
+  loopGate: MiddlewareHandler;
   /** Rejects anything that is not an URL-encoded form (415). Sits before the
    *  body cap so the media type is judged before the body is read. */
   formContentType: MiddlewareHandler;
@@ -201,13 +175,21 @@ export function createDashboardRoutes(deps: DashboardRouteDeps): DashboardRoutes
     onError: () => dashboardJson(413, "request body too large"),
   });
 
-  const index: Handler = async () => {
+  const index: Handler = async (c) => {
     try {
-      const model = buildDashboardPageModel(await deps.read.snapshot());
-      return new Response(renderDashboardPage(model, { csrfToken: deps.csrfToken }), {
-        status: 200,
-        headers: securityHeaders({ "content-type": "text/html; charset=UTF-8" }),
-      });
+      const session = deps.access.sessionOf(c);
+      if (session === undefined) return dashboardJson(401, "not authenticated");
+      const model = buildDashboardPageModel(await deps.read.snapshot(session.teamId));
+      return new Response(
+        renderDashboardPage(model, {
+          csrfToken: session.csrfToken,
+          account: { username: session.username, teamName: session.teamName },
+        }),
+        {
+          status: 200,
+          headers: securityHeaders({ "content-type": "text/html; charset=UTF-8" }),
+        },
+      );
     } catch (err) {
       console.error("[dashboard] unhandled error", err);
       return dashboardJson(500, "internal server error");
@@ -216,7 +198,9 @@ export function createDashboardRoutes(deps: DashboardRouteDeps): DashboardRoutes
 
   const run: Handler = async (c) => {
     try {
-      const verdict = checkCsrfForm(await c.req.text(), deps.csrfToken);
+      const session = deps.access.sessionOf(c);
+      if (session === undefined) return dashboardJson(401, "not authenticated");
+      const verdict = checkSessionCsrfForm(await c.req.text(), session.csrfToken);
       switch (verdict) {
         case "bad_form":
           return dashboardJson(400, "invalid request");
@@ -255,7 +239,7 @@ export function createDashboardRoutes(deps: DashboardRouteDeps): DashboardRoutes
 
   /** The fixed-string page failure (404/403); storage errors stay JSON 500s.
    *  Existence never leaks: unknown/cross-scope are one 404 text. */
-  function artifactPageFailure(c: Context, failure: ArtifactReadFailure): Response {
+  function artifactPageFailure(failure: ArtifactReadFailure): Response {
     switch (failure) {
       case "loop_not_found":
       case "run_not_found":
@@ -281,21 +265,23 @@ export function createDashboardRoutes(deps: DashboardRouteDeps): DashboardRoutes
     artifacts &&
     (async (c) => {
       try {
+        const session = deps.access.sessionOf(c);
+        if (session === undefined) return dashboardJson(401, "not authenticated");
         const loopId = c.req.param("id") ?? "";
         // 决策 27's evaluation order holds for the page too (review #113):
         // the domain verdict comes FIRST, the bare snapshot-list read only
         // after it — a list-read fault must never mask attribution_missing
         // (403) into a 500. Sequential, not Promise.all.
-        const view = await artifacts.loopArtifacts(loopId);
-        if (!view.ok) return artifactPageFailure(c, view.failure);
-        const bound = await artifacts.boundSnapshots(loopId);
+        const view = await artifacts.loopArtifacts(session.teamId, loopId);
+        if (!view.ok) return artifactPageFailure(view.failure);
+        const bound = await artifacts.boundSnapshots(session.teamId, loopId);
         const model = buildLoopArtifactsPageModel({
           loopId,
           view: view.response,
           bound,
           configToken: c.req.query("config") ?? null,
         });
-        return new Response(renderLoopArtifactsPage(model, { csrfToken: deps.csrfToken }), {
+        return new Response(renderLoopArtifactsPage(model, { csrfToken: session.csrfToken }), {
           status: 200,
           headers: securityHeaders({ "content-type": "text/html; charset=UTF-8" }),
         });
@@ -309,6 +295,8 @@ export function createDashboardRoutes(deps: DashboardRouteDeps): DashboardRoutes
     artifacts &&
     (async (c) => {
       try {
+        const session = deps.access.sessionOf(c);
+        if (session === undefined) return dashboardJson(401, "not authenticated");
         // #111: the run page is NESTED under its parent loop — the parent path
         // rides the facade's IDENTITY step (no route-level DB side channel),
         // so a mismatched or nonexistent parent is the same 404 as a run that
@@ -316,8 +304,12 @@ export function createDashboardRoutes(deps: DashboardRouteDeps): DashboardRoutes
         // failure included — a 403 under a foreign parent would leak the
         // run's existence across scopes, 决策 13/27). The correct parent's
         // attribution_missing stays the 403 control.
-        const result = await artifacts.runArtifacts(c.req.param("id") ?? "", c.req.param("runId") ?? "");
-        if (!result.ok) return artifactPageFailure(c, result.failure);
+        const result = await artifacts.runArtifacts(
+          session.teamId,
+          c.req.param("id") ?? "",
+          c.req.param("runId") ?? "",
+        );
+        if (!result.ok) return artifactPageFailure(result.failure);
         return new Response(renderRunArtifactsPage(buildRunArtifactsPageModel({ response: result.response })), {
           status: 200,
           headers: securityHeaders({ "content-type": "text/html; charset=UTF-8" }),
@@ -332,6 +324,8 @@ export function createDashboardRoutes(deps: DashboardRouteDeps): DashboardRoutes
     artifacts &&
     (async (c) => {
       try {
+        const session = deps.access.sessionOf(c);
+        if (session === undefined) return dashboardJson(401, "not authenticated");
         const loopId = c.req.param("id") ?? "";
         // Same normalization as the JSON route: an empty baseline option
         // submits `from=`.
@@ -348,9 +342,9 @@ export function createDashboardRoutes(deps: DashboardRouteDeps): DashboardRoutes
         }
         // Same domain-first sequencing as the artifacts page (#113): the
         // diff verdict precedes the bare snapshot-list read.
-        const result = await artifacts.diff(loopId, { from, to });
-        if (!result.ok) return artifactPageFailure(c, result.failure);
-        const bound = await artifacts.boundSnapshots(loopId);
+        const result = await artifacts.diff(session.teamId, loopId, { from, to });
+        if (!result.ok) return artifactPageFailure(result.failure);
+        const bound = await artifacts.boundSnapshots(session.teamId, loopId);
         const model = buildArtifactDiffPageModel({
           loopId,
           response: result.response,
@@ -372,7 +366,9 @@ export function createDashboardRoutes(deps: DashboardRouteDeps): DashboardRoutes
     artifacts &&
     (async (c) => {
       try {
-        const verdict = checkCsrfFormFields(await c.req.text(), deps.csrfToken, [ARTIFACT_DIR_FIELD]);
+        const session = deps.access.sessionOf(c);
+        if (session === undefined) return dashboardJson(401, "not authenticated");
+        const verdict = checkCsrfFormFields(await c.req.text(), session.csrfToken, [ARTIFACT_DIR_FIELD]);
         if (!verdict.ok) {
           switch (verdict.verdict) {
             case "bad_form":
@@ -413,7 +409,19 @@ export function createDashboardRoutes(deps: DashboardRouteDeps): DashboardRoutes
       }
     });
 
-  return { hostGate, formContentType, bodyCap, index, run, loopArtifacts, runArtifacts, artifactDiff, artifactConfig };
+  return {
+    hostGate,
+    pageGate: deps.access.pageGate,
+    loopGate: deps.access.loopGate,
+    formContentType,
+    bodyCap,
+    index,
+    run,
+    loopArtifacts,
+    runArtifacts,
+    artifactDiff,
+    artifactConfig,
+  };
 }
 
 /** Re-exported so the composition root has ONE dashboard import for both the

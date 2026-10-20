@@ -1,12 +1,16 @@
 /**
- * Poll — machine credential + self-registration + heartbeat/identity (A-13).
+ * Poll — machine credential gate + heartbeat/identity (A-13, ADR-011 PG1–PG6).
  *
- * The poll endpoint is Phase 1's ONLY machine enrollment surface: a first
- * well-shaped `dk_` poll self-registers the machine (derived id + full token
- * hash), later polls verify BOTH the derived id and the full hash (64-bit
- * truncation collision defense, reference audit H-01). `lastSeen` is a
- * monotonic 10s persisted watermark — never a per-poll audit stamp — with the
- * identity snapshot merged into the same single UPDATE when it changes.
+ * Phase 5 Batch 3 slice 3: poll no longer self-registers machines. The five-
+ * step eligibility gate (shape → derived-id → full-hash → teamId claimed →
+ * revokedAt null) rejects unknown, unclaimed and revoked machines BEFORE any
+ * heartbeat write. All rejection reasons collapse to the same
+ * InvalidMachineCredentialError (unified 401, no signal leakage).
+ *
+ * Zero-write proofs: the machines/runs/leases snapshots before and after a
+ * rejected poll are equal. `lastSeen` is a monotonic 10s persisted watermark —
+ * never a per-poll audit stamp — with the identity snapshot merged into the
+ * same single UPDATE when it changes.
  */
 import { eq, sql } from "drizzle-orm";
 import { afterEach, describe, expect, it } from "vitest";
@@ -14,15 +18,27 @@ import { afterEach, describe, expect, it } from "vitest";
 import { machineIdFromToken, sha256, watchConfigDigest } from "@loopzhb/protocol/node";
 
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
-import { loops, machines, type Machine } from "../db/schema.js";
+import {
+  artifactBlobs,
+  artifactManifests,
+  artifactSyncSessions,
+  loops,
+  machines,
+  type Machine,
+} from "../db/schema.js";
 import { HEARTBEAT_SKEW_SLACK_MS, applyMachinePollContact } from "../store/machines.js";
 import {
   FakeClock,
+  seedClaimedMachineById,
+  seedClaimedMachineForToken,
+  seedLease,
   seedLoop,
   seedMachineForToken,
   seedRun,
+  snapshotBusinessState,
   snapshotLeases,
   snapshotRuns,
+  TEST_TEAM_ID,
   testDeps,
 } from "../testkit/index.js";
 import { createRunCoordinator, type RunCoordinator } from "./index.js";
@@ -52,6 +68,8 @@ async function getRow(id: string): Promise<Machine | undefined> {
 }
 
 describe("poll: machine credential", () => {
+  const TEAM_ID = TEST_TEAM_ID;
+
   it("rejects a malformed device token with zero machine writes", async () => {
     await fresh();
     for (const bad of ["", "rk_testcred_1", "dk_", "dk_ has spaces", "dk_x"]) {
@@ -77,80 +95,248 @@ describe("poll: machine credential", () => {
 
   it("accepts the enrolled token (derived id + full hash both verified)", async () => {
     await fresh();
-    await seedMachineForToken(db, TOKEN);
+    await seedMachineForToken(db, TOKEN, { teamId: TEAM_ID });
     await expect(coordinator.poll(TOKEN, {})).resolves.toEqual({ deliveries: [] });
   });
 });
 
-describe("poll: self-registration", () => {
-  it("creates the machine on first poll: derived id, full hash, identity snapshot, watermark", async () => {
-    await fresh();
-    const result = await coordinator.poll(TOKEN, {
-      host: "mbp.local",
-      platform: "darwin",
-      arch: "arm64",
-      version: "0.1.0",
+describe("poll: machine credential gate (PG1–PG6)", () => {
+  const CLAIMED_TOKEN = "dk_test_machine_claimed";
+  const TEAM_ID = TEST_TEAM_ID;
+
+  /**
+   * An UNRELATED machine with live work: a queued pending run carrying
+   * progress, its lease, and committed Artifact history (a committed sync
+   * session, its manifest and the verified blob metadata). Nothing here
+   * belongs to the credential under test — it exists so every refusal below
+   * is compared against a POPULATED database instead of a set of empty
+   * tables, where "zero writes" would be trivially true (review issue #123).
+   */
+  async function seedPopulatedWorld(): Promise<void> {
+    const other = "m-otherworld00000";
+    await seedClaimedMachineById(db, other);
+    await seedLoop(db, { id: "loop-other", machineId: other, artifactDir: "/data/out" });
+    await seedRun(db, {
+      id: "run-other",
+      loopId: "loop-other",
+      machineId: other,
+      progress: { step: 3, label: "building", at: clock.iso() },
     });
+    await seedLease(db, {
+      tokenHash: sha256("rk_other_lease"),
+      runId: "run-other",
+      loopId: "loop-other",
+      machineId: other,
+    });
+    await db.insert(artifactSyncSessions).values({
+      id: "sync-other",
+      namespaceId: TEAM_ID,
+      machineId: other,
+      loopId: "loop-other",
+      requestId: "req-other",
+      configRevision: 1,
+      baseManifestRevision: 0,
+      normalizedManifest: [{ path: "dist/a.js", hash: "a".repeat(64), size: 1 }],
+      payloadFingerprint: "f".repeat(64),
+      negotiatedHashes: ["a".repeat(64)],
+      createdAt: clock.iso(),
+      expiresAt: new Date(clock.now().getTime() + 3_600_000).toISOString(),
+      receipt: { artifactSnapshotId: "manifest-other", manifestRevision: 1 },
+    });
+    await db.insert(artifactManifests).values({
+      id: "manifest-other",
+      namespaceId: TEAM_ID,
+      machineId: other,
+      loopId: "loop-other",
+      configRevision: 1,
+      manifestRevision: 1,
+      entries: [{ path: "dist/a.js", hash: "a".repeat(64), size: 1 }],
+      fileCount: 1,
+      totalBytes: 1,
+      committedAt: clock.iso(),
+    });
+    await db.insert(artifactBlobs).values({
+      namespaceId: TEAM_ID,
+      hash: "a".repeat(64),
+      size: 1,
+      verifiedAt: clock.iso(),
+    });
+  }
+
+  it("PG1/PG2: rejects a malformed device token with zero business writes", async () => {
+    await fresh();
+    await seedPopulatedWorld();
+    const before = await snapshotBusinessState(db);
+    // The fixture is only worth comparing against when it is NOT empty.
+    expect(before.runs).toHaveLength(1);
+    expect(before.runLeases).toHaveLength(1);
+    expect(before.artifactManifests).toHaveLength(1);
+    for (const bad of ["", "rk_testcred_1", "dk_", "dk_ has spaces", "dk_x"]) {
+      await expect(coordinator.poll(bad, {})).rejects.toMatchObject({ name: "InvalidMachineCredentialError" });
+    }
+    expect(await snapshotBusinessState(db)).toEqual(before);
+  });
+
+  it("PG1 ordering: the credential gate answers 401 BEFORE the capability resource policy can answer 400", async () => {
+    await fresh();
+    await seedPopulatedWorld();
+    const world = await snapshotBusinessState(db);
+    // 33 entries is over CAPABILITY_MAX_ENTRIES — a policy violation that a
+    // VERIFIED machine gets as a 400. For EVERY credential class the gate
+    // rejects the 401 must win: policy verdicts are never reported to a caller
+    // who is not authenticated (ADR-009 修订 2026-09-01 决策 1 fixes
+    // 401-before-400; the reverse order was a review finding). The four
+    // classes below are exactly the ones the review probe drove.
+    const illegal = { capabilities: Array.from({ length: 33 }, (_, i) => `cap-${i}`) };
+
+    // 1. ill-shaped.
+    await expect(coordinator.poll("dk_x", illegal)).rejects.toMatchObject({
+      name: "InvalidMachineCredentialError",
+    });
+    // 2. well-shaped but UNKNOWN (no row).
+    await expect(coordinator.poll(CLAIMED_TOKEN, illegal)).rejects.toMatchObject({
+      name: "InvalidMachineCredentialError",
+    });
+    // 3. enrolled but UNCLAIMED.
+    await seedMachineForToken(db, CLAIMED_TOKEN);
+    await expect(coordinator.poll(CLAIMED_TOKEN, illegal)).rejects.toMatchObject({
+      name: "InvalidMachineCredentialError",
+    });
+    // 4. claimed but REVOKED — and the refusal is still zero-write: no
+    //    heartbeat may ride a rejected credential.
+    await db
+      .update(machines)
+      .set({ teamId: TEAM_ID, revokedAt: clock.iso() })
+      .where(eq(machines.id, machineIdFromToken(CLAIMED_TOKEN)));
+    const beforeRevokedRefusal = await snapshotBusinessState(db);
+    await expect(coordinator.poll(CLAIMED_TOKEN, illegal)).rejects.toMatchObject({
+      name: "InvalidMachineCredentialError",
+    });
+    expect(await snapshotBusinessState(db)).toEqual(beforeRevokedRefusal);
+
+    // The control: the SAME declaration from a VERIFIED machine is the 400 the
+    // policy owes an authenticated caller — and it too precedes every write.
+    await db
+      .update(machines)
+      .set({ revokedAt: null })
+      .where(eq(machines.id, machineIdFromToken(CLAIMED_TOKEN)));
+    const beforePolicyRefusal = await snapshotBusinessState(db);
+    await expect(coordinator.poll(CLAIMED_TOKEN, illegal)).rejects.toMatchObject({
+      name: "CapabilityDeclarationInvalidError",
+    });
+    expect(await snapshotBusinessState(db)).toEqual(beforePolicyRefusal);
+    // The unrelated world was never a candidate for a write either.
+    expect(beforePolicyRefusal.runs).toEqual(world.runs);
+    expect(beforePolicyRefusal.artifactManifests).toEqual(world.artifactManifests);
+  });
+
+  it("PG3: well-shaped unknown token → 401, zero business writes (auto-registration is removed)", async () => {
+    await fresh();
+    await seedPopulatedWorld();
+    const before = await snapshotBusinessState(db);
+    await expect(coordinator.poll(CLAIMED_TOKEN, {})).rejects.toMatchObject({ name: "InvalidMachineCredentialError" });
+    const after = await snapshotBusinessState(db);
+    expect(after).toEqual(before);
+    // No row was created for the unknown token — self-registration is gone.
+    expect(after.machines.some((m) => m.id === machineIdFromToken(CLAIMED_TOKEN))).toBe(false);
+  });
+
+  it("PG4: rejects a well-shaped token whose full hash mismatches the enrolled row (collision defense)", async () => {
+    await fresh();
+    await seedPopulatedWorld();
+    await db.insert(machines).values({
+      id: machineIdFromToken(TOKEN),
+      name: "enrolled",
+      tokenHash: sha256(OTHER_TOKEN),
+      teamId: TEAM_ID,
+      createdAt: "2026-07-01T00:00:00.000Z",
+    });
+    const before = await snapshotBusinessState(db);
+    await expect(coordinator.poll(TOKEN, {})).rejects.toMatchObject({ name: "InvalidMachineCredentialError" });
+    // FULL-ROW comparison: not just `name`/`lastSeen` on the enrolled machine,
+    // but every field of every row in every business table.
+    expect(await snapshotBusinessState(db)).toEqual(before);
+    expect(before.machines.find((m) => m.id === machineIdFromToken(TOKEN))).toMatchObject({
+      name: "enrolled",
+      lastSeen: null,
+      hostname: null,
+      capabilities: null,
+    });
+  });
+
+  it("PG5: existing machine with teamId IS NULL (unclaimed) → 401, zero business writes", async () => {
+    await fresh();
+    await seedPopulatedWorld();
+    await seedMachineForToken(db, TOKEN); // no teamId → null
+    const before = await snapshotBusinessState(db);
+    await expect(coordinator.poll(TOKEN, {})).rejects.toMatchObject({ name: "InvalidMachineCredentialError" });
+    const after = await snapshotBusinessState(db);
+    expect(after).toEqual(before);
+    // The unclaimed row itself is untouched: no heartbeat, no claims.
+    expect(after.machines.find((m) => m.id === machineIdFromToken(TOKEN))).toMatchObject({
+      teamId: null,
+      lastSeen: null,
+    });
+  });
+
+  it("PG5b: existing machine with revokedAt IS NOT NULL → 401, zero business writes", async () => {
+    await fresh();
+    await seedPopulatedWorld();
+    await seedMachineForToken(db, TOKEN, { teamId: TEAM_ID, revokedAt: clock.iso() });
+    const before = await snapshotBusinessState(db);
+    await expect(coordinator.poll(TOKEN, {})).rejects.toMatchObject({ name: "InvalidMachineCredentialError" });
+    const after = await snapshotBusinessState(db);
+    expect(after).toEqual(before);
+    expect(after.machines.find((m) => m.id === machineIdFromToken(TOKEN))).toMatchObject({
+      revokedAt: clock.iso(),
+      lastSeen: null,
+    });
+  });
+
+  it("PG6: claimed, non-revoked machine → poll succeeds, and the heartbeat is the ONLY write", async () => {
+    await fresh();
+    await seedPopulatedWorld();
+    await seedMachineForToken(db, TOKEN, { teamId: TEAM_ID });
+    const before = await snapshotBusinessState(db);
+
+    const result = await coordinator.poll(TOKEN, {});
     expect(result).toEqual({ deliveries: [] });
 
-    const row = await getRow(machineIdFromToken(TOKEN));
-    expect(row).toMatchObject({
-      id: machineIdFromToken(TOKEN),
-      name: "mbp.local",
-      hostname: "mbp.local",
-      platform: "darwin",
-      arch: "arm64",
-      daemonVersion: "0.1.0",
-      tokenHash: sha256(TOKEN),
+    const after = await snapshotBusinessState(db);
+    const pollerId = machineIdFromToken(TOKEN);
+    expect(after.machines.find((m) => m.id === pollerId)).toMatchObject({
       lastSeen: clock.iso(),
-      createdAt: clock.iso(),
+      teamId: TEAM_ID,
+      revokedAt: null,
     });
+    // Everything else — including the POPULATED world: the queued run with its
+    // progress, the lease, the committed Artifact history — is byte-identical.
+    const withoutPoller = (rows: { id: string }[]) => rows.filter((r) => r.id !== pollerId);
+    expect(withoutPoller(after.machines)).toEqual(withoutPoller(before.machines));
+    expect(after.loops).toEqual(before.loops);
+    expect(after.runs).toEqual(before.runs);
+    expect(after.runLeases).toEqual(before.runLeases);
+    expect(after.artifactSyncSessions).toEqual(before.artifactSyncSessions);
+    expect(after.artifactManifests).toEqual(before.artifactManifests);
+    expect(after.artifactBlobs).toEqual(before.artifactBlobs);
   });
 
-  it("falls back to a stable machine-id-derived name when no usable host is reported", async () => {
+  it("PG6: accepts the enrolled claimed token (derived id + full hash + team verified)", async () => {
     await fresh();
-    await coordinator.poll(TOKEN, { host: "   " });
-    const id = machineIdFromToken(TOKEN);
-    const row = await getRow(id);
-    expect(row).toMatchObject({ name: `machine-${id.slice(2, 8)}`, hostname: null });
-  });
-
-  it("cleans identity fields: NUL-stripped, trimmed, capped, blank treated as not reported", async () => {
-    await fresh();
-    await coordinator.poll(TOKEN, {
-      host: `  dev\0-box  `,
-      platform: "darwin".repeat(30), // 210 chars → capped at 64
-      arch: "\0\0",
-      version: "v1",
-    });
-    const row = await getRow(machineIdFromToken(TOKEN));
-    expect(row).toMatchObject({
-      name: "dev-box",
-      hostname: "dev-box",
-      platform: "darwin".repeat(10) + "darw", // 64 chars
-      arch: null,
-      daemonVersion: "v1",
-    });
-    expect(row!.platform).toHaveLength(64);
-  });
-
-  it("converges concurrent first polls for the same token to ONE row (idempotent, no 500)", async () => {
-    await fresh();
-    const [a, b] = await Promise.all([coordinator.poll(TOKEN, {}), coordinator.poll(TOKEN, {})]);
-    expect(a).toEqual({ deliveries: [] });
-    expect(b).toEqual({ deliveries: [] });
-    const rows = await db.select().from(machines);
-    expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ id: machineIdFromToken(TOKEN), tokenHash: sha256(TOKEN) });
+    await seedMachineForToken(db, TOKEN, { teamId: TEAM_ID });
+    await expect(coordinator.poll(TOKEN, {})).resolves.toEqual({ deliveries: [] });
   });
 });
 
 describe("poll: heartbeat watermark + identity snapshot (A-13)", () => {
+  const TEAM_ID = TEST_TEAM_ID;
+
   async function enrolled(lastSeen: string | null): Promise<string> {
     return seedMachineForToken(db, TOKEN, {
       name: "friendly",
       hostname: "old-host",
       lastSeen,
+      teamId: TEAM_ID,
     });
   }
 
@@ -274,7 +460,7 @@ describe("poll: heartbeat watermark + identity snapshot (A-13)", () => {
 
   it("never regresses under skewed clocks: a later stamp survives an earlier-clocked poll", async () => {
     await fresh();
-    const id = await seedMachineForToken(db, TOKEN, { lastSeen: null });
+    const id = await seedMachineForToken(db, TOKEN, { lastSeen: null, teamId: TEAM_ID });
     // First poll at T+20s stamps T+20s.
     const ahead = createRunCoordinator(testDeps(db, new FakeClock(clock.now().getTime() + 20_000)));
     await ahead.poll(TOKEN, {});
@@ -299,9 +485,32 @@ describe("poll: heartbeat watermark + identity snapshot (A-13)", () => {
     expect(await getRow(id)).toMatchObject({ hostname: "old-host", platform: null, arch: null });
   });
 
+  it("cleans and caps identity fields at the same limits (NUL-strip → trim → cap → blank means not reported)", async () => {
+    await fresh();
+    // Unnamed + never-seen, so the host also has to fill the friendly name —
+    // this is the contact-path successor of the coverage the deleted
+    // self-registration suite carried (Phase 5 Batch 3 slice 3).
+    const id = await seedClaimedMachineForToken(db, TOKEN, { name: "", lastSeen: null });
+    await coordinator.poll(TOKEN, {
+      host: `  dev\0-box  `,
+      platform: "darwin".repeat(30), // 210 chars → capped at 64
+      arch: "\0\0",
+      version: "v1",
+    });
+    const row = await getRow(id);
+    expect(row).toMatchObject({
+      name: "dev-box",
+      hostname: "dev-box",
+      platform: "darwin".repeat(10) + "darw",
+      arch: null,
+      daemonVersion: "v1",
+    });
+    expect(row!.platform).toHaveLength(64);
+  });
+
   it("fills an EMPTY name from a valid hostname, exactly once", async () => {
     await fresh();
-    const id = await seedMachineForToken(db, TOKEN, { name: "", lastSeen: clock.iso() });
+    const id = await seedMachineForToken(db, TOKEN, { name: "", lastSeen: clock.iso(), teamId: TEAM_ID });
     await coordinator.poll(TOKEN, { host: "first-host" });
     expect((await getRow(id))!.name).toBe("first-host");
     // Once named, later hosts never overwrite it.
@@ -312,10 +521,11 @@ describe("poll: heartbeat watermark + identity snapshot (A-13)", () => {
 
 describe("AD2(b): poll distributes watch and gates artifact claims (Batch 2 slice 2, ADR-010 决策 22)", () => {
   const CAPABLE = ["terminal-journal-v1", "artifact-sync-v1"];
+  const TEAM_ID = TEST_TEAM_ID;
 
   it("a machine WITHOUT artifact-sync-v1 keeps the Batch 1 idle shape — watchDigest or not", async () => {
     await fresh();
-    await seedMachineForToken(db, TOKEN);
+    await seedMachineForToken(db, TOKEN, { teamId: TEAM_ID });
     // The watch configuration is only distributed to machines that declared
     // the capability: an old daemon's response stays byte-identical.
     await expect(coordinator.poll(TOKEN, { watchDigest: "w-1" })).resolves.toEqual({ deliveries: [] });
@@ -324,7 +534,7 @@ describe("AD2(b): poll distributes watch and gates artifact claims (Batch 2 slic
 
   it("a capable machine on drift receives the FULL watch set + digest; a matching digest carries neither key", async () => {
     await fresh();
-    const machineId = await seedMachineForToken(db, TOKEN);
+    const machineId = await seedMachineForToken(db, TOKEN, { teamId: TEAM_ID });
     await seedLoop(db, {
       id: "loop-1",
       machineId,
@@ -357,7 +567,7 @@ describe("AD2(b): poll distributes watch and gates artifact claims (Batch 2 slic
 
   it("clearing the last configured loop sends watch: [] on drift — the clear-all payload", async () => {
     await fresh();
-    const machineId = await seedMachineForToken(db, TOKEN);
+    const machineId = await seedMachineForToken(db, TOKEN, { teamId: TEAM_ID });
     await seedLoop(db, { id: "loop-1", machineId, artifactDir: "/data/out", artifactConfigRevision: 1 });
     await coordinator.poll(TOKEN, { capabilities: CAPABLE }); // declares the capability
 
@@ -368,7 +578,7 @@ describe("AD2(b): poll distributes watch and gates artifact claims (Batch 2 slic
 
   it("busy polls (availableSlots 0) process watchDigest too — watch is not run dispatch", async () => {
     await fresh();
-    const machineId = await seedMachineForToken(db, TOKEN);
+    const machineId = await seedMachineForToken(db, TOKEN, { teamId: TEAM_ID });
     await seedLoop(db, { id: "loop-1", machineId, artifactDir: "/data/out", artifactConfigRevision: 1 });
     const result = await coordinator.poll(TOKEN, { capabilities: CAPABLE, availableSlots: 0 });
     expect(result.deliveries).toEqual([]);
@@ -380,7 +590,7 @@ describe("AD2(b): poll distributes watch and gates artifact claims (Batch 2 slic
 
   it("an UNCONFIGURED loop stays claimable without the capability", async () => {
     await fresh();
-    const machineId = await seedMachineForToken(db, TOKEN);
+    const machineId = await seedMachineForToken(db, TOKEN, { teamId: TEAM_ID });
     await seedLoop(db, { id: "loop-1", machineId, taskFile: "/home/dev/TASK.md" });
     await seedRun(db, { id: "run-1", machineId });
 
@@ -392,7 +602,7 @@ describe("AD2(b): poll distributes watch and gates artifact claims (Batch 2 slic
 
   it("a configured candidate is skipped without the capability — and never blocks the other candidate", async () => {
     await fresh();
-    const machineId = await seedMachineForToken(db, TOKEN);
+    const machineId = await seedMachineForToken(db, TOKEN, { teamId: TEAM_ID });
     await seedLoop(db, { id: "loop-a", machineId, artifactDir: "/data/out", artifactConfigRevision: 3 });
     await seedLoop(db, { id: "loop-b", machineId, taskFile: "/home/dev/TASK.md" });
     await seedRun(db, { id: "run-configured", machineId, loopId: "loop-a", ts: "2026-07-01T00:00:00.000Z" });
@@ -410,7 +620,7 @@ describe("AD2(b): poll distributes watch and gates artifact claims (Batch 2 slic
 
   it("a capable machine claims the configured loop and the Delivery carries the artifact config", async () => {
     await fresh();
-    const machineId = await seedMachineForToken(db, TOKEN);
+    const machineId = await seedMachineForToken(db, TOKEN, { teamId: TEAM_ID });
     await seedLoop(db, { id: "loop-a", machineId, artifactDir: "/data/out", artifactConfigRevision: 5 });
     await seedRun(db, { id: "run-1", machineId, loopId: "loop-a" });
 
@@ -421,7 +631,7 @@ describe("AD2(b): poll distributes watch and gates artifact claims (Batch 2 slic
 
   it("a config write between the scan and the claim is caught by the claim's authoritative re-check", async () => {
     await fresh();
-    const machineId = await seedMachineForToken(db, TOKEN);
+    const machineId = await seedMachineForToken(db, TOKEN, { teamId: TEAM_ID });
     await seedLoop(db, { id: "loop-1", machineId, taskFile: "/t/TASK.md" });
     await seedRun(db, { id: "run-1", machineId });
     let hooked = false;

@@ -40,7 +40,7 @@ import {
   FakeClock,
   seedLease,
   seedLoop,
-  seedMachineForToken,
+  seedClaimedMachineForToken,
   seedRun,
   snapshotLeases,
   snapshotLoops,
@@ -66,7 +66,9 @@ async function fresh(): Promise<void> {
   handles.push(h);
   db = h.db;
   clock = new FakeClock();
-  machineId = await seedMachineForToken(db, TOKEN);
+  // Phase 5 Batch 3 slice 3: the manual enqueue boundary requires a CLAIMED,
+  // non-revoked machine; the token fixture states exactly that.
+  machineId = await seedClaimedMachineForToken(db, TOKEN);
   coordinator = createRunCoordinator(testDeps(db, clock));
 }
 

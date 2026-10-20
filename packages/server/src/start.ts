@@ -19,16 +19,20 @@ import { serve, type ServerType } from "@hono/node-server";
 
 import { createLoopAdmin, newUuidLoopId } from "./admin/index.js";
 import { createArtifactApi, type ArtifactApi } from "./artifact/api.js";
-import { createMachineAttributionResolver } from "./artifact/attribution-machine.js";
+import { createTeamAttributionResolver } from "./artifact/attribution-team.js";
 import { createProductionArtifactHome } from "./artifact/production.js";
+import { createAuthModule } from "./auth/index.js";
 import { createRunCoordinator, mintRunCredential, newUuidRunId, type CoordinatorHooks, type RunCoordinator } from "./coordinator/index.js";
-import { isLoopbackHost, loadServerConfig, unauthenticatedExposureWarning, type ServerConfig } from "./config.js";
-import { mintCsrfToken } from "./dashboard/csrf.js";
+import { isLoopbackHost, loadServerConfig, nonLoopbackExposureWarning, type ServerConfig } from "./config.js";
+import { createDashboardAccess } from "./dashboard/access.js";
 import { createDashboardArtifactRead, createDashboardRead } from "./dashboard/index.js";
 import { createDashboardRoutes } from "./dashboard/routes.js";
+import { acquireDataDirLock, DataDirLockError, formatAcquireFailureMessage } from "./data-dir-lock.js";
 import { closeDb, openMigratedDb, type DbHandle } from "./db/index.js";
 import { createServerApp } from "./http/app.js";
+import { closeHttpServer } from "./http/server-shutdown.js";
 import { createLifecycleAdmin, type LifecycleOpsHooks } from "./loop-lifecycle/admin.js";
+import { createManagementAccess } from "./management/access.js";
 import { createOwnerControl } from "./owner/index.js";
 import { createScheduleAdmin } from "./schedule/index.js";
 import { createScheduler, type CronFactory, type Scheduler } from "./scheduler/index.js";
@@ -73,19 +77,21 @@ export interface BootstrapOverrides {
    *  LifecycleAdmin (review SPEC-1: C8 commits a real claim between the
    *  retarget's resolve and its guarded write). */
   lifecycleHooks?: LifecycleOpsHooks;
-  /** TEST-ONLY pinned Dashboard CSRF token. Production mints a fresh random
-   *  one per boot (ADR-009: a restart invalidates every old token); an empty
-   *  or whitespace override is IGNORED rather than honoured, so no test seam
-   *  can silently disable CSRF. */
-  csrfToken?: string;
+  /** TEST-ONLY GitHub transport for the auth module (Batch 3 slice 2): a
+   *  scripted in-process fetch, so an E2E login never touches a real socket.
+   *  Production passes neither field. */
+  githubFetch?: typeof fetch;
+  /** TEST-ONLY GitHub request timeout override (ms). */
+  githubTimeoutMs?: number;
 }
 
 /**
  * Everything except the listener — the testable core of boot. Creates the
- * data dir, opens+migrates the file-backed DB at `<dataDir>/pgdata`, and
- * wires the production coordinator (systemClock, UUID run ids, `rk_` mint)
- * and the production sweep (default 20min timeout). Throws if the data dir
- * cannot be created — boot fails fast, before listen.
+ * data dir, takes the dataDir exclusive lock (ADR-011 决策 20), opens+migrates
+ * the file-backed DB at `<dataDir>/pgdata`, and wires the production
+ * coordinator (systemClock, UUID run ids, `rk_` mint) and the production sweep
+ * (default 20min timeout). Throws if the data dir cannot be created or is
+ * locked by another process — boot fails fast, before listen.
  *
  * DB-handle ownership: a failure INSIDE bootstrap closes the handle here; once
  * the BootedServer is returned, the caller owns the handle exactly once.
@@ -99,7 +105,22 @@ export async function bootstrapServer(
   const clock = overrides.clock ?? systemClock;
   const cronFactory = overrides.cronFactory ?? productionCronFactory;
   await fs.promises.mkdir(config.dataDir, { recursive: true });
-  const handle = await openMigratedDb({ dataDir: config.dataDir });
+  // Boot gate (ADR-011 决策 20): take the dataDir lock BEFORE the database is
+  // opened. PGlite takes no cross-process lock of its own, so this is the only
+  // thing keeping two processes off one `<dataDir>/pgdata` — and the only thing
+  // that can refuse an offline claim against a RUNNING server.
+  const lockResult = await acquireDataDirLock(config.dataDir, { role: "server", clock });
+  if (!lockResult.ok) {
+    throw new DataDirLockError(formatAcquireFailureMessage(lockResult));
+  }
+  let handle: DbHandle;
+  try {
+    handle = await openMigratedDb({ dataDir: config.dataDir, dataDirLock: lockResult.lock });
+  } catch (err) {
+    // The handle never existed, so the catch below cannot release this lock.
+    await lockResult.lock.release().catch(() => {});
+    throw err;
+  }
   try {
     const coordinator = createRunCoordinator({
       db: handle.db,
@@ -112,7 +133,7 @@ export async function bootstrapServer(
       // per call on the caller-supplied (transaction) handle — never cached,
       // never wire input.
       artifactBinding: {
-        resolveAttribution: (machineId, db) => createMachineAttributionResolver({ db }).resolve({ machineId }),
+        resolveAttribution: (machineId, db) => createTeamAttributionResolver({ db }).resolve({ machineId }),
       },
     });
     const admin = createLoopAdmin({ db: handle.db, clock, newLoopId: newUuidLoopId });
@@ -132,12 +153,24 @@ export async function bootstrapServer(
     // the server side at all. Built BEFORE the Dashboard because the slice-7
     // artifact pages read through the SAME facade instance.
     const artifacts = createArtifactApi(createProductionArtifactHome({ db: handle.db, dataDir: config.dataDir, clock }));
+    // Batch 3 slice 2: the auth surface. config.auth is REQUIRED (ADR-011
+    // 决策 5 — loadServerConfig has already failed the boot on a missing or
+    // malformed OAuth config), so production ALWAYS mounts the five routes;
+    // the GitHub transport seams are test-only overrides.
+    //
+    // Built BEFORE the Dashboard (slice 6, ADR-011 决策 33): the HTML surface
+    // must resolve its Login Sessions through the SAME resolver as the login
+    // routes and the management gate.
+    const auth = createAuthModule({
+      authConfig: config.auth,
+      db: handle.db,
+      clock,
+      fetchImpl: overrides.githubFetch,
+      timeoutMs: overrides.githubTimeoutMs,
+    });
     // The Dashboard exists ONLY on a loopback bind (Batch 3 plan §2): the
     // mount decision is made HERE, from config, so no request header can ever
-    // turn it on. Its presence also arms the global loopback-Host gate — on a
-    // non-loopback bind there is no way to tell a rebinding client from a
-    // legitimate one, so the existing "no auth, trusted network" posture
-    // stands unchanged (and is warned about at boot).
+    // turn it on. Its presence also arms the global loopback-Host gate.
     const dashboard = isLoopbackHost(config.host)
       ? createDashboardRoutes({
           read: createDashboardRead({ admin, db: handle.db, clock }),
@@ -152,21 +185,29 @@ export async function bootstrapServer(
           // end-to-end, because forgetting it would fail no typecheck.
           enqueue: (loopId) =>
             coordinator.enqueueExecRun(loopId, { kind: "manual", pendingPolicy: "skip" }),
-          csrfToken: overrides.csrfToken?.trim() ? overrides.csrfToken : mintCsrfToken(),
+          // Slice 6: Session gate + ownership gate + session-derived CSRF,
+          // all sharing the login module's resolver.
+          access: createDashboardAccess({ db: handle.db, sessions: auth.sessions }),
         })
       : undefined;
+    // Slice 5 (ADR-011 决策 23/28): the management gate shares the login
+    // module's SessionService. Production cannot omit it — `management` is a
+    // REQUIRED field of createServerApp's deps.
+    const management = createManagementAccess({ db: handle.db, sessions: auth.sessions });
 
     return {
-      app: createServerApp(
+      app: createServerApp({
         coordinator,
         admin,
         lifecycle,
         schedule,
         ownerControl,
-        (loop) => scheduler.reconcile(loop),
+        management,
+        onScheduleCommitted: (loop) => scheduler.reconcile(loop),
         dashboard,
         artifacts,
-      ),
+        auth: auth.routes,
+      }),
       coordinator,
       sweep,
       scheduler,
@@ -183,7 +224,7 @@ export async function bootstrapServer(
 
 export async function main(): Promise<void> {
   const config = loadServerConfig(process.env, os.homedir(), process.cwd());
-  const warning = unauthenticatedExposureWarning(config.host);
+  const warning = nonLoopbackExposureWarning(config.host);
   if (warning) console.warn(warning);
 
   // The outer catch is the SINGLE owner of post-bootstrap DB cleanup
@@ -225,7 +266,9 @@ export async function main(): Promise<void> {
       // block new sweep ticks and DRAIN the in-flight pass → HTTP → DB.
       void scheduler.stopAndDrain().catch(() => {}).then(() => {
         void sweepTimer.stopAndDrain().catch(() => {}).then(() => {
-          server.close(async () => {
+          // Bounded: an idle browser keep-alive must not keep the process (and
+          // the dataDir lock) alive forever (slice 7 manual-smoke finding).
+          void closeHttpServer(server).then(async () => {
             await closeDb(handle!).catch(() => {});
             process.exit(0);
           });

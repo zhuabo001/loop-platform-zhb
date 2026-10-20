@@ -27,7 +27,7 @@ import { eq } from "drizzle-orm";
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
 import { loops } from "../db/schema.js";
 import { updateSchedule } from "../schedule/index.js";
-import { FakeClock, FakeCronFactory, seedMachine, seedLoop, seedRun, snapshotRuns, testDeps } from "../testkit/index.js";
+import { FakeClock, FakeCronFactory, seedClaimedMachineById, seedLoop, seedRun, snapshotRuns, testDeps } from "../testkit/index.js";
 import { createRunCoordinator, type RunCoordinator } from "../coordinator/index.js";
 import { createScheduler, type Scheduler } from "./index.js";
 
@@ -76,7 +76,7 @@ describe("R-group: restart catch-up", () => {
     clock = new FakeClock(new Date("2026-08-27T12:30:00.000Z"));
     logs = [];
     runSeq = 0;
-    await seedMachine(db, MACHINE_ID);
+    await seedClaimedMachineById(db, MACHINE_ID);
   });
 
   test("R1: a short downtime missing ONE occurrence recovers exactly that occurrence", async () => {
@@ -151,7 +151,7 @@ describe("R-group: restart catch-up", () => {
     const h1 = await openMigratedDb({ dataDir });
     handles.push(h1);
     db = h1.db;
-    await seedMachine(db, MACHINE_ID);
+    await seedClaimedMachineById(db, MACHINE_ID);
     await seedLoop(db, {
       id: "loop-1",
       machineId: MACHINE_ID,

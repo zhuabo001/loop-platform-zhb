@@ -87,6 +87,8 @@ import { closeDb, type DbHandle } from "./db/index.js";
 import { loops, runs } from "./db/schema.js";
 import { DaemonLogObserver, DetachedProcessSupervisor } from "./real-claude-e2e-harness.js";
 import { bootstrapServer, waitForListening } from "./start.js";
+import { makeTestAuthConfig, seedClaimedMachineForToken, seedManagementSession } from "./testkit/index.js";
+import { systemClock } from "./time.js";
 
 const TOKEN = "dk_e2e_slice4_machine";
 /** The planted provider credential. It lives ONLY in the temp settings
@@ -260,8 +262,18 @@ describe("Phase 4 Batch 3 slice 4 (Issue #53): the settings-derived provider sec
       // 2. Production server: file PGlite + real HTTP listener.
       const dataDir = await mkdtemp(path.join(tmpdir(), `loopzhb-s4e2e-data-${process.pid}-`));
       tempDirs.push(dataDir);
-      const booted = await bootstrapServer({ host: "127.0.0.1", port: 0, dataDir });
+      const booted = await bootstrapServer({ auth: makeTestAuthConfig(), host: "127.0.0.1", port: 0, dataDir });
       handles.push(booted.handle);
+      // Phase 5 Batch 3 slice 3: poll no longer self-registers — state the
+      // claimed machine this daemon's token polls as.
+      await seedClaimedMachineForToken(booted.handle.db, TOKEN);
+      // Slice 5: management requests need a Login Session.
+      const { credential } = await seedManagementSession(booted.handle.db, { clock: systemClock });
+      const sessionHeaders = (extra?: ConstructorParameters<typeof Headers>[0]): Headers => {
+        const headers = new Headers(extra);
+        if (!headers.has("cookie")) headers.set("cookie", `loopzhb_session=${credential}`);
+        return headers;
+      };
       // The daemon's own traffic, captured at the listener (round-1 review):
       // cloning the request BEFORE the app reads it observes the exact bytes
       // the production daemon produced. Only the BODY is captured — the
@@ -297,7 +309,7 @@ describe("Phase 4 Batch 3 slice 4 (Issue #53): the settings-derived provider sec
         route: string,
         init?: RequestInit,
       ): Promise<{ status: number; body: unknown }> => {
-        const res = await fetch(`${baseUrl}${route}`, init);
+        const res = await fetch(`${baseUrl}${route}`, { ...init, headers: sessionHeaders(init?.headers) });
         const text = await res.text();
         wireBodies.push(text);
         return { status: res.status, body: JSON.parse(text) };
@@ -365,13 +377,15 @@ describe("Phase 4 Batch 3 slice 4 (Issue #53): the settings-derived provider sec
 
       let loopId = "";
       try {
-        // 5. Machine registration (the daemon self-registers on first poll).
+        // 5. Daemon readiness. Phase 5 Batch 3 slice 3 removed self-
+        //    registration: the machine ROW exists from the start, so wait for
+        //    `lastSeen` — written only by the daemon's own poll contact.
         const machineId = machineIdFromToken(TOKEN);
         await waitFor(async () => {
-          const res = await fetch(`${baseUrl}/api/machines`);
+          const res = await fetch(`${baseUrl}/api/machines`, { headers: sessionHeaders() });
           if (!res.ok) return false;
-          const body = (await res.json()) as { machines?: Array<{ id: string }> };
-          return body.machines?.some((m) => m.id === machineId) ?? false;
+          const body = (await res.json()) as { machines?: Array<{ id: string; lastSeen: string | null }> };
+          return body.machines?.some((m) => m.id === machineId && m.lastSeen !== null) ?? false;
         }, REGISTER_TIMEOUT_MS);
 
         // 6. The control root exists (0700) and its static wrapper carries

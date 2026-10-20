@@ -394,3 +394,8 @@ claim 的 capability 门控是**逐候选**的，不是整轮 Poll 门控：已�
 - 决策 16 终态：AD1–AD4 已逐片翻转为激活断言（片 2/5/6/7），片 8 新增 AI7「生产启用 + 旧 Loop 不上传」e2e 守卫取代 Batch 1 休眠守卫套件；基础回归（旧 Loop 不上传单元钉四处、runtime 可选依赖组合钉）全部保留。
 - 片 3 的 [#91](https://github.com/zhuabo001/loop-platform-zhb/issues/91) 已经片 5 第二轮独立复审核销关闭；2026-10-05 条目的「#91 保持 OPEN」为历史记录，不改写。
 - 残余如实登记：U2（等价内容重启首轮铸一次 revision，AS6 已记录）在真实 HTTP 集成面复现，AI6(a) 钉为恰 +1 且零 PUT；决策 27 的三项残余（中流截断不可检、忽略 Range、`artifact_dir_unconfigured` 无路由返回）不变；#11/#72 的真实 Postgres 多物理连接验收继续归 Phase 6。
+
+### 2026-10-10
+
+- 决策 2/7 的 Team namespace 切换**完整落地**：片 3 切换写路径（生产 Attribution Resolver 取 `machines.teamId`），片 4 的离线认领 CLI 以「先复制验证、后单事务」迁移历史——被改写的是 `artifact_manifests.namespace_id` 与 `artifact_sync_sessions.namespace_id`，以及目标 namespace 下新增的 `artifact_blobs` 行；manifest id/entries/manifestRevision/committedAt、session receipt/normalizedManifest、`runs.artifact_snapshot_id`、`loops.artifactManifestId` 与 `machines.id`/`token_hash` 全部保持不变。存储键规则 `(namespaceId, hash)` 与 wire 形状仍逐字不变。
+- 源侧 `(machineId, hash)` 元数据行**保留**（与源 Blob 文件同样不删、不 GC）：保留使迁移可复查、可逆，并与保留的 `createMachineAttributionResolver` 相互一致；对同一目标重复认领是幂等 no-op，不会把源行当作待迁移数据。裁决见 ADR-011 决策 21。

@@ -48,7 +48,7 @@ import {
   FakeCronFactory,
   seedLease,
   seedLoop,
-  seedMachineForToken,
+  seedClaimedMachineForToken,
   seedRun,
   snapshotLeases,
   snapshotLoops,
@@ -92,7 +92,7 @@ describe("Q5/Q6: Dashboard no-supersede vs claim, finish, dashboard and cron", (
     db = h.db;
     clock = new FakeClock(new Date("2026-08-27T12:30:00.000Z"));
     runSeq = 0;
-    machineId = await seedMachineForToken(db, MACHINE_TOKEN);
+    machineId = await seedClaimedMachineForToken(db, MACHINE_TOKEN);
   }
 
   async function watermarkOf(loopId: string): Promise<string | null> {

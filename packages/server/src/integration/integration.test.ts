@@ -14,7 +14,17 @@ import { eq } from "drizzle-orm";
 
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
 import { loops, runs } from "../db/schema.js";
-import { FakeClock, seedMachine, seedMachineForToken, seedLoop, snapshotRuns, testDeps } from "../testkit/index.js";
+import {
+  createTestManagementAccess,
+  FakeClock,
+  seedClaimedMachineById,
+  seedClaimedMachineForToken,
+  seedLoop,
+  seedManagementSession,
+  snapshotRuns,
+  testDeps,
+  withManagementSession,
+} from "../testkit/index.js";
 import { createRunCoordinator, type RunCoordinator } from "../coordinator/index.js";
 import { createLoopAdmin, newUuidLoopId } from "../admin/index.js";
 import { createLifecycleAdmin } from "../loop-lifecycle/admin.js";
@@ -72,6 +82,7 @@ describe("F-group: Integration and production wiring", () => {
   let app: ReturnType<typeof createServerApp>;
   let coordinator: RunCoordinator;
   let machineId: string;
+let sessionCredential: string;
 
   beforeEach(async () => {
     const h = await openMigratedDb();
@@ -80,7 +91,7 @@ describe("F-group: Integration and production wiring", () => {
     clock = new FakeClock(new Date("2026-08-27T10:00:00Z"));
     machineId = "m-test123456789a";
 
-    await seedMachine(db, machineId);
+    await seedClaimedMachineById(db, machineId);
 
     coordinator = createRunCoordinator(testDeps(db, clock));
     const admin = createLoopAdmin({ db, clock, newLoopId: newUuidLoopId });
@@ -94,13 +105,20 @@ describe("F-group: Integration and production wiring", () => {
       cronFactory: cronFactory as any,
     });
 
-    app = createServerApp(
-      coordinator,
-      admin,
-      createLifecycleAdmin({ db, clock }),
-      createScheduleAdmin({ db, clock }),
-      ownerControl,
-      (loop) => scheduler.reconcile(loop),
+    const management = createTestManagementAccess(db, clock);
+    const { credential } = await seedManagementSession(db, { clock });
+    sessionCredential = credential;
+    app = withManagementSession(
+      createServerApp({
+        coordinator,
+        admin,
+        lifecycle: createLifecycleAdmin({ db, clock }),
+        schedule: createScheduleAdmin({ db, clock }),
+        ownerControl,
+        management,
+        onScheduleCommitted: (loop) => scheduler.reconcile(loop),
+      }),
+      credential,
     );
   });
 
@@ -183,21 +201,25 @@ describe("F-group: Integration and production wiring", () => {
       let failSummaryReadOnce = true;
       const failingReadAdmin = {
         ...stableAdmin,
-        async getLoopSummary(loopId: string) {
+        async getLoopSummary(loopId: string, teamId: string) {
           if (failSummaryReadOnce) {
             failSummaryReadOnce = false;
             throw new Error("injected post-commit summary read failure");
           }
-          return stableAdmin.getLoopSummary(loopId);
+          return stableAdmin.getLoopSummary(loopId, teamId);
         },
       };
-      const retryableApp = createServerApp(
-        coordinator,
-        failingReadAdmin,
-        createLifecycleAdmin({ db, clock }),
-        createScheduleAdmin({ db, clock }),
-        createOwnerControl({ db, clock }),
-        (loop) => scheduler.reconcile(loop),
+      const retryableApp = withManagementSession(
+        createServerApp({
+          coordinator,
+          admin: failingReadAdmin,
+          lifecycle: createLifecycleAdmin({ db, clock }),
+          schedule: createScheduleAdmin({ db, clock }),
+          ownerControl: createOwnerControl({ db, clock }),
+          management: createTestManagementAccess(db, clock),
+          onScheduleCommitted: (loop) => scheduler.reconcile(loop),
+        }),
+        sessionCredential,
       );
       const request = {
         method: "PATCH",
@@ -332,7 +354,7 @@ describe("F-group: Integration and production wiring", () => {
     });
 
     test("F8: after offline ticks, the recovering machine claims ONLY the latest pending run", async () => {
-      const tokenMachineId = await seedMachineForToken(db, TOKEN);
+      const tokenMachineId = await seedClaimedMachineForToken(db, TOKEN);
       await seedLoop(db, {
         id: "loop-1",
         machineId: tokenMachineId,
@@ -455,7 +477,7 @@ describe("F-group: Integration and production wiring", () => {
     });
 
     test("F11: a tick racing a poll claim converges to one running run (real interleaving)", async () => {
-      const tokenMachineId = await seedMachineForToken(db, TOKEN);
+      const tokenMachineId = await seedClaimedMachineForToken(db, TOKEN);
       await seedLoop(db, {
         id: "loop-1",
         machineId: tokenMachineId,
@@ -521,7 +543,7 @@ describe("F-group: Integration and production wiring", () => {
     const WIRE_MACHINE_ID = "m-0123456789abcdef";
 
     test("F12: POST /loops with a schedule hot-registers the job through the seam", async () => {
-      await seedMachine(db, WIRE_MACHINE_ID);
+      await seedClaimedMachineById(db, WIRE_MACHINE_ID);
 
       // The app is wired with the seam in beforeEach — creating a scheduled
       // loop must register the Croner job WITHOUT a restart (Round 1 P1).
@@ -547,18 +569,22 @@ describe("F-group: Integration and production wiring", () => {
     });
 
     test("F13: a failing seam never fails the committed create (no 500-but-committed)", async () => {
-      await seedMachine(db, WIRE_MACHINE_ID);
+      await seedClaimedMachineById(db, WIRE_MACHINE_ID);
       const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
       try {
-        const failingApp = createServerApp(
-          coordinator,
-          createLoopAdmin({ db, clock, newLoopId: newUuidLoopId }),
-          createLifecycleAdmin({ db, clock }),
-          createScheduleAdmin({ db, clock }),
-          createOwnerControl({ db, clock }),
-          () => {
-            throw new Error("injected reconcile failure");
-          },
+        const failingApp = withManagementSession(
+          createServerApp({
+            coordinator,
+            admin: createLoopAdmin({ db, clock, newLoopId: newUuidLoopId }),
+            lifecycle: createLifecycleAdmin({ db, clock }),
+            schedule: createScheduleAdmin({ db, clock }),
+            ownerControl: createOwnerControl({ db, clock }),
+            management: createTestManagementAccess(db, clock),
+            onScheduleCommitted: () => {
+              throw new Error("injected reconcile failure");
+            },
+          }),
+          sessionCredential,
         );
 
         const res = await failingApp.request("/api/loops", {

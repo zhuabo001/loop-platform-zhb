@@ -4,13 +4,13 @@
  * artifact domain: the adapter never imports Db/BlobStore/store functions
  * (its own module doc forbids it), and this module never shapes HTTP.
  *
- * Every machine method authenticates through `verifyMachineCredential`
- * (existing machines only, NEVER registering — ADR-010 决策 7) and passes the
- * store-resolved identity into the state machine, which re-resolves the
- * storage namespace per operation. Credential failure throws the coordinator's
+ * Every machine method authenticates through `verifyEligibleMachineCredential`
+ * (existing AND claimed AND non-revoked machines only, NEVER registering —
+ * ADR-010 决策 7, ADR-011 slice 3). Credential failure throws the coordinator's
  * `InvalidMachineCredentialError` — the ONE 401 source the edge already maps
- * for poll. `updateConfig` is the management path: it carries NO credential
- * (loopback/trusted-network boundary, like every other /api/loops route).
+ * for poll. `updateConfig` is the management path: the HTTP layer puts it
+ * behind the shared Login Session gate, and this facade receives the team
+ * scope explicitly (ADR-011 决策 23/26).
  *
  * Storage-failure classification is completed HERE, at the operation boundary
  * (#85): the shared credential read and machineRead's attribution read sit
@@ -20,10 +20,10 @@
  * therefore wraps its WHOLE flow, so the failure code and the retry class can
  * no longer depend on which query failed.
  *
- * Batch 2 slice 7 adds the four MANAGEMENT reads (决策 27): no credential
- * (loopback boundary, like `updateConfig`), the machine identity discovered
- * from the loop row, attribution re-resolved before any snapshot/path/blob
- * resolution. `openDownload` returns a structured stream HANDLE — response
+ * Batch 2 slice 7 adds the four MANAGEMENT reads (决策 27): the caller passes
+ * an explicit team scope (the HTTP layer resolved it from the Login Session),
+ * the machine identity is discovered from the loop row, and attribution is
+ * re-resolved before any snapshot/path/blob resolution. `openDownload` returns a structured stream HANDLE — response
  * composition, the mid-stream pump and abort cleanup belong to the route.
  */
 import { eq } from "drizzle-orm";
@@ -36,7 +36,7 @@ import type {
 
 import { InvalidMachineCredentialError } from "../coordinator/errors.js";
 import { loops } from "../db/schema.js";
-import { verifyMachineCredential } from "../store/machines.js";
+import { verifyEligibleMachineCredential } from "../store/machines.js";
 import type { TrustedMachineIdentity } from "./attribution.js";
 import {
   diffLoopSnapshots,
@@ -80,19 +80,26 @@ export type MachineLoopArtifactsReadResult =
 export interface ArtifactApi {
   /** PATCH /api/loops/:id/artifact-dir — management, no credential. */
   updateConfig(loopId: string, command: { artifactDir: string | null }): Promise<UpdateArtifactConfigResult>;
-  /** GET /api/loops/:id/artifacts — management read: the current file view. */
-  readLoop(loopId: string): Promise<ReadLoopArtifactsResult>;
-  /** GET /api/runs/:id/artifacts — management read: bound snapshot or explicit
-   *  missing. `expectedLoopId` is the nested Dashboard page's parent path: a
-   *  mismatch folds into `run_not_found` at the identity step, BEFORE any
-   *  attribution/snapshot failure could leak the run's existence (#111). */
-  readRun(runId: string, expectedLoopId?: string): Promise<ReadRunArtifactsResult>;
-  /** GET /api/loops/:id/artifacts/diff — management read: structural diff of two same-loop snapshots. */
-  diffSnapshots(loopId: string, query: { from?: string; to: string }): Promise<ReadDiffResult>;
+
+  // ---- management reads: Team-Scoped (Phase 5 Batch 3 slice 5, 决策 26) ----
+  // These are the ONLY read methods the management HTTP routes may call. The
+  // ownership comparison happens before attribution, snapshot parsing and any
+  // blob open.
+  /** GET /api/loops/:id/artifacts — the current file view. */
+  readLoopForTeam(loopId: string, teamId: string): Promise<ReadLoopArtifactsResult>;
+  /** GET /api/runs/:id/artifacts — bound snapshot or explicit missing. */
+  readRunForTeam(runId: string, teamId: string, expectedLoopId?: string): Promise<ReadRunArtifactsResult>;
+  /** GET /api/loops/:id/artifacts/diff — structural diff of two same-loop snapshots. */
+  diffSnapshotsForTeam(loopId: string, teamId: string, query: { from?: string; to: string }): Promise<ReadDiffResult>;
   /** GET /api/loops/:id/artifacts/download — opens the verified blob stream
    *  for one manifest entry; the ROUTE owns response composition, the
    *  mid-stream pump and abort cleanup (决策 27). */
-  openDownload(loopId: string, query: { snapshotId: string; path: string }): Promise<OpenArtifactDownloadResult>;
+  openDownloadForTeam(
+    loopId: string,
+    teamId: string,
+    query: { snapshotId: string; path: string },
+  ): Promise<OpenArtifactDownloadResult>;
+
   /** GET /api/machine/loops/:id/artifacts — the restart/conflict recovery read. */
   readMachineLoop(token: string, loopId: string): Promise<MachineLoopArtifactsReadResult>;
   /** POST /api/machine/sync. */
@@ -110,7 +117,7 @@ export function createArtifactApi(home: ArtifactHomeDeps): ArtifactApi {
   const reads: ArtifactReadHome = { db, attribution, blobStore };
 
   async function authenticate(token: string): Promise<TrustedMachineIdentity> {
-    const machine = await verifyMachineCredential(db, token);
+    const machine = await verifyEligibleMachineCredential(db, token);
     if (!machine) throw new InvalidMachineCredentialError();
     return { machineId: machine.id };
   }
@@ -120,30 +127,30 @@ export function createArtifactApi(home: ArtifactHomeDeps): ArtifactApi {
       return updateArtifactConfig({ db, clock }, loopId, { artifactDir: command.artifactDir });
     },
 
-    readLoop(loopId) {
+    readLoopForTeam(loopId, teamId) {
       return withStorageError(
-        () => readLoopArtifactsView(reads, loopId),
+        () => readLoopArtifactsView(reads, loopId, { kind: "team", teamId }),
         (cause) => ({ ok: false, failure: "storage_error", cause }),
       );
     },
 
-    readRun(runId, expectedLoopId) {
+    readRunForTeam(runId, teamId, expectedLoopId) {
       return withStorageError(
-        () => readRunArtifactsView(reads, runId, expectedLoopId),
+        () => readRunArtifactsView(reads, runId, { kind: "team", teamId }, expectedLoopId),
         (cause) => ({ ok: false, failure: "storage_error", cause }),
       );
     },
 
-    diffSnapshots(loopId, query) {
+    diffSnapshotsForTeam(loopId, teamId, query) {
       return withStorageError(
-        () => diffLoopSnapshots(reads, loopId, query),
+        () => diffLoopSnapshots(reads, loopId, query, { kind: "team", teamId }),
         (cause) => ({ ok: false, failure: "storage_error", cause }),
       );
     },
 
-    openDownload(loopId, query) {
+    openDownloadForTeam(loopId, teamId, query) {
       return withStorageError(
-        () => openArtifactDownload(reads, loopId, query),
+        () => openArtifactDownload(reads, loopId, query, { kind: "team", teamId }),
         (cause) => ({ ok: false, failure: "storage_error", cause }),
       );
     },

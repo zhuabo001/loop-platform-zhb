@@ -5,7 +5,7 @@
 
 **阶段状态**：Phase 1–4 已完成（Phase 4 于 2026-09-27 收口，验收证据 `docs/tests/phase4-acceptance.md`）；当前进入 Phase 5（Artifact 同步 → 认证 → 通知）。
 
-**部署边界**：认证（Phase 5）上线之前，server 只允许 localhost / 受信网络使用，**不得公开暴露**——机器注册与触发端点在 auth 之前没有任何身份边界。
+**部署边界**：管理 JSON API 与 Dashboard 均已要求 GitHub 登录（Batch 3 片 5–6），机器自注册已关闭；但 ConnectKey 与公开部署所需的硬化尚未完成，server 仍只允许 localhost / 受信网络使用，**不得公开暴露**。
 
 ## 核心功能
 
@@ -85,29 +85,73 @@ Loop 不只是定时任务：它可带一个 **Goal**，跨 Run 继承状态，�
 
 ## Server 运行
 
+Batch 3 起登录配置是**必填**：缺少或写错 OAuth 配置时启动在打开任何资源前失败，不存在匿名回退（ADR-011 决策 5）。
+
+1. 在 GitHub 创建 OAuth App。Authorization callback URL 必须精确等于
+   `<LOOPZHB_ORIGIN>/auth/github/callback`（例如 `http://127.0.0.1:3000/auth/github/callback`）。
+2. 设置环境变量并启动：
+
 ```bash
+export LOOPZHB_ORIGIN=http://127.0.0.1:3000
+export LOOPZHB_GITHUB_CLIENT_ID=<client id>
+export LOOPZHB_GITHUB_CLIENT_SECRET=<client secret>
 pnpm --filter @loopzhb/server start
 ```
 
-零配置启动：默认绑定 `127.0.0.1:3000`，数据落在 `~/.loopzhb`（嵌入式 PGlite 文件库，**不是**内存库）。所有值都可用环境变量覆盖，但显式写错会 fail-fast，不静默回落默认值。
+默认绑定 `127.0.0.1:3000`，数据落在 `~/.loopzhb`（嵌入式 PGlite 文件库，**不是**内存库）。所有值都可用环境变量覆盖，但显式写错会 fail-fast，不静默回落默认值。
 
 | 环境变量 | 必填 | 默认 | 说明 |
 |---|---|---|---|
-| `LOOPZHB_HOST` | 否 | `127.0.0.1` | 绑定地址；非回环地址会打印「未认证暴露」警告，且 Dashboard 完全不挂载 |
+| `LOOPZHB_ORIGIN` | 是 | — | 固定 origin；用于拼接回调 URL，不从请求 Host 或 forwarded header 推导 |
+| `LOOPZHB_GITHUB_CLIENT_ID` | 是 | — | GitHub OAuth App 的 client id |
+| `LOOPZHB_GITHUB_CLIENT_SECRET` | 是 | — | GitHub OAuth App 的 client secret |
+| `LOOPZHB_HOST` | 否 | `127.0.0.1` | 绑定地址；非回环地址会打印暴露警告，且 Dashboard 完全不挂载 |
 | `LOOPZHB_PORT` | 否 | `3000` | 严格十进制，1–65535 |
 | `LOOPZHB_DATA_DIR` | 否 | `~/.loopzhb` | 相对路径按启动 cwd 解析为绝对路径 |
 
-启动后：`GET /` 是 Dashboard（仅回环绑定才有），`/api/machine/*` 供 daemon 接入，`/api/loops*` 与 `/api/runs*` 是管理接口。
+启动后：匿名访问 `GET /` → 303 `/login`；完成 GitHub 登录后 `GET /` 是所属团队的 Dashboard（仅回环绑定才有）。`/api/machine/*` 供 daemon 接入，`/api/loops*` 与 `/api/runs*` 是要求 Login Session 的管理接口。
+
+停止：按 Ctrl+C 或发送 SIGTERM。Server 先排空调度与 sweep，再关闭监听与空闲 keep-alive 连接；5 秒宽限期后强制关闭剩余连接，最后关闭数据库并释放 `data-dir.lock`。干净的 SIGINT/SIGTERM **不应**留下锁；只有 SIGKILL 或崩溃才需要按认领一节的说明手工恢复。
+
+## 从 Batch 2 升级到 Batch 3
+
+1. 备份完整数据目录，停止新增任务，等待已有 Run 结束并停止 Daemon。
+2. 停止旧 Server，部署整个 Batch 3（不可只升级部分组件），配置上面的 OAuth 与固定 origin。
+3. 启动新 Server 一次，让迁移 `0006` 应用；目标账号访问 `/login` 完成 GitHub 登录并创建个人团队。此时旧机器仍不可见、不可执行。
+4. 停止 Server，按下一节先跑 `claim:legacy --dry-run`，核对数字 ID、机器集合与复制字节数后执行认领。
+5. 重启 Server 与既有 Daemon，验证执行、同步与历史快照下载。
+
+**回滚**：认领改写 Artifact namespace 后，只回退应用二进制不够；必须恢复升级前的完整数据目录备份。
+
+## 旧机器认领（离线）
+
+Batch 3 关闭了 poll 自注册：旧机器在被显式认领前对管理面不可见、不可执行。认领必须**停服**执行。
+
+```bash
+pnpm --filter @loopzhb/server build
+pnpm --filter @loopzhb/server claim:legacy -- --data-dir <数据目录> --github-user-id <数字ID> --machine-id <机器ID> [--machine-id <机器ID> ...] [--dry-run]
+```
+
+- **先停 Server 与 Daemon**，再执行。Server 与本命令共用数据目录独占锁（`<数据目录>/data-dir.lock`），在打开数据库之前获取。
+- 先跑 `--dry-run` 核对目标账号、团队、机器与需复制字节数；移除 `--dry-run` 才真正执行。
+- `--machine-id` 可重复；不提供「认领全部」。目标账号必须**已经通过 GitHub 登录**并拥有个人团队，本命令不创建账号。
+- 选中机器存在 **running** Run 时拒绝（先 drain）；pending Run 只在报告里提示，认领后随机器恢复执行。
+- 复制失败或事务失败不会留下半认领机器；已复制的目标 Blob 保留并由重试复用。源 Blob 与源元数据一律保留，不执行 GC。
+- 退出码：`0` 成功/幂等 no-op、`1` 拒绝或失败、`2` 用法错误、`3` 数据目录被锁。
+- **锁绝不自动抢占**。若持有者已崩溃，确认没有进程在使用该数据目录后手工删除锁文件：`rm <数据目录>/data-dir.lock`。
+- **回滚须知**：认领会改写 Artifact namespace，只回退应用二进制不够——必须恢复升级前的完整数据目录备份。
+
+完整参数与退出码以 `--help` 为准。
 
 ## Dashboard（本机）
 
 仅当 server 绑定**回环地址**时存在，入口是 `GET /`（例如 `http://127.0.0.1:3000/`）；绑定非回环地址时完全不挂载——`GET /` 与写路由都落回普通 404，与任意未知路径不可区分。
 
 - **只读页面，单一动作**：服务端渲染、无客户端 JavaScript、每 3 秒 meta refresh；单页最多显示 100 条 Loop（按最近更新时间倒序），页面自己写明当前条数与排序口径。
-- **Run Now**：每张卡片一个按钮（`POST /dashboard/loops/:id/run`，表单带每 boot 一枚的 CSRF token，重启即失效）。按钮可用条件与后端规则同源、同序：已完成（Completed）禁用 → 已有 Running Run 禁用 → 已有 Pending Run 禁用；Paused 且无活跃 Run 仍可用。页面最多陈旧 3 秒，**后端才是权威**：按钮可点但后端判定已有 Run 时，结果是零写跳过而不是替换。
+- **Run Now**：每张卡片一个按钮（`POST /dashboard/loops/:id/run`，表单带当前 Login Session 派生的 CSRF token；另一 Session 的 token 会被拒绝）。按钮可用条件与后端规则同源、同序：已完成（Completed）禁用 → 已有 Running Run 禁用 → 已有 Pending Run 禁用；Paused 且无活跃 Run 仍可用。页面最多陈旧 3 秒，**后端才是权威**：按钮可点但后端判定已有 Run 时，结果是零写跳过而不是替换。
 - **不替换已有 Run**：Dashboard 触发的 Run Now **不会**取消或替换任何已排队的 Run——任意 role 的 pending/running 都会让它零写跳过（不改 Run、不推进 revision 与调度水位）。cron 与重启 catch-up 的 T7 supersede 语义不受影响（ADR-007 §4 / ADR-008）。
 - **Completed 行为**：Loop 完成后页面显示 Completed、按钮禁用并给出原因；`POST /api/loops/:id/run`、重新启用调度与修改 Goal 均为 `409 loop_completed`（只有 Reopen 能恢复）。
-- **信任模型**：回环绑定时生效的全局 Host 门禁只封 DNS rebinding，**不是认证**——本机上的其他进程仍可直接请求，与 JSON API 的既有边界一致。Dashboard 不是对外服务。
+- **信任模型**：JSON API 的管理路由与 Dashboard 页面都要求 GitHub 登录后的 Login Session。页面未登录时跳转 `/login`，表单未登录时返回 401；跨团队、未认领与不存在的 Loop 在页面与写入上统一为同一扁平 404。回环 Host 门禁只封 DNS rebinding，**不是认证**。Dashboard 不是对外服务。
 
 ## Daemon 运行
 
@@ -190,7 +234,7 @@ LOOPZHB_CLAUDE_PERMISSION_PROBE=1 pnpm --filter @loopzhb/daemon test src/claude-
 | `docs/roadmap.md` | 阶段范围与状态（第一份文档） |
 | `docs/adr/` | 架构决策记录，含各 ADR 的修订记录 |
 | `GitHub Issues` | 未关闭、需执行的问题的唯一权威来源；工作流见 `docs/agents/issue-tracker.md` |
-| `docs/tests/` | 各阶段验收证据（`phase2-batch4` / `phase3` / `phase4`） |
+| `docs/tests/` | 各阶段验收证据（`phase2-batch4` / `phase3` / `phase4` / `phase5`） |
 | `docs/plan/` | 当批计划中携带长期引用锚点的部分 |
 | `AGENTS.md` | 仓库工作规约（文档四层分流、批次收口仪式） |
 

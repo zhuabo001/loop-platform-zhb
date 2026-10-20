@@ -68,7 +68,14 @@ import { createOwnerControl } from "./owner/index.js";
 import { createScheduleAdmin } from "./schedule/index.js";
 import { RECLAIM_RUN_ERROR } from "./store/runs.js";
 import { createInactivitySweep, type InactivitySweep } from "./sweep/index.js";
-import { FakeClock, makeTestFactories } from "./testkit/index.js";
+import {
+  createTestManagementAccess,
+  FakeClock,
+  makeTestFactories,
+  seedClaimedMachineForToken,
+  seedManagementSession,
+  withManagementSession,
+} from "./testkit/index.js";
 
 const handles: DbHandle[] = [];
 
@@ -100,7 +107,19 @@ async function bootFake(options: { lifecycleHooks?: LifecycleOpsHooks } = {}): P
   const ownerControl = createOwnerControl({ db: handle.db, clock });
   const lifecycle = createLifecycleAdmin({ db: handle.db, clock, hooks: options.lifecycleHooks });
   const schedule = createScheduleAdmin({ db: handle.db, clock });
-  return { app: createServerApp(coordinator, admin, lifecycle, schedule, ownerControl), db: handle.db, handle, clock, sweep };
+  const { credential } = await seedManagementSession(handle.db, { clock });
+  const app = withManagementSession(
+    createServerApp({
+      coordinator,
+      admin,
+      lifecycle,
+      schedule,
+      ownerControl,
+      management: createTestManagementAccess(handle.db, clock),
+    }),
+    credential,
+  );
+  return { app, db: handle.db, handle, clock, sweep };
 }
 
 function appFetch(app: FakeBoot["app"]): typeof fetch {
@@ -270,10 +289,12 @@ describe("C1 — goal/report: a mid-run goal change makes the in-flight finish s
   it("claim at goalRevision 0 → PATCH goal → finish report is a stable run failure, Loop frozen, lease consumed", async () => {
     const b = await bootFake();
     const token = "dk_conc_goal";
+    // Phase 5 Batch 3 slice 3: poll no longer self-registers.
+    await seedClaimedMachineForToken(b.db, token);
     const { runner, gates } = createSequentialGates();
     const daemon = createDaemon(b.app, token, runner);
 
-    await daemon.pollOnce(); // register
+    await daemon.pollOnce(); // first poll after the claimed-machine fixture
     const loopId = await createLoop(b.app, token, { goal: "goal-one" });
     const runId = await trigger(b.app, loopId);
 
@@ -318,10 +339,12 @@ describe("C2 — task-file/claim: a retarget between enqueue and claim clears th
   it("run 1 syncs content → retarget PATCH on a pending run → snapshot cleared → claim's authoritative snapshot carries the new taskFile", async () => {
     const b = await bootFake();
     const token = "dk_conc_taskfile";
+    // Phase 5 Batch 3 slice 3: poll no longer self-registers.
+    await seedClaimedMachineForToken(b.db, token);
     const { runner, gates } = createSequentialGates();
     const daemon = createDaemon(b.app, token, runner);
 
-    await daemon.pollOnce(); // register
+    await daemon.pollOnce(); // first poll after the claimed-machine fixture
     const loopId = await createLoop(b.app, token, { taskFile: "/srv/project/A.md" });
 
     // Run 1 completes and syncs the task-file content onto the loop.
@@ -396,10 +419,12 @@ describe("C8 — task-file/claim TRUE interleave (review SPEC-1/ADV-3): a claim 
       },
     });
     const token = "dk_conc_interleave";
+    // Phase 5 Batch 3 slice 3: poll no longer self-registers.
+    await seedClaimedMachineForToken(b.db, token);
     const { runner, gates } = createSequentialGates();
     daemonRef = createDaemon(b.app, token, runner);
 
-    await daemonRef.pollOnce(); // register
+    await daemonRef.pollOnce(); // first poll after the claimed-machine fixture
     const loopId = await createLoop(b.app, token, { taskFile: "/srv/project/A.md" });
     const runId = await trigger(b.app, loopId); // pending, unclaimed
 
@@ -431,13 +456,15 @@ describe("C3 — finish/report: run 2's finish completes the Loop while run 1 sl
   it("finish wins → Completed; the reclaimed run's late plain report = done/exec + byte-frozen Loop + reconciled:true", async () => {
     const b = await bootFake();
     const token = "dk_conc_fin";
+    // Phase 5 Batch 3 slice 3: poll no longer self-registers.
+    await seedClaimedMachineForToken(b.db, token);
     const gates1 = createSequentialGates();
     const gates2 = createSequentialGates();
     const seenReports: unknown[] = [];
     const daemon1 = createDaemon(b.app, token, gates1.runner, (base) => recordingReportBodies(base, seenReports));
     const daemon2 = createDaemon(b.app, token, gates2.runner);
 
-    await daemon1.pollOnce(); // register
+    await daemon1.pollOnce(); // first poll after the claimed-machine fixture
     const loopId = await createLoop(b.app, token, { goal: "shared-goal" });
 
     // Instance 1 claims run 1 and "sleeps"; the sweep reclaims it
@@ -496,11 +523,13 @@ describe("C4 — finish/sweep: the wake-report after a reclaim is a FINISH — r
   it("claim → sleep past the timeout → sweep reclaims → the waking daemon's finish completes the Loop once", async () => {
     const b = await bootFake();
     const token = "dk_conc_sweep";
+    // Phase 5 Batch 3 slice 3: poll no longer self-registers.
+    await seedClaimedMachineForToken(b.db, token);
     const seenReports: unknown[] = [];
     const { runner, gates } = createSequentialGates();
     const daemon = createDaemon(b.app, token, runner, (base) => recordingReportBodies(base, seenReports));
 
-    await daemon.pollOnce(); // register
+    await daemon.pollOnce(); // first poll after the claimed-machine fixture
     const loopId = await createLoop(b.app, token, { goal: "sweep-goal" });
     const runId = await trigger(b.app, loopId);
 
@@ -543,12 +572,14 @@ describe("C5 — reopen/late-report: reopen revokes the old generation; its late
   it("finish completes → reopen deletes the reclaimed run's terminal-grace lease → the late wake-report is 401, run stays an error", async () => {
     const b = await bootFake();
     const token = "dk_conc_reopen";
+    // Phase 5 Batch 3 slice 3: poll no longer self-registers.
+    await seedClaimedMachineForToken(b.db, token);
     const gates1 = createSequentialGates();
     const gates2 = createSequentialGates();
     const daemon1 = createDaemon(b.app, token, gates1.runner);
     const daemon2 = createDaemon(b.app, token, gates2.runner);
 
-    await daemon1.pollOnce(); // register
+    await daemon1.pollOnce(); // first poll after the claimed-machine fixture
     const loopId = await createLoop(b.app, token, { goal: "reopen-goal" });
 
     // Same build-up as C3: instance 1 sleeps past the sweep; instance 2
@@ -606,11 +637,13 @@ describe("C6 — duplicate delivery: the daemon's exact report bytes replayed af
   it("daemon reports successfully → byte-identical replay → 401; run/loop snapshots unchanged", async () => {
     const b = await bootFake();
     const token = "dk_conc_replay";
+    // Phase 5 Batch 3 slice 3: poll no longer self-registers.
+    await seedClaimedMachineForToken(b.db, token);
     const seenRequests: { body: string; authorization: string }[] = [];
     const { runner, gates } = createSequentialGates();
     const daemon = createDaemon(b.app, token, runner, (base) => capturingReportRequests(base, seenRequests));
 
-    await daemon.pollOnce(); // register
+    await daemon.pollOnce(); // first poll after the claimed-machine fixture
     const loopId = await createLoop(b.app, token);
     const runId = await trigger(b.app, loopId);
 
@@ -651,10 +684,12 @@ describe("C7 — double report: two different terminals on one lease — the sec
   it("plain report consumes the lease → a finish on the same credential is refused, the Loop never completes", async () => {
     const b = await bootFake();
     const token = "dk_conc_double";
+    // Phase 5 Batch 3 slice 3: poll no longer self-registers.
+    await seedClaimedMachineForToken(b.db, token);
     const { runner, gates } = createSequentialGates();
     const daemon = createDaemon(b.app, token, runner);
 
-    await daemon.pollOnce(); // register
+    await daemon.pollOnce(); // first poll after the claimed-machine fixture
     const loopId = await createLoop(b.app, token, { goal: "double-goal" });
     const runId = await trigger(b.app, loopId);
 

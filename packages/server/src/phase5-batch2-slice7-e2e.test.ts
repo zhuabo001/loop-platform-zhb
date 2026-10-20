@@ -5,7 +5,7 @@
  * daemon's fetch — the slice-6 precedent), with the REAL artifact sync client
  * and a REAL temp artifact directory:
  *
- *   register → create loop WITH artifactDir → run 1 (binds snapshot 1 with
+ *   seeded claimed machine → create loop WITH artifactDir → run 1 (binds snapshot 1 with
  *   three files) → edit (modify / add / delete) → run 2 (binds snapshot 2) →
  *   the management reads serve the current view, download BYTES equal the
  *   on-disk blob, the structural diff shows exactly the three change classes,
@@ -47,6 +47,8 @@ import { createArtifactTransport } from "../../daemon/dist/artifact-client.js";
 import { closeDb, type Db, type DbHandle } from "./db/index.js";
 import { artifactManifests, loops, runs } from "./db/schema.js";
 import { bootstrapServer, type BootedServer } from "./start.js";
+import { makeTestAuthConfig, seedClaimedMachineForToken, TEST_TEAM_ID, seedManagementSession, withManagementSession } from "./testkit/index.js";
+import { systemClock } from "./time.js";
 
 const TOKEN = "dk_slice7_e2e_machine";
 const V1 = "console.log('v1')";
@@ -67,9 +69,14 @@ let dataDir: string;
 async function boot(): Promise<BootedServer> {
   dataDir = await mkdtemp(path.join(tmpdir(), `loopzhb-slice7-e2e-${process.pid}-`));
   dirs.push(dataDir);
-  const b = await bootstrapServer({ host: "127.0.0.1", port: 3000, dataDir });
+  const b = await bootstrapServer({ auth: makeTestAuthConfig(), host: "127.0.0.1", port: 3000, dataDir });
   handles.push(b.handle);
-  return b;
+  // Phase 5 Batch 3 slice 3: poll no longer self-registers — state the claimed
+  // machine this daemon's token polls as.
+  await seedClaimedMachineForToken(b.handle.db, TOKEN);
+  // Slice 5: the management surface requires a Login Session.
+  const { credential } = await seedManagementSession(b.handle.db, { clock: systemClock });
+  return { ...b, app: withManagementSession(b.app, credential) };
 }
 
 /** Adapt the Hono app into the daemon's fetch (the daemon-e2e precedent). */
@@ -196,7 +203,7 @@ describe("slice 7 E2E: reads, download, diff and the R3 blob-missing composition
     expect(download.headers.get("content-type")).toBe("application/octet-stream");
     expect(download.headers.get("content-disposition")).toBe('attachment; filename="app.js"');
     const downloaded = new Uint8Array(await download.arrayBuffer());
-    const onDisk = await readFile(path.join(dataDir, "blobs", machineId, v2Hash));
+    const onDisk = await readFile(path.join(dataDir, "blobs", TEST_TEAM_ID, v2Hash));
     expect(Buffer.from(downloaded).equals(onDisk)).toBe(true);
     expect(Buffer.from(downloaded).toString()).toBe(V2);
 
@@ -246,7 +253,7 @@ describe("slice 7 E2E: reads, download, diff and the R3 blob-missing composition
     expect(bound.files.map((f) => f.path).sort()).toEqual(["dist/app.js", "extra.txt"]);
 
     // ---- R3: the blob file deleted under <dataDir>/blobs ⇒ the code-less 404 ----
-    await rm(path.join(dataDir, "blobs", machineId, v2Hash));
+    await rm(path.join(dataDir, "blobs", TEST_TEAM_ID, v2Hash));
     const gone = await b.app.request(
       `/api/loops/${loop.id}/artifacts/download?snapshotId=${snapshot2}&path=${encodeURIComponent("dist/app.js")}`,
     );
