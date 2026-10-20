@@ -42,7 +42,15 @@ afterEach(() => {
 /** Let every pending microtask and immediate callback drain. */
 const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
-async function waitUntil(predicate: () => boolean, label: string, timeoutMs = 2_000): Promise<void> {
+/** Poll until a positive condition holds. The deadline is a regression
+ *  tripwire, not a performance assertion: a passing run resolves at the 2 ms
+ *  poll cadence and never pays it, while a broken one still fails — just
+ *  later. The waits below cover real async work (admission lstat + full
+ *  rehash + sync round) that must fit inside this WALL-CLOCK budget even when
+ *  a loaded CI runner stalls the event loop for seconds at a time; 2 s was
+ *  calibrated on a dev machine and flaked there (4 red / 2 green on the same
+ *  tree), so the budget is 10 s. Absence assertions use settleFor instead. */
+async function waitUntil(predicate: () => boolean, label: string, timeoutMs = 10_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
     if (Date.now() > deadline) throw new Error(`deadline exceeded waiting for ${label}`);
