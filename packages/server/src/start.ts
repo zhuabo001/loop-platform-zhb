@@ -23,13 +23,14 @@ import { createTeamAttributionResolver } from "./artifact/attribution-team.js";
 import { createProductionArtifactHome } from "./artifact/production.js";
 import { createAuthModule } from "./auth/index.js";
 import { createRunCoordinator, mintRunCredential, newUuidRunId, type CoordinatorHooks, type RunCoordinator } from "./coordinator/index.js";
-import { isLoopbackHost, loadServerConfig, unauthenticatedExposureWarning, type ServerConfig } from "./config.js";
+import { isLoopbackHost, loadServerConfig, nonLoopbackExposureWarning, type ServerConfig } from "./config.js";
 import { createDashboardAccess } from "./dashboard/access.js";
 import { createDashboardArtifactRead, createDashboardRead } from "./dashboard/index.js";
 import { createDashboardRoutes } from "./dashboard/routes.js";
 import { acquireDataDirLock, DataDirLockError, formatAcquireFailureMessage } from "./data-dir-lock.js";
 import { closeDb, openMigratedDb, type DbHandle } from "./db/index.js";
 import { createServerApp } from "./http/app.js";
+import { closeHttpServer } from "./http/server-shutdown.js";
 import { createLifecycleAdmin, type LifecycleOpsHooks } from "./loop-lifecycle/admin.js";
 import { createManagementAccess } from "./management/access.js";
 import { createOwnerControl } from "./owner/index.js";
@@ -223,7 +224,7 @@ export async function bootstrapServer(
 
 export async function main(): Promise<void> {
   const config = loadServerConfig(process.env, os.homedir(), process.cwd());
-  const warning = unauthenticatedExposureWarning(config.host);
+  const warning = nonLoopbackExposureWarning(config.host);
   if (warning) console.warn(warning);
 
   // The outer catch is the SINGLE owner of post-bootstrap DB cleanup
@@ -265,7 +266,9 @@ export async function main(): Promise<void> {
       // block new sweep ticks and DRAIN the in-flight pass → HTTP → DB.
       void scheduler.stopAndDrain().catch(() => {}).then(() => {
         void sweepTimer.stopAndDrain().catch(() => {}).then(() => {
-          server.close(async () => {
+          // Bounded: an idle browser keep-alive must not keep the process (and
+          // the dataDir lock) alive forever (slice 7 manual-smoke finding).
+          void closeHttpServer(server).then(async () => {
             await closeDb(handle!).catch(() => {});
             process.exit(0);
           });

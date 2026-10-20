@@ -221,7 +221,7 @@ describe("T5 — the sleeping daemon's late report reconciles the sweep's misjud
     const gate = createGatedRunner();
     const daemon = createDaemon(b.app, gate.runner, seenReports);
 
-    await daemon.pollOnce(); // register only — nothing pending yet
+    await daemon.pollOnce(); // first poll after the claimed-machine fixture — nothing pending yet
     const { loopId, runId } = await createLoopAndTrigger(b.app);
 
     // The daemon claims the run and the "laptop sleeps" inside the runner.
@@ -280,7 +280,7 @@ describe("T6 — a canceled run's late report is intercepted", () => {
     const gate = createGatedRunner();
     const daemon = createDaemon(b.app, gate.runner);
 
-    await daemon.pollOnce(); // register
+    await daemon.pollOnce(); // first poll after the claimed-machine fixture
     const { loopId, runId } = await createLoopAndTrigger(b.app);
 
     // The daemon claims the run; the runner is mid-execution holding the
@@ -324,7 +324,7 @@ describe("delivery response lost — the orphaned run converges to an observable
     const gate = createGatedRunner();
     const daemon = createDaemon(b.app, gate.runner);
 
-    await daemon.pollOnce(); // register
+    await daemon.pollOnce(); // first poll after the claimed-machine fixture
     const { loopId, runId } = await createLoopAndTrigger(b.app);
 
     // A RAW poll completes the claim server-side; the daemon never processes
@@ -374,7 +374,7 @@ describe("T4 — a server restart never loses an in-flight run", () => {
     const gate = createGatedRunner();
     const daemon = createDaemon(a.app, gate.runner, undefined, switchableFetch);
 
-    await daemon.pollOnce(); // register against A
+    await daemon.pollOnce(); // first poll after the claimed-machine fixture (A)
     const { loopId, runId } = await createLoopAndTrigger(a.app);
 
     // A claims the run; the runner is mid-execution holding the credential.

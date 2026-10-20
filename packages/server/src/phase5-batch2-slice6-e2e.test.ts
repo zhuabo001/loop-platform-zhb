@@ -5,7 +5,7 @@
  * fetch — the daemon-e2e precedent), with the REAL artifact sync client and
  * a REAL temp artifact directory:
  *
- *   register → create loop WITH artifactDir → trigger → claim (the delivery
+ *   seeded claimed machine → create loop WITH artifactDir → trigger → claim (the delivery
  *   carries the pinned artifact generation) → fake runner → RUN-FINAL SYNC
  *   (fresh session, full rehash, real prepare→PUT→commit over the app's
  *   routes) → report carries artifactSnapshotId → the report transaction

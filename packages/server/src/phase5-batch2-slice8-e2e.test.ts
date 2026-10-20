@@ -493,7 +493,7 @@ describe("slice 8 fault-integration E2E (real HTTP + file PGlite + local BlobSto
 
     const dial = makeDial(rs.baseUrl);
     const stack = makeDaemonStack(dial, [root]);
-    await stack.runtime.pollOnce(); // machine self-registration
+    await stack.runtime.pollOnce(); // first poll after the claim fixture
     const loopId = await createLoop(rs, "ai1-loop", root);
     await stack.runtime.pollOnce(); // delivers the watch set → apply → subscribe → startup scan
 

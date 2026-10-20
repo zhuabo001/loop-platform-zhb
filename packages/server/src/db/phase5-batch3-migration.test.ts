@@ -25,20 +25,29 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { migrate } from "drizzle-orm/pglite/migrator";
 import { afterEach, describe, expect, test } from "vitest";
 
-import { machineIdFromToken, sha256 } from "@loopzhb/protocol/node";
+import { machineIdFromToken } from "@loopzhb/protocol/node";
 
 import { closeDb, createDb, runMigrations, type DbHandle } from "../db/index.js";
 import { authSessions, machines, memberships, teams, users } from "../db/schema.js";
+import {
+  BATCH2_BLOB_COLUMNS,
+  BATCH2_LEASE_COLUMNS,
+  BATCH2_LOOP_COLUMNS,
+  BATCH2_MACHINE_COLUMNS,
+  BATCH2_MANIFEST_COLUMNS,
+  BATCH2_RUN_COLUMNS,
+  BATCH2_SESSION_COLUMNS,
+  openBatch2Db as openBatch2DbAt,
+  seedBatch2Data,
+} from "../testkit/batch2-world.js";
 import { seedClaimedMachine, seedPersonalIdentity, seedSession } from "../testkit/index.js";
 
 const FIXTURE_DIR = path.resolve("test-fixtures/phase5-migrations");
 const LIVE_DIR = path.resolve("drizzle");
 
 const MACHINE_TOKEN = "dk_batch2_machine";
-const LEASE_TOKEN = "rk_batch2_legacy";
 const MACHINE_ID = machineIdFromToken(MACHINE_TOKEN);
 
 const HASH_A = "a".repeat(64);
@@ -51,173 +60,18 @@ afterEach(async () => {
   await Promise.all(tempDirs.splice(0).map((d) => rm(d, { recursive: true, force: true }).catch(() => {})));
 });
 
-/** Build the OLD (Batch 2, 0000–0005) database from the frozen fixture. */
-async function openBatch2Db(): Promise<DbHandle> {
-  const dataDir = await mkdtemp(path.join(tmpdir(), `loopzhb-b3-m-${process.pid}-`));
-  tempDirs.push(dataDir);
-  const handle = await createDb({ dataDir });
-  handles.push(handle);
-  await migrate(handle.db, { migrationsFolder: FIXTURE_DIR });
-  return handle;
-}
-
-/** Representative Batch 2 rows in every business table — written with raw SQL
- *  so only OLD columns may be named (a typo fails loudly against the old DDL;
- *  the identity tables and machines.team_id/revoked_at must NOT exist yet).
- *  The artifact reference chain is deliberately complete: a committed
- *  manifest, its blob rows, a pending and a committed sync session, and a run
- *  bound to the manifest via artifact_snapshot_id. */
-async function seedBatch2Data(handle: DbHandle): Promise<void> {
-  await handle.client.exec(`
-    INSERT INTO machines (
-      id, name, hostname, platform, arch, daemon_version, token_hash, roots, last_seen, capabilities, created_at
-    ) VALUES (
-      '${MACHINE_ID}', 'mbp', 'mbp.local', 'darwin', 'arm64', '0.1.0',
-      '${sha256(MACHINE_TOKEN)}', '["/home/user"]'::jsonb, '2026-10-06T00:00:00.000Z',
-      '["terminal-journal-v1","artifact-sync-v1"]'::jsonb, '2026-07-01T00:00:00.000Z'
-    );
-
-    INSERT INTO loops (
-      id, machine_id, name, workdir, task_file, task_file_content, task_file_synced_at,
-      workflow, model, allow_control, agent, enabled, state,
-      cron, timezone, next_run_at, schedule_revision, schedule_activated_at, last_scheduled_at,
-      goal, goal_revision, completed_at, completion_reason,
-      task_file_sync_attempted_at, task_file_sync_error,
-      artifact_dir, artifact_config_revision, artifact_manifest_revision, artifact_manifest_id,
-      artifact_sync_attempted_at, artifact_sync_succeeded_at, artifact_sync_error,
-      created_at, updated_at, revision
-    ) VALUES
-      (
-        'loop-old', '${MACHINE_ID}', 'nightly', '/home/user/project', '/home/user/project/TASK.md',
-        E'# TASK\\nspec v1', '2026-10-06T00:00:00.000Z',
-        NULL, NULL, true, 'claude-code', true, '{"cursor":3}'::jsonb,
-        '0 3 * * *', 'Asia/Shanghai', NULL, 7, '2026-08-20T00:00:00.000Z', '2026-10-06T03:00:00.000Z',
-        'triage the queue', 2, NULL, NULL,
-        '2026-10-06T00:00:01.000Z', NULL,
-        'dist', 2, 1, 'amf-1',
-        '2026-10-06T03:00:04.000Z', '2026-10-06T03:00:04.500Z', NULL,
-        '2026-07-01T00:00:00.000Z', '2026-10-06T00:00:00.000Z', 5
-      ),
-      (
-        'loop-plain', '${MACHINE_ID}', 'manual', NULL, NULL,
-        NULL, NULL,
-        NULL, NULL, true, 'claude-code', false, NULL,
-        NULL, 'UTC', NULL, 0, NULL, NULL,
-        NULL, 0, NULL, NULL,
-        NULL, NULL,
-        NULL, 0, 0, NULL,
-        NULL, NULL, NULL,
-        '2026-07-01T00:00:00.000Z', '2026-07-01T00:00:00.000Z', 0
-      );
-
-    INSERT INTO runs (
-      id, loop_id, machine_id, phase, role, ts, outcome, status, message, duration_ms,
-      error, state, session_id, cost_usd, usage, artifacts, transcript, progress,
-      artifact_snapshot_id, artifact_sync_error
-    ) VALUES
-      (
-        'run-done', 'loop-old', '${MACHINE_ID}', 'done', 'exec', '2026-10-06T03:00:05.000Z',
-        'exec', 'new', 'found 2 issues', 42000,
-        NULL, '{"seen":2}'::jsonb, 'sess_1', 0.42, '{"inputTokens":12000}'::jsonb,
-        '[{"path":"a.ts","kind":"edited"}]'::jsonb, '[{"kind":"text","text":"hi"}]'::jsonb, NULL,
-        'amf-1', NULL
-      ),
-      (
-        'run-running', 'loop-old', '${MACHINE_ID}', 'running', 'exec', '2026-10-07T00:00:00.000Z',
-        NULL, NULL, NULL, NULL,
-        NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-        '{"step":2,"label":"working","at":"2026-10-07T00:00:01.000Z"}'::jsonb,
-        NULL, NULL
-      );
-
-    INSERT INTO run_leases (
-      token_hash, run_id, loop_id, machine_id, role,
-      allow_control, can_set_ui, can_set_schema, can_set_workflow, can_finish,
-      state, expires_at, terminal_protocol_version, goal_revision, created_at
-    ) VALUES (
-      '${sha256(LEASE_TOKEN)}', 'run-running', 'loop-old', '${MACHINE_ID}', 'exec',
-      false, false, false, false, false,
-      'active', NULL, 0, 0, '2026-10-07T00:00:00.000Z'
-    );
-
-    INSERT INTO artifact_manifests (
-      id, namespace_id, machine_id, loop_id, config_revision, manifest_revision,
-      entries, file_count, total_bytes, committed_at
-    ) VALUES (
-      'amf-1', '${MACHINE_ID}', '${MACHINE_ID}', 'loop-old', 2, 1,
-      '[{"path":"dist/app.js","hash":"${HASH_A}","size":1200},{"path":"docs/readme.md","hash":"${HASH_B}","size":40}]'::jsonb,
-      2, 1240, '2026-10-06T03:00:04.500Z'
-    );
-
-    INSERT INTO artifact_sync_sessions (
-      id, namespace_id, machine_id, loop_id, request_id, config_revision, base_manifest_revision,
-      normalized_manifest, payload_fingerprint, negotiated_hashes, created_at, expires_at, receipt
-    ) VALUES
-      (
-        'sync-committed', '${MACHINE_ID}', '${MACHINE_ID}', 'loop-old', 'req-1', 2, 0,
-        '[{"path":"dist/app.js","hash":"${HASH_A}","size":1200},{"path":"docs/readme.md","hash":"${HASH_B}","size":40}]'::jsonb,
-        '${"f".repeat(64)}', '["${HASH_A}","${HASH_B}"]'::jsonb,
-        '2026-10-06T03:00:00.000Z', '2026-10-06T04:00:00.000Z',
-        '{"artifactSnapshotId":"amf-1","manifestRevision":1}'::jsonb
-      ),
-      (
-        'sync-pending', '${MACHINE_ID}', '${MACHINE_ID}', 'loop-old', 'req-2', 2, 1,
-        '[]'::jsonb,
-        '${"e".repeat(64)}', '[]'::jsonb,
-        '2026-10-07T00:30:00.000Z', '2026-10-07T01:30:00.000Z', NULL
-      );
-
-    INSERT INTO artifact_blobs (namespace_id, hash, size, verified_at) VALUES
-      ('${MACHINE_ID}', '${HASH_A}', 1200, '2026-10-06T03:00:02.000Z'),
-      ('${MACHINE_ID}', '${HASH_B}', 40, '2026-10-06T03:00:03.000Z');
-  `);
-}
-
-/** The full Batch 2 (0000–0005) column sets — everything the old DB knows.
- *  The Batch 3 identity columns/tables are deliberately NOT here. */
-const BATCH2_MACHINE_COLUMNS = [
-  "id", "name", "hostname", "platform", "arch", "daemon_version", "token_hash", "roots",
-  "last_seen", "capabilities", "created_at",
-] as const;
-
-const BATCH2_LOOP_COLUMNS = [
-  "id", "machine_id", "name", "workdir", "task_file", "task_file_content", "task_file_synced_at",
-  "workflow", "model", "allow_control", "agent", "enabled", "state",
-  "cron", "timezone", "next_run_at", "schedule_revision", "schedule_activated_at", "last_scheduled_at",
-  "goal", "goal_revision", "completed_at", "completion_reason",
-  "task_file_sync_attempted_at", "task_file_sync_error",
-  "artifact_dir", "artifact_config_revision", "artifact_manifest_revision", "artifact_manifest_id",
-  "artifact_sync_attempted_at", "artifact_sync_succeeded_at", "artifact_sync_error",
-  "created_at", "updated_at", "revision",
-] as const;
-
-const BATCH2_RUN_COLUMNS = [
-  "id", "loop_id", "machine_id", "phase", "role", "ts", "outcome", "status", "message",
-  "duration_ms", "error", "state", "session_id", "cost_usd", "usage", "artifacts", "transcript", "progress",
-  "artifact_snapshot_id", "artifact_sync_error",
-] as const;
-
-const BATCH2_LEASE_COLUMNS = [
-  "token_hash", "run_id", "loop_id", "machine_id", "role",
-  "allow_control", "can_set_ui", "can_set_schema", "can_set_workflow", "can_finish",
-  "state", "expires_at", "terminal_protocol_version", "goal_revision", "created_at",
-] as const;
-
-const BATCH2_SESSION_COLUMNS = [
-  "id", "namespace_id", "machine_id", "loop_id", "request_id", "config_revision", "base_manifest_revision",
-  "normalized_manifest", "payload_fingerprint", "negotiated_hashes", "created_at", "expires_at", "receipt",
-] as const;
-
-const BATCH2_MANIFEST_COLUMNS = [
-  "id", "namespace_id", "machine_id", "loop_id", "config_revision", "manifest_revision",
-  "entries", "file_count", "total_bytes", "committed_at",
-] as const;
-
-const BATCH2_BLOB_COLUMNS = ["namespace_id", "hash", "size", "verified_at"] as const;
-
 async function selectColumns(handle: DbHandle, table: string, columns: readonly string[]): Promise<unknown[]> {
   const result = await handle.client.query(`SELECT ${columns.join(", ")} FROM ${table} ORDER BY 1, 2`);
   return result.rows;
+}
+
+/** Test-local lifetime: a fresh temp dataDir plus the two cleanup registries. */
+async function openBatch2Db(): Promise<DbHandle> {
+  const dataDir = await mkdtemp(path.join(tmpdir(), `loopzhb-b3-m-${process.pid}-`));
+  tempDirs.push(dataDir);
+  const handle = await openBatch2DbAt(dataDir);
+  handles.push(handle);
+  return handle;
 }
 
 /** Close, reopen the file database, run the production migration runner. */
@@ -234,6 +88,16 @@ describe("LM: Batch 3 migration 0006 — identity schema without touching histor
   test("LM1: a Batch 2 file database upgrades losslessly; machines stay unclaimed; identity tables empty; artifact chain intact", async () => {
     const handle = await openBatch2Db();
     await seedBatch2Data(handle);
+
+    // The extracted builder's DEFAULT must still BE the LM fixture: the
+    // representative Loop keeps its active schedule. Without this, a builder
+    // that silently seeds a manual Loop leaves the pre/post comparison green
+    // (NULL on both sides) while the schedule-migration coverage is gone
+    // (review #125).
+    const seededSchedule = await handle.client.query<{ cron: string | null }>(
+      "SELECT cron FROM loops WHERE id = 'loop-old'",
+    );
+    expect(seededSchedule.rows[0]!.cron).toBe("0 3 * * *");
 
     // Pre-upgrade snapshots (old columns only — the new ones don't exist yet).
     const before = {

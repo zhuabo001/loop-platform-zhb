@@ -5,7 +5,7 @@
  * daemon's fetch — the slice-6 precedent), with the REAL artifact sync client
  * and a REAL temp artifact directory:
  *
- *   register → create loop WITH artifactDir → run 1 (binds snapshot 1 with
+ *   seeded claimed machine → create loop WITH artifactDir → run 1 (binds snapshot 1 with
  *   three files) → edit (modify / add / delete) → run 2 (binds snapshot 2) →
  *   the management reads serve the current view, download BYTES equal the
  *   on-disk blob, the structural diff shows exactly the three change classes,

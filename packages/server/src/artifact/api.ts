@@ -8,8 +8,9 @@
  * (existing AND claimed AND non-revoked machines only, NEVER registering —
  * ADR-010 决策 7, ADR-011 slice 3). Credential failure throws the coordinator's
  * `InvalidMachineCredentialError` — the ONE 401 source the edge already maps
- * for poll. `updateConfig` is the management path: it carries NO credential
- * (loopback/trusted-network boundary, like every other /api/loops route).
+ * for poll. `updateConfig` is the management path: the HTTP layer puts it
+ * behind the shared Login Session gate, and this facade receives the team
+ * scope explicitly (ADR-011 决策 23/26).
  *
  * Storage-failure classification is completed HERE, at the operation boundary
  * (#85): the shared credential read and machineRead's attribution read sit
@@ -19,10 +20,10 @@
  * therefore wraps its WHOLE flow, so the failure code and the retry class can
  * no longer depend on which query failed.
  *
- * Batch 2 slice 7 adds the four MANAGEMENT reads (决策 27): no credential
- * (loopback boundary, like `updateConfig`), the machine identity discovered
- * from the loop row, attribution re-resolved before any snapshot/path/blob
- * resolution. `openDownload` returns a structured stream HANDLE — response
+ * Batch 2 slice 7 adds the four MANAGEMENT reads (决策 27): the caller passes
+ * an explicit team scope (the HTTP layer resolved it from the Login Session),
+ * the machine identity is discovered from the loop row, and attribution is
+ * re-resolved before any snapshot/path/blob resolution. `openDownload` returns a structured stream HANDLE — response
  * composition, the mid-stream pump and abort cleanup belong to the route.
  */
 import { eq } from "drizzle-orm";

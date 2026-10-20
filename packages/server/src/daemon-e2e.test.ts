@@ -63,7 +63,7 @@ function appFetch(app: BootedServer["app"]): typeof fetch {
 }
 
 describe("daemon E2E: the full HTTP user chain", () => {
-  it("register → create → trigger → execute → observe; second poll re-executes nothing", async () => {
+  it("seeded claimed machine → create → trigger → execute → observe; second poll re-executes nothing", async () => {
     const b = await boot();
     const client = createMachineClient({
       baseUrl: "http://e2e.local",
@@ -86,7 +86,7 @@ describe("daemon E2E: the full HTTP user chain", () => {
       machineCredential: TOKEN,
     });
 
-    // 1. First poll: self-registration only — nothing is pending yet.
+    // 1. First poll after the claimed-machine fixture: heartbeat only — nothing pending yet.
     await runtime.pollOnce();
     expect(runnerCalls).toBe(0);
 
@@ -213,7 +213,7 @@ describe("daemon E2E: the full HTTP user chain", () => {
     });
 
     const machineId = machineIdFromToken(TOKEN);
-    await runtime.pollOnce(); // register only
+    await runtime.pollOnce(); // first poll after the claimed-machine fixture
 
     // Two loops → two pending runs (a second trigger on the SAME loop would
     // supersede the first pending, T7). Dispatch order between them is the

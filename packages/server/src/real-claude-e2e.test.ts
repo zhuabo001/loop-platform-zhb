@@ -42,7 +42,7 @@ import { closeDb, type DbHandle } from "./db/index.js";
 import { runLeases } from "./db/schema.js";
 import { DaemonControlObserver, DaemonLogObserver, DetachedProcessSupervisor } from "./real-claude-e2e-harness.js";
 import { bootstrapServer, waitForListening } from "./start.js";
-import { makeTestAuthConfig, seedClaimedMachineIfAbsent } from "./testkit/index.js";
+import { makeTestAuthConfig, seedClaimedMachineIfAbsent, seedManagementSession } from "./testkit/index.js";
 
 const ENABLED = process.env.LOOPZHB_REAL_CLAUDE_E2E === "1";
 const SUCCESS_MARKER = "PHASE2_BATCH4_E2E_OK";
@@ -93,7 +93,7 @@ async function waitFor(
 
 describe.skipIf(!ENABLED)("real Claude E2E (opt-in)", () => {
   it(
-    "full chain: machine register → create loop → trigger → real Claude → report → DB",
+    "full chain: claimed machine → create loop → trigger → real Claude → report → DB",
     async () => {
       const expectedClaudeSha256 = process.env.LOOPZHB_EXPECTED_CLAUDE_SHA256;
       if (expectedClaudeSha256 === undefined || !/^[0-9a-f]{64}$/i.test(expectedClaudeSha256)) {
@@ -120,6 +120,12 @@ describe.skipIf(!ENABLED)("real Claude E2E (opt-in)", () => {
       // Phase 5 Batch 3 slice 3: poll no longer self-registers — state the
       // claimed machine this daemon's token polls as.
       await seedClaimedMachineIfAbsent(booted.handle.db, TOKEN);
+      // Slice 5: every management route requires a Login Session.
+      const sessionCredential = (await seedManagementSession(booted.handle.db, {})).credential;
+      const sessionHeaders = (extra: Record<string, string> = {}): Record<string, string> => ({
+        cookie: `loopzhb_session=${sessionCredential}`,
+        ...extra,
+      });
 
       const server = serve({ fetch: booted.app.fetch, port: 0, hostname: "127.0.0.1" });
       servers.push(server);
@@ -197,7 +203,7 @@ describe.skipIf(!ENABLED)("real Claude E2E (opt-in)", () => {
         const machineId = machineIdFromToken(TOKEN);
         await waitFor(
           async () => {
-            const res = await fetch(`${baseUrl}/api/machines`);
+            const res = await fetch(`${baseUrl}/api/machines`, { headers: sessionHeaders() });
             if (!res.ok) return false;
             const body = (await res.json()) as { machines?: Array<{ id: string; lastSeen: string | null }> };
             return body.machines?.some((m) => m.id === machineId && m.lastSeen !== null) ?? false;
@@ -208,7 +214,7 @@ describe.skipIf(!ENABLED)("real Claude E2E (opt-in)", () => {
         // 6. Create loop via HTTP
         const createRes = await fetch(`${baseUrl}/api/loops`, {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers: sessionHeaders({ "content-type": "application/json" }),
           body: JSON.stringify({
             machineId,
             name: "e2e-real-claude",
@@ -220,7 +226,10 @@ describe.skipIf(!ENABLED)("real Claude E2E (opt-in)", () => {
         const { loop } = createLoopResponseSchema.parse(await createRes.json());
 
         // 7. Trigger run via HTTP
-        const triggerRes = await fetch(`${baseUrl}/api/loops/${loop.id}/run`, { method: "POST" });
+        const triggerRes = await fetch(`${baseUrl}/api/loops/${loop.id}/run`, {
+          method: "POST",
+          headers: sessionHeaders(),
+        });
         expect(triggerRes.status).toBe(202);
         const trigger = triggerRunResponseSchema.parse(await triggerRes.json());
         if (!trigger.enqueued) throw new Error("expected the trigger to enqueue");
@@ -229,7 +238,7 @@ describe.skipIf(!ENABLED)("real Claude E2E (opt-in)", () => {
         // 8. Wait for Run to reach terminal state (agent execution)
         await waitFor(
           async () => {
-            const res = await fetch(`${baseUrl}/api/loops/${loop.id}/runs`);
+            const res = await fetch(`${baseUrl}/api/loops/${loop.id}/runs`, { headers: sessionHeaders() });
             if (!res.ok) return false;
             const body = runListResponseSchema.parse(await res.json());
             const run = body.runs.find((r) => r.id === runId);
@@ -239,7 +248,7 @@ describe.skipIf(!ENABLED)("real Claude E2E (opt-in)", () => {
         );
 
         // 9. Assertions: DB state
-        const runsRes = await fetch(`${baseUrl}/api/loops/${loop.id}/runs`);
+        const runsRes = await fetch(`${baseUrl}/api/loops/${loop.id}/runs`, { headers: sessionHeaders() });
         expect(runsRes.status).toBe(200);
         const runList = runListResponseSchema.parse(await runsRes.json()).runs;
         expect(runList).toHaveLength(1);
@@ -261,7 +270,7 @@ describe.skipIf(!ENABLED)("real Claude E2E (opt-in)", () => {
         const leases = await booted.handle.db.select().from(runLeases);
         expect(leases).toHaveLength(0);
 
-        const loopsRes = await fetch(`${baseUrl}/api/loops`);
+        const loopsRes = await fetch(`${baseUrl}/api/loops`, { headers: sessionHeaders() });
         const loopBody = (await loopsRes.json()) as { loops: Array<{ id: string; lastRun: any }> };
         const updatedLoop = loopBody.loops.find((l) => l.id === loop.id);
         expect(updatedLoop?.lastRun).toMatchObject({ id: runId, phase: "done", outcome: "exec" });

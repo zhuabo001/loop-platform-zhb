@@ -85,19 +85,43 @@ Loop 不只是定时任务：它可带一个 **Goal**，跨 Run 继承状态，�
 
 ## Server 运行
 
+Batch 3 起登录配置是**必填**：缺少或写错 OAuth 配置时启动在打开任何资源前失败，不存在匿名回退（ADR-011 决策 5）。
+
+1. 在 GitHub 创建 OAuth App。Authorization callback URL 必须精确等于
+   `<LOOPZHB_ORIGIN>/auth/github/callback`（例如 `http://127.0.0.1:3000/auth/github/callback`）。
+2. 设置环境变量并启动：
+
 ```bash
+export LOOPZHB_ORIGIN=http://127.0.0.1:3000
+export LOOPZHB_GITHUB_CLIENT_ID=<client id>
+export LOOPZHB_GITHUB_CLIENT_SECRET=<client secret>
 pnpm --filter @loopzhb/server start
 ```
 
-零配置启动：默认绑定 `127.0.0.1:3000`，数据落在 `~/.loopzhb`（嵌入式 PGlite 文件库，**不是**内存库）。所有值都可用环境变量覆盖，但显式写错会 fail-fast，不静默回落默认值。
+默认绑定 `127.0.0.1:3000`，数据落在 `~/.loopzhb`（嵌入式 PGlite 文件库，**不是**内存库）。所有值都可用环境变量覆盖，但显式写错会 fail-fast，不静默回落默认值。
 
 | 环境变量 | 必填 | 默认 | 说明 |
 |---|---|---|---|
+| `LOOPZHB_ORIGIN` | 是 | — | 固定 origin；用于拼接回调 URL，不从请求 Host 或 forwarded header 推导 |
+| `LOOPZHB_GITHUB_CLIENT_ID` | 是 | — | GitHub OAuth App 的 client id |
+| `LOOPZHB_GITHUB_CLIENT_SECRET` | 是 | — | GitHub OAuth App 的 client secret |
 | `LOOPZHB_HOST` | 否 | `127.0.0.1` | 绑定地址；非回环地址会打印暴露警告，且 Dashboard 完全不挂载 |
 | `LOOPZHB_PORT` | 否 | `3000` | 严格十进制，1–65535 |
 | `LOOPZHB_DATA_DIR` | 否 | `~/.loopzhb` | 相对路径按启动 cwd 解析为绝对路径 |
 
-启动后：`GET /` 是 Dashboard（仅回环绑定才有），`/api/machine/*` 供 daemon 接入，`/api/loops*` 与 `/api/runs*` 是管理接口。
+启动后：匿名访问 `GET /` → 303 `/login`；完成 GitHub 登录后 `GET /` 是所属团队的 Dashboard（仅回环绑定才有）。`/api/machine/*` 供 daemon 接入，`/api/loops*` 与 `/api/runs*` 是要求 Login Session 的管理接口。
+
+停止：按 Ctrl+C 或发送 SIGTERM。Server 先排空调度与 sweep，再关闭监听与空闲 keep-alive 连接；5 秒宽限期后强制关闭剩余连接，最后关闭数据库并释放 `data-dir.lock`。干净的 SIGINT/SIGTERM **不应**留下锁；只有 SIGKILL 或崩溃才需要按认领一节的说明手工恢复。
+
+## 从 Batch 2 升级到 Batch 3
+
+1. 备份完整数据目录，停止新增任务，等待已有 Run 结束并停止 Daemon。
+2. 停止旧 Server，部署整个 Batch 3（不可只升级部分组件），配置上面的 OAuth 与固定 origin。
+3. 启动新 Server 一次，让迁移 `0006` 应用；目标账号访问 `/login` 完成 GitHub 登录并创建个人团队。此时旧机器仍不可见、不可执行。
+4. 停止 Server，按下一节先跑 `claim:legacy --dry-run`，核对数字 ID、机器集合与复制字节数后执行认领。
+5. 重启 Server 与既有 Daemon，验证执行、同步与历史快照下载。
+
+**回滚**：认领改写 Artifact namespace 后，只回退应用二进制不够；必须恢复升级前的完整数据目录备份。
 
 ## 旧机器认领（离线）
 
@@ -210,7 +234,7 @@ LOOPZHB_CLAUDE_PERMISSION_PROBE=1 pnpm --filter @loopzhb/daemon test src/claude-
 | `docs/roadmap.md` | 阶段范围与状态（第一份文档） |
 | `docs/adr/` | 架构决策记录，含各 ADR 的修订记录 |
 | `GitHub Issues` | 未关闭、需执行的问题的唯一权威来源；工作流见 `docs/agents/issue-tracker.md` |
-| `docs/tests/` | 各阶段验收证据（`phase2-batch4` / `phase3` / `phase4`） |
+| `docs/tests/` | 各阶段验收证据（`phase2-batch4` / `phase3` / `phase4` / `phase5`） |
 | `docs/plan/` | 当批计划中携带长期引用锚点的部分 |
 | `AGENTS.md` | 仓库工作规约（文档四层分流、批次收口仪式） |
 

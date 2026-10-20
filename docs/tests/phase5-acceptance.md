@@ -2,7 +2,7 @@
 
 > 本文档按批次记录 Phase 5 的内部验收证据，各批次一节。各批次的交付范围与完成定义见其权威计划
 > （Batch 1：`docs/plan/codex-phase5-batch1-plan.md`；Batch 2：`docs/plan/codex-phase5-batch2-plan.md`）。
-> **Phase 5 未收口**：Batch 3（认证）未启动。
+> **Phase 5 未收口**：Batch 3 片 1–7 已实现，片 7 待独立三轨复审；Batch 4–6 未开始。
 
 ## 测试环境
 
@@ -103,8 +103,8 @@ $ git diff --check   # EXIT=0
 
 Batch 1 全部编组（AM/AP/AB/AC 与 AD）与内部集成验收通过，五道质量门全绿；收口三轨复审
 Round 1 零阻断，唯一 P3 证据措辞项经定点复核核销关闭；生产仍运行 Phase 4 行为（AD1–AD4 在测）。
-**Batch 1 完成（2026-10-03）**，批次 PR #68 已转待合入；Batch 2（watcher、持续同步、Run 快照与
-文件视图）与 Batch 3（认证）另行规划。
+**Batch 1 完成（2026-10-03）**，批次 PR #68 已转待合入。Batch 2（watcher、持续同步、Run 快照与
+文件视图）已完成；Batch 3（认证）片 1–7 已实现、片 7 待独立复审，证据见下文各批次段。
 
 ---
 
@@ -223,7 +223,9 @@ Batch 2 全部编组（AT/AH/AJ/AS/AW/AR/AV）与 AI1–AI7 故障集成验收�
 - **pnpm**: 10.6.1
 - **分支**: `feat/phase5-batch3-dev`
 - **批次基线**: `4ff517a`（Batch 2 合入后的 main）
-- **长期决策**: `docs/adr/011-phase5-identity-and-legacy-claim.md`（片 1 冻结决策 1–7）
+- **批次 PR**: [#119](https://github.com/zhuabo001/loop-platform-zhb/pull/119)（保持 OPEN，合入另行授权）
+- **片 7 环境**: 2026-10-20，Node.js v24.21.0，同一分支；验收时 `feat/phase5-batch3-dev` @ `3852539` + 本片工作区
+- **长期决策**: `docs/adr/011-phase5-identity-and-legacy-claim.md`（决策 1–38；片 7 增补 34–38）
 
 ## 验收范围（Batch 3 完成定义复述，plan §1）
 
@@ -622,3 +624,116 @@ server 较片 5 审后基线（1269 + 3 skipped）**+15**：新增 16 项（门�
 ### 结论（片 6）
 
 片 6 结束了 Dashboard 的匿名窗口：页面未登录跳转 `/login`、表单未登录 401；登录后只显示本团队资源；跨团队、未认领与不存在的 Loop 在页面与写入上统一扁平 404；所有表单使用当前 Session 派生的 CSRF token；页头显示账号并可退出。DG1–DG6 全覆盖，十一项变异全部被抓住（含一项编译期证明），五道质量门全绿。如实登记：孤儿/未认领 Loop 不可见、重启不再使 token 失效、Artifact 页面暂无账号/退出控件、每请求解析一次 Session。本片不核销 #56/#61，不宣称 Phase 5 完成。
+
+## 片 7 — 生产装配、升级演练与批次收口
+
+> 权威计划：`docs/plan/codex-phase5-batch3-slices-plan.md` Slice 7 节（行 215–237）；长期裁决：ADR-011 决策 34–37。
+
+### 测试编组与结果（片 7）
+
+| 编号 | 场景 | 文件 | 结果 |
+|---|---|---|---|
+| PG7 | 新库生产启动与连续两次重启：未知/未认领/已撤销凭据均 401，业务 + 身份 11 表零写；已认领控制机 200 | `phase5-batch3-slice7-pg7-pg8-e2e.test.ts` | 通过 |
+| PG8 | Batch 2 旧库经 0006 升级并连续重启：旧 token 401；离线认领后同一 token 200，未知 token 仍 401 且零写 | 同上 | 通过 |
+| BI1–BI6 | 完整升级链：旧库升级 → 首次登录 → 旧数据不可见 → 停服认领 → 重启 → 原 Daemon 执行与同步 → 旧快照下载 | `phase5-batch3-slice7-e2e.test.ts` | 通过 |
+| LOCK-CP1 | 父进程持锁时真实子进程 `open("wx")` 得 EEXIST；释放后可获取 | `data-dir-lock-cross-process.test.ts` | 通过 |
+| LOCK-CP2 | 子进程持锁时真实 claim 退出 3、boot 在 `pgdata` 出现前抛 `DataDirLockError`；SIGTERM 后可重新获取 | 同上 | 通过 |
+| DRILL | 构建产物子进程：`dist/start.js` 持锁 → `dist/claim/main.js` 3→0 → 内置 daemon CLI 执行并同步 | `phase5-batch3-slice7-subprocess-drill.test.ts`（opt-in） | 通过（单独记录，不计入默认门禁） |
+| SD1/SD2 | 停止有界：空闲 keep-alive 不阻塞 close；永不完成的请求在宽限期被强制关闭 | `http/server-shutdown.test.ts` | 通过 |
+
+### BI1–BI6 映射与链（片 7）
+
+单个顺序用例，真实 `127.0.0.1` 监听、文件型 PGlite、本地 BlobStore、脚本化 GitHub adapter、Fake Runner；claim 为进程内调用。
+
+| 阶段 | 断言 | 编号 |
+|---|---|---|
+| A 升级 | 旧库 journal 6 → 7；七张业务表旧列逐项相等；旧机器 `team_id/revoked_at = null`；身份表为空 | BI1 |
+| B 首次登录 | 真实 `/auth/github` + callback（脚本化 adapter）→ 303 `/`；`/api/session` 返回个人团队；未自动认领机器 | BI1 |
+| C 旧数据不可见 | `/api/machines` 与 `/api/loops` 为空；旧 Loop 的 Run/下载与 `/nope` 逐字节同 404；Dashboard 200 且显示空团队 + `claim:legacy`、不含旧 Loop；旧 token poll 401；登录后 11 表快照前后相等；`blobs/<teamId>` 不存在 | BI2、BI6 |
+| D 服务中拒绝认领 | Server 持锁时 claim 退出 3，stderr 含本进程 pid 与 `rm` 恢复行；机器仍未认领 | BI3 |
+| E 迁移失败恢复 | 目标 Blob 长度正确、内容错误 → claim 退出 1、`target_blob_corrupt`；11 表零写；损坏文件未被覆盖；源 Blob 完好 | BI3 |
+| F 认领成功 | 退出 0；`machines.id`/`token_hash` 不变、`team_id` 切到个人团队；manifest/session `namespace_id` 切换；snapshot id、entries、revision、committed receipt 逐项不变；源 namespace 保留；目标 Blob 验证通过 | BI1、BI4、BI5 |
+| G 重启与保真 | journal 仍 7；原 Session 200；旧 Loop 可见；旧 token 200（`availableSlots:0`，不领取 pending Run）；无重复机器行；旧快照下载字节与头（attachment/nosniff/no-store/content-length）完全一致；旧 Bearer 重放 committed commit 返回精确 receipt 且零写；另一用户 Session 访问旧 Loop → 扁平 404 | BI1、BI4、BI5、BI6 |
+| H 原 Daemon 执行与同步 | 生产 daemon 模块执行旧 pending Run → done/exec；绑定新 snapshot（≠ `amf-1`）且 `artifactSyncError = null`；`amf-1` 行与字节冻结且仍可下载；团队 namespace 新增 Blob；机器行不重复；再次 poll 不重复执行 | BI1、BI5 |
+| I 认证不可旁路 | 匿名管理读/写 401 `{"error":"not authenticated"}`；Session cookie 打机器端点 401；Bearer 打管理端点 401；匿名 Dashboard 303 `/login` 且不 Set-Cookie；匿名表单 POST 零写 | BI6 |
+
+**BI3 的如实定义**：本片把「迁移故障恢复」验证为（i）另一路径持锁时的认领拒绝，以及（ii）Artifact namespace 迁移中目标 Blob 损坏时整组拒绝、零 DB 写、修复后可重试成功；**不是** SQL migration 中途失败的注入。
+
+### 跨进程锁证据（片 7）
+
+- LOCK-CP1：生产 `acquireDataDirLock` 持锁时，`node -e` 真实子进程 `open(<dataDir>/data-dir.lock, "wx")` 返回 EEXIST（探针退出 0）；释放后同一探针成功并自行清理。
+- LOCK-CP2：真实子进程持锁并写入合法 holder 记录；进程内 `runClaimForTest` 退出 3，stderr 含子进程 pid 与 `rm <path>`；`bootstrapServer` 抛 `DataDirLockError`，且 `<dataDir>/pgdata` 不存在；SIGTERM 子进程后锁文件消失，下一次获取成功。
+
+### 子进程构建产物 drill（opt-in，单独记录）
+
+- 命令：`LOOPZHB_SUBPROCESS_DRILL=1 pnpm --filter @loopzhb/server exec vitest run src/phase5-batch3-slice7-subprocess-drill.test.ts`（前置 `pnpm build`）。
+- 日期：2026-10-20；结果：1/1 通过，耗时约 4.9s。
+- 观测：真实 `dist/start.js` 启动并持有 `<dataDir>/data-dir.lock`；真实 `dist/claim/main.js` 在服务运行时退出 **3**，SIGTERM Server 退出 **0** 且锁移除后同一命令退出 **0**；重启后旧 Loop 可见、旧快照下载字节与升级前一致、未知 token poll 401；内置 daemon CLI（fake-Claude 夹具）在 60s 内为旧 pending Run 绑定新 snapshot（≠ `amf-1`），SIGTERM 后退出 **0**。
+- 该结果不计入默认 `pnpm test` 通过数；未设置门闩时该套件 skip。
+
+### 真实 GitHub OAuth 人工 smoke
+
+- 执行方式：真实 `dist/start.js`、临时 dataDir、`LOOPZHB_HOST=127.0.0.1`、固定端口、`LOOPZHB_ORIGIN=http://127.0.0.1:<port>`、真实 OAuth App client id/secret；OAuth App 回调精确为 `<origin>/auth/github/callback`。
+- 检查点：私密窗口打开 `/login` → GitHub 授权 → 跳转 `/` 显示当前账号/团队；`/api/session` 200；另一匿名窗口 `/` 303 `/login`、`/api/machines` 401；停止后退出 0、锁文件移除；日志无 `gho_` 或 secret 泄漏。
+- 结果（2026-10-20，用户执行）：
+  - 登录、跳转 `/`、页头账号/团队、`/api/session` 200、匿名窗口 303 与 401：**PASS**。
+  - 停止检查点：**首次 FAIL**——Ctrl+C 后进程仍存活，`data-dir.lock` 保留。定位见下节「人工 smoke 发现的停止缺陷」。
+  - 独立 dataDir 核对：`users=1 / teams=1 / memberships=1 / auth_sessions=1 / machines=0 / loops=0`——真实登录只建立身份链，不自动认领旧数据。仅记录行数，不记录账号标识。
+  - 日志泄漏扫描：终端日志未留存文件；实现路径只输出固定的 host/port/dataDir 与固定分类行，不输出 token 或 secret。该项以代码路径与未留存日志如实登记，不作为独立扫描通过。
+- 本节与脚本化 adapter 结果严格分开；脚本 adapter 通过不构成真实 OAuth 验收。
+
+### 人工 smoke 发现的停止缺陷与修复（片 7，Issue #124）
+
+- **现象**：真实 OAuth smoke 中按 Ctrl+C 后，Node 进程仍存活，`data-dir.lock` 未删除。`lsof` 显示 Chrome 与该 Server 保持一条 ESTABLISHED keep-alive 连接。
+- **根因**：`main()` 的停止顺序在 `server.close(callback)` 内执行 `closeDb`（它同时释放 dataDir 锁）。`server.close()` 的回调等待既有连接结束；浏览器 keep-alive 连接不主动断开，回调永不执行。
+- **修复**：新增 `http/server-shutdown.ts`：关闭监听 → 立即关闭空闲 keep-alive 连接 → 5 秒宽限期后强制关闭剩余连接并继续关闭 DB/释放锁。生产 `main()` 与测试台架共用；ADR-011 决策 38 记录裁决。
+- **验证**：
+  - `http/server-shutdown.test.ts` SD1/SD2 通过（空闲 keep-alive 不阻塞；活跃未完成请求在宽限期被强制关闭）。
+  - 真实 `dist/start.js` 重放：另开 keep-alive 客户端持有连接，SIGTERM 后 `SERVER_EXIT=0`、`LOCK_REMOVED`。
+  - 构建产物 drill 与 BI/PG/跨进程锁套件在修复后复跑全绿。
+- **Issue**：[#124](https://github.com/zhuabo001/loop-platform-zhb/issues/124) 已创建并保持 OPEN；修复与测试已具备，按仓库规则待独立复审后再关闭。
+
+### 显式边界核对（片 7）
+
+- 生产接线（认证、团队过滤、机器准入、Team attribution、dataDir 锁）已在片 1–6 完成；本片只验证与记录，不重复实现。
+- 默认 BI 的「原 Daemon」是生产 daemon 模块在测试进程内运行；真实 CLI 子进程证据由 DRILL 单独提供。
+- 不新增迁移（journal 保持 7 条）、不改 wire DTO；生产行为改动只有两项并已披露：内部警告函数改名（`nonLoopbackExposureWarning`，仅文案）与 HTTP 有界停止（`http/server-shutdown.ts`，Issue #124 / ADR-011 决策 38，修复真实 OAuth smoke 发现的停止不释放锁缺陷）；其余为注释与文案修正。
+- 三个 opt-in real-Claude 套件只做机械 Session 迁移（匿名管理调用改为真实 Session 头、两处相对 URL 修正），本片**未执行**；不得描述为真实 Claude 验收。
+- `docs/handoff/` 未提交；PR 描述只引用 ADR、验收记录与真实 Issue。
+- #56（Batch 4）与 #61（Batch 6）保持 OPEN，本片不核销；不宣称 Phase 5 完成或可公开部署。
+
+### 变异验证（片 7）
+
+| 变异 | 击红的用例 |
+|---|---|
+| M12 在凭据门失败处恢复自注册（按 token 派生 id 插入机器行并继续） | PG7 与 PG8 均转红（未知/旧 token 不再 401） |
+| M13 `queryMachines`/`queryLoops` 忽略 teamId | slice7 BI（首次登录看到旧数据）与 `admin/team-scope.test.ts`，共 4 项转红 |
+| M14 `management.sessionGate` 无条件注入固定团队并 `next()` | slice7 BI 的匿名 401/零写与 `management/access.test.ts`，共 8 项转红 |
+| M15 `verifyExisting` 不读目标字节、直接信任文件名 | slice7 BI 的 `target_blob_corrupt` 与 `claim/slice4-refusal-e2e.test.ts`，共 2 项转红 |
+
+四项均遵循「复制 → 注入 → 记录红色 → 恢复 → SHA-256 逐字节一致 → 复跑绿色」；变异未提交。
+
+### 完整质量门（片 7）
+
+```bash
+pnpm test                                   # protocol 292 / daemon 790 + 7 skipped / server 1291 + 4 skipped，EXIT=0
+pnpm typecheck                              # EXIT=0
+pnpm build                                  # EXIT=0
+pnpm --filter @loopzhb/server db:check      # 零漂移（本片无新增迁移），EXIT=0
+git diff --check                            # EXIT=0
+```
+
+server 较片 6 基线（1284 + 3 skipped）**+7 passed、+1 skipped**：新增跨进程锁 2、PG7/PG8 2、BI 1、停止有界 SD1/SD2 2；opt-in drill 以 skipped 计入默认套件。Batch 2 世界构建器抽取不改变迁移测试用例数（LM 仍为 3 项）。protocol 与 daemon 计数不变（本片不改变两包行为）。
+
+### 迁移与认领保真的 oracle 验证（片 7）
+
+| 契约 | 实现与范围 | 变异验证 |
+|---|---|---|
+| LM 默认夹具保留非空 schedule（[#125](https://github.com/zhuabo001/loop-platform-zhb/issues/125)） | 默认 `cron='0 3 * * *'`；`cron?: string \| null` 允许 BI/PG8/drill 显式传 `null`；LM1 在迁移前断言默认夹具契约 | 迁移 0006 注入 `UPDATE loops SET cron = NULL` → LM1/LM2 红；把 helper 默认改为 `null` → LM1 红；两次均恢复并 SHA-256 一致，复跑绿 |
+| 认领仅改 Artifact namespace，保留 manifest 与 committed session 的其他字段 | 升级后、停服前采集 manifest 与 committed session 全行；认领后比较除 `namespaceId` 外全部字段，namespace 另有正向断言 | 认领 UPDATE 同时写 `committedAt=2099-01-01` → BI 在整行比较处红；恢复后绿 |
+
+定向验证：migration + BI + PG7/PG8 三文件 **6/6 通过**；`LOOPZHB_SUBPROCESS_DRILL=1` 的构建产物 drill **1/1 通过**（fake-Claude，未访问真实 GitHub）。测试用例数不变，仅加强既有断言。完整质量门见上节。
+
+### 结论（片 7）
+
+片 7 以真实 HTTP、文件型 PGlite、本地 BlobStore、生产 daemon 模块与 Fake Runner 走通完整升级链，PG7/PG8 钉住新库、旧库与连续重启均不恢复自注册，跨进程锁获得 OS 级证据，构建产物 drill 以真实 CLI 复核同一链路，M12–M15 全部被抓住。真实 GitHub OAuth 人工 smoke 的登录与隔离检查点通过，并发现「浏览器 keep-alive 使停止回调不返回、锁不释放」的缺陷；修复后 SD1/SD2、真实进程重放与全部相关套件通过。LM 迁移夹具的非空 schedule 与认领前后 manifest/session 全字段保真分别由迁移和 BI oracle 验证。如实登记：终端日志未留存文件，未做独立 secret 扫描；三个 opt-in real-Claude 套件未执行；#56/#61 不在本片核销范围；Phase 5 仍待 Batch 4–6，不宣称可公开部署。

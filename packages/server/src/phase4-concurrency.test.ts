@@ -294,7 +294,7 @@ describe("C1 — goal/report: a mid-run goal change makes the in-flight finish s
     const { runner, gates } = createSequentialGates();
     const daemon = createDaemon(b.app, token, runner);
 
-    await daemon.pollOnce(); // register
+    await daemon.pollOnce(); // first poll after the claimed-machine fixture
     const loopId = await createLoop(b.app, token, { goal: "goal-one" });
     const runId = await trigger(b.app, loopId);
 
@@ -344,7 +344,7 @@ describe("C2 — task-file/claim: a retarget between enqueue and claim clears th
     const { runner, gates } = createSequentialGates();
     const daemon = createDaemon(b.app, token, runner);
 
-    await daemon.pollOnce(); // register
+    await daemon.pollOnce(); // first poll after the claimed-machine fixture
     const loopId = await createLoop(b.app, token, { taskFile: "/srv/project/A.md" });
 
     // Run 1 completes and syncs the task-file content onto the loop.
@@ -424,7 +424,7 @@ describe("C8 — task-file/claim TRUE interleave (review SPEC-1/ADV-3): a claim 
     const { runner, gates } = createSequentialGates();
     daemonRef = createDaemon(b.app, token, runner);
 
-    await daemonRef.pollOnce(); // register
+    await daemonRef.pollOnce(); // first poll after the claimed-machine fixture
     const loopId = await createLoop(b.app, token, { taskFile: "/srv/project/A.md" });
     const runId = await trigger(b.app, loopId); // pending, unclaimed
 
@@ -464,7 +464,7 @@ describe("C3 — finish/report: run 2's finish completes the Loop while run 1 sl
     const daemon1 = createDaemon(b.app, token, gates1.runner, (base) => recordingReportBodies(base, seenReports));
     const daemon2 = createDaemon(b.app, token, gates2.runner);
 
-    await daemon1.pollOnce(); // register
+    await daemon1.pollOnce(); // first poll after the claimed-machine fixture
     const loopId = await createLoop(b.app, token, { goal: "shared-goal" });
 
     // Instance 1 claims run 1 and "sleeps"; the sweep reclaims it
@@ -529,7 +529,7 @@ describe("C4 — finish/sweep: the wake-report after a reclaim is a FINISH — r
     const { runner, gates } = createSequentialGates();
     const daemon = createDaemon(b.app, token, runner, (base) => recordingReportBodies(base, seenReports));
 
-    await daemon.pollOnce(); // register
+    await daemon.pollOnce(); // first poll after the claimed-machine fixture
     const loopId = await createLoop(b.app, token, { goal: "sweep-goal" });
     const runId = await trigger(b.app, loopId);
 
@@ -579,7 +579,7 @@ describe("C5 — reopen/late-report: reopen revokes the old generation; its late
     const daemon1 = createDaemon(b.app, token, gates1.runner);
     const daemon2 = createDaemon(b.app, token, gates2.runner);
 
-    await daemon1.pollOnce(); // register
+    await daemon1.pollOnce(); // first poll after the claimed-machine fixture
     const loopId = await createLoop(b.app, token, { goal: "reopen-goal" });
 
     // Same build-up as C3: instance 1 sleeps past the sweep; instance 2
@@ -643,7 +643,7 @@ describe("C6 — duplicate delivery: the daemon's exact report bytes replayed af
     const { runner, gates } = createSequentialGates();
     const daemon = createDaemon(b.app, token, runner, (base) => capturingReportRequests(base, seenRequests));
 
-    await daemon.pollOnce(); // register
+    await daemon.pollOnce(); // first poll after the claimed-machine fixture
     const loopId = await createLoop(b.app, token);
     const runId = await trigger(b.app, loopId);
 
@@ -689,7 +689,7 @@ describe("C7 — double report: two different terminals on one lease — the sec
     const { runner, gates } = createSequentialGates();
     const daemon = createDaemon(b.app, token, runner);
 
-    await daemon.pollOnce(); // register
+    await daemon.pollOnce(); // first poll after the claimed-machine fixture
     const loopId = await createLoop(b.app, token, { goal: "double-goal" });
     const runId = await trigger(b.app, loopId);
 

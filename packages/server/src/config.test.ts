@@ -16,7 +16,7 @@ import {
   isLoopbackHost,
   loadServerConfig,
   parsePort,
-  unauthenticatedExposureWarning,
+  nonLoopbackExposureWarning,
 } from "./config.js";
 
 const HOME = "/home/tester";
@@ -113,12 +113,12 @@ describe("loopback policy", () => {
   it("loopback hosts produce NO warning", () => {
     for (const host of ["127.0.0.1", "localhost", "::1", "[::1]"]) {
       expect(isLoopbackHost(host)).toBe(true);
-      expect(unauthenticatedExposureWarning(host)).toBeNull();
+      expect(nonLoopbackExposureWarning(host)).toBeNull();
     }
   });
 
   it("a non-loopback host warns about the exposure — naming the login gate, closed enrollment and the missing Dashboard", () => {
-    const warning = unauthenticatedExposureWarning("0.0.0.0");
+    const warning = nonLoopbackExposureWarning("0.0.0.0");
     expect(warning).toContain("0.0.0.0");
     // Slice 5: the old "NO authentication" claim is now false.
     expect(warning).not.toMatch(/NO authentication/);
@@ -126,7 +126,7 @@ describe("loopback policy", () => {
     expect(warning).toContain("claimed offline");
     expect(warning).toContain("/api/runs*");
     expect(warning).toContain("loopback");
-    expect(unauthenticatedExposureWarning("192.168.1.10")).not.toBeNull();
+    expect(nonLoopbackExposureWarning("192.168.1.10")).not.toBeNull();
   });
 });
 

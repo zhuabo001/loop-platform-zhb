@@ -223,3 +223,43 @@ Run Now 改用 `checkSessionCsrfForm(body, session.csrfToken)`；Artifact 配置
 `start.ts` 先构造 `createAuthModule`，再构造 Dashboard，把 `auth.sessions` 同时交给 `createDashboardAccess` 与管理门禁——登录路由、HTML 门禁、JSON 门禁共用**同一个** Session 解析器。Dashboard 仍只在回环绑定挂载；非回环时 `/login`、`/auth/*` 照旧存在而 Dashboard 完全缺席。
 
 本片不新增迁移（journal 保持 7 条）、不改 wire DTO、不实现 Connect UI/成员管理/通知/在线认领或撤销。BI1–BI6 与真实 HTTP 升级演练仍属片 7；#56（同源意图检查、Content-Type 门禁、空体加固）与 #61 不核销。
+
+## 修订 2026-10-20（片 7 落实增补）
+
+### 34. 验收证据分级：脚本化 adapter、构建产物与真实 OAuth 不得混称
+
+自动化 BI/PG 套件使用**脚本化 GitHub `fetch`**（`BootstrapOverrides.githubFetch`），永不访问真实 GitHub；验收记录必须标注「脚本化 adapter，非真实 GitHub」。真实 GitHub OAuth 只以**人工 smoke** 验收：单独记录日期、检查点与通过/失败，不记录账号、授权码、access token 或 client secret。脚本 adapter 的通过不构成真实 OAuth 验收。
+
+同理，自动测试不执行真实 Claude；三个 opt-in real-Claude 套件只做机械的 Session 迁移，本片不运行，不描述为真实 Claude 验收。
+
+### 35. 升级与回滚顺序
+
+Batch 2 → Batch 3 的固定顺序：完整备份 dataDir → 停止 Server/Daemon 并 drain → 部署整个 Batch 3 → 启动一次 Server 应用 0006 → 目标账号登录并创建个人团队 → 停服执行 `claim:legacy --dry-run` → 核对后认领 → 重启 Server 与 Daemon。
+
+认领改写 `artifact_manifests` / `artifact_sync_sessions` 的 namespace 并新增团队 Blob 行后，**只回退应用二进制不够**；回退旧版本必须恢复升级前的完整 dataDir 备份。dataDir 锁不自动抢占；陈旧锁按 `--help` 与 README 的说明手工删除。
+
+### 36. 新库、旧库与连续重启的生产启动门禁
+
+三条路径必须在任何业务或身份写入之前拒绝未知、未认领与已撤销凭据，并统一 401：
+
+- 新库首次生产启动；
+- Batch 2 旧库经 0006 升级后的生产启动；
+- 同一 dataDir 的连续重启。
+
+默认门禁同时包含 **OS 级跨进程锁探针**：父进程持锁时子进程 `open(path, "wx")` 得 EEXIST；子进程持锁时真实 claim 路径退出 3、`bootstrapServer` 在 `<dataDir>/pgdata` 出现前抛 `DataDirLockError`。变异 M12–M15 证明 oracle 能抓住自注册恢复、团队过滤移除、管理门禁旁路与目标 Blob 校验跳过。
+
+### 37. 跨进程证据分层与构建产物 drill
+
+默认 `pnpm test` 不依赖 server `dist/`：BI 链使用真实 HTTP、文件型 PGlite、本地 BlobStore、生产 daemon 模块与进程内 claim。真实构建产物的进程级证据由 `LOOPZHB_SUBPROCESS_DRILL=1` 的 opt-in drill 提供：`dist/start.js` 持锁 → `dist/claim/main.js` 退出 3 → SIGTERM 后退出 0 → 重启验证历史 → 内置 daemon CLI 执行旧 pending Run 并同步新 snapshot。drill 单独记录，不计入默认门禁通过数；启用但缺产物时必须报错并提示 `pnpm build`，不得静默跳过。
+
+### 38. 停止必须有界：数据库关闭与锁释放不依赖客户端断开
+
+片 7 的真实 OAuth 人工 smoke 暴露了一个停止缺陷：浏览器打开 Dashboard 后保持 keep-alive 连接，`server.close()` 的回调一直等待该连接，`closeDb`（同时释放 dataDir 锁）只在回调内执行，于是 Ctrl+C 后进程长期存活、锁文件保留，下一次启动被拒绝。
+
+裁决：生产停止顺序仍为 scheduler drain → sweep drain → HTTP → DB，但 HTTP 关闭必须**有界**：
+
+1. 关闭监听；
+2. 立即关闭空闲 keep-alive 连接（`closeIdleConnections`）；
+3. 5 秒宽限期后强制关闭剩余连接（`closeAllConnections`）并继续关闭数据库与释放锁。
+
+`closeDb` 与锁释放不得以「所有客户端自行断开」为前提。实现集中在 `http/server-shutdown.ts`，生产 `main()` 与测试台架共用；SD1（空闲 keep-alive）与 SD2（永不完成的请求在宽限期被强制关闭）钉住行为。ADR-011 决策 20 的「SIGKILL 可留下陈旧锁」仍然成立，但干净 SIGINT/SIGTERM 不应留下锁。

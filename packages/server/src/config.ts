@@ -1,9 +1,12 @@
 /**
  * Startup configuration (A-12) — a PURE, package-internal function validated
- * ONCE before any resource opens. Zero-config production boots persist to
- * `~/.loopzhb` (NEVER in-memory; the no-dataDir DB factory is a test-only
- * fixture). Every value may be overridden by env, but a malformed explicit
- * value fails fast — silent fallback to a default would hide operator error.
+ * ONCE before any resource opens. A production boot persists to `~/.loopzhb`
+ * by default (NEVER in-memory; the no-dataDir DB factory is a test-only
+ * fixture). The GitHub OAuth configuration is REQUIRED — there is no
+ * anonymous fallback (ADR-011 决策 5) — so a bare `pnpm start` without it
+ * fails before any resource opens. Every value may be overridden by env, but a
+ * malformed explicit value fails fast — silent fallback to a default would
+ * hide operator error.
  */
 import path from "node:path";
 
@@ -134,7 +137,7 @@ export function parseAuthConfig(env: ServerConfigEnv, host: string, port: number
  *  requires a Login Session and machine enrollment is closed (machines are
  *  claimed offline), so the old "NO authentication" claim is false. What
  *  remains true is that public exposure needs Phase 6 hardening. */
-export function unauthenticatedExposureWarning(host: string): string | null {
+export function nonLoopbackExposureWarning(host: string): string | null {
   if (isLoopbackHost(host)) return null;
   return [
     `⚠️  LOOPZHB_HOST=${host}: listening on a NON-loopback address.`,

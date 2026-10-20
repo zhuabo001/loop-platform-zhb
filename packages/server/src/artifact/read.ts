@@ -153,8 +153,8 @@ export async function readLoopArtifactsView(
  *  must stay indistinguishable from never-existed on EVERY path, including
  *  the `attribution_missing` failure — otherwise 403-vs-404 under a foreign
  *  parent leaks the run's existence across scopes (决策 13/27). With the
- *  matching parent the failure domain is unchanged; absent (the flat JSON
- *  route) the read is unscoped. */
+ *  matching parent the failure domain is unchanged; the flat JSON route simply
+ *  omits the parent and supplies the same explicit team scope. */
 export async function readRunArtifactsView(
   home: ArtifactReadHome,
   runId: string,

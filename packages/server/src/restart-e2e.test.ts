@@ -173,7 +173,7 @@ describe("E-group: file-backed DB + real HTTP restart E2E", () => {
     const clock = new FakeClock(T0);
 
     const first = await boot(dir, clock);
-    await makeDaemon(first).pollOnce(); // machine self-registration
+    await makeDaemon(first).pollOnce(); // first poll: heartbeat only
     const loopId = await createScheduledLoop(first, "0 10 * * *");
     await shutdown(first);
 

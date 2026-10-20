@@ -187,7 +187,8 @@ export interface DashboardBoundSnapshotRef {
  *  evaluation order and failure domain); the two snapshot-list reads are
  *  plain batched selects, because the facade deliberately has no "list"
  *  operation. `updateConfig` is the existing management write the config
- *  form consumes — no credential, the loopback boundary. */
+ *  form consumes; its HTTP route sits behind the Dashboard Session and
+ *  ownership gates (ADR-011 决策 29/30). */
 export interface DashboardArtifactRead {
   loopArtifacts(teamId: string, loopId: string): Promise<ReadLoopArtifactsResult>;
   /** The nested run page: `loopId` is the PARENT PATH, folded into the

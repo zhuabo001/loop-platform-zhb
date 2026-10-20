@@ -60,7 +60,7 @@ describe("heartbeatAgeMs — liveness evidence for presence/sweep", () => {
 });
 
 // AH4 (Batch 2 slice 2): the existing-machine-only auth read path the artifact
-// routes use. Poll keeps its own register-on-first-contact flow; this seam
+// routes use. Poll verifies an EXISTING eligible machine; this seam
 // NEVER registers — an unknown token must leave the machines table untouched.
 describe("verifyMachineCredential — existing machines only, never registering", () => {
   const handles: DbHandle[] = [];
@@ -94,7 +94,7 @@ describe("verifyMachineCredential — existing machines only, never registering"
     const before = await rows(db);
     expect(before).toEqual([]);
     expect(await verifyMachineCredential(db, OTHER)).toBeUndefined();
-    expect(await rows(db)).toEqual(before); // zero writes — poll is the only enroll surface
+    expect(await rows(db)).toEqual(before); // zero writes — poll verifies only; enrollment is the offline claim
   });
 
   it("a row at the derived id under a DIFFERENT hash is refused (full-hash check)", async () => {

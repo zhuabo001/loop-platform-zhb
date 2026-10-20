@@ -307,7 +307,7 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 3 real Claude E2E (opt-in)", () => {
         //    — written only by the daemon's own poll contact.
         const machineId = machineIdFromToken(TOKEN);
         await waitFor(async () => {
-          const res = await fetch(`/api/machines`, { headers: sessionHeaders() });
+          const res = await fetch(`${baseUrl}/api/machines`, { headers: sessionHeaders() });
           if (!res.ok) return false;
           const body = (await res.json()) as { machines?: Array<{ id: string; lastSeen: string | null }> };
           return body.machines?.some((m) => m.id === machineId && m.lastSeen !== null) ?? false;
@@ -415,10 +415,13 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 3 real Claude E2E (opt-in)", () => {
 
         // The operator-visible end state: Completed page, disabled button, and
         // the coded 409 from the API.
-        const completedPage = await (await fetch(`${baseUrl}/`)).text();
+        const completedPage = await (await fetch(`${baseUrl}/`, { headers: sessionHeaders() })).text();
         expect(completedPage).toContain('data-lifecycle="completed"');
         expect(completedPage).toContain('<button type="submit" disabled>Run Now</button>');
-        const runNow = await fetch(`${baseUrl}/api/loops/${loopId}/run`, { method: "POST" });
+        const runNow = await fetch(`${baseUrl}/api/loops/${loopId}/run`, {
+          method: "POST",
+          headers: sessionHeaders(),
+        });
         expect(runNow.status).toBe(409);
         expect(((await runNow.json()) as { code?: string }).code).toBe(LOOP_COMPLETED_CODE);
 
@@ -450,7 +453,7 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 3 real Claude E2E (opt-in)", () => {
         // tautology.
         const controlRes = await fetch(`${baseUrl}/api/loops`, {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers: sessionHeaders({ "content-type": "application/json" }),
           body: JSON.stringify({ machineId, name: "b3-real-control", workdir, taskFile, cron: CRON_EVERY_MINUTE }),
         });
         expect(controlRes.status).toBe(201);
@@ -476,7 +479,9 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 3 real Claude E2E (opt-in)", () => {
         expect(completedAfterRestart.completedAt).toBe(completedBefore.completedAt);
         expect(completedAfterRestart.completionReason).toBe(completedBefore.completionReason);
         expect(completedAfterRestart).toEqual(completedBefore);
-        expect(await (await fetch(`${second.url}/`)).text()).toContain('data-lifecycle="completed"');
+        expect(await (await fetch(`${second.url}/`, { headers: sessionHeaders() })).text()).toContain(
+          'data-lifecycle="completed"',
+        );
         await bootClose(second);
 
         // Restart #2 at the SAME instant: the occurrence is already covered.

@@ -17,9 +17,11 @@
  * schemas; Zod issues, exception messages, stacks and DB details go to the
  * server log only.
  *
- * The management routes carry NO credential at all (Phase 1: localhost /
- * trusted network is the whole security boundary — see config.ts's
- * unauthenticated-exposure warning). The trigger route owns no lifecycle
+ * Every management route is behind the shared Login Session gate (Batch 3
+ * slice 5, ADR-011 决策 23): `sessionGate` resolves the team BEFORE any
+ * handler, and the ownership gates answer a flat 404. Non-loopback binds are
+ * warned about by config.ts's `nonLoopbackExposureWarning`. The trigger route
+ * owns no lifecycle
  * logic: it delegates to `coordinator.enqueueExecRun` (ADR-001 T7); the
  * cancel route delegates to `ownerControl.cancelRun` (ADR-001 T6) — the
  * coordinator's three-method interface is NOT the HTTP permission surface.
@@ -431,7 +433,7 @@ export function createServerApp(deps: ServerAppDeps): Hono<ManagementEnv> {
     }
   });
 
-  // ---- local management routes (no credential — Phase 1 loopback boundary) ----
+  // ---- management routes (Login Session gate + team scope, ADR-011 决策 23) ----
 
   app.get("/api/machines", async (c) => c.json({ machines: await admin.listMachines(teamOf(c)) }));
 
@@ -660,10 +662,10 @@ export function createServerApp(deps: ServerAppDeps): Hono<ManagementEnv> {
   });
 
   // ---- Phase 5 artifact routes (Batch 2 slice 2, ADR-010 决策 22) ----
-  // Mounted ONLY when the production facade is wired. Management config needs
-  // no credential (loopback boundary); machine routes verify an EXISTING
-  // machine (never registering) and every domain failure rides the frozen
-  // `ARTIFACT_FAILURE_HTTP` table verbatim.
+  // Mounted ONLY when the production facade is wired. Management reads/config
+  // sit behind the Login Session gate; machine routes verify an EXISTING,
+  // claimed, non-revoked machine (never registering) and every domain failure
+  // rides the frozen `ARTIFACT_FAILURE_HTTP` table verbatim.
   if (artifacts !== undefined) {
     /** The table entry as a JSON error — the ONE failure shaper. */
     const artifactError = (c: Context, failure: ArtifactInternalFailure): Response => {
