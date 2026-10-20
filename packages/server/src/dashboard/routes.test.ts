@@ -6,7 +6,8 @@
  * H3  security headers on EVERY dashboard response, CSP hash of the rendered
  *     <style> bytes, zero-JS/meta-refresh invariants kept
  * H4  CSRF and form edges (403/400/415/413) — all with ZERO writes
- * H5  instance isolation (one token never authorises another instance)
+ * H5  Session isolation (one Session's token never authorises another)
+
  * H6  every business outcome is 303 Location: /, exceptions are a fixed 500,
  *     and slice 2's temporary supersede semantics are pinned explicitly
  * H7  the loopback Host gate (DNS rebinding), on both the HTML routes and the
@@ -31,15 +32,33 @@ import { createLifecycleAdmin } from "../loop-lifecycle/admin.js";
 import { createOwnerControl } from "../owner/index.js";
 import { createScheduleAdmin } from "../schedule/index.js";
 import { waitForListening } from "../start.js";
-import { FakeClock, permissiveManagementAccess, seedClaimedMachineById, seedLoop, seedRun } from "../testkit/index.js";
+import {
+  FakeClock,
+  permissiveManagementAccess,
+  seedClaimedMachineById,
+  seedLoop,
+  seedMachine,
+  seedManagementSession,
+  seedRun,
+} from "../testkit/index.js";
 import { createServerApp } from "../http/app.js";
+import { deriveSessionCsrfToken } from "../auth/session-csrf.js";
+import { createSessionService, type SessionService } from "../auth/session.js";
+import { createDashboardAccess } from "./access.js";
 import { createDashboardRead, type DashboardArtifactRead, type DashboardRead } from "./index.js";
 import { dashboardCsp } from "./routes.js";
 import { createDashboardRoutes, type DashboardRoutes } from "./routes.js";
 import type { EnqueueExecRunResult } from "../store/runs.js";
 
-const TOKEN_A = "token-instance-a";
-const TOKEN_B = "token-instance-b";
+/** `seedManagementSession` derives this credential from the default user id
+ *  (424242), so the cookie and the CSRF token are module constants — no
+ *  getter plumbing through every request helper. */
+const CRED_A = "sk_management_424242";
+const CRED_B = "sk_management_second";
+const TOKEN_A = deriveSessionCsrfToken(CRED_A);
+const TOKEN_B = deriveSessionCsrfToken(CRED_B);
+const COOKIE_A = `loopzhb_session=${CRED_A}`;
+const COOKIE_B = `loopzhb_session=${CRED_B}`;
 const FORM = "application/x-www-form-urlencoded";
 
 const handles: DbHandle[] = [];
@@ -58,13 +77,13 @@ let coordinator: RunCoordinator;
 let read: DashboardRead;
 let app: ReturnType<typeof createServerApp>;
 let enqueueCalls: string[];
+let sessions: SessionService;
 
 /** Per-test override seams for the two failure paths H6 needs. */
 interface FreshOptions {
   enqueue?: (loopId: string) => Promise<EnqueueExecRunResult>;
   read?: DashboardRead;
   artifacts?: DashboardArtifactRead;
-  csrfToken?: string;
 }
 
 /** Build an app WITHOUT the dashboard (the pre-Batch-3 shape), for the
@@ -82,7 +101,7 @@ function appWithoutDashboard(): ReturnType<typeof createServerApp> {
   });
 }
 
-function buildApp(options: FreshOptions & { csrfToken: string }): ReturnType<typeof createServerApp> {
+function buildApp(options: FreshOptions = {}): ReturnType<typeof createServerApp> {
   const routes: DashboardRoutes = createDashboardRoutes({
     read: options.read ?? read,
     artifacts: options.artifacts,
@@ -95,7 +114,7 @@ function buildApp(options: FreshOptions & { csrfToken: string }): ReturnType<typ
         // production superseded — the exact drift mount.test.ts also guards.
         return coordinator.enqueueExecRun(loopId, { kind: "manual", pendingPolicy: "skip" });
       }),
-    csrfToken: options.csrfToken,
+    access: createDashboardAccess({ db, sessions }),
   });
   return createServerApp({
     coordinator,
@@ -127,13 +146,19 @@ async function fresh(options: FreshOptions = {}): Promise<void> {
   // coordinator behind the Run Now seam refuses an enqueue for a machine that
   // is not execution-eligible (Phase 5 Batch 3 slice 3) — so it is CLAIMED.
   await seedClaimedMachineById(db, "m-test");
-  app = buildApp({ ...options, csrfToken: options.csrfToken ?? TOKEN_A });
+  // Two Sessions for the SAME user/team (slice 6, DG5): one is the request
+  // cookie, the other supplies a token that must never authorise it.
+  await seedManagementSession(db, { clock, credential: CRED_A });
+  await seedManagementSession(db, { clock, credential: CRED_B });
+  sessions = createSessionService({ db, clock });
+  app = buildApp(options);
 }
 
 /** Every gate test sets Host EXPLICITLY: Hono's app.request defaults the URL
  *  host to `localhost` and sends no Host header, so a case that forgot it
- *  would pass even if the gate always returned true. */
-const LOOPBACK = { host: "127.0.0.1" };
+ *  would pass even if the gate always returned true. The Session cookie is
+ *  part of every authenticated request (slice 6). */
+const LOOPBACK = { host: "127.0.0.1", cookie: COOKIE_A };
 
 function postForm(
   target: ReturnType<typeof createServerApp>,
@@ -144,7 +169,7 @@ function postForm(
   return Promise.resolve(
     target.request(`/dashboard/loops/${encodeURIComponent(loopId)}/run`, {
       method: "POST",
-      headers: { "content-type": FORM, host: "127.0.0.1", ...headers },
+      headers: { "content-type": FORM, host: "127.0.0.1", cookie: COOKIE_A, ...headers },
       body,
     }),
   );
@@ -209,7 +234,7 @@ describe("H-group (Batch 3 Dashboard HTTP): routes and security", () => {
 
     // The action is a path segment: percent-encoded, so no raw quote can
     // terminate the attribute and no second path segment can appear.
-    const action = html.match(/action="([^"]*)"/)?.[1];
+    const action = html.match(/action="([^"]*\/run)"/)?.[1];
     expect(action).toBe(`/dashboard/loops/${encodeURIComponent(hostileId)}/run`);
     expect(action).not.toContain("<");
     expect(action).not.toContain('"');
@@ -245,10 +270,16 @@ describe("H-group (Batch 3 Dashboard HTTP): routes and security", () => {
       await postForm(app, "loop-1", "csrf=a&extra=1"),
       await postForm(app, "loop-1", formBody(TOKEN_A), { "content-type": "application/json" }),
       await postForm(app, "loop-1", `csrf=${"x".repeat(5000)}`),
-      await postForm(app, "loop-missing", formBody(TOKEN_A)),
     ]) {
       expectSecurityHeaders(res);
     }
+
+    // The ownership gate's flat 404 is the ONE dashboard-path refusal without
+    // dashboard headers: it must match `app.notFound` byte for byte (决策 29).
+    const foreign = await postForm(app, "loop-missing", formBody(TOKEN_A));
+    expect(foreign.status).toBe(404);
+    expect(foreign.headers.get("content-security-policy")).toBeNull();
+    expect(await foreign.text()).toBe(await (await app.request("/nope", { headers: LOOPBACK })).text());
   });
 
   it("H4: verifies the token before anything else and never writes on a reject", async () => {
@@ -258,12 +289,14 @@ describe("H-group (Batch 3 Dashboard HTTP): routes and security", () => {
     // The happy path, driven by the action the PAGE rendered (closes the
     // encode → register → decode loop).
     const html = await (await app.request("/", { headers: LOOPBACK })).text();
-    const renderedAction = html.match(/action="([^"]*)"/)![1]!;
+    const renderedAction = html.match(/action="([^"]*\/run)"/)![1]!;
+    // The token is identical in the logout and Run forms (same Session); the
+    // Run form's value is what the POST below replays.
     const renderedToken = html.match(/name="csrf" value="([^"]*)"/)![1]!;
     expect(renderedAction).toBe("/dashboard/loops/loop-1/run");
     const accepted = await app.request(renderedAction, {
       method: "POST",
-      headers: { "content-type": FORM, host: "127.0.0.1" },
+      headers: { "content-type": FORM, host: "127.0.0.1", cookie: COOKIE_A },
       body: formBody(renderedToken),
     });
     expect(accepted.status).toBe(303);
@@ -281,7 +314,7 @@ describe("H-group (Batch 3 Dashboard HTTP): routes and security", () => {
       ["empty token", await postForm(app, "loop-1", "csrf=")],
       ["token in the query string only", await app.request(`/dashboard/loops/loop-1/run?csrf=${TOKEN_A}`, {
         method: "POST",
-        headers: { "content-type": FORM, host: "127.0.0.1" },
+        headers: { "content-type": FORM, host: "127.0.0.1", cookie: COOKIE_A },
         body: "",
       })],
       ["token in a header only", await postForm(app, "loop-1", "", { "x-csrf-token": TOKEN_A })],
@@ -305,7 +338,7 @@ describe("H-group (Batch 3 Dashboard HTTP): routes and security", () => {
     expect((await postForm(app, "loop-1", "", { "content-type": "multipart/form-data; boundary=x" })).status).toBe(415);
     const noContentType = await app.request("/dashboard/loops/loop-1/run", {
       method: "POST",
-      headers: { host: "127.0.0.1" },
+      headers: { host: "127.0.0.1", cookie: COOKIE_A },
       body: "",
     });
     expect(noContentType.status).toBe(415);
@@ -332,16 +365,20 @@ describe("H-group (Batch 3 Dashboard HTTP): routes and security", () => {
     expect(await runRows()).toEqual(before);
   });
 
-  it("H5: a token from one instance never authorises another", async () => {
+  it("H5: a token from one Session never authorises another (DG5)", async () => {
     await fresh();
     await seedLoop(db, { id: "loop-1" });
-    const other = buildApp({ csrfToken: TOKEN_B });
 
-    expect((await postForm(other, "loop-1", formBody(TOKEN_A))).status).toBe(403);
+    // Cookie A + token B and cookie B + token A are both refused, zero write.
     expect((await postForm(app, "loop-1", formBody(TOKEN_B))).status).toBe(403);
+    expect(
+      (await postForm(app, "loop-1", formBody(TOKEN_A), { cookie: COOKIE_B })).status,
+    ).toBe(403);
     expect(await runRows()).toEqual([]);
-    // Each instance accepts its own.
-    expect((await postForm(other, "loop-1", formBody(TOKEN_B))).status).toBe(303);
+
+    // Each Session accepts its own token.
+    expect((await postForm(app, "loop-1", formBody(TOKEN_B), { cookie: COOKIE_B })).status).toBe(303);
+    expect((await postForm(app, "loop-1", formBody(TOKEN_A))).status).toBe(303);
   });
 
   it("H6: maps every business outcome to 303 / and a throw to a fixed 500", async () => {
@@ -351,19 +388,23 @@ describe("H-group (Batch 3 Dashboard HTTP): routes and security", () => {
     await seedLoop(db, { id: "busy" });
     await seedRun(db, { id: "run-running", loopId: "busy", phase: "running" });
 
-    for (const [label, loopId] of [["created", "idle"], ["unknown loop", "nope"], ["completed", "completed"], ["already running", "busy"]] as const) {
+    for (const [label, loopId] of [["created", "idle"], ["completed", "completed"], ["already running", "busy"]] as const) {
       const res = await postForm(app, loopId, formBody(TOKEN_A));
       expect([label, res.status, res.headers.get("location")]).toEqual([label, 303, "/"]);
     }
-    // Only the idle loop wrote (one pending exec run); running, completed and
-    // unknown all left the database alone.
+    // An unknown loop is now the ownership gate's flat 404 BEFORE the handler
+    // (slice 6, DG4) — it never reaches the enqueue seam.
+    const unknown = await postForm(app, "nope", formBody(TOKEN_A));
+    expect(unknown.status).toBe(404);
+    expect(await unknown.text()).toBe(await (await app.request("/nope", { headers: LOOPBACK })).text());
+    // Only the idle loop wrote (one pending exec run); running and completed
+    // left the database alone.
     expect((await runRows()).map((r) => r.id).sort()).toEqual(["run-1", "run-running"]);
-    expect(enqueueCalls).toEqual(["idle", "nope", "completed", "busy"]);
+    expect(enqueueCalls).toEqual(["idle", "completed", "busy"]);
 
     // A reason the union does not have today is still a business outcome, not
     // an error: the route folds EVERY non-throwing result into 303.
     const future = buildApp({
-      csrfToken: TOKEN_A,
       // Deliberately not a member of today's union — that is the point.
       enqueue: async () => ({ enqueued: false, reason: "some_future_reason" }) as unknown as EnqueueExecRunResult,
     });
@@ -384,7 +425,6 @@ describe("H-group (Batch 3 Dashboard HTTP): routes and security", () => {
     // A throw is never disguised as success — and its message never reaches
     // the wire.
     const boom = buildApp({
-      csrfToken: TOKEN_A,
       enqueue: async () => {
         throw new Error("pg connection failed: secret-token-abc");
       },
@@ -398,7 +438,6 @@ describe("H-group (Batch 3 Dashboard HTTP): routes and security", () => {
     expectSecurityHeaders(failed);
 
     const readBoom = buildApp({
-      csrfToken: TOKEN_A,
       read: {
         snapshot: async () => {
           throw new Error("db exploded: secret-token-xyz");
@@ -476,6 +515,68 @@ describe("H-group (Batch 3 Dashboard HTTP): routes and security", () => {
     expect(await runRows()).toEqual(settled);
   });
 
+  it("DG1/DG2: anonymous pages redirect to /login; an anonymous POST is 401 before form parsing", async () => {
+    await fresh();
+    await seedLoop(db, { id: "loop-1" });
+
+    for (const path of [
+      "/",
+      "/dashboard",
+      "/dashboard/loops/loop-1/run",
+      "/dashboard/loops/loop-1/artifacts",
+      "/dashboard/loops/loop-1/artifacts/runs/run-1",
+      "/dashboard/loops/loop-1/artifacts/diff?to=amf-1",
+    ]) {
+      const res = await app.request(path, { headers: { host: "127.0.0.1" } });
+      expect([path, res.status]).toEqual([path, 303]);
+      expect([path, res.headers.get("location")]).toEqual([path, "/login"]);
+      expect(res.headers.get("set-cookie")).toBeNull();
+      expectSecurityHeaders(res);
+    }
+
+    const before = await runRows();
+    for (const [contentType, body] of [
+      [FORM, formBody(TOKEN_A)],
+      ["application/json", "{}"],
+      [FORM, `csrf=${"x".repeat(5000)}`], // auth precedes the 4 KiB cap
+    ] as const) {
+      const res = await app.request("/dashboard/loops/loop-1/run", {
+        method: "POST",
+        headers: { host: "127.0.0.1", "content-type": contentType },
+        body,
+      });
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual({ error: "not authenticated" });
+      expectSecurityHeaders(res);
+    }
+    expect(await runRows()).toEqual(before);
+    expect(enqueueCalls).toEqual([]);
+  });
+
+  it("DG4: another team's loop is the flat 404 on pages and writes, with zero writes", async () => {
+    await fresh();
+    await seedMachine(db, "m-b", { teamId: "t-ffffffffffffffff" });
+    await seedLoop(db, { id: "loop-b", machineId: "m-b" });
+
+    const canonical = await (await app.request("/nope", { headers: LOOPBACK })).text();
+    for (const path of [
+      "/dashboard/loops/loop-b/artifacts",
+      "/dashboard/loops/loop-b/artifacts/runs/run-1",
+      "/dashboard/loops/loop-b/artifacts/diff?to=amf-1",
+    ]) {
+      const res = await app.request(path, { headers: LOOPBACK });
+      expect([path, res.status]).toEqual([path, 404]);
+      expect(await res.text(), path).toBe(canonical);
+    }
+
+    const before = await runRows();
+    const post = await postForm(app, "loop-b", formBody(TOKEN_A));
+    expect(post.status).toBe(404);
+    expect(await post.text()).toBe(canonical);
+    expect(await runRows()).toEqual(before);
+    expect(enqueueCalls).toEqual([]);
+  });
+
   it("H7: gates every route on a loopback Host, and forwarded headers cannot flip it", async () => {
     await fresh();
     await seedLoop(db, { id: "loop-1" });
@@ -512,12 +613,20 @@ describe("H-group (Batch 3 Dashboard HTTP): routes and security", () => {
 
     // Forwarded headers are not consulted in either direction.
     expect((await app.request("/", { headers: { host: "evil.com", "x-forwarded-host": "127.0.0.1" } })).status).toBe(404);
-    expect((await app.request("/", { headers: { host: "127.0.0.1", "x-forwarded-host": "evil.com" } })).status).toBe(200);
+    expect(
+      (await app.request("/", { headers: { host: "127.0.0.1", "x-forwarded-host": "evil.com", cookie: COOKIE_A } }))
+        .status,
+    ).toBe(200);
 
     // Loopback forms that MUST pass (IPv6 bracket form included).
     for (const host of ["127.0.0.1", "127.0.0.1:3000", "localhost", "localhost:3000", "[::1]:3000"]) {
-      expect([host, (await app.request("/", { headers: { host } })).status]).toEqual([host, 200]);
+      expect([host, (await app.request("/", { headers: { host, cookie: COOKIE_A } })).status]).toEqual([host, 200]);
     }
+    // Without the Session cookie the same loopback page is a redirect, not a
+    // 200 — the host gate is not authentication (DG1).
+    const anonymous = await app.request("/", { headers: { host: "127.0.0.1" } });
+    expect(anonymous.status).toBe(303);
+    expect(anonymous.headers.get("location")).toBe("/login");
 
     // The gate covers the JSON API too — that is the point: a rebinding
     // attacker reads /api/loops first, then triggers blind.
@@ -554,7 +663,7 @@ describe("H-group (Batch 3 Dashboard HTTP): routes and security", () => {
     expect(realHostilePost.status).toBe(404);
     expect(await runRows()).toEqual([]);
 
-    const realLoopback = await rawRequest(port, "/", { Host: `127.0.0.1:${port}` });
+    const realLoopback = await rawRequest(port, "/", { Host: `127.0.0.1:${port}`, Cookie: COOKIE_A });
     expect(realLoopback.status).toBe(200);
     expect(realLoopback.body).toContain("Loop Dashboard");
   });
@@ -601,13 +710,22 @@ function fakeArtifacts(overrides: Partial<DashboardArtifactRead> = {}): Dashboar
     diff: () => Promise.resolve({ ok: false, failure: "snapshot_not_found" }),
     updateConfig: () => Promise.resolve({ ok: false, failure: "loop_not_found" }),
     boundSnapshots: () => Promise.resolve([]),
-    loopSnapshots: () => Promise.resolve([]),
     ...overrides,
   };
 }
 
+/** The artifact pages sit behind the loop ownership gate (slice 6), so every
+ *  fixture needs a REAL owned loop before the fake seams can be reached. */
+async function freshArtifact(
+  overrides: Partial<DashboardArtifactRead> = {},
+  loopId = "loop-1",
+): Promise<void> {
+  await fresh({ artifacts: fakeArtifacts(overrides) });
+  await seedLoop(db, { id: loopId });
+}
+
 const getArtifactPage = (target: ReturnType<typeof createServerApp>, path: string): Promise<Response> =>
-  Promise.resolve(target.request(path, { headers: { host: "127.0.0.1" } }));
+  Promise.resolve(target.request(path, { headers: { host: "127.0.0.1", cookie: COOKIE_A } }));
 
 const postConfig = (
   target: ReturnType<typeof createServerApp>,
@@ -617,18 +735,16 @@ const postConfig = (
   Promise.resolve(
     target.request(`/dashboard/loops/${encodeURIComponent(loopId)}/artifacts/config`, {
       method: "POST",
-      headers: { "content-type": FORM, host: "127.0.0.1" },
+      headers: { "content-type": FORM, host: "127.0.0.1", cookie: COOKIE_A },
       body,
     }),
   );
 
 describe("slice 7 artifact pages (决策 27)", () => {
   it("the artifact page renders config form, current view, snapshot list and the diff form", async () => {
-    await fresh({
-      artifacts: fakeArtifacts({
-        loopArtifacts: () => Promise.resolve(VIEW_FIXTURE as ReadLoopArtifactsResult),
-        boundSnapshots: () => Promise.resolve(BOUND_FIXTURE),
-      }),
+    await freshArtifact({
+      loopArtifacts: () => Promise.resolve(VIEW_FIXTURE as ReadLoopArtifactsResult),
+      boundSnapshots: () => Promise.resolve(BOUND_FIXTURE),
     });
     const res = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts");
     expect(res.status).toBe(200);
@@ -656,40 +772,36 @@ describe("slice 7 artifact pages (决策 27)", () => {
   });
 
   it("the first snapshot's default baseline is the empty set (空集合 selected)", async () => {
-    await fresh({
-      artifacts: fakeArtifacts({
-        loopArtifacts: () =>
-          Promise.resolve({
-            ...VIEW_FIXTURE,
-            response: { ...VIEW_FIXTURE.response, manifestRevision: 1, manifestId: "amf-1" },
-          } as ReadLoopArtifactsResult),
-        boundSnapshots: () => Promise.resolve([BOUND_FIXTURE[1]]), // amf-1, the only snapshot
-      }),
+    await freshArtifact({
+      loopArtifacts: () =>
+        Promise.resolve({
+          ...VIEW_FIXTURE,
+          response: { ...VIEW_FIXTURE.response, manifestRevision: 1, manifestId: "amf-1" },
+        } as ReadLoopArtifactsResult),
+      boundSnapshots: () => Promise.resolve([BOUND_FIXTURE[1]]), // amf-1, the only snapshot
     });
     const html = await (await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts")).text();
     expect(html).toContain('value="" selected');
   });
 
   it("the run page renders the bound file table; the missing state is explicit", async () => {
-    await fresh({
-      artifacts: fakeArtifacts({
-        runArtifacts: (_loopId, runId): Promise<ReadRunArtifactsResult> =>
-          Promise.resolve({
-            ok: true,
-            response: {
-              runId,
-              loopId: "loop-1",
-              state: "bound",
-              snapshotId: "amf-1",
-              manifestRevision: 1,
-              configRevision: 1,
-              committedAt: "2026-10-06T00:00:00.000Z",
-              fileCount: 1,
-              totalBytes: 3,
-              files: [{ path: "a.txt", hash: "b".repeat(64), size: 3 }],
-            },
-          }),
-      }),
+    await freshArtifact({
+      runArtifacts: (_teamId, _loopId, runId): Promise<ReadRunArtifactsResult> =>
+        Promise.resolve({
+          ok: true,
+          response: {
+            runId,
+            loopId: "loop-1",
+            state: "bound",
+            snapshotId: "amf-1",
+            manifestRevision: 1,
+            configRevision: 1,
+            committedAt: "2026-10-06T00:00:00.000Z",
+            fileCount: 1,
+            totalBytes: 3,
+            files: [{ path: "a.txt", hash: "b".repeat(64), size: 3 }],
+          },
+        }),
     });
     const bound = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts/runs/run-1");
     expect(bound.status).toBe(200);
@@ -697,11 +809,9 @@ describe("slice 7 artifact pages (决策 27)", () => {
     expect(boundHtml).toContain("a.txt");
     expect(boundHtml).toContain("下载");
 
-    await fresh({
-      artifacts: fakeArtifacts({
-        runArtifacts: (_loopId, runId): Promise<ReadRunArtifactsResult> =>
-          Promise.resolve({ ok: true, response: { runId, loopId: "loop-1", state: "missing" } }),
-      }),
+    await freshArtifact({
+      runArtifacts: (_teamId, _loopId, runId): Promise<ReadRunArtifactsResult> =>
+        Promise.resolve({ ok: true, response: { runId, loopId: "loop-1", state: "missing" } }),
     });
     const missing = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts/runs/run-9");
     expect(missing.status).toBe(200);
@@ -709,24 +819,22 @@ describe("slice 7 artifact pages (决策 27)", () => {
   });
 
   it("the diff page renders the three classes and the re-select form", async () => {
-    await fresh({
-      artifacts: fakeArtifacts({
-        diff: (): Promise<ReadDiffResult> =>
-          Promise.resolve({
-            ok: true,
-            response: {
-              loopId: "loop-1",
-              from: { snapshotId: "amf-1", manifestRevision: 1 },
-              to: { snapshotId: "amf-2", manifestRevision: 2 },
-              added: [{ path: "new.txt", hash: "c".repeat(64), size: 1 }],
-              modified: [
-                { path: "mod.txt", beforeHash: "d".repeat(64), beforeSize: 1, afterHash: "e".repeat(64), afterSize: 2 },
-              ],
-              removed: [{ path: "gone.txt", hash: "f".repeat(64), size: 1 }],
-            },
-          }),
-        boundSnapshots: () => Promise.resolve(BOUND_FIXTURE),
-      }),
+    await freshArtifact({
+      diff: (): Promise<ReadDiffResult> =>
+        Promise.resolve({
+          ok: true,
+          response: {
+            loopId: "loop-1",
+            from: { snapshotId: "amf-1", manifestRevision: 1 },
+            to: { snapshotId: "amf-2", manifestRevision: 2 },
+            added: [{ path: "new.txt", hash: "c".repeat(64), size: 1 }],
+            modified: [
+              { path: "mod.txt", beforeHash: "d".repeat(64), beforeSize: 1, afterHash: "e".repeat(64), afterSize: 2 },
+            ],
+            removed: [{ path: "gone.txt", hash: "f".repeat(64), size: 1 }],
+          },
+        }),
+      boundSnapshots: () => Promise.resolve(BOUND_FIXTURE),
     });
     const res = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts/diff?from=amf-1&to=amf-2");
     expect(res.status).toBe(200);
@@ -741,26 +849,22 @@ describe("slice 7 artifact pages (决策 27)", () => {
   });
 
   it("the diff page with no target redirects back to the artifact page", async () => {
-    await fresh({ artifacts: fakeArtifacts() });
+    await freshArtifact();
     const res = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts/diff");
     expect(res.status).toBe(303);
     expect(res.headers.get("location")).toBe("/dashboard/loops/loop-1/artifacts");
   });
 
   it("read failures render the fixed-string error pages (404/403), never domain detail", async () => {
-    await fresh({
-      artifacts: fakeArtifacts({
-        loopArtifacts: () => Promise.resolve({ ok: false, failure: "attribution_missing" }),
-      }),
+    await freshArtifact({
+      loopArtifacts: () => Promise.resolve({ ok: false, failure: "attribution_missing" }),
     });
     const forbidden = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts");
     expect(forbidden.status).toBe(403);
     expect(await forbidden.text()).toContain("归属缺失");
 
-    await fresh({
-      artifacts: fakeArtifacts({
-        loopArtifacts: () => Promise.resolve({ ok: false, failure: "loop_not_found" }),
-      }),
+    await freshArtifact({
+      loopArtifacts: () => Promise.resolve({ ok: false, failure: "loop_not_found" }),
     });
     const gone = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts");
     expect(gone.status).toBe(404);
@@ -769,16 +873,17 @@ describe("slice 7 artifact pages (决策 27)", () => {
 
   it("hostile loop ids and directory values are escaped in text and attribute position", async () => {
     const hostile = 'loop-<script>"\'';
-    await fresh({
-      artifacts: fakeArtifacts({
-        loopArtifacts: (loopId): Promise<ReadLoopArtifactsResult> =>
+    await freshArtifact(
+      {
+        loopArtifacts: (_teamId, loopId): Promise<ReadLoopArtifactsResult> =>
           Promise.resolve({
             ...VIEW_FIXTURE,
             response: { ...VIEW_FIXTURE.response, loopId, artifactDir: hostile },
           }),
         boundSnapshots: () => Promise.resolve([]),
-      }),
-    });
+      },
+      hostile,
+    );
     const res = await getArtifactPage(app, `/dashboard/loops/${encodeURIComponent(hostile)}/artifacts`);
     expect(res.status).toBe(200);
     const html = await res.text();
@@ -788,7 +893,10 @@ describe("slice 7 artifact pages (决策 27)", () => {
 
   it("without the artifact seam the pages are the indistinguishable 404", async () => {
     await fresh();
-    const canonical = await (await app.request("/nope", { headers: { host: "127.0.0.1" } })).text();
+    // Seed the loop so the ownership gate PASSES and the 404 proves the route
+    // is absent, not merely unowned.
+    await seedLoop(db, { id: "loop-1" });
+    const canonical = await (await app.request("/nope", { headers: LOOPBACK })).text();
     for (const path of [
       "/dashboard/loops/loop-1/artifacts",
       "/dashboard/loops/loop-1/artifacts/runs/run-1",
@@ -801,31 +909,32 @@ describe("slice 7 artifact pages (决策 27)", () => {
   });
 
   it("#111: the run page is nested under its parent loop — a mismatched parent path is the same 404", async () => {
-    await fresh({
-      artifacts: fakeArtifacts({
-        // The fake emulates the facade's identity-step fold (pinned for real
-        // in artifact/read.test.ts): a parent mismatch is run_not_found.
-        runArtifacts: (loopId, runId): Promise<ReadRunArtifactsResult> =>
-          loopId !== "loop-1"
-            ? Promise.resolve({ ok: false, failure: "run_not_found" })
-            : Promise.resolve({
-                ok: true,
-                response: {
-                  runId,
-                  loopId: "loop-1", // the run really belongs to loop-1…
-                  state: "bound",
-                  snapshotId: "amf-1",
-                  manifestRevision: 1,
-                  configRevision: 1,
-                  committedAt: "2026-10-06T00:00:00.000Z",
-                  fileCount: 1,
-                  totalBytes: 3,
-                  files: [{ path: "a.txt", hash: "b".repeat(64), size: 3 }],
-                },
-              }),
-      }),
+    await freshArtifact({
+      // The fake emulates the facade's identity-step fold (pinned for real in
+      // artifact/read.test.ts): a parent mismatch is run_not_found.
+      runArtifacts: (_teamId, loopId, runId): Promise<ReadRunArtifactsResult> =>
+        loopId !== "loop-1"
+          ? Promise.resolve({ ok: false, failure: "run_not_found" })
+          : Promise.resolve({
+              ok: true,
+              response: {
+                runId,
+                loopId: "loop-1", // the run really belongs to loop-1…
+                state: "bound",
+                snapshotId: "amf-1",
+                manifestRevision: 1,
+                configRevision: 1,
+                committedAt: "2026-10-06T00:00:00.000Z",
+                fileCount: 1,
+                totalBytes: 3,
+                files: [{ path: "a.txt", hash: "b".repeat(64), size: 3 }],
+              },
+            }),
     });
-    const res = await getArtifactPage(app, "/dashboard/loops/loop-OTHER/artifacts/runs/run-1"); // …not loop-OTHER
+    // loop-OTHER is OWNED by the session team (so the path gate passes) but is
+    // not the run's parent — the facade folds it to run_not_found.
+    await seedLoop(db, { id: "loop-OTHER" });
+    const res = await getArtifactPage(app, "/dashboard/loops/loop-OTHER/artifacts/runs/run-1");
     expect(res.status).toBe(404);
     const html = await res.text();
     expect(html).toContain("不存在或不可见");
@@ -840,28 +949,33 @@ describe("slice 7 artifact pages (决策 27)", () => {
     // identity step; this fake emulates that fold (the real ordering is
     // pinned in artifact/read.test.ts).
     const seen: string[] = [];
-    await fresh({
-      artifacts: fakeArtifacts({
-        runArtifacts: (loopId, runId): Promise<ReadRunArtifactsResult> => {
-          seen.push(`${loopId}/${runId}`);
-          if (runId === "run-nope") return Promise.resolve({ ok: false, failure: "run_not_found" });
-          if (loopId !== "loop-1") return Promise.resolve({ ok: false, failure: "run_not_found" });
-          return Promise.resolve({ ok: false, failure: "attribution_missing" });
-        },
-      }),
+    await freshArtifact({
+      runArtifacts: (_teamId, loopId, runId): Promise<ReadRunArtifactsResult> => {
+        seen.push(`${loopId}/${runId}`);
+        if (runId === "run-nope") return Promise.resolve({ ok: false, failure: "run_not_found" });
+        if (loopId !== "loop-1") return Promise.resolve({ ok: false, failure: "run_not_found" });
+        return Promise.resolve({ ok: false, failure: "attribution_missing" });
+      },
     });
+    await seedLoop(db, { id: "loop-OTHER" });
     // The never-existed run's page is the canonical shape.
     const unknown = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts/runs/run-nope");
     expect(unknown.status).toBe(404);
     const canonical = await unknown.text();
-    // Wrong / nonexistent parent with the attribution-missing run: byte-identical 404.
-    for (const parent of ["loop-OTHER", "loop-nope"]) {
-      const res = await getArtifactPage(app, `/dashboard/loops/${parent}/artifacts/runs/run-1`);
-      expect(res.status, parent).toBe(404);
-      expect(await res.text(), parent).toBe(canonical);
-    }
+    // A wrong but OWNED parent with the attribution-missing run: the facade's
+    // identity step folds it into byte-identical 404.
+    const wrongParent = await getArtifactPage(app, "/dashboard/loops/loop-OTHER/artifacts/runs/run-1");
+    expect(wrongParent.status).toBe(404);
+    expect(await wrongParent.text()).toBe(canonical);
+    // A NONEXISTENT parent never reaches the facade at all — the ownership
+    // gate answers its flat 404 first (slice 6), which is also indistinguishable
+    // from an unknown path.
+    const missingParent = await getArtifactPage(app, "/dashboard/loops/loop-nope/artifacts/runs/run-1");
+    expect(missingParent.status).toBe(404);
+    expect(await missingParent.text()).toBe('{"error":"not found"}');
     // The parent path reached the facade as the FIRST argument (identity step).
     expect(seen).toContain("loop-OTHER/run-1");
+    expect(seen).not.toContain("loop-nope/run-1");
     // The correct parent's attribution_missing stays the 403 control.
     const control = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts/runs/run-1");
     expect(control.status).toBe(403);
@@ -882,24 +996,22 @@ describe("slice 7 artifact pages (决策 27)", () => {
           return Promise.reject(new Error("injected list-read storage fault"));
         },
       });
-    await fresh({ artifacts: faultingSeam() });
+    await freshArtifact(faultingSeam());
     const page = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts");
     expect(page.status).toBe(403);
     expect(await page.text()).toContain("归属缺失");
     expect(listCalls).toBe(0); // the list read never started — domain verdict first
 
-    await fresh({ artifacts: faultingSeam() });
+    await freshArtifact(faultingSeam());
     const diff = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts/diff?from=amf-1&to=amf-2");
     expect(diff.status).toBe(403);
     expect(listCalls).toBe(0);
   });
 
   it("P3: banner tokens are OWN-KEY lookups — __proto__/constructor/toString render no banner", async () => {
-    await fresh({
-      artifacts: fakeArtifacts({
-        loopArtifacts: () => Promise.resolve(VIEW_FIXTURE as ReadLoopArtifactsResult),
-        boundSnapshots: () => Promise.resolve([]),
-      }),
+    await freshArtifact({
+      loopArtifacts: () => Promise.resolve(VIEW_FIXTURE as ReadLoopArtifactsResult),
+      boundSnapshots: () => Promise.resolve([]),
     });
     for (const token of ["__proto__", "constructor", "toString"]) {
       const res = await getArtifactPage(app, `/dashboard/loops/loop-1/artifacts?config=${token}`);
@@ -916,17 +1028,15 @@ describe("slice 7 artifact pages (决策 27)", () => {
   describe("the config form POST", () => {
     it("valid token saves and redirects with the outcome banner token", async () => {
       const calls: Array<{ loopId: string; command: { artifactDir: string | null } }> = [];
-      await fresh({
-        artifacts: fakeArtifacts({
-          updateConfig: (loopId, command): Promise<UpdateArtifactConfigResult> => {
-            calls.push({ loopId, command });
-            return Promise.resolve({
-              ok: true,
-              outcome: "changed",
-              loop: { artifactDir: command.artifactDir } as never,
-            });
-          },
-        }),
+      await freshArtifact({
+        updateConfig: (loopId, command): Promise<UpdateArtifactConfigResult> => {
+          calls.push({ loopId, command });
+          return Promise.resolve({
+            ok: true,
+            outcome: "changed",
+            loop: { artifactDir: command.artifactDir } as never,
+          });
+        },
       });
       const res = await postConfig(app, "loop-1", `csrf=${TOKEN_A}&artifactDir=${encodeURIComponent("/data/new")}`);
       expect(res.status).toBe(303);
@@ -946,10 +1056,8 @@ describe("slice 7 artifact pages (决策 27)", () => {
           [{ ok: false, failure: "artifact_revision_exhausted" }, "artifact_config_conflict"],
         ] as const
       ) {
-        await fresh({
-          artifacts: fakeArtifacts({
-            updateConfig: () => Promise.resolve(outcome as UpdateArtifactConfigResult),
-          }),
+        await freshArtifact({
+          updateConfig: () => Promise.resolve(outcome as UpdateArtifactConfigResult),
         });
         const body =
           expected === "cleared"
@@ -963,13 +1071,11 @@ describe("slice 7 artifact pages (决策 27)", () => {
 
     it("CSRF edges: bad token 403, extra field 400, duplicate artifactDir 400 — zero writes", async () => {
       let calls = 0;
-      await fresh({
-        artifacts: fakeArtifacts({
-          updateConfig: () => {
-            calls += 1;
-            return Promise.resolve({ ok: false, failure: "loop_not_found" });
-          },
-        }),
+      await freshArtifact({
+        updateConfig: () => {
+          calls += 1;
+          return Promise.resolve({ ok: false, failure: "loop_not_found" });
+        },
       });
       expect((await postConfig(app, "loop-1", `csrf=${TOKEN_B}&artifactDir=/x`)).status).toBe(403);
       expect((await postConfig(app, "loop-1", `csrf=${TOKEN_A}&artifactDir=/x&extra=1`)).status).toBe(400);
@@ -980,11 +1086,9 @@ describe("slice 7 artifact pages (决策 27)", () => {
     });
 
     it("the banner renders for a known token and stays silent for an unknown one", async () => {
-      await fresh({
-        artifacts: fakeArtifacts({
-          loopArtifacts: () => Promise.resolve(VIEW_FIXTURE as ReadLoopArtifactsResult),
-          boundSnapshots: () => Promise.resolve([]),
-        }),
+      await freshArtifact({
+        loopArtifacts: () => Promise.resolve(VIEW_FIXTURE as ReadLoopArtifactsResult),
+        boundSnapshots: () => Promise.resolve([]),
       });
       const known = await getArtifactPage(app, "/dashboard/loops/loop-1/artifacts?config=updated");
       expect(await known.text()).toContain("Artifact 目录已更新。");

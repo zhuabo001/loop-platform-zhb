@@ -5,7 +5,7 @@
 
 **阶段状态**：Phase 1–4 已完成（Phase 4 于 2026-09-27 收口，验收证据 `docs/tests/phase4-acceptance.md`）；当前进入 Phase 5（Artifact 同步 → 认证 → 通知）。
 
-**部署边界**：管理 JSON API 已要求 GitHub 登录（Batch 3 片 5），机器自注册已关闭；但 Dashboard 登录态、ConnectKey 与公开部署所需的硬化尚未完成，server 仍只允许 localhost / 受信网络使用，**不得公开暴露**。
+**部署边界**：管理 JSON API 与 Dashboard 均已要求 GitHub 登录（Batch 3 片 5–6），机器自注册已关闭；但 ConnectKey 与公开部署所需的硬化尚未完成，server 仍只允许 localhost / 受信网络使用，**不得公开暴露**。
 
 ## 核心功能
 
@@ -124,10 +124,10 @@ pnpm --filter @loopzhb/server claim:legacy -- --data-dir <数据目录> --github
 仅当 server 绑定**回环地址**时存在，入口是 `GET /`（例如 `http://127.0.0.1:3000/`）；绑定非回环地址时完全不挂载——`GET /` 与写路由都落回普通 404，与任意未知路径不可区分。
 
 - **只读页面，单一动作**：服务端渲染、无客户端 JavaScript、每 3 秒 meta refresh；单页最多显示 100 条 Loop（按最近更新时间倒序），页面自己写明当前条数与排序口径。
-- **Run Now**：每张卡片一个按钮（`POST /dashboard/loops/:id/run`，表单带每 boot 一枚的 CSRF token，重启即失效）。按钮可用条件与后端规则同源、同序：已完成（Completed）禁用 → 已有 Running Run 禁用 → 已有 Pending Run 禁用；Paused 且无活跃 Run 仍可用。页面最多陈旧 3 秒，**后端才是权威**：按钮可点但后端判定已有 Run 时，结果是零写跳过而不是替换。
+- **Run Now**：每张卡片一个按钮（`POST /dashboard/loops/:id/run`，表单带当前 Login Session 派生的 CSRF token；另一 Session 的 token 会被拒绝）。按钮可用条件与后端规则同源、同序：已完成（Completed）禁用 → 已有 Running Run 禁用 → 已有 Pending Run 禁用；Paused 且无活跃 Run 仍可用。页面最多陈旧 3 秒，**后端才是权威**：按钮可点但后端判定已有 Run 时，结果是零写跳过而不是替换。
 - **不替换已有 Run**：Dashboard 触发的 Run Now **不会**取消或替换任何已排队的 Run——任意 role 的 pending/running 都会让它零写跳过（不改 Run、不推进 revision 与调度水位）。cron 与重启 catch-up 的 T7 supersede 语义不受影响（ADR-007 §4 / ADR-008）。
 - **Completed 行为**：Loop 完成后页面显示 Completed、按钮禁用并给出原因；`POST /api/loops/:id/run`、重新启用调度与修改 Goal 均为 `409 loop_completed`（只有 Reopen 能恢复）。
-- **信任模型**：JSON API 的管理路由要求 GitHub 登录后的 Login Session（未登录 401，跨团队/未认领资源统一 404）；Dashboard 页面在片 6 之前仍只有回环信任边界——全局 Host 门禁只封 DNS rebinding，**不是认证**。Dashboard 不是对外服务。
+- **信任模型**：JSON API 的管理路由与 Dashboard 页面都要求 GitHub 登录后的 Login Session。页面未登录时跳转 `/login`，表单未登录时返回 401；跨团队、未认领与不存在的 Loop 在页面与写入上统一为同一扁平 404。回环 Host 门禁只封 DNS rebinding，**不是认证**。Dashboard 不是对外服务。
 
 ## Daemon 运行
 

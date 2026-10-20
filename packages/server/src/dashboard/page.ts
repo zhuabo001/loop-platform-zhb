@@ -68,6 +68,9 @@ header, main { max-width: 1100px; margin: 0 auto; }
 h1 { font-size: 20px; margin: 0 0 4px; }
 h2 { font-size: 16px; margin: 0; }
 .meta { margin: 0 0 4px; color: var(--muted); }
+.account { margin: 0 0 4px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; }
+.logout-form { margin: 0; }
+.logout-form button { font: inherit; padding: 2px 10px; cursor: pointer; }
 .warn {
   margin: 8px 0 0;
   padding: 8px 12px;
@@ -197,8 +200,19 @@ export interface DashboardPageOptions {
   csrfToken: string;
 }
 
-export function renderDashboardPage(model: DashboardPageModel, options: DashboardPageOptions): string {
-  const { csrfToken } = options;
+/** The account block is shown ONLY on the index page (slice 6 boundary); the
+ *  artifact pages carry the token but no account/logout control. */
+export interface DashboardAccount {
+  username: string;
+  teamName: string;
+}
+
+export interface DashboardIndexPageOptions extends DashboardPageOptions {
+  account: DashboardAccount;
+}
+
+export function renderDashboardPage(model: DashboardPageModel, options: DashboardIndexPageOptions): string {
+  const { csrfToken, account } = options;
   const page = html`<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -211,6 +225,14 @@ export function renderDashboardPage(model: DashboardPageModel, options: Dashboar
 <body>
 <header>
 <h1>Loop Dashboard</h1>
+<div class="account">
+<span>当前账号：${account.username}</span>
+<span>团队：${account.teamName}</span>
+<form class="logout-form" method="post" action="/auth/logout">
+<input type="hidden" name="${CSRF_FIELD}" value="${csrfToken}">
+<button type="submit">退出登录</button>
+</form>
+</div>
 <p class="meta">页面生成时间：${model.generatedAtLabel}</p>
 <p class="meta">${model.rangeNotice}</p>
 ${model.truncationNotice === null ? "" : html`<p class="warn">${model.truncationNotice}</p>`}

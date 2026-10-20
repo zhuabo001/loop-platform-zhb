@@ -125,21 +125,22 @@ describe("MG8: cross-team and unclaimed artifact reads fold into the flat 404", 
 
   it("download: cross-team is refused BEFORE the blob is opened (the bytes exist!)", async () => {
     const rig = await fresh();
-    // Control: the foreign blob IS openable through the unscoped arm.
-    const unscoped = await openArtifactDownload(
+    // Control: the foreign blob IS openable by ITS OWN team (slice 6 deleted
+    // the unscoped arm, so the control is the rightful owner's scope).
+    const foreignTeam = await openArtifactDownload(
       rig.home,
       "loop-b",
       { snapshotId: "amf-b", path: "b.txt" },
-      { kind: "unscoped" },
+      teamB,
     );
-    expect(unscoped.ok).toBe(true);
-    if (unscoped.ok) await unscoped.stream.close();
-    const readsAfterUnscoped = rig.storeReads();
-    expect(readsAfterUnscoped).toBeGreaterThan(0);
+    expect(foreignTeam.ok).toBe(true);
+    if (foreignTeam.ok) await foreignTeam.stream.close();
+    const readsAfterForeignTeam = rig.storeReads();
+    expect(readsAfterForeignTeam).toBeGreaterThan(0);
 
     const refused = await openArtifactDownload(rig.home, "loop-b", { snapshotId: "amf-b", path: "b.txt" }, teamA);
     expect(refused).toEqual({ ok: false, failure: "loop_not_found" });
-    expect(rig.storeReads()).toBe(readsAfterUnscoped); // NOT ONE additional open
+    expect(rig.storeReads()).toBe(readsAfterForeignTeam); // NOT ONE additional open
   });
 
   it("diff: cross-team is loop_not_found before either snapshot is read", async () => {

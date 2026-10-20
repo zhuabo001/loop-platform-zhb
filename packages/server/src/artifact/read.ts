@@ -70,15 +70,14 @@ export type OpenArtifactDownloadResult =
   | { ok: false; failure: ArtifactReadFailure; cause?: unknown };
 
 /**
- * The read's ownership scope (Phase 5 Batch 3 slice 5, ADR-011 决策 24/26).
+ * The read's ownership scope (Phase 5 Batch 3 slices 5–6, ADR-011 决策 24/26/30).
  *
  * A discriminated union, NOT an optional `teamId`: an optional parameter makes
  * `undefined` silently mean "everyone's data", which is exactly the failure the
- * slice exists to prevent. The management HTTP routes can only reach the
- * `team` arm; the `unscoped` arm is the Dashboard's temporary escape hatch
- * (slice 6 removes it) and is named at the `ArtifactApi` surface.
+ * slice exists to prevent. Slice 6 deleted the temporary `unscoped` arm — the
+ * Dashboard now reads through the same team scope as the management routes.
  */
-export type ReadScope = { kind: "team"; teamId: string } | { kind: "unscoped" };
+export type ReadScope = { kind: "team"; teamId: string };
 
 /** Loop row lookup + ownership + per-operation attribution, in the frozen
  *  order. The loop row read IS the identity-discovery step for credential-less
@@ -95,11 +94,9 @@ type LoopScope =
 async function resolveLoopScope(home: ArtifactReadHome, loopId: string, scope: ReadScope): Promise<LoopScope> {
   const loop = (await home.db.select().from(loops).where(eq(loops.id, loopId)).limit(1))[0];
   if (!loop) return { ok: false, failure: "loop_not_found" };
-  if (scope.kind === "team") {
-    const ownership = await getLoopTeam(home.db, loopId);
-    if (!ownership.found || !teamMatches(ownership.teamId, scope.teamId)) {
-      return { ok: false, failure: "loop_not_found" };
-    }
+  const ownership = await getLoopTeam(home.db, loopId);
+  if (!ownership.found || !teamMatches(ownership.teamId, scope.teamId)) {
+    return { ok: false, failure: "loop_not_found" };
   }
   const resolved = await home.attribution.resolve({ machineId: loop.machineId });
   if (!resolved.ok) return { ok: false, failure: "attribution_missing" };

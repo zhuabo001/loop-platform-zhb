@@ -24,7 +24,7 @@ import { createProductionArtifactHome } from "./artifact/production.js";
 import { createAuthModule } from "./auth/index.js";
 import { createRunCoordinator, mintRunCredential, newUuidRunId, type CoordinatorHooks, type RunCoordinator } from "./coordinator/index.js";
 import { isLoopbackHost, loadServerConfig, unauthenticatedExposureWarning, type ServerConfig } from "./config.js";
-import { mintCsrfToken } from "./dashboard/csrf.js";
+import { createDashboardAccess } from "./dashboard/access.js";
 import { createDashboardArtifactRead, createDashboardRead } from "./dashboard/index.js";
 import { createDashboardRoutes } from "./dashboard/routes.js";
 import { acquireDataDirLock, DataDirLockError, formatAcquireFailureMessage } from "./data-dir-lock.js";
@@ -76,11 +76,6 @@ export interface BootstrapOverrides {
    *  LifecycleAdmin (review SPEC-1: C8 commits a real claim between the
    *  retarget's resolve and its guarded write). */
   lifecycleHooks?: LifecycleOpsHooks;
-  /** TEST-ONLY pinned Dashboard CSRF token. Production mints a fresh random
-   *  one per boot (ADR-009: a restart invalidates every old token); an empty
-   *  or whitespace override is IGNORED rather than honoured, so no test seam
-   *  can silently disable CSRF. */
-  csrfToken?: string;
   /** TEST-ONLY GitHub transport for the auth module (Batch 3 slice 2): a
    *  scripted in-process fetch, so an E2E login never touches a real socket.
    *  Production passes neither field. */
@@ -157,12 +152,24 @@ export async function bootstrapServer(
     // the server side at all. Built BEFORE the Dashboard because the slice-7
     // artifact pages read through the SAME facade instance.
     const artifacts = createArtifactApi(createProductionArtifactHome({ db: handle.db, dataDir: config.dataDir, clock }));
+    // Batch 3 slice 2: the auth surface. config.auth is REQUIRED (ADR-011
+    // 决策 5 — loadServerConfig has already failed the boot on a missing or
+    // malformed OAuth config), so production ALWAYS mounts the five routes;
+    // the GitHub transport seams are test-only overrides.
+    //
+    // Built BEFORE the Dashboard (slice 6, ADR-011 决策 33): the HTML surface
+    // must resolve its Login Sessions through the SAME resolver as the login
+    // routes and the management gate.
+    const auth = createAuthModule({
+      authConfig: config.auth,
+      db: handle.db,
+      clock,
+      fetchImpl: overrides.githubFetch,
+      timeoutMs: overrides.githubTimeoutMs,
+    });
     // The Dashboard exists ONLY on a loopback bind (Batch 3 plan §2): the
     // mount decision is made HERE, from config, so no request header can ever
-    // turn it on. Its presence also arms the global loopback-Host gate — on a
-    // non-loopback bind there is no way to tell a rebinding client from a
-    // legitimate one, so the existing "no auth, trusted network" posture
-    // stands unchanged (and is warned about at boot).
+    // turn it on. Its presence also arms the global loopback-Host gate.
     const dashboard = isLoopbackHost(config.host)
       ? createDashboardRoutes({
           read: createDashboardRead({ admin, db: handle.db, clock }),
@@ -177,20 +184,11 @@ export async function bootstrapServer(
           // end-to-end, because forgetting it would fail no typecheck.
           enqueue: (loopId) =>
             coordinator.enqueueExecRun(loopId, { kind: "manual", pendingPolicy: "skip" }),
-          csrfToken: overrides.csrfToken?.trim() ? overrides.csrfToken : mintCsrfToken(),
+          // Slice 6: Session gate + ownership gate + session-derived CSRF,
+          // all sharing the login module's resolver.
+          access: createDashboardAccess({ db: handle.db, sessions: auth.sessions }),
         })
       : undefined;
-    // Batch 3 slice 2: the auth surface. config.auth is REQUIRED (ADR-011
-    // 决策 5 — loadServerConfig has already failed the boot on a missing or
-    // malformed OAuth config), so production ALWAYS mounts the five routes;
-    // the GitHub transport seams are test-only overrides.
-    const auth = createAuthModule({
-      authConfig: config.auth,
-      db: handle.db,
-      clock,
-      fetchImpl: overrides.githubFetch,
-      timeoutMs: overrides.githubTimeoutMs,
-    });
     // Slice 5 (ADR-011 决策 23/28): the management gate shares the login
     // module's SessionService. Production cannot omit it — `management` is a
     // REQUIRED field of createServerApp's deps.

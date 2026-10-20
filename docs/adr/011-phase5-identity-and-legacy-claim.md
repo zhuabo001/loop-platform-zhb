@@ -185,3 +185,41 @@ Dashboard 在片 6 之前仍未认证，其无 scope 读取被收敛为**具名�
 ### 28. 片 5 提前接线生产组合根
 
 相对批次计划第 223 行把「认证接入实际生产组合根」列在片 7 的偏差点，本片**如实登记**：`createAuthModule` 改为返回 `{ routes, sessions }`，`bootstrapServer` 无条件构造 `ManagementAccess` 并注入 `createServerApp` 的必填字段。理由：片 3 已关闭生产 poll 自注册，若管理面继续匿名，分支上的生产形态将长期停在「机器侧已关、管理侧全开」的中间态；片 4 提前接锁已开此先例。片 7 保留的部分不变：真实 HTTP 升级演练（BI1–BI6）、生产认证不可旁路的完整验收、旧测试假设清理的最终核对。
+
+## 修订 2026-10-20（片 6 落实增补）
+
+### 29. Dashboard 门禁：页面 303、表单 401、归属扁平 404
+
+HTML 表面新增两道中间件，注册在全局 `hostGate` 之后、全部 Dashboard 路由之前：
+
+- `pageGate` 挂在 `/` 与 `/dashboard/*`（两条都要注册：Hono 的 `use("/")` 只匹配根路径，`use("/dashboard/*")` 覆盖 `/dashboard`、`/dashboard/` 与全部子路径）。只读 `loopzhb_session` Cookie 并经 `SessionService.resolve` 解析。无会话、过期、身份链断裂：`GET`/`HEAD` → **303 `Location: /login`**，带全套安全响应头、**不 Set-Cookie**；其余方法 → **401 `{"error":"not authenticated"}`**。认证先于 `formContentType` 与 `bodyCap`，因此匿名超大或错误 Content-Type 的表单是 401，不是 413/415。
+- `loopGate` 挂在 `/dashboard/loops/:id` 与 `.../:id/*`，复用 `store/scope.ts` 的 `getLoopTeam` + `teamMatches`。缺失、孤儿、未认领、跨团队一律 `404 {"error":"not found"}`，**与管理门禁、`app.notFound` 逐字节一致**，且**不带 Dashboard 安全头**——「未挂载 / 未知路径 / 拒绝」不可区分的约定与 hostGate 相同。中间件拿不到会话时 fail-closed 401。
+- Session 每请求只解析一次，结果写入 context；处理器通过 `sessionOf` 读取用户、团队与 CSRF token，绝不从请求参数取团队。
+
+### 30. Dashboard 读全部团队化；删除无 scope 出口
+
+`DashboardRead.snapshot(teamId)` 改为 `admin.listLoops(teamId)`；四个 Artifact 页面读改为 `readLoopForTeam` / `readRunForTeam` / `diffSnapshotsForTeam`；`boundSnapshots(teamId, loopId)` 在 SQL 内 join runs→loops→machines 并过滤 `machines.teamId`。零调用的 `loopSnapshots` 删除。
+
+片 5 的具名出口全部删除：`admin.listLoopsUnscoped`、`ArtifactApi` 的 `readLoopUnscoped` / `readRunUnscoped` / `diffSnapshotsUnscoped` / `openDownloadUnscoped`，以及 `ReadScope` 的 `{ kind: "unscoped" }` 分支。`queryLoops` / `queryMachines` 只接受 `teamId: string`，无 scope 的 SQL 形状不可达；类型检查是删除完整性的编译期证明。
+
+**已披露的行为变化**：团队过滤的 INNER JOIN 使孤儿 Loop（machine 行缺失）与未认领机器的 Loop 从 Dashboard 消失，与 JSON API 一致。`updateArtifactConfig` 仍不接收 teamId——写归属由 `loopGate` 在 HTTP 边界执法（决策 26 不变）。
+
+### 31. Dashboard 表单使用 Session 级 CSRF
+
+Run Now 改用 `checkSessionCsrfForm(body, session.csrfToken)`；Artifact 配置继续用 `checkCsrfFormFields(body, session.csrfToken, [artifactDir])`——白名单、`field_duplicate` 与「stray field 先于 token 判定」的冻结顺序不变，只把期望值换成 `sha256(credential + ":csrf")`。
+
+进程启动级 token 整条删除：`mintCsrfToken()`、`DashboardRouteDeps.csrfToken`、`BootstrapOverrides.csrfToken` 与 `start.ts` 的铸造点。后果：重启不再使 token 失效（Session 行持久、token 派生），**跨 Session 的 token 才是新的拒绝边界**；同用户的两个 Session 各有独立 token。`extractSoleCsrfToken` 及其良构/重复规则保持冻结，logout 与 Dashboard 共用同一判定。
+
+### 32. 账号状态、退出表单与空团队指引
+
+索引页页头显示「当前账号 / 团队」并提供退出表单（`POST /auth/logout`，隐藏 `csrf`，按钮不具名——表单仍只有一个具名控件）。已登录用户访问 `GET /login` → 303 `/`；未知或过期 Cookie 仍渲染登录页。
+
+空团队提示改为可执行指引：先说明「当前团队暂无 Loop」，再给出停服后 `claim:legacy` 的命令形状与占位符。占位符作为文本插值（转义为 `&lt;目录&gt;` 等），不暗示每个空团队都有旧数据。HTML 转义、零 JavaScript 与 CSP 单一样式哈希不变。
+
+四个 Artifact 页面本轮不显示账号/退出控件，但仍受同两道门禁保护；这是显式边界，不是遗漏。
+
+### 33. 片 6 的装配顺序与停止边界
+
+`start.ts` 先构造 `createAuthModule`，再构造 Dashboard，把 `auth.sessions` 同时交给 `createDashboardAccess` 与管理门禁——登录路由、HTML 门禁、JSON 门禁共用**同一个** Session 解析器。Dashboard 仍只在回环绑定挂载；非回环时 `/login`、`/auth/*` 照旧存在而 Dashboard 完全缺席。
+
+本片不新增迁移（journal 保持 7 条）、不改 wire DTO、不实现 Connect UI/成员管理/通知/在线认领或撤销。BI1–BI6 与真实 HTTP 升级演练仍属片 7；#56（同源意图检查、Content-Type 门禁、空体加固）与 #61 不核销。

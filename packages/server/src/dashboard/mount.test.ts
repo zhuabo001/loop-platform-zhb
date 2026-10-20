@@ -5,8 +5,8 @@
  * H1  mount gating: a loopback bind serves the page, a non-loopback bind makes
  *     both routes vanish into the ordinary JSON 404 (byte-identical to any
  *     unknown path), and the JSON API keeps working either way
- * H5  the production CSRF token is minted per boot: a restart invalidates the
- *     token the previous instance handed out, and the new page's token works
+ * H5  the production CSRF token is Session-derived: it survives a restart with
+ *     the Session, and another Session's token is refused
  *
  * These are the tests that fail if `bootstrapServer` ever stops constructing
  * the Dashboard — the 7th argument to createServerApp is optional, so nothing
@@ -69,11 +69,19 @@ async function runPhases(handle: DbHandle): Promise<{ id: string; phase: string;
   return (await snapshotRuns(handle.db)).map((r) => ({ id: r.id, phase: r.phase, outcome: r.outcome }));
 }
 
-function postRun(app: BootedServer["app"], body: string): Promise<Response> {
+function cookieOf(credential: string): string {
+  return `loopzhb_session=${credential}`;
+}
+
+function postRun(app: BootedServer["app"], body: string, credential?: string): Promise<Response> {
   return Promise.resolve(
     app.request("/dashboard/loops/loop-1/run", {
       method: "POST",
-      headers: { "content-type": FORM, host: "127.0.0.1" },
+      headers: {
+        "content-type": FORM,
+        host: "127.0.0.1",
+        ...(credential === undefined ? {} : { cookie: cookieOf(credential) }),
+      },
       body,
     }),
   );
@@ -82,12 +90,25 @@ function postRun(app: BootedServer["app"], body: string): Promise<Response> {
 describe("H-group (Batch 3 Dashboard mount): assembly through bootstrapServer", () => {
   it("H1: mounts on a loopback bind and disappears entirely on a non-loopback bind", async () => {
     const loopback = await boot("127.0.0.1", await tmpDataDir());
-    const page = await loopback.app.request("/", { headers: { host: "127.0.0.1" } });
+    await seedClaimedMachineById(loopback.handle.db, "m-test");
+    await seedLoop(loopback.handle.db, { id: "loop-1" });
+
+    // DG1: an anonymous page is a redirect to the login page, not a 200.
+    const anonymousPage = await loopback.app.request("/", { headers: { host: "127.0.0.1" } });
+    expect(anonymousPage.status).toBe(303);
+    expect(anonymousPage.headers.get("location")).toBe("/login");
+    expect(anonymousPage.headers.get("set-cookie")).toBeNull();
+
+    const page = await loopback.app.request("/", {
+      headers: { host: "127.0.0.1", cookie: cookieOf(loopback.credential) },
+    });
     expect(page.status).toBe(200);
     expect(page.headers.get("content-type")).toBe("text/html; charset=UTF-8");
     expect(await page.text()).toContain("Loop Dashboard");
-    // The write route exists too (403 = mounted but untokened, not 404).
-    expect((await postRun(loopback.app, "")).status).toBe(403);
+    // DG2: the anonymous write is 401 before form parsing.
+    expect((await postRun(loopback.app, "")).status).toBe(401);
+    // Authenticated but untokened: the route exists (403, not 404).
+    expect((await postRun(loopback.app, "", loopback.credential)).status).toBe(403);
 
     const exposed = await boot("0.0.0.0", await tmpDataDir());
     const unknown = await exposed.app.request("/nope", { headers: { host: "127.0.0.1" } });
@@ -95,7 +116,10 @@ describe("H-group (Batch 3 Dashboard mount): assembly through bootstrapServer", 
 
     for (const res of [
       await exposed.app.request("/", { headers: { host: "127.0.0.1" } }),
-      await postRun(exposed.app, ""),
+      await exposed.app.request("/", {
+        headers: { host: "127.0.0.1", cookie: cookieOf(exposed.credential) },
+      }),
+      await postRun(exposed.app, "", exposed.credential),
     ]) {
       expect(res.status).toBe(404);
       // Byte-identical to any unknown path: a non-loopback bind must not
@@ -116,28 +140,63 @@ describe("H-group (Batch 3 Dashboard mount): assembly through bootstrapServer", 
     }
   });
 
-  it("H5: a restart mints a new token and the previous one stops working", async () => {
+  it("H5 (DG5): the session token survives a restart; another Session's token is refused", async () => {
     const dataDir = await tmpDataDir();
 
     const first = await boot("127.0.0.1", dataDir);
-    // The token rides on a card's form, so the page needs a loop to render.
+    // The token rides on a card's form, so the page needs a loop to render —
+    // on a CLAIMED machine, or the ownership gate answers 404.
+    await seedClaimedMachineById(first.handle.db, "m-test");
     await seedLoop(first.handle.db, { id: "loop-1" });
-    const firstToken = csrfFrom(await (await first.app.request("/", { headers: { host: "127.0.0.1" } })).text());
+    const firstToken = csrfFrom(
+      await (
+        await first.app.request("/", {
+          headers: { host: "127.0.0.1", cookie: cookieOf(first.credential) },
+        })
+      ).text(),
+    );
     expect(firstToken.length).toBeGreaterThanOrEqual(32);
-    expect((await postRun(first.app, `csrf=${encodeURIComponent(firstToken)}`)).status).toBe(303);
+    expect(
+      (await postRun(first.app, `csrf=${encodeURIComponent(firstToken)}`, first.credential)).status,
+    ).toBe(303);
 
     // Close the handle exactly once before re-opening the same data dir.
     await closeDb(first.handle);
     handles.splice(handles.indexOf(first.handle), 1);
 
+    // Session rows are persistent and the CSRF token is DERIVED, so the same
+    // credential yields the same token after a restart (the slice-2 boot token
+    // was invalidated here; that primitive is gone).
     const second = await boot("127.0.0.1", dataDir);
-    const secondToken = csrfFrom(await (await second.app.request("/", { headers: { host: "127.0.0.1" } })).text());
-    expect(secondToken).not.toBe(firstToken);
+    const secondToken = csrfFrom(
+      await (
+        await second.app.request("/", {
+          headers: { host: "127.0.0.1", cookie: cookieOf(second.credential) },
+        })
+      ).text(),
+    );
+    expect(secondToken).toBe(firstToken);
+    expect(
+      (await postRun(second.app, `csrf=${encodeURIComponent(secondToken)}`, second.credential)).status,
+    ).toBe(303);
 
-    // The stale token is refused (and wrote nothing)…
-    expect((await postRun(second.app, `csrf=${encodeURIComponent(firstToken)}`)).status).toBe(403);
-    // …while the instance's own token still works.
-    expect((await postRun(second.app, `csrf=${encodeURIComponent(secondToken)}`)).status).toBe(303);
+    // A SECOND Session of the same user is a different token holder: its own
+    // token works with its own cookie, and never with the first cookie.
+    const other = await seedManagementSession(second.handle.db, {
+      clock: systemClock,
+      credential: "sk_management_other",
+    });
+    const otherToken = csrfFrom(
+      await (
+        await second.app.request("/", {
+          headers: { host: "127.0.0.1", cookie: cookieOf(other.credential) },
+        })
+      ).text(),
+    );
+    expect(otherToken).not.toBe(secondToken);
+    expect(
+      (await postRun(second.app, `csrf=${encodeURIComponent(secondToken)}`, other.credential)).status,
+    ).toBe(403);
   });
 
   it("H9: a second Run Now leaves the queued run alone — the skip policy is really assembled", async () => {
@@ -146,9 +205,15 @@ describe("H-group (Batch 3 Dashboard mount): assembly through bootstrapServer", 
     // the enqueue boundary refuses orphan/unclaimed/revoked machines).
     await seedClaimedMachineById(booted.handle.db, "m-test");
     await seedLoop(booted.handle.db, { id: "loop-1" });
-    const token = csrfFrom(await (await booted.app.request("/", { headers: { host: "127.0.0.1" } })).text());
+    const token = csrfFrom(
+      await (
+        await booted.app.request("/", {
+          headers: { host: "127.0.0.1", cookie: cookieOf(booted.credential) },
+        })
+      ).text(),
+    );
 
-    const first = await postRun(booted.app, `csrf=${encodeURIComponent(token)}`);
+    const first = await postRun(booted.app, `csrf=${encodeURIComponent(token)}`, booted.credential);
     expect(first.status).toBe(303);
     const afterFirst = await runPhases(booted.handle);
     expect(afterFirst).toHaveLength(1);
@@ -157,7 +222,7 @@ describe("H-group (Batch 3 Dashboard mount): assembly through bootstrapServer", 
     // THIS is the assertion that fails if `start.ts` ever drops the
     // `pendingPolicy: "skip"` argument: the type checker cannot see the
     // difference, and no other test drives the REAL composition root.
-    const second = await postRun(booted.app, `csrf=${encodeURIComponent(token)}`);
+    const second = await postRun(booted.app, `csrf=${encodeURIComponent(token)}`, booted.credential);
     expect(second.status).toBe(303);
     expect(await runPhases(booted.handle)).toEqual(afterFirst);
   });
@@ -174,7 +239,7 @@ describe("slice 7 (决策 27): the artifact pages through the REAL composition r
     await seedRun(booted.handle.db, { id: "run-1", loopId: "loop-1", machineId: "m-test", artifactSnapshotId: null });
 
     const pageRes = await booted.app.request("/dashboard/loops/loop-1/artifacts", {
-      headers: { host: "127.0.0.1" },
+      headers: { host: "127.0.0.1", cookie: cookieOf(booted.credential) },
     });
     expect(pageRes.status).toBe(200);
     const html = await pageRes.text();
@@ -189,19 +254,21 @@ describe("slice 7 (决策 27): the artifact pages through the REAL composition r
     // outcome banner; following the redirect renders it.
     const saved = await booted.app.request("/dashboard/loops/loop-1/artifacts/config", {
       method: "POST",
-      headers: { "content-type": FORM, host: "127.0.0.1" },
+      headers: { "content-type": FORM, host: "127.0.0.1", cookie: cookieOf(booted.credential) },
       body: `csrf=${encodeURIComponent(token)}&artifactDir=${encodeURIComponent("/data/moved")}`,
     });
     expect(saved.status).toBe(303);
     expect(saved.headers.get("location")).toBe("/dashboard/loops/loop-1/artifacts?config=updated");
-    const after = await booted.app.request(saved.headers.get("location")!, { headers: { host: "127.0.0.1" } });
+    const after = await booted.app.request(saved.headers.get("location")!, {
+      headers: { host: "127.0.0.1", cookie: cookieOf(booted.credential) },
+    });
     const afterHtml = await after.text();
     expect(afterHtml).toContain("Artifact 目录已更新。");
     expect(afterHtml).toContain("/data/moved");
 
     // The unbound run's snapshot page is the explicit missing state.
     const runPage = await booted.app.request("/dashboard/loops/loop-1/artifacts/runs/run-1", {
-      headers: { host: "127.0.0.1" },
+      headers: { host: "127.0.0.1", cookie: cookieOf(booted.credential) },
     });
     expect(runPage.status).toBe(200);
     expect(await runPage.text()).toContain("未绑定 Artifact 快照");

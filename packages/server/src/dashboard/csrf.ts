@@ -1,7 +1,8 @@
 /**
- * The Dashboard's CSRF primitive (Batch 3 plan §2 切片二): ONE token per
- * server bootstrap, held only in that instance's memory, submitted as a hidden
- * form field and verified BEFORE the coordinator is ever called.
+ * The Dashboard's CSRF primitives (Batch 3 plan §2 切片二; session-derived
+ * since slice 6). The expected token now comes from the Login Session
+ * (`sha256(credential + ":csrf")`, ADR-011 决策 11/31), is submitted as a
+ * hidden form field and verified BEFORE the coordinator is ever called.
  *
  * Why not `c.req.parseBody()`: it collapses repeated keys (last one wins), so
  * a body carrying the token twice is indistinguishable from one carrying it
@@ -12,13 +13,7 @@
  * The token never reaches a URL, a log line or an error body; only the
  * rendered form carries it, on a response marked `Cache-Control: no-store`.
  */
-import { randomBytes, timingSafeEqual } from "node:crypto";
-
-/** 32 bytes of CSPRNG, base64url so the value is attribute- and
- *  query-safe without escaping. */
-export function mintCsrfToken(): string {
-  return randomBytes(32).toString("base64url");
-}
+import { timingSafeEqual } from "node:crypto";
 
 /** The single form field the Dashboard's own form submits. */
 export const CSRF_FIELD = "csrf";

@@ -325,6 +325,18 @@ export function createServerApp(deps: ServerAppDeps): Hono<ManagementEnv> {
   app.use("/api/runs/:id", management.runGate);
   app.use("/api/runs/:id/*", management.runGate);
 
+  // ---- dashboard gates (Batch 3 slice 6, ADR-011 决策 29/30) ---------------
+  // Registered after hostGate and after the management gates: a hostile Host
+  // is answered before authentication, and an anonymous dashboard POST is
+  // answered before form parsing (401, never 413/415). `/dashboard/*` covers
+  // `/dashboard` and every child; `/` needs its own registration.
+  if (dashboard !== undefined) {
+    app.use("/", dashboard.pageGate);
+    app.use("/dashboard/*", dashboard.pageGate);
+    app.use("/dashboard/loops/:id", dashboard.loopGate);
+    app.use("/dashboard/loops/:id/*", dashboard.loopGate);
+  }
+
   /** The Team Scope established by sessionGate. A management route reaching a
    *  handler without one is an assembly bug, not a request to serve unscoped. */
   const teamOf = (c: Context<ManagementEnv>): string => {

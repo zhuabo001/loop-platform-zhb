@@ -30,7 +30,7 @@ import type { UpdateArtifactConfigResult } from "../artifact/config.js";
 import type { ArtifactApi } from "../artifact/api.js";
 import type { ReadDiffResult, ReadLoopArtifactsResult, ReadRunArtifactsResult } from "../artifact/read.js";
 import type { Db } from "../db/index.js";
-import { artifactManifests, machines, runs } from "../db/schema.js";
+import { artifactManifests, loops, machines, runs } from "../db/schema.js";
 import type { Clock } from "../time.js";
 import { classifyDisplayLifecycle } from "./view.js";
 
@@ -77,14 +77,15 @@ export interface DashboardSnapshot {
 
 export interface DashboardReadDeps {
   /** Narrow read seam to the existing observation surface — the Dashboard
-   *  never reaches past `listLoops` into the admin module's writes. */
-  admin: Pick<LoopAdmin, "listLoopsUnscoped">;
+   *  never reaches past `listLoops` into the admin module's writes. The Team
+   *  Scope comes from the Login Session (slice 6, ADR-011 决策 30). */
+  admin: Pick<LoopAdmin, "listLoops">;
   db: Db;
   clock: Clock;
 }
 
 export interface DashboardRead {
-  snapshot(): Promise<DashboardSnapshot>;
+  snapshot(teamId: string): Promise<DashboardSnapshot>;
 }
 
 /** The one phase filter this module selects on. */
@@ -109,9 +110,9 @@ function toActiveRun(run: RunSummary): DashboardActiveRun {
 
 export function createDashboardRead(deps: DashboardReadDeps): DashboardRead {
   return {
-    async snapshot(): Promise<DashboardSnapshot> {
+    async snapshot(teamId: string): Promise<DashboardSnapshot> {
       const generatedAt = deps.clock.now().toISOString();
-      const loopSummaries = await deps.admin.listLoopsUnscoped();
+      const loopSummaries = await deps.admin.listLoops(teamId);
       if (loopSummaries.length === 0) {
         // Nothing to enrich: the two batched reads below are skipped rather
         // than issued with empty IN lists.
@@ -171,18 +172,14 @@ export function createDashboardRead(deps: DashboardReadDeps): DashboardRead {
   };
 }
 
-/** One committed snapshot of a loop, as the pages list it. */
-export interface DashboardSnapshotRef {
-  snapshotId: string;
-  manifestRevision: number;
-  committedAt: string;
-}
-
 /** A snapshot BOUND to a Run — the run-snapshot list and the diff dropdowns
  *  operate on these (the plan's default baseline is the most recent bound
  *  Run snapshot). */
-export interface DashboardBoundSnapshotRef extends DashboardSnapshotRef {
+export interface DashboardBoundSnapshotRef {
   runId: string;
+  snapshotId: string;
+  manifestRevision: number;
+  committedAt: string;
 }
 
 /** The artifact read seam for the slice-7 Dashboard pages (ADR-010 决策 27).
@@ -192,25 +189,25 @@ export interface DashboardBoundSnapshotRef extends DashboardSnapshotRef {
  *  operation. `updateConfig` is the existing management write the config
  *  form consumes — no credential, the loopback boundary. */
 export interface DashboardArtifactRead {
-  loopArtifacts(loopId: string): Promise<ReadLoopArtifactsResult>;
+  loopArtifacts(teamId: string, loopId: string): Promise<ReadLoopArtifactsResult>;
   /** The nested run page: `loopId` is the PARENT PATH, folded into the
    *  facade's identity step (#111 — a mismatched parent is `run_not_found`
    *  before any domain failure, so failure paths leak nothing across scopes). */
-  runArtifacts(loopId: string, runId: string): Promise<ReadRunArtifactsResult>;
-  diff(loopId: string, query: { from?: string; to: string }): Promise<ReadDiffResult>;
+  runArtifacts(teamId: string, loopId: string, runId: string): Promise<ReadRunArtifactsResult>;
+  diff(teamId: string, loopId: string, query: { from?: string; to: string }): Promise<ReadDiffResult>;
   updateConfig(loopId: string, command: { artifactDir: string | null }): Promise<UpdateArtifactConfigResult>;
   /** Runs of the loop with a bound snapshot, joined to their manifest rows,
-   *  newest revision first. */
-  boundSnapshots(loopId: string): Promise<DashboardBoundSnapshotRef[]>;
-  /** Every committed snapshot of the loop, newest revision first. */
-  loopSnapshots(loopId: string): Promise<DashboardSnapshotRef[]>;
+   *  newest revision first. Team-filtered in SQL: the page never relies on
+   *  the caller having checked ownership first. */
+  boundSnapshots(teamId: string, loopId: string): Promise<DashboardBoundSnapshotRef[]>;
 }
 
 /** The narrow slice of `ArtifactApi` the dashboard pages consume — the same
- *  narrowing pattern as `DashboardReadDeps.admin`. */
+ *  narrowing pattern as `DashboardReadDeps.admin`. The unscoped methods are
+ *  GONE (ADR-011 决策 30); the page reads through the team arm only. */
 export type DashboardArtifactReadSource = Pick<
   ArtifactApi,
-  "readLoopUnscoped" | "readRunUnscoped" | "diffSnapshotsUnscoped" | "updateConfig"
+  "readLoopForTeam" | "readRunForTeam" | "diffSnapshotsForTeam" | "updateConfig"
 >;
 
 export function createDashboardArtifactRead(deps: {
@@ -218,12 +215,12 @@ export function createDashboardArtifactRead(deps: {
   api: DashboardArtifactReadSource;
 }): DashboardArtifactRead {
   return {
-    loopArtifacts: (loopId) => deps.api.readLoopUnscoped(loopId),
-    runArtifacts: (loopId, runId) => deps.api.readRunUnscoped(runId, loopId),
-    diff: (loopId, query) => deps.api.diffSnapshotsUnscoped(loopId, query),
+    loopArtifacts: (teamId, loopId) => deps.api.readLoopForTeam(loopId, teamId),
+    runArtifacts: (teamId, loopId, runId) => deps.api.readRunForTeam(runId, teamId, loopId),
+    diff: (teamId, loopId, query) => deps.api.diffSnapshotsForTeam(loopId, teamId, query),
     updateConfig: (loopId, command) => deps.api.updateConfig(loopId, command),
 
-    async boundSnapshots(loopId): Promise<DashboardBoundSnapshotRef[]> {
+    async boundSnapshots(teamId, loopId): Promise<DashboardBoundSnapshotRef[]> {
       const rows = await deps.db
         .select({
           runId: runs.id,
@@ -233,7 +230,15 @@ export function createDashboardArtifactRead(deps: {
         })
         .from(runs)
         .innerJoin(artifactManifests, eq(artifactManifests.id, runs.artifactSnapshotId))
-        .where(and(eq(runs.loopId, loopId), isNotNull(runs.artifactSnapshotId)))
+        .innerJoin(loops, eq(loops.id, runs.loopId))
+        .innerJoin(machines, eq(machines.id, loops.machineId))
+        .where(
+          and(
+            eq(runs.loopId, loopId),
+            eq(machines.teamId, teamId),
+            isNotNull(runs.artifactSnapshotId),
+          ),
+        )
         .orderBy(desc(artifactManifests.manifestRevision));
       return rows.map((row) => ({
         runId: row.runId,
@@ -241,19 +246,6 @@ export function createDashboardArtifactRead(deps: {
         manifestRevision: row.manifestRevision,
         committedAt: row.committedAt,
       }));
-    },
-
-    async loopSnapshots(loopId): Promise<DashboardSnapshotRef[]> {
-      const rows = await deps.db
-        .select({
-          snapshotId: artifactManifests.id,
-          manifestRevision: artifactManifests.manifestRevision,
-          committedAt: artifactManifests.committedAt,
-        })
-        .from(artifactManifests)
-        .where(eq(artifactManifests.loopId, loopId))
-        .orderBy(desc(artifactManifests.manifestRevision));
-      return rows;
     },
   };
 }

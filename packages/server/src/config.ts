@@ -141,7 +141,8 @@ export function unauthenticatedExposureWarning(host: string): string | null {
     "⚠️  The management API (/api/machines, /api/loops*, /api/runs*) requires a",
     "⚠️  GitHub login Session, and machine enrollment is closed — machines must be",
     "⚠️  claimed offline with claim:legacy before they can poll.",
-    "⚠️  The Dashboard is mounted ONLY on a loopback bind, so it is absent here.",
+    "⚠️  The Dashboard is mounted ONLY on a loopback bind, so it is absent here;",
+    "⚠️  when mounted, it requires the same login Session before it serves any page.",
     "⚠️  Public exposure still needs the Phase 6 hardening (TLS termination, rate",
     "⚠️  limits, CSRF/origin intent checks) — keep this on a trusted network.",
   ].join("\n");

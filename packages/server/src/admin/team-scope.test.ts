@@ -59,14 +59,6 @@ describe("MG3: list isolation across A / B / unclaimed", () => {
     expect(await admin.getLoopSummary("loop-u", TEST_TEAM_ID)).toBeUndefined();
   });
 
-  it("the Dashboard's temporary unscoped read still sees every loop", async () => {
-    await fresh();
-    await seedMachine(db, "m-b", { teamId: TEAM_B });
-    await seedMachine(db, "m-u");
-    await seedLoop(db, { id: "loop-b", machineId: "m-b" });
-    await seedLoop(db, { id: "loop-u", machineId: "m-u" });
-    expect((await admin.listLoopsUnscoped()).map((l) => l.id).sort()).toEqual(["loop-b", "loop-u"]);
-  });
 });
 
 describe("MG4: filtering happens BEFORE ordering and limiting", () => {

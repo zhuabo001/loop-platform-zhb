@@ -330,7 +330,10 @@ export function buildDashboardPageModel(snapshot: DashboardSnapshot): DashboardP
     generatedAtLabel: formatUtc(snapshot.generatedAt),
     rangeNotice: `按最近更新时间倒序显示，最多 ${snapshot.listCap} 条，当前 ${shown} 条；以下时间均为 UTC。`,
     truncationNotice: atCap ? "已达显示上限，可能还有更早更新的 Loop 未显示。" : null,
-    emptyNotice: shown === 0 ? "暂无 Loop。通过管理 API 创建 Loop 后会显示在这里。" : null,
+    emptyNotice:
+      shown === 0
+        ? "当前团队暂无 Loop。若旧机器尚未认领，可在停止 Server 后运行 pnpm --filter @loopzhb/server claim:legacy -- --data-dir <目录> --github-user-id <数字ID> --machine-id <机器ID> 把旧机器认领给当前账号；新建的 Loop 会直接显示在这里。"
+        : null,
     loops: snapshot.loops.map(toLoopCard),
   };
 }

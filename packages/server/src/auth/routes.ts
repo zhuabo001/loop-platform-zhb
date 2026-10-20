@@ -81,11 +81,18 @@ export function createAuthRoutes(deps: AuthRouteDeps): AuthRoutes {
   // Derived ONCE from the configured origin — never from the request.
   const secure = new URL(deps.authConfig.origin).protocol === "https:";
 
-  const loginPage: Handler = (c) =>
-    new Response(renderLoginPage({ error: c.req.query("error") }), {
+  const loginPage: Handler = async (c) => {
+    // Slice 6 (ADR-011 决策 32): an already-authenticated visitor goes to the
+    // Dashboard, never to a login page whose only action is to log in again.
+    const credential = parseCookieHeader(c.req.header("cookie")).get(SESSION_COOKIE);
+    if ((await deps.sessions.resolve(credential)) !== null) {
+      return new Response(null, { status: 303, headers: securityHeaders({ location: "/" }) });
+    }
+    return new Response(renderLoginPage({ error: c.req.query("error") }), {
       status: 200,
       headers: securityHeaders({ "content-type": "text/html; charset=UTF-8" }),
     });
+  };
 
   const githubStart: Handler = () => {
     const { txId, tx } = deps.pendingTx.create();

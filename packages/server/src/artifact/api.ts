@@ -99,19 +99,6 @@ export interface ArtifactApi {
     query: { snapshotId: string; path: string },
   ): Promise<OpenArtifactDownloadResult>;
 
-  // ---- TEMPORARY: the un-gated Dashboard (slice 6 removes this arm) --------
-  // Named `Unscoped` so the escape hatch is greppable and cannot be mistaken
-  // for the management surface. `expectedLoopId` is the nested Dashboard
-  // page's parent path: a mismatch folds into `run_not_found` at the identity
-  // step, BEFORE any attribution/snapshot failure could leak the run's
-  // existence (#111).
-  readLoopUnscoped(loopId: string): Promise<ReadLoopArtifactsResult>;
-  readRunUnscoped(runId: string, expectedLoopId?: string): Promise<ReadRunArtifactsResult>;
-  diffSnapshotsUnscoped(loopId: string, query: { from?: string; to: string }): Promise<ReadDiffResult>;
-  openDownloadUnscoped(
-    loopId: string,
-    query: { snapshotId: string; path: string },
-  ): Promise<OpenArtifactDownloadResult>;
   /** GET /api/machine/loops/:id/artifacts — the restart/conflict recovery read. */
   readMachineLoop(token: string, loopId: string): Promise<MachineLoopArtifactsReadResult>;
   /** POST /api/machine/sync. */
@@ -163,34 +150,6 @@ export function createArtifactApi(home: ArtifactHomeDeps): ArtifactApi {
     openDownloadForTeam(loopId, teamId, query) {
       return withStorageError(
         () => openArtifactDownload(reads, loopId, query, { kind: "team", teamId }),
-        (cause) => ({ ok: false, failure: "storage_error", cause }),
-      );
-    },
-
-    readLoopUnscoped(loopId) {
-      return withStorageError(
-        () => readLoopArtifactsView(reads, loopId, { kind: "unscoped" }),
-        (cause) => ({ ok: false, failure: "storage_error", cause }),
-      );
-    },
-
-    readRunUnscoped(runId, expectedLoopId) {
-      return withStorageError(
-        () => readRunArtifactsView(reads, runId, { kind: "unscoped" }, expectedLoopId),
-        (cause) => ({ ok: false, failure: "storage_error", cause }),
-      );
-    },
-
-    diffSnapshotsUnscoped(loopId, query) {
-      return withStorageError(
-        () => diffLoopSnapshots(reads, loopId, query, { kind: "unscoped" }),
-        (cause) => ({ ok: false, failure: "storage_error", cause }),
-      );
-    },
-
-    openDownloadUnscoped(loopId, query) {
-      return withStorageError(
-        () => openArtifactDownload(reads, loopId, query, { kind: "unscoped" }),
         (cause) => ({ ok: false, failure: "storage_error", cause }),
       );
     },

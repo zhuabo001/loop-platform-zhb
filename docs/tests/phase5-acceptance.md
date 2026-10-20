@@ -552,3 +552,73 @@ server 较片 4 基线（1220 + 3 skipped）**+47**，恰为新增的七个套�
 **Specs P3 — 零写入 oracle 的 Artifact 历史 fixture 为空。** 原因：`snapshotBusinessState` 已包含 `artifact_sync_sessions`，但 `http/management-routes.test.ts` 的夹具只有 manifest/blob 没有 sync session，生产根 E2E 的三张 Artifact 表全空；空表相等无法证明拒绝路径没有 UPDATE 既有 receipt 或 DELETE pending session（计划要求非空世界）。修复：management-routes 夹具在 A/B/未认领三个世界各补 manifest + sync session（A、B 为带 receipt 的 committed；未认领为 pending，即「清理式 bug」会删的那一行）；生产根 E2E 经 `createProductionArtifactHome` 的真实 LocalBlobStore 在 `<dataDir>/blobs` 下补齐 A/B/未认领的 blob + manifest + sync session（B 用 `TEAM_B` namespace；未认领沿用片 4 之前的每机器 legacy namespace，且 session 保持 pending）。变异：在拒绝 helper 内注入 `delete artifactSyncSessions` ⇒ MG6 零写入与 MG9 历史保留各红一项，恢复后全绿。
 
 **复审后质量门**：`pnpm test` server **1269 + 3 skipped**（较修复前 +2，为 helper 的两项新回归）、daemon 790 + 7 skipped、protocol 292，全绿；`pnpm typecheck`、`pnpm build`、`db:check`（零漂移，journal 仍 7 条）、`git diff --check` 全部 EXIT=0。修复仅触及测试与 testkit，生产代码零改动，wire 与迁移均无变化。
+
+## 片 6 — Dashboard 登录态与团队视图
+
+> 权威计划：`docs/plan/codex-phase5-batch3-slices-plan.md` Slice 6（行 192–213）。长期裁决：ADR-011 决策 29–33。
+
+### 测试编组与结果（片 6）
+
+| 编号 | 场景 | 文件 |
+|---|---|---|
+| DG1 | 匿名 GET/HEAD 的全部 Dashboard 路径 → 303 `/login`，带安全头、无 Set-Cookie；`/dashboardX` 不被门禁匹配；非回环仍 404 | `dashboard/access.test.ts`、`dashboard/routes.test.ts`、`dashboard/mount.test.ts`、slice6 e2e |
+| DG2 | 匿名 POST（Run Now、Artifact 配置、非 loop 路径的 dashboard 写）→ 401，认证先于 415/413，零写入（`snapshotBusinessState` 7 张业务表 + `snapshotIdentityState` 4 张身份表，均于匿名 POST 前采集、循环后比较） | `dashboard/access.test.ts`、`dashboard/routes.test.ts`、slice6 e2e |
+| DG3 | 登录后 A 只见 A 的 Loop 与账号块；B 只见 B；空团队 C 显示认领指引；列表限量发生于团队过滤之后 | `dashboard/index.test.ts`、`dashboard/page.test.ts`、`dashboard/routes.test.ts`、slice6 e2e |
+| DG4 | A 会话访问 B/未认领/不存在/孤儿 Loop → 与 `/nope` 逐字节相同的 404（页面与写入）；零写入 | `dashboard/access.test.ts`、`dashboard/routes.test.ts`、slice6 e2e |
+| DG5 | 跨 Session CSRF → 403 零写入；`/api/session` token 与页面隐藏值相等；重启后同 Session token 仍有效；另一 Session 的 token 被拒 | `dashboard/routes.test.ts`、`dashboard/mount.test.ts`、slice6 e2e |
+| DG6 | 退出 → 303 `/login` 并清 cookie；旧 cookie 页面 303、`/api/session` 401；同用户第二 Session 仍有效 | `dashboard/page.test.ts`、`auth/routes.test.ts`、slice6 e2e |
+
+**编组明细**：
+
+- **门禁**（`dashboard/access.test.ts`，8 项）：`/` 与 `/dashboard/*` 的路径绑定证明（含 `/dashboardX` 不匹配）；匿名 GET/HEAD 303 与无 Set-Cookie；匿名非 GET 401（含一条非 loop 路径，防止归属门禁的 401 掩盖 pageGate 回归）；过期、未知、身份链断裂与空凭据均视为匿名；Loop 归属门禁的自有/跨团队/未认领/孤儿/缺失五面，404 与 `app.notFound` 逐字节一致且无 Dashboard 头；无 pageGate 时 loopGate fail-closed 401。
+- **读模型**（`dashboard/index.test.ts`，7 项）：`snapshot(teamId)` 的排序、限量与生命周期语义不变；新增 D6「A 的旧 Loop 在 B 的 100 条更新更晚的行之后仍出现」与 D7「boundSnapshots 的 SQL 团队过滤」；孤儿 Loop 从 fail-safe 渲染改为被排除。
+- **页面**（`dashboard/page.test.ts`，24 项）：账号/团队渲染与转义；退出表单 action `/auth/logout`、唯一具名 `csrf` 控件；空团队的 `claim:legacy` 指引与占位符转义；Run 表单断言改为按 action 定位（页头新增了退出表单）。
+- **HTTP 矩阵**（`dashboard/routes.test.ts`，27 项）：H2 XSS、H3 每状态安全头、H4 CSRF/表单边界、H5 跨 Session、H6 业务 303/固定 500/未知 loop 改 404、H7 Host 门禁、H8 按钮与后端一致、H9 不替换 pending；新增 DG1/DG2 与 DG4 两条矩阵；Artifact 页面测试补 owned Loop 夹具，错误路径仍钉 403/404 与「先取领域判定再读快照列表」。
+- **生产装配**（`dashboard/mount.test.ts`，5 项）：经 `bootstrapServer` 的匿名 303/401、非回环完全缺席；H5 改为「重启后同 Session token 仍有效 + 另一 Session token 403」；Run Now 与 Artifact 配置全程带 cookie。
+- **生产根 E2E**（`phase5-batch3-slice6-e2e.test.ts`，1 项，含 DG1–DG6）：脚本化 GitHub adapter 登录 A/B/C，A、B 各一台已认领机器与 Loop，U 未认领；匿名跳转、团队视图、跨团队扁平 404、跨 Session CSRF、退出后第二 Session 仍有效。DG2 与 DG4 的零写入均同时比较业务与身份两半 oracle；DG2 的两次快照都取自匿名 POST 之前，身份表在三次登录后已非空。
+- **登录页**（`auth/routes.test.ts`，+1）：已登录 `GET /login` → 303 `/`；未知 cookie 仍 200。
+
+**既有测试迁移（如实记录）**：`dashboard/routes.test.ts` 改为真实 Session + `createDashboardAccess`，请求默认携带 cookie，token 常量换成 `deriveSessionCsrfToken`；`mount.test.ts` 的「重启使 token 失效」断言**反转**为「重启不改变派生 token」；匿名页面 200 改 303、匿名 POST 403 改 401；`artifact/read.test.ts` 的 `UNSCOPED` 常量整体替换为 `{ kind: "team", teamId: TEST_TEAM_ID }` 且机器夹具改为已认领（约 35 处机械替换）；`artifact/scope.test.ts` 的对照从「unscoped 可读他团队 blob」改为「他团队自己的 scope 可读」，比原对照更强；`admin/team-scope.test.ts` 删除临时无 scope 读取测试；`phase4-batch3-e2e.test.ts` 的页面 GET 与表单 POST 补 Session cookie；opt-in 的真实 Claude E2E 同步补 cookie，但本片未执行。
+
+### 显式边界核对（片 6）
+
+- **停止边界**：Connect UI、成员管理、通知、在线认领/撤销、团队迁移均未实现；Dashboard 仍只在回环绑定挂载；不新增迁移（journal 7 条）；不改 wire DTO；BI1–BI6 与真实 HTTP 升级演练仍属片 7。
+- **行为变化（如实披露）**：孤儿 Loop 与未认领机器的 Loop 从 Dashboard 消失（团队 INNER JOIN 的必然结果，与 JSON API 一致）；未知 Loop 的 `POST /dashboard/loops/:id/run` 由业务 303 变为路径门禁 404；重启不再使 CSRF token 失效（派生自持久 Session，跨 Session 才是拒绝边界）。
+- **账号/退出控件只在索引页**：四个 Artifact 页面仍受两道门禁保护，但不显示账号与退出按钮。
+- **每请求一次 Session 解析**：页面每 3 秒刷新都会读取 user/team；单用户本地服务可接受，未做缓存。
+- **归属门禁的不变量**：依赖本批「Server 运行期间归属不可变」；Batch 4 引入在线归属变更时必须重审 TOCTOU。
+- **不在本片核验**：真实 GitHub OAuth、真实 Claude、真实 HTTP 升级链路；DG 矩阵使用脚本化 adapter 与测试时钟。#56/#61 保持 OPEN。
+
+### 变异验证（片 6）
+
+十一项变异，全部被对应用例抓住（每项恢复后复跑）：
+
+| 变异 | 击红的用例 |
+|---|---|
+| M1 删除 `/dashboard/*` 的 pageGate 注册（只留 `/`） | `routes.test.ts` DG1/DG2（artifact 路径匿名请求） |
+| M2 匿名非 GET 时 pageGate 直接放行 | `access.test.ts`「匿名非 GET 401」（含非 loop 路径探针） |
+| M3 `snapshot()` 忽略 teamId | `index.test.ts` D6 |
+| M4 loopGate 只验存在、不验团队 | `access.test.ts` 两条归属用例 |
+| M5 loopGate 的 404 换状态/形状 | `access.test.ts` 逐字节 404 与团队 B 用例 |
+| M6 Run Now 跳过 Session CSRF | `routes.test.ts` H4 |
+| M7 Artifact 配置去掉 `artifactDir` 白名单 | `routes.test.ts`「valid token saves」 |
+| M8 `boundSnapshots` 去掉团队 join | `index.test.ts` D7 |
+| M9 删除退出表单 | `page.test.ts` 账号/退出用例 |
+| M10 重新引入 `{ kind: "unscoped" }` 读取 | `tsc --noEmit`：`Type '"unscoped"' is not assignable to type '"team"'`（编译期） |
+| M11（片 6 复审补强）在匿名拒绝返回 401 前 UPDATE `users.updatedAt` | slice6 e2e 的 DG2 身份快照断言（差异列出 alice/bob/carol 三人的 `updatedAt`） |
+
+### 完整质量门（片 6）
+
+```bash
+pnpm test                                   # protocol 292 / daemon 790 + 7 skipped / server 1284 + 3 skipped，全绿
+pnpm typecheck                              # EXIT=0
+pnpm build                                  # EXIT=0
+pnpm --filter @loopzhb/server db:check      # 零漂移（本片无新增迁移），EXIT=0
+git diff --check                            # EXIT=0
+```
+
+server 较片 5 审后基线（1269 + 3 skipped）**+15**：新增 16 项（门禁 8、生产根 E2E 1、读模型 +2、页面 +2、HTTP 矩阵 +2、登录页 +1），删除临时无 scope 用例 1 项，净 +15。protocol 与 daemon 计数不变（本片零改动这两个包）。
+
+### 结论（片 6）
+
+片 6 结束了 Dashboard 的匿名窗口：页面未登录跳转 `/login`、表单未登录 401；登录后只显示本团队资源；跨团队、未认领与不存在的 Loop 在页面与写入上统一扁平 404；所有表单使用当前 Session 派生的 CSRF token；页头显示账号并可退出。DG1–DG6 全覆盖，十一项变异全部被抓住（含一项编译期证明），五道质量门全绿。如实登记：孤儿/未认领 Loop 不可见、重启不再使 token 失效、Artifact 页面暂无账号/退出控件、每请求解析一次 Session。本片不核销 #56/#61，不宣称 Phase 5 完成。

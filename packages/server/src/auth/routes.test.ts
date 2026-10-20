@@ -149,6 +149,19 @@ async function expectFailedLogin(res: Response, classification: string, db: Db):
 // ---- GET /login ----
 
 describe("GET /login", () => {
+  it("redirects an already-authenticated visitor to the Dashboard (slice 6)", async () => {
+    const { app } = await fresh();
+    const credential = await login(app);
+    const res = await app.request("/login", { headers: { cookie: sessionCookieHeader(credential) } });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/");
+    expect(res.headers.get("cache-control")).toBe("no-store");
+
+    // An unknown cookie is NOT authenticated: the login page still renders.
+    const stale = await app.request("/login", { headers: { cookie: sessionCookieHeader("sk_unknown") } });
+    expect(stale.status).toBe(200);
+  });
+
   it("renders the GitHub entry with the shared security headers", async () => {
     const { app } = await fresh();
     const res = await app.request("/login");

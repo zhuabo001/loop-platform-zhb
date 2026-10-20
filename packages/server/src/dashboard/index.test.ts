@@ -16,10 +16,23 @@ import { afterEach, describe, expect, it } from "vitest";
 import { closeDb, openMigratedDb, type Db, type DbHandle } from "../db/index.js";
 import { machines } from "../db/schema.js";
 import { createLoopAdmin, LOOP_LIST_CAP, type LoopAdmin } from "../admin/index.js";
-import { FakeClock, seedLoop, seedRun } from "../testkit/index.js";
-import { createDashboardRead, type DashboardRead, type DashboardSnapshot } from "./index.js";
+import {
+  FakeClock,
+  seedArtifactManifest,
+  seedLoop,
+  seedMachine,
+  seedRun,
+  TEST_TEAM_ID,
+} from "../testkit/index.js";
+import {
+  createDashboardArtifactRead,
+  createDashboardRead,
+  type DashboardRead,
+  type DashboardSnapshot,
+} from "./index.js";
 import { buildDashboardPageModel, NONE_TEXT } from "./view.js";
 
+const TEAM_B = "t-ffffffffffffffff";
 const handles: DbHandle[] = [];
 afterEach(async () => {
   await Promise.all(handles.splice(0).map((h) => closeDb(h).catch(() => {})));
@@ -38,6 +51,9 @@ async function fresh(): Promise<void> {
   let n = 0;
   admin = createLoopAdmin({ db, clock, newLoopId: () => `loop-${++n}` });
   read = createDashboardRead({ admin, db, clock });
+  // Slice 6: the Dashboard lists through `listLoops(teamId)`, whose INNER
+  // JOIN drops loops whose machine is missing, unclaimed or another team's.
+  await seedMachine(db, "m-test", { teamId: TEST_TEAM_ID });
 }
 
 /** Machines with an explicit capability snapshot (testkit's seedMachine
@@ -47,6 +63,7 @@ async function seedMachineCapabilities(id: string, capabilities: string[] | null
     id,
     name: "",
     tokenHash: `hash-${id}`,
+    teamId: TEST_TEAM_ID,
     capabilities,
     createdAt: "2026-07-01T00:00:00.000Z",
   });
@@ -63,7 +80,7 @@ const loopById = (snapshot: DashboardSnapshot, id: string) => {
 describe("D-group (Batch 3 Dashboard): read model and page model", () => {
   it("D1: an empty database yields an empty snapshot and the empty-list notice", async () => {
     await fresh();
-    const snapshot = await read.snapshot();
+    const snapshot = await read.snapshot(TEST_TEAM_ID);
 
     expect(snapshot.loops).toEqual([]);
     expect(snapshot.listCap).toBe(LOOP_LIST_CAP);
@@ -89,7 +106,7 @@ describe("D-group (Batch 3 Dashboard): read model and page model", () => {
     await seedLoop(db, { id: "loop-oldest", updatedAt: iso(0) });
     await seedRun(db, { id: "run-offpage", loopId: "loop-oldest", phase: "running", ts: iso(1) });
 
-    const snapshot = await read.snapshot();
+    const snapshot = await read.snapshot(TEST_TEAM_ID);
 
     expect(snapshot.loops).toHaveLength(LOOP_LIST_CAP);
     expect(snapshot.loops[0]!.loop.id).toBe("loop-a");
@@ -130,7 +147,7 @@ describe("D-group (Batch 3 Dashboard): read model and page model", () => {
     });
     await seedRun(db, { id: "run-late", loopId: "loop-completed-late", phase: "running", ts: iso(41) });
 
-    const snapshot = await read.snapshot();
+    const snapshot = await read.snapshot(TEST_TEAM_ID);
 
     expect(loopById(snapshot, "loop-open").lifecycle).toBe("open");
     expect(loopById(snapshot, "loop-closed").lifecycle).toBe("closed");
@@ -188,7 +205,7 @@ describe("D-group (Batch 3 Dashboard): read model and page model", () => {
     });
     await seedRun(db, { id: "run-running", loopId: "loop-2", phase: "running", ts: iso(2) });
 
-    const snapshot = await read.snapshot();
+    const snapshot = await read.snapshot(TEST_TEAM_ID);
     const one = loopById(snapshot, "loop-1");
     const two = loopById(snapshot, "loop-2");
 
@@ -220,7 +237,8 @@ describe("D-group (Batch 3 Dashboard): read model and page model", () => {
     await seedLoop(db, { id: "loop-capable", machineId: "m-capable" });
     await seedLoop(db, { id: "loop-other", machineId: "m-other" });
     await seedLoop(db, { id: "loop-empty", machineId: "m-empty" });
-    // No machine row at all — must fail safe to the same hint.
+    // No machine row at all — slice 6's team-scoped INNER JOIN excludes it
+    // entirely (an orphan loop is invisible to every team, like the API).
     await seedLoop(db, { id: "loop-no-machine", machineId: "m-absent" });
 
     // A failed sync: the attempt stamp IS the failure time while an error is set.
@@ -271,7 +289,7 @@ describe("D-group (Batch 3 Dashboard): read model and page model", () => {
       transcript: [{ kind: "text", text: "run-transcript-secret" }],
     });
 
-    const snapshot = await read.snapshot();
+    const snapshot = await read.snapshot(TEST_TEAM_ID);
     const model = buildDashboardPageModel(snapshot);
 
     // The Run holding all sentinels was selected by both reads above: latest
@@ -284,13 +302,13 @@ describe("D-group (Batch 3 Dashboard): read model and page model", () => {
     expect(loopById(snapshot, "loop-capable").terminalJournalV1).toBe(true);
     expect(loopById(snapshot, "loop-other").terminalJournalV1).toBe(false);
     expect(loopById(snapshot, "loop-empty").terminalJournalV1).toBe(false);
-    expect(loopById(snapshot, "loop-no-machine").terminalJournalV1).toBe(false);
+    expect(snapshot.loops.some((l) => l.loop.id === "loop-no-machine")).toBe(false);
 
     const cards = new Map(model.loops.map((c) => [c.id, c]));
     expect(cards.get("loop-capable")!.capabilityWarning).toBeNull();
     expect(cards.get("loop-other")!.capabilityWarning).not.toBeNull();
     expect(cards.get("loop-empty")!.capabilityWarning).not.toBeNull();
-    expect(cards.get("loop-no-machine")!.capabilityWarning).not.toBeNull();
+    expect(cards.has("loop-no-machine")).toBe(false);
 
     const failed = cards.get("loop-sync-failed")!;
     expect(failed.taskFilePathLabel).toBe("/tmp/task.md");
@@ -355,5 +373,54 @@ describe("D-group (Batch 3 Dashboard): read model and page model", () => {
         "workdir",
       ].sort(),
     );
+  });
+
+  it("D7: boundSnapshots is team-filtered in SQL (a foreign loop yields no rows)", async () => {
+    await fresh();
+    await seedMachine(db, "m-b", { teamId: TEAM_B });
+    await seedLoop(db, { id: "loop-a" });
+    await seedLoop(db, { id: "loop-b", machineId: "m-b" });
+    await seedArtifactManifest(db, {
+      id: "amf-a",
+      namespaceId: TEST_TEAM_ID,
+      machineId: "m-test",
+      loopId: "loop-a",
+    });
+    await seedArtifactManifest(db, { id: "amf-b", namespaceId: TEAM_B, machineId: "m-b", loopId: "loop-b" });
+    await seedRun(db, { id: "run-a-bound", loopId: "loop-a", artifactSnapshotId: "amf-a" });
+    await seedRun(db, { id: "run-b-bound", loopId: "loop-b", machineId: "m-b", artifactSnapshotId: "amf-b" });
+
+    // The read seam only touches `db` for this method; the API arm is unused.
+    const artifacts = createDashboardArtifactRead({ db, api: {} as never });
+    expect((await artifacts.boundSnapshots(TEST_TEAM_ID, "loop-a")).map((r) => [r.runId, r.snapshotId])).toEqual([
+      ["run-a-bound", "amf-a"],
+    ]);
+    expect(await artifacts.boundSnapshots(TEST_TEAM_ID, "loop-b")).toEqual([]);
+    expect((await artifacts.boundSnapshots(TEAM_B, "loop-b")).map((r) => r.runId)).toEqual(["run-b-bound"]);
+  });
+
+  it("D6: lists ONLY the session team's loops; unclaimed, foreign and orphan rows are invisible, and the cap applies after the filter", async () => {
+    await fresh();
+    await seedMachine(db, "m-b", { teamId: TEAM_B });
+    await seedMachine(db, "m-u"); // unclaimed
+    // Team B owns a full cap of NEWER loops; team A owns one much older loop.
+    // A global LIMIT before the team filter would drop A's row.
+    for (let i = 0; i < LOOP_LIST_CAP; i += 1) {
+      await seedLoop(db, {
+        id: `loop-b-${String(i).padStart(3, "0")}`,
+        machineId: "m-b",
+        updatedAt: iso(1000 + i),
+      });
+    }
+    await seedLoop(db, { id: "loop-a", updatedAt: iso(0) });
+    await seedLoop(db, { id: "loop-u", machineId: "m-u", updatedAt: iso(2000) });
+    await seedLoop(db, { id: "loop-orphan", machineId: "m-absent", updatedAt: iso(2001) });
+
+    const a = await read.snapshot(TEST_TEAM_ID);
+    expect(a.loops.map((l) => l.loop.id)).toEqual(["loop-a"]);
+
+    const b = await read.snapshot(TEAM_B);
+    expect(b.loops).toHaveLength(LOOP_LIST_CAP);
+    expect(b.loops.every((l) => l.loop.id.startsWith("loop-b-"))).toBe(true);
   });
 });

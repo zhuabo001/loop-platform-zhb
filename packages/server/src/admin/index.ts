@@ -132,42 +132,32 @@ export type CreateLoopResult =
 
 export function createLoopAdmin(deps: LoopAdminDeps) {
   /**
-   * The shared list queries. `teamId === null` is the DASHBOARD's TEMPORARY
-   * unscoped read (Phase 5 Batch 3 slice 5; slice 6 removes it) and is
-   * reachable ONLY through the explicitly named `listLoopsUnscoped` method —
-   * never through a defaulted or optional parameter on a management method.
+   * The shared list queries. Both are TEAM-SCOPED in SQL, with the filter
+   * applied BEFORE ORDER BY and LIMIT: filtering after truncation would let
+   * another team's newer rows consume the cap. There is no unscoped arm —
+   * slice 6 deleted the Dashboard's temporary exit (ADR-011 决策 24/30).
    *
-   * The unscoped loop query keeps the original no-join shape so an orphan loop
-   * (missing machine row) stays visible to the Dashboard exactly as before.
-   * The scoped query INNER JOINs machines and filters in SQL, BEFORE the
-   * ORDER BY and LIMIT: filtering after truncation would let another team's
-   * newer rows consume the 100-row cap.
+   * The loop query INNER JOINs machines, so an orphan loop (missing machine
+   * row) is invisible to every caller — including the Dashboard.
    */
-  async function queryMachines(teamId: string | null): Promise<MachineSummary[]> {
+  async function queryMachines(teamId: string): Promise<MachineSummary[]> {
     const rows = await deps.db
       .select(machineSummaryColumns)
       .from(machines)
-      .where(teamId === null ? undefined : eq(machines.teamId, teamId))
+      .where(eq(machines.teamId, teamId))
       .orderBy(asc(machines.name), asc(machines.id))
       .limit(MACHINE_LIST_CAP);
     return rows.map(toMachineSummary);
   }
 
-  async function queryLoops(teamId: string | null): Promise<LoopSummary[]> {
-    const loopRows =
-      teamId === null
-        ? await deps.db
-            .select(loopSummaryColumns)
-            .from(loops)
-            .orderBy(desc(loops.updatedAt), asc(loops.id))
-            .limit(LOOP_LIST_CAP)
-        : await deps.db
-            .select(loopSummaryColumns)
-            .from(loops)
-            .innerJoin(machines, eq(machines.id, loops.machineId))
-            .where(eq(machines.teamId, teamId))
-            .orderBy(desc(loops.updatedAt), asc(loops.id))
-            .limit(LOOP_LIST_CAP);
+  async function queryLoops(teamId: string): Promise<LoopSummary[]> {
+    const loopRows = await deps.db
+      .select(loopSummaryColumns)
+      .from(loops)
+      .innerJoin(machines, eq(machines.id, loops.machineId))
+      .where(eq(machines.teamId, teamId))
+      .orderBy(desc(loops.updatedAt), asc(loops.id))
+      .limit(LOOP_LIST_CAP);
     if (loopRows.length === 0) return [];
 
     const runRows = await deps.db
@@ -360,16 +350,6 @@ export function createLoopAdmin(deps: LoopAdminDeps) {
      */
     async listLoops(teamId: string): Promise<LoopSummary[]> {
       return queryLoops(teamId);
-    },
-
-    /**
-     * TEMPORARY (Phase 5 Batch 3 slice 5; slice 6 removes it): the Dashboard is
-     * not session-gated yet, so it still reads every loop. Named `Unscoped` so
-     * the escape hatch is greppable and cannot be mistaken for the management
-     * query.
-     */
-    async listLoopsUnscoped(): Promise<LoopSummary[]> {
-      return queryLoops(null);
     },
 
     /**

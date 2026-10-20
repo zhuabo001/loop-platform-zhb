@@ -67,7 +67,13 @@ import { closeDb } from "./db/index.js";
 import { loops, runLeases, runs } from "./db/schema.js";
 import { AcceptedReportCostObserver, DaemonControlObserver, DaemonLogObserver, DetachedProcessSupervisor } from "./real-claude-e2e-harness.js";
 import { bootstrapServer, waitForListening, type BootedServer } from "./start.js";
-import { FakeClock, FakeCronFactory, makeTestAuthConfig, seedClaimedMachineIfAbsent } from "./testkit/index.js";
+import {
+  FakeClock,
+  FakeCronFactory,
+  makeTestAuthConfig,
+  seedClaimedMachineIfAbsent,
+  seedManagementSession,
+} from "./testkit/index.js";
 import { assertBatch3StateSource, buildBatch3AcceptanceTask } from "./phase4-batch3-acceptance-task.js";
 
 const ENABLED = process.env.LOOPZHB_REAL_CLAUDE_E2E === "1";
@@ -82,6 +88,16 @@ const AGENT_TIMEOUT_MS = 10 * 60_000;
 const TEST_TIMEOUT_MS = 25 * 60_000;
 const MAX_LOG_BYTES = 64 * 1024;
 const FORM = "application/x-www-form-urlencoded";
+
+let sessionCredential = "";
+
+/** Every management request and Dashboard page carries the Login Session
+ *  (slices 5–6). */
+function sessionHeaders(extra: ConstructorParameters<typeof Headers>[0] = {}): Headers {
+  const headers = new Headers(extra);
+  if (!headers.has("cookie")) headers.set("cookie", `loopzhb_session=${sessionCredential}`);
+  return headers;
+}
 
 const daemons: DetachedProcessSupervisor[] = [];
 const servers: ServerType[] = [];
@@ -190,6 +206,9 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 3 real Claude E2E (opt-in)", () => {
         // claimed machine this daemon's token polls as (idempotent across the
         // restart phases, which boot repeatedly on the same dataDir).
         await seedClaimedMachineIfAbsent(booted.handle.db, TOKEN);
+        // Slice 5/6: every management request and the Dashboard itself require
+        // a Login Session. Idempotent across the restart below.
+        sessionCredential = (await seedManagementSession(booted.handle.db, { clock })).credential;
         const listener = serve({ fetch: (req: Request) => reportCosts.fetch(req, (r) => booted.app.fetch(r)), port: 0, hostname: "127.0.0.1" });
         servers.push(listener);
         await waitForListening(listener);
@@ -262,7 +281,7 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 3 real Claude E2E (opt-in)", () => {
       daemon.stderr?.on("data", (chunk: Buffer) => logs.append("stderr", chunk));
 
       const runsOf = async (url: string, loopId: string) => {
-        const res = await fetch(`${url}/api/loops/${loopId}/runs`);
+        const res = await fetch(`${url}/api/loops/${loopId}/runs`, { headers: sessionHeaders() });
         expect(res.status).toBe(200);
         return runListResponseSchema.parse(await res.json()).runs;
       };
@@ -288,7 +307,7 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 3 real Claude E2E (opt-in)", () => {
         //    — written only by the daemon's own poll contact.
         const machineId = machineIdFromToken(TOKEN);
         await waitFor(async () => {
-          const res = await fetch(`/api/machines`);
+          const res = await fetch(`/api/machines`, { headers: sessionHeaders() });
           if (!res.ok) return false;
           const body = (await res.json()) as { machines?: Array<{ id: string; lastSeen: string | null }> };
           return body.machines?.some((m) => m.id === machineId && m.lastSeen !== null) ?? false;
@@ -298,7 +317,7 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 3 real Claude E2E (opt-in)", () => {
         //    disarm a live cron rather than a dormant one.
         const createRes = await fetch(`${baseUrl}/api/loops`, {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers: sessionHeaders({ "content-type": "application/json" }),
           body: JSON.stringify({
             machineId,
             name: "b3-real-claude",
@@ -314,7 +333,7 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 3 real Claude E2E (opt-in)", () => {
 
         // 7. The page the operator actually clicks: `GET /`, token scraped
         //    from the rendered form.
-        const page = await fetch(`${baseUrl}/`);
+        const page = await fetch(`${baseUrl}/`, { headers: sessionHeaders() });
         expect(page.status).toBe(200);
         const { action, token } = runFormFrom(await page.text());
 
@@ -325,7 +344,7 @@ describe.skipIf(!ENABLED)("Phase 4 Batch 3 real Claude E2E (opt-in)", () => {
           const before = new Set((await runsOf(baseUrl, loopId)).map((r) => r.id));
           const res = await fetch(`${baseUrl}${action}`, {
             method: "POST",
-            headers: { "content-type": FORM },
+            headers: sessionHeaders({ "content-type": FORM }),
             body: `csrf=${encodeURIComponent(token)}`,
             redirect: "manual",
           });

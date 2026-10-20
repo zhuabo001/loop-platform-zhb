@@ -42,6 +42,12 @@ The Session gate plus the ownership gates over the management JSON surface: deny
 `/api/*`, exempting the login-status probe and the machine credential routes.
 _Avoid_: Admin login, API key, per-route permission
 
+**Dashboard Access**:
+The HTML-surface counterpart: a Session gate over `/` and `/dashboard/*` that redirects anonymous
+page loads to `/login` and refuses anonymous writes with 401, plus the same loop ownership gate the
+JSON surface uses. It reads the same Login Session and never a request-selected team.
+_Avoid_: Page login, cookie-only view, dashboard ACL
+
 **Ownership Chain**:
 The one derivation Run → Loop → Machine → Team used by the management gates and the Artifact reads;
 `runs.machineId` is a redundant copy and never decides ownership.
@@ -242,7 +248,7 @@ _Avoid_: OAuth session, login state (both collide with Login Session)
 
 **Session CSRF Token**:
 The per-Login-Session form token DERIVED from the session credential
-(`sha256(credential + ":csrf")`), never stored; submitted as the `csrf` form field of logout
-(and later dashboard forms). Distinct from the dashboard's boot-level token, which is one
-process-wide value until slice 6 re-wires the forms.
-_Avoid_: CSRF token unqualified, double-submit cookie
+(`sha256(credential + ":csrf")`), never stored; submitted as the `csrf` form field of logout, the
+Dashboard's Run Now form and the Artifact config form. Two Sessions of the same user hold different
+tokens, and a token never authorises another Session. The old boot-level process token is gone.
+_Avoid_: CSRF token unqualified, double-submit cookie, per-boot token

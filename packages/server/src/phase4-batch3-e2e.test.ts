@@ -186,7 +186,8 @@ function runFormFrom(html: string): { action: string; token: string } {
 }
 
 async function getPage(baseUrl: string): Promise<string> {
-  const res = await fetch(`${baseUrl}/`);
+  // Slice 6: the Dashboard requires the same Login Session as /api/*.
+  const res = await fetch(`${baseUrl}/`, { headers: sessionHeaders() });
   expect(res.status).toBe(200);
   expect(res.headers.get("content-type")).toBe("text/html; charset=UTF-8");
   return res.text();
@@ -337,7 +338,7 @@ describe("Phase 4 Batch 3 deterministic E2E (E1–E2): Dashboard → state → f
           const before = new Set((await runsOf(first.baseUrl, loopId)).map((r) => r.id));
           const res = await fetch(`${first.baseUrl}${action}`, {
             method: "POST",
-            headers: { "content-type": FORM },
+            headers: sessionHeaders({ "content-type": FORM }),
             body: `csrf=${encodeURIComponent(token)}`,
             redirect: "manual",
           });
