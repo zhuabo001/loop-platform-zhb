@@ -2,7 +2,7 @@
 
 > 本文档按批次记录 Phase 5 的内部验收证据，各批次一节。各批次的交付范围与完成定义见其权威计划
 > （Batch 1：`docs/plan/codex-phase5-batch1-plan.md`；Batch 2：`docs/plan/codex-phase5-batch2-plan.md`）。
-> **Phase 5 未收口**：Batch 3 片 1–7 已实现，片 7 待独立三轨复审；Batch 4–6 未开始。
+> **Phase 5 未收口**：Batch 3 片 1–7 已完成并收口；Batch 4–6 未开始。
 
 ## 测试环境
 
@@ -223,7 +223,7 @@ Batch 2 全部编组（AT/AH/AJ/AS/AW/AR/AV）与 AI1–AI7 故障集成验收�
 - **pnpm**: 10.6.1
 - **分支**: `feat/phase5-batch3-dev`
 - **批次基线**: `4ff517a`（Batch 2 合入后的 main）
-- **批次 PR**: [#119](https://github.com/zhuabo001/loop-platform-zhb/pull/119)（保持 OPEN，合入另行授权）
+- **批次 PR**: [#119](https://github.com/zhuabo001/loop-platform-zhb/pull/119)（已合入 main，合并提交 `2412dbc`）
 - **片 7 环境**: 2026-10-20，Node.js v24.21.0，同一分支；验收时 `feat/phase5-batch3-dev` @ `3852539` + 本片工作区
 - **长期决策**: `docs/adr/011-phase5-identity-and-legacy-claim.md`（决策 1–38；片 7 增补 34–38）
 
@@ -691,7 +691,7 @@ server 较片 5 审后基线（1269 + 3 skipped）**+15**：新增 16 项（门�
   - `http/server-shutdown.test.ts` SD1/SD2 通过（空闲 keep-alive 不阻塞；活跃未完成请求在宽限期被强制关闭）。
   - 真实 `dist/start.js` 重放：另开 keep-alive 客户端持有连接，SIGTERM 后 `SERVER_EXIT=0`、`LOCK_REMOVED`。
   - 构建产物 drill 与 BI/PG/跨进程锁套件在修复后复跑全绿。
-- **Issue**：[#124](https://github.com/zhuabo001/loop-platform-zhb/issues/124) 已创建并保持 OPEN；修复与测试已具备，按仓库规则待独立复审后再关闭。
+- **修复提交**：`e617732`（含 [#124](https://github.com/zhuabo001/loop-platform-zhb/issues/124) 的 HTTP 停止修复与 SD1/SD2 回归），已随 `2412dbc` 合入 main。
 
 ### 显式边界核对（片 7）
 

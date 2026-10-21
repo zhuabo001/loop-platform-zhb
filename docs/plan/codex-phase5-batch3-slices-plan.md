@@ -1,6 +1,6 @@
 # Phase 5 Batch 3 开发计划：GitHub 登录、个人团队与旧数据认领
 
-- 状态：Slice 1–7 已实现（2026-10-20）；片 7 三轨复审 Round 1/2 通过，剩余文档归档 P3 已修正；批次 PR #119 保持 OPEN，合入另行授权
+- 状态：Slice 1–7 已完成并收口（2026-10-21）；批次 PR [#119](https://github.com/zhuabo001/loop-platform-zhb/pull/119) 已合入 main（`2412dbc`）
 - 调查基线：`feat/phase5-batch3-dev`，提交 `4ff517a`
 - 上位计划：[codex-phase5-dev-roadmap.md](codex-phase5-dev-roadmap.md)
 - Batch 2：PR [#84](https://github.com/zhuabo001/loop-platform-zhb/pull/84) 已合入；实现与验收记录见 [codex-phase5-batch2-plan.md](codex-phase5-batch2-plan.md) 和 `docs/tests/phase5-acceptance.md`
