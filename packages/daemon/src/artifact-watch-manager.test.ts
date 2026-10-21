@@ -45,11 +45,9 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
 /** Poll until a positive condition holds. The deadline is a regression
  *  tripwire, not a performance assertion: a passing run resolves at the 2 ms
  *  poll cadence and never pays it, while a broken one still fails — just
- *  later. The waits below cover real async work (admission lstat + full
- *  rehash + sync round) that must fit inside this WALL-CLOCK budget even when
- *  a loaded CI runner stalls the event loop for seconds at a time; 2 s was
- *  calibrated on a dev machine and flaked there (4 red / 2 green on the same
- *  tree), so the budget is 10 s. Absence assertions use settleFor instead. */
+ *  later. 10 s (was 2 s) is headroom for CI event-loop stalls. Note the
+ *  headline P2 flake was NOT a budget problem but a tick/restore race in the
+ *  test itself — see the P2 case below. Absence assertions use settleFor. */
 async function waitUntil(predicate: () => boolean, label: string, timeoutMs = 10_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
@@ -382,8 +380,9 @@ describe("artifact-watch-manager", () => {
 
     await waitUntil(() => harness.time.pendingMs().includes(ARTIFACT_WATCH_RECONCILE_MS), "the reconcile tick");
     harness.time.fire(ARTIFACT_WATCH_RECONCILE_MS);
-    await tick();
-    await tick();
+    // The tick's full scan does real fs I/O; two fixed ticks do not
+    // deterministically cover it — wait for the call itself.
+    await waitUntil(() => harness.sync.calls.length === 2, "the tick's full scan");
 
     expect(harness.sync.calls).toHaveLength(2);
     // Mutation: reuse the cache on the tick ⇒ red (the reconcile MUST rehash).
@@ -1036,15 +1035,21 @@ describe("artifact-watch-manager", () => {
     rmSync(base, { recursive: true, force: true });
     await waitUntil(() => harness.time.pendingMs().includes(ARTIFACT_WATCH_RECONCILE_MS), "the tick");
     harness.time.fire(ARTIFACT_WATCH_RECONCILE_MS);
-    await tick();
-    await tick();
+    // Wait for the tick to FINISH before asserting absence and before the
+    // restore below: the loop re-arms only after reconcileTick RETURNS, and
+    // its admit does real fs I/O — two fixed ticks do not cover it. A slow
+    // admit that lands after the restore re-admits on THIS tick, and the
+    // recovery tick's full scan then adds a second call that makes the
+    // exact-count wait below permanently false (the CI flake: "deadline
+    // exceeded waiting for the re-admission scan", 5 red / 2 green).
+    await waitUntil(() => harness.time.pendingMs().includes(ARTIFACT_WATCH_RECONCILE_MS), "the tick to finish");
     expect(harness.sync.calls).toHaveLength(callsAfterFailure);
     expect(harness.watchers.handles).toHaveLength(1);
 
-    // Recovery: the root comes back ⇒ re-subscribe and FULL rehash.
+    // Recovery: the root comes back ⇒ re-subscribe and FULL rehash. The loop
+    // re-armed above, so this fire is the recovery tick.
     mkdirSync(base, { recursive: true });
     harness.sync.setOutcome({ kind: "unchanged" });
-    await waitUntil(() => harness.time.pendingMs().includes(ARTIFACT_WATCH_RECONCILE_MS), "the re-armed tick");
     harness.time.fire(ARTIFACT_WATCH_RECONCILE_MS);
     await waitUntil(() => harness.watchers.handles.length === 2, "the recovered subscription");
     await waitUntil(() => harness.sync.calls.length === callsAfterFailure + 1, "the re-admission scan");
